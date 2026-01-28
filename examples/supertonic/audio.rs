@@ -1,6 +1,6 @@
-use std::fs::File;
-use std::io::{Write, BufWriter};
 use anyhow::Result;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 
 pub struct WavWriter;
 
@@ -21,7 +21,7 @@ impl WavWriter {
         // fmt chunk
         writer.write_all(b"fmt ")?;
         writer.write_all(&(16u32).to_le_bytes())?; // Subchunk1Size
-        writer.write_all(&(1u16).to_le_bytes())?;    // AudioFormat (PCM)
+        writer.write_all(&(1u16).to_le_bytes())?; // AudioFormat (PCM)
         writer.write_all(&num_channels.to_le_bytes())?;
         writer.write_all(&sample_rate.to_le_bytes())?;
         writer.write_all(&(sample_rate * num_channels as u32 * 2).to_le_bytes())?; // ByteRate

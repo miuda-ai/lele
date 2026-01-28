@@ -1,10 +1,10 @@
-use crate::tensor::TensorView;
 use crate::kernels::utils;
+use crate::tensor::TensorView;
 use std::borrow::Cow;
 pub fn softmax<'b, 'a>(
     input: &TensorView<'b>,
     axis: i32,
-    out_buf: &'a mut Vec<f32>
+    out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     let ndim = input.shape.len();
     let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
@@ -12,7 +12,7 @@ pub fn softmax<'b, 'a>(
     let numel = input.data.len();
     utils::ensure_capacity(out_buf, numel);
     let out_slice = unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), numel) };
-    let inner_size: usize = input.shape[axis+1..].iter().product();
+    let inner_size: usize = input.shape[axis + 1..].iter().product();
     let axis_size = input.shape[axis];
     let outer_size: usize = input.shape[..axis].iter().product();
     let data = &input.data;
@@ -39,30 +39,31 @@ pub fn softmax<'b, 'a>(
     }
     TensorView {
         data: Cow::Borrowed(out_slice),
-        shape: std::borrow::Cow::Owned(input.shape.to_vec())
+        shape: std::borrow::Cow::Owned(input.shape.to_vec()),
     }
 }
 pub fn layer_norm<'b, 'a>(
     input: &TensorView<'b>,
     scale: &TensorView<'b>,
     bias: &TensorView<'b>,
-    axis: i32, 
+    axis: i32,
     epsilon: f32,
-    out_buf: &'a mut Vec<f32>
+    out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     let ndim = input.shape.len();
     let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
     let outer_size: usize = input.shape[..axis].iter().product();
     let norm_size: usize = input.shape[axis..].iter().product();
     utils::ensure_capacity(out_buf, input.data.len());
-    let out_slice = unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), input.data.len()) };
+    let out_slice =
+        unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), input.data.len()) };
     let src = &input.data;
     let gamma = &scale.data;
     let beta = &bias.data;
     for i in 0..outer_size {
         let offset = i * norm_size;
-        let chunk = &src[offset .. offset + norm_size];
-        let out_chunk = &mut out_slice[offset .. offset + norm_size];
+        let chunk = &src[offset..offset + norm_size];
+        let out_chunk = &mut out_slice[offset..offset + norm_size];
         let sum: f32 = chunk.iter().sum();
         let mean = sum / norm_size as f32;
         let var_sum: f32 = chunk.iter().map(|&x| (x - mean) * (x - mean)).sum();
@@ -74,7 +75,7 @@ pub fn layer_norm<'b, 'a>(
     }
     TensorView {
         data: Cow::Borrowed(out_slice),
-        shape: std::borrow::Cow::Owned(input.shape.to_vec())
+        shape: std::borrow::Cow::Owned(input.shape.to_vec()),
     }
 }
 pub fn batch_norm<'b, 'a>(
@@ -84,7 +85,7 @@ pub fn batch_norm<'b, 'a>(
     mean: &TensorView<'b>,
     var: &TensorView<'b>,
     epsilon: f32,
-    out_buf: &'a mut Vec<f32>
+    out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     let shape = &input.shape;
     let numel = input.data.len();
@@ -114,7 +115,11 @@ pub fn batch_norm<'b, 'a>(
     } else {
         let c = if shape.len() > 1 { shape[1] } else { shape[0] };
         let outer_size = shape[0];
-        let inner_size: usize = if shape.len() > 2 { shape[2..].iter().product() } else { 1 };
+        let inner_size: usize = if shape.len() > 2 {
+            shape[2..].iter().product()
+        } else {
+            1
+        };
         let src = &input.data;
         let s = &scale.data;
         let b = &bias.data;
@@ -133,6 +138,6 @@ pub fn batch_norm<'b, 'a>(
     }
     TensorView {
         data: Cow::Borrowed(out_slice),
-        shape: Cow::Owned(shape.to_vec())
+        shape: Cow::Owned(shape.to_vec()),
     }
 }

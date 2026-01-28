@@ -96,19 +96,15 @@ mod tests {
     use super::*;
     #[test]
     fn test_cmvn_basic() {
-        let data = vec![
-            1.0, 10.0, 
-            2.0, 20.0, 
-            3.0, 30.0, 
-        ];
+        let data = vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0];
         let input = TensorView::from_owned(data, vec![3, 2]);
         let cmvn = Cmvn::default();
         let output = cmvn.compute(&input);
         let out_data = output.data.as_ref();
         let col0_mean = (out_data[0] + out_data[2] + out_data[4]) / 3.0;
         assert!((col0_mean).abs() < 1e-5, "Mean should be near 0");
-        assert!(out_data[0] < 0.0); 
-        assert!(out_data[2].abs() < 1e-5); 
-        assert!(out_data[4] > 0.0); 
+        assert!(out_data[0] < 0.0);
+        assert!(out_data[2].abs() < 1e-5);
+        assert!(out_data[4] > 0.0);
     }
 }

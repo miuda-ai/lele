@@ -1,5 +1,5 @@
-use crate::tensor::TensorView;
 use crate::kernels::activations::{sigmoid, tanh};
+use crate::tensor::TensorView;
 pub fn lstm<'b, 'a>(
     input: &TensorView<'b>,
     w: &TensorView<'b>,
@@ -15,8 +15,7 @@ pub fn lstm<'b, 'a>(
     let seq_len = input.shape[0];
     let batch_size = input.shape[1];
     let input_size = input.shape[2];
-    if seq_len == 0 {
-    }
+
     let num_directions = w.shape[0];
     let hidden_size = w.shape[1] / 4;
     if num_directions != 1 {
@@ -28,7 +27,11 @@ pub fn lstm<'b, 'a>(
     let w_data = &w.data;
     let r_data = &r.data;
     let default_bias = vec![0.0; 8 * hidden_size];
-    let bias_data: &[f32] = if let Some(b) = bias { b.data.as_ref() } else { default_bias.as_slice() };
+    let bias_data: &[f32] = if let Some(b) = bias {
+        b.data.as_ref()
+    } else {
+        default_bias.as_slice()
+    };
     let (bias_w_slice, bias_r_slice) = bias_data.split_at(4 * hidden_size);
     out_h.resize(hidden_size, 0.0);
     if let Some(h) = initial_h {
@@ -45,7 +48,7 @@ pub fn lstm<'b, 'a>(
     out_y.resize(seq_len * hidden_size, 0.0);
     let mut gates = vec![0.0; 4 * hidden_size];
     for t in 0..seq_len {
-        let input_offset = t * input_size; 
+        let input_offset = t * input_size;
         let x_t = &input.data[input_offset..input_offset + input_size];
         for g in 0..(4 * hidden_size) {
             let mut val = bias_w_slice[g];
@@ -59,8 +62,8 @@ pub fn lstm<'b, 'a>(
             gates[g] = val;
         }
         for k in 0..hidden_size {
-            let i_gate = sigmoid(gates[0 * hidden_size + k]);
-            let o_gate = sigmoid(gates[1 * hidden_size + k]);
+            let i_gate = sigmoid(gates[k]);
+            let o_gate = sigmoid(gates[hidden_size + k]);
             let f_gate = sigmoid(gates[2 * hidden_size + k]);
             let c_gate = tanh(gates[3 * hidden_size + k]);
             let ct = f_gate * out_c[k] + i_gate * c_gate;

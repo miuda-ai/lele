@@ -34,17 +34,9 @@ name = "silero"
 path = "examples/silero/main.rs"
 
 [[example]]
-name = "silero_benchmark"
-path = "examples/silero/benchmark.rs"
-
-[[example]]
 name = "sensevoice"
 path = "examples/sensevoice/main.rs"
 
 [[example]]
 name = "supertonic"
 path = "examples/supertonic/main.rs"
-
-[[example]]
-name = "test_quant_pipeline"
-path = "examples/test_quant_pipeline.rs"

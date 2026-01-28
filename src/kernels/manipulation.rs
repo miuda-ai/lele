@@ -10,7 +10,7 @@ pub fn concat<'b, 'a>(
     }
     let non_empty_inputs: Vec<&TensorView<'b>> = inputs
         .iter()
-        .filter(|inp| inp.data.len() > 0)
+        .filter(|inp| !inp.data.is_empty())
         .copied()
         .collect();
     if non_empty_inputs.is_empty() {
@@ -205,7 +205,7 @@ pub fn pad<'b, 'a>(
         out.set_len(total);
     }
     let fill_val = constant_value
-        .and_then(|t| t.data.get(0))
+        .and_then(|t| t.data.first())
         .copied()
         .unwrap_or(0.0);
     out.fill(fill_val);
@@ -357,7 +357,7 @@ pub fn to_i64_vec(input: &TensorView) -> Vec<i64> {
 pub fn split<'a>(
     input: &TensorView,
     axis: i64,
-    splits: &[i64], 
+    splits: &[i64],
     outputs: &'a mut [Vec<f32>],
 ) -> Vec<TensorView<'a>> {
     let ndim = input.dim();
@@ -417,7 +417,7 @@ pub fn where_op<'b, 'a>(
         let numel = cond_data.len();
         utils::ensure_capacity(out, numel);
         unsafe {
-            out.set_len(0); 
+            out.set_len(0);
         }
         for i in 0..numel {
             out.push(if cond_data[i] != 0.0 {
@@ -434,7 +434,7 @@ pub fn where_op<'b, 'a>(
     let out_numel = out_shape.iter().product();
     utils::ensure_capacity(out, out_numel);
     unsafe {
-        out.set_len(0); 
+        out.set_len(0);
     }
     let cond_strides = utils::compute_strides(&condition.shape);
     let x_strides = utils::compute_strides(&x.shape);
@@ -480,7 +480,7 @@ mod tests {
         let d1 = vec![1.0, 2.0, 3.0, 4.0];
         let t1 = TensorView::from_slice(&d1, vec![2, 2]);
         let d2 = vec![5.0, 6.0];
-        let t2 = TensorView::from_slice(&d2, vec![2, 1]); 
+        let t2 = TensorView::from_slice(&d2, vec![2, 1]);
         let mut out = Vec::new();
         let res = concat(&[&t1, &t2], 1, &mut out);
         assert_eq!(res.shape, vec![2, 3]);

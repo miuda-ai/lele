@@ -192,7 +192,7 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
                 if let Some(mapped) = available_vars.get(n) {
                     mapped.clone()
                 } else {
-                    format!("lele::tensor::TensorView::empty()")
+                    "lele::tensor::TensorView::empty()".to_string()
                 }
             })
             .collect();
@@ -262,10 +262,8 @@ pub(crate) fn generate_nodes<W: Write>(
         let op = node.op_type.as_str();
         let outputs: Vec<String> = node.output.iter().map(|s| sanitize_name(s)).collect();
         // Skip Code Generation for Constants that are already in weights
-        if op == "Constant" && !outputs.is_empty() {
-            if known_weights.contains_key(&outputs[0]) {
-                continue;
-            }
+        if op == "Constant" && !outputs.is_empty() && known_weights.contains_key(&outputs[0]) {
+            continue;
         }
         let inputs: Vec<String> = node
             .input
@@ -598,7 +596,7 @@ pub(crate) fn generate_nodes<W: Write>(
                             .attribute
                             .iter()
                             .find(|a| a.name == "epsilon")
-                            .and_then(|a| Some(a.f))
+                            .map(|a| a.f)
                             .unwrap_or(1e-5);
                         let axis = node
                             .attribute

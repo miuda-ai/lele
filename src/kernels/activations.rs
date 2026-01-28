@@ -5,7 +5,7 @@ pub fn tanh(x: f32) -> f32 {
     x.tanh()
 }
 pub fn hard_sigmoid(x: f32, alpha: f32, beta: f32) -> f32 {
-    (alpha * x + beta).max(0.0).min(1.0)
+    (alpha * x + beta).clamp(0.0, 1.0)
 }
 pub fn relu_scalar(x: f32) -> f32 {
     x.max(0.0)

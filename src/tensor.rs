@@ -8,9 +8,9 @@ impl<'a> TensorView<'a> {
     pub fn new(data: &'a [f32], shape: &'a [usize]) -> Self {
         let len: usize = shape.iter().product();
         assert_eq!(data.len(), len, "Data length mismatch");
-        Self { 
-            data: Cow::Borrowed(data), 
-            shape: Cow::Borrowed(shape) 
+        Self {
+            data: Cow::Borrowed(data),
+            shape: Cow::Borrowed(shape),
         }
     }
     pub fn from_owned(data: Vec<f32>, shape: Vec<usize>) -> Self {
@@ -18,14 +18,17 @@ impl<'a> TensorView<'a> {
         assert_eq!(data.len(), len, "Data length mismatch");
         Self {
             data: Cow::Owned(data),
-            shape: Cow::Owned(shape)
+            shape: Cow::Owned(shape),
         }
     }
     pub fn to_owned(&self) -> TensorView<'static> {
         TensorView::from_owned(self.data.to_vec(), self.shape.to_vec())
     }
     pub fn empty() -> Self {
-        Self { data: Cow::Borrowed(&[]), shape: Cow::Borrowed(&[]) } 
+        Self {
+            data: Cow::Borrowed(&[]),
+            shape: Cow::Borrowed(&[]),
+        }
     }
     pub fn dim(&self) -> usize {
         self.shape.len()
@@ -36,11 +39,14 @@ impl<'a> TensorView<'a> {
     pub fn from_slice(data: &'a [f32], shape: Vec<usize>) -> Self {
         let len: usize = shape.iter().product();
         assert_eq!(data.len(), len, "Data length mismatch");
-        Self { 
-            data: Cow::Borrowed(data), 
-            shape: Cow::Owned(shape) 
+        Self {
+            data: Cow::Borrowed(data),
+            shape: Cow::Owned(shape),
         }
     }
+    /// # Safety
+    /// This function is unsafe because it bypasses the lifetime system to create a new `TensorView`
+    /// that might outlive the data it points to.
     pub unsafe fn detach<'b>(&self) -> TensorView<'b> {
         let slice = std::slice::from_raw_parts(self.data.as_ptr(), self.data.len());
         let shape_slice = std::slice::from_raw_parts(self.shape.as_ptr(), self.shape.len());

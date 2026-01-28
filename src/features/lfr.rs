@@ -31,7 +31,7 @@ impl Lfr {
         if t == 0 {
             return TensorView::from_owned(vec![], vec![0, d * m]);
         }
-        let t_lfr = (t + n - 1) / n;
+        let t_lfr = t.div_ceil(n);
         let d_out = d * m;
         let mut output_data = vec![0.0; t_lfr * d_out];
         let pad = (m - 1) / 2;

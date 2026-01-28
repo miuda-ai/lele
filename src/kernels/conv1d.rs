@@ -23,14 +23,25 @@ pub fn conv1d<'b, 'a>(
     };
     let out_channels = w_shape[0];
     let kernel_size = w_shape[2];
-    let dilation = if dilations.is_empty() { 1 } else { dilations[0] as usize };
-    let stride = if strides.is_empty() { 1 } else { strides[0] as usize };
+    let dilation = if dilations.is_empty() {
+        1
+    } else {
+        dilations[0] as usize
+    };
+    let stride = if strides.is_empty() {
+        1
+    } else {
+        strides[0] as usize
+    };
     let pad_left = if pads.is_empty() { 0 } else { pads[0] as usize };
     let pad_right = if pads.len() > 1 { pads[1] as usize } else { 0 };
-    let output_len = (input_len + pad_left + pad_right - dilation * (kernel_size - 1) - 1) / stride + 1;
+    let output_len =
+        (input_len + pad_left + pad_right - dilation * (kernel_size - 1) - 1) / stride + 1;
     let total_output_size = batch_size * out_channels * output_len;
     utils::ensure_capacity(out, total_output_size);
-    unsafe { out.set_len(total_output_size); }
+    unsafe {
+        out.set_len(total_output_size);
+    }
     let in_channels_per_group = in_channels / group as usize;
     let out_channels_per_group = out_channels / group as usize;
     let unfolded_rows = in_channels_per_group * kernel_size;
@@ -42,29 +53,39 @@ pub fn conv1d<'b, 'a>(
             let in_group_offset = (b * in_channels + g * in_channels_per_group) * input_len;
             for ic in 0..in_channels_per_group {
                 let in_row_offset = in_group_offset + ic * input_len;
-                let in_data = &input.data[in_row_offset .. in_row_offset + input_len];
+                let in_data = &input.data[in_row_offset..in_row_offset + input_len];
                 for k in 0..kernel_size {
                     let k_offset = k * dilation;
                     let unfolded_row_idx = ic * kernel_size + k;
                     let unfolded_row_offset = unfolded_row_idx * output_len;
                     for t_out in 0..output_len {
-                        let t_in = (t_out * stride) as isize - pad_left as isize + k_offset as isize;
+                        let t_in =
+                            (t_out * stride) as isize - pad_left as isize + k_offset as isize;
                         if t_in >= 0 && (t_in as usize) < input_len {
                             unfolded[unfolded_row_offset + t_out] = in_data[t_in as usize];
                         }
                     }
                 }
             }
-            let weight_group_offset = (g * out_channels_per_group) * in_channels_per_group * kernel_size;
+            let weight_group_offset =
+                (g * out_channels_per_group) * in_channels_per_group * kernel_size;
             let out_group_offset = (b * out_channels + g * out_channels_per_group) * output_len;
             unsafe {
                 sgemm(
-                    out_channels_per_group, unfolded_rows, output_len,
+                    out_channels_per_group,
+                    unfolded_rows,
+                    output_len,
                     1.0,
-                    weights.data.as_ptr().add(weight_group_offset), unfolded_rows as isize, 1,
-                    unfolded.as_ptr(), output_len as isize, 1,
+                    weights.data.as_ptr().add(weight_group_offset),
+                    unfolded_rows as isize,
+                    1,
+                    unfolded.as_ptr(),
+                    output_len as isize,
+                    1,
                     0.0,
-                    out.as_mut_ptr().add(out_group_offset), output_len as isize, 1
+                    out.as_mut_ptr().add(out_group_offset),
+                    output_len as isize,
+                    1,
                 );
             }
         }

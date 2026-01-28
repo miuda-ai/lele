@@ -41,47 +41,40 @@ pub fn tensor_to_array(tensor: &TensorProto) -> Result<(Vec<f32>, Vec<usize>), M
     } else if !tensor.int64_data.is_empty() {
         tensor.int64_data.iter().map(|&x| x as f32).collect()
     } else if !tensor.int32_data.is_empty() {
-         tensor.int32_data.iter().map(|&x| x as f32).collect()
+        tensor.int32_data.iter().map(|&x| x as f32).collect()
     } else if !tensor.raw_data.is_empty() {
-         match tensor.data_type {
-             1 => { 
-                tensor.raw_data
-                    .chunks_exact(4)
-                    .map(|chunk| {
-                        let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                        f32::from_le_bytes(bytes)
-                    })
-                    .collect()
-             },
-             2 => { 
-                 tensor.raw_data.iter().map(|&x| x as f32).collect()
-             },
-             3 => { 
-                 tensor.raw_data.iter().map(|&x| (x as i8) as f32).collect()
-             },
-             6 => { 
-                tensor.raw_data
+        match tensor.data_type {
+            1 => tensor
+                .raw_data
+                .chunks_exact(4)
+                .map(|chunk| {
+                    let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                    f32::from_le_bytes(bytes)
+                })
+                .collect(),
+            2 => tensor.raw_data.iter().map(|&x| x as f32).collect(),
+            3 => tensor.raw_data.iter().map(|&x| (x as i8) as f32).collect(),
+            6 => tensor
+                .raw_data
                 .chunks_exact(4)
                 .map(|chunk| {
                     let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
                     i32::from_le_bytes(bytes) as f32
                 })
-                .collect()
-             },
-             7 => { 
-                tensor.raw_data
+                .collect(),
+            7 => tensor
+                .raw_data
                 .chunks_exact(8)
                 .map(|chunk| {
-                    let bytes = [chunk[0], chunk[1], chunk[2], chunk[3], 
-                                 chunk[4], chunk[5], chunk[6], chunk[7]];
+                    let bytes = [
+                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
+                        chunk[7],
+                    ];
                     i64::from_le_bytes(bytes) as f32
                 })
-                .collect()
-             },
-             _ => {
-                 Vec::new()
-             }
-         }
+                .collect(),
+            _ => Vec::new(),
+        }
     } else {
         Vec::new()
     };

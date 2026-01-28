@@ -1,10 +1,10 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
+use rand_distr::{Distribution, Normal};
 use regex::Regex;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use unicode_normalization::UnicodeNormalization;
-use rand_distr::{Distribution, Normal};
 
 pub const AVAILABLE_LANGS: &[&str] = &["en", "ko", "es", "pt", "fr", "zh"];
 
@@ -60,10 +60,23 @@ pub fn preprocess_text(text: &str, lang: &str) -> Result<String> {
     text = emoji_pattern.replace_all(&text, "").to_string();
 
     let replacements = [
-        ("–", "-"),         ("‑", "-"),         ("—", "-"),         ("_", " "),
-        ("\u{201C}", "\""), ("\u{201D}", "\""), ("\u{2018}", "'"),  ("\u{2019}", "'"),
-        ("´", "'"),         ("`", "'"),         ("[", " "),         ("]", " "),
-        ("|", " "),         ("/", " "),         ("#", " "),         ("→", " "),         ("←", " "),
+        ("–", "-"),
+        ("‑", "-"),
+        ("—", "-"),
+        ("_", " "),
+        ("\u{201C}", "\""),
+        ("\u{201D}", "\""),
+        ("\u{2018}", "'"),
+        ("\u{2019}", "'"),
+        ("´", "'"),
+        ("`", "'"),
+        ("[", " "),
+        ("]", " "),
+        ("|", " "),
+        ("/", " "),
+        ("#", " "),
+        ("→", " "),
+        ("←", " "),
     ];
 
     for (from, to) in &replacements {
@@ -75,18 +88,27 @@ pub fn preprocess_text(text: &str, lang: &str) -> Result<String> {
         text = text.replace(symbol, "");
     }
 
-    text = Regex::new(r"\s+").unwrap().replace_all(&text, " ").to_string();
+    text = Regex::new(r"\s+")
+        .unwrap()
+        .replace_all(&text, " ")
+        .to_string();
     text = text.trim().to_string();
 
     if !text.is_empty() {
-        let ends_with_punct = Regex::new(r#"[.!?;:,'"\u{201C}\u{201D}\u{2018}\u{2019})\]}…。」』】〉》›»]$"#).unwrap();
+        let ends_with_punct =
+            Regex::new(r#"[.!?;:,'"\u{201C}\u{201D}\u{2018}\u{2019})\]}…。」』】〉》›»]$"#)
+                .unwrap();
         if !ends_with_punct.is_match(&text) {
             text.push('.');
         }
     }
 
     if !is_valid_lang(lang) {
-        bail!("Invalid language: {}. Available: {:?}", lang, AVAILABLE_LANGS);
+        bail!(
+            "Invalid language: {}. Available: {:?}",
+            lang,
+            AVAILABLE_LANGS
+        );
     }
 
     text = format!("<{}>{}</{}>", lang, text, lang);
@@ -122,7 +144,10 @@ pub fn sample_noisy_latent(
     let max_duration = duration.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let wav_len_max = (max_duration * sample_rate as f32) as usize;
 
-    let wav_lengths: Vec<usize> = duration.iter().map(|&d| (d * sample_rate as f32) as usize).collect();
+    let wav_lengths: Vec<usize> = duration
+        .iter()
+        .map(|&d| (d * sample_rate as f32) as usize)
+        .collect();
 
     let chunk_size = (base_chunk_size * chunk_compress) as usize;
     let latent_len = (wav_len_max + chunk_size - 1) / chunk_size;
@@ -136,7 +161,10 @@ pub fn sample_noisy_latent(
         *val = normal.sample(&mut rng);
     }
 
-    let latent_lengths: Vec<usize> = wav_lengths.iter().map(|&len| (len + chunk_size - 1) / chunk_size).collect();
+    let latent_lengths: Vec<usize> = wav_lengths
+        .iter()
+        .map(|&len| (len + chunk_size - 1) / chunk_size)
+        .collect();
     let (latent_mask, mask_shape) = length_to_mask(&latent_lengths, Some(latent_len));
 
     for b in 0..bsz {
@@ -149,13 +177,20 @@ pub fn sample_noisy_latent(
         }
     }
 
-    (noisy_latent, vec![bsz, latent_dim_val, latent_len], latent_mask, mask_shape)
+    (
+        noisy_latent,
+        vec![bsz, latent_dim_val, latent_len],
+        latent_mask,
+        mask_shape,
+    )
 }
 
 pub fn chunk_text(text: &str, max_len: Option<usize>) -> Vec<String> {
     let max_len = max_len.unwrap_or(300);
     let text = text.trim();
-    if text.is_empty() { return vec![String::new()]; }
+    if text.is_empty() {
+        return vec![String::new()];
+    }
 
     let para_re = Regex::new(r"\n\s*\n").unwrap();
     let paragraphs: Vec<&str> = para_re.split(text).collect();
@@ -163,7 +198,9 @@ pub fn chunk_text(text: &str, max_len: Option<usize>) -> Vec<String> {
 
     for para in paragraphs {
         let para = para.trim();
-        if para.is_empty() { continue; }
+        if para.is_empty() {
+            continue;
+        }
         if para.len() <= max_len {
             chunks.push(para.to_string());
         } else {

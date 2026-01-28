@@ -126,11 +126,11 @@ impl<'a> NodeVisitor<'a> {
                 if matches!(
                     node.op_type.as_str(),
                     "Squeeze" | "Unsqueeze" | "Reshape" | "Identity" | "Flatten" | "Cast"
-                ) {
-                    if !node.input.is_empty() && !node.output.is_empty() {
-                        self.aliases
-                            .insert(node.output[0].clone(), vec![node.input[0].clone()]);
-                    }
+                ) && !node.input.is_empty()
+                    && !node.output.is_empty()
+                {
+                    self.aliases
+                        .insert(node.output[0].clone(), vec![node.input[0].clone()]);
                 }
                 for attr in &node.attribute {
                     if let Some(g) = &attr.g {
@@ -293,6 +293,12 @@ pub struct Compiler {
     pub(crate) patterns: Vec<Pattern>,
     pub(crate) custom_methods: Vec<String>,
     pub constant_folding: bool,
+}
+
+impl Default for Compiler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Compiler {
@@ -551,11 +557,13 @@ impl Compiler {
             if let Some((data, shape)) = result {
                 let out_name = &node.output[0];
                 constants.insert(out_name.clone(), (data.clone(), shape.clone()));
-                let mut new_init = TensorProto::default();
-                new_init.name = out_name.clone();
-                new_init.dims = shape.iter().map(|&s| s as i64).collect();
-                new_init.data_type = 1; // FLOAT
-                new_init.float_data = data;
+                let new_init = TensorProto {
+                    name: out_name.clone(),
+                    dims: shape.iter().map(|&s| s as i64).collect(),
+                    data_type: 1, // FLOAT
+                    float_data: data,
+                    ..Default::default()
+                };
                 new_initializers.push(new_init);
                 folded_indices.insert(i);
             }
@@ -599,9 +607,9 @@ impl Compiler {
         let mut weight_lookup = HashMap::new();
         for (name, offset, len, shape) in &offset_map {
             let safe_name = sanitize_name(name);
-            if !weight_lookup.contains_key(&safe_name) {
-                weight_lookup.insert(safe_name, (*offset, *len, shape.clone()));
-            }
+            weight_lookup
+                .entry(safe_name)
+                .or_insert((*offset, *len, shape.clone()));
         }
         // --- OPTIMIZATION: Reorder ConstantOfShape -> Concat pattern ---
         // We create a modified list of nodes to pass to body generation
@@ -611,7 +619,7 @@ impl Compiler {
         for (i, node) in nodes.iter().enumerate() {
             if node.op_type == "Concat" && node.input.len() >= 2 {
                 // Check inputs
-                for (_input_idx, input_name) in node.input.iter().enumerate() {
+                for input_name in &node.input {
                     // Check if this input comes from a ConstantOfShape
                     if let Some(pos) = nodes
                         .iter()
@@ -654,11 +662,9 @@ impl Compiler {
                 // We want to insert 'from' node right BEFORE 'to' node.
                 // Find all moves where 'to' == i
                 for (from, to) in &changes {
-                    if *to == i {
-                        if moved_indices.contains(from) {
-                            new_nodes.push(nodes[*from]);
-                            // Remove from set to avoid dups if multiple targets? (Should not happen for unique unique producer)
-                        }
+                    if *to == i && moved_indices.contains(from) {
+                        new_nodes.push(nodes[*from]);
+                        // Remove from set to avoid dups if multiple targets? (Should not happen for unique unique producer)
                     }
                 }
                 if !moved_indices.contains(&i) {
@@ -842,7 +848,7 @@ pub fn sanitize_name(name: &str) -> String {
         .replace("/", "_")
         .replace("-", "_")
         .replace(":", "_");
-    if s.chars().next().map_or(false, |c| c.is_numeric()) {
+    if s.chars().next().is_some_and(|c| c.is_numeric()) {
         format!("_{}", s)
     } else {
         s
@@ -854,7 +860,7 @@ fn collect_weights(
     bin_data: &mut Vec<u8>,
     offset_map: &mut Vec<(String, usize, usize, Vec<usize>)>,
     current_offset: &mut usize,
-    int64_map: &mut HashMap<String, (Vec<i64>, Vec<usize>)>,
+    _int64_map: &mut HashMap<String, (Vec<i64>, Vec<usize>)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initializers
     for init in &graph.initializer {
@@ -882,29 +888,26 @@ fn collect_weights(
             if let Some(attr) = node.attribute.iter().find(|a| a.name == "value") {
                 if let Some(t) = &attr.t {
                     // Convert everything to f32 weights to avoid inlining large/many constants code
-                    match tensor_to_array(t) {
-                        Ok((data, shape)) => {
-                            if !data.is_empty() {
-                                let slice = data.as_slice();
-                                let bytes: &[u8] = unsafe {
-                                    std::slice::from_raw_parts(
-                                        slice.as_ptr() as *const u8,
-                                        slice.len() * 4,
-                                    )
-                                };
-                                bin_data.write_all(bytes)?;
-                                if let Some(out_name) = node.output.first() {
-                                    offset_map.push((
-                                        out_name.clone(),
-                                        *current_offset,
-                                        bytes.len(),
-                                        shape,
-                                    ));
-                                    *current_offset += bytes.len();
-                                }
+                    if let Ok((data, shape)) = tensor_to_array(t) {
+                        if !data.is_empty() {
+                            let slice = data.as_slice();
+                            let bytes: &[u8] = unsafe {
+                                std::slice::from_raw_parts(
+                                    slice.as_ptr() as *const u8,
+                                    slice.len() * 4,
+                                )
+                            };
+                            bin_data.write_all(bytes)?;
+                            if let Some(out_name) = node.output.first() {
+                                offset_map.push((
+                                    out_name.clone(),
+                                    *current_offset,
+                                    bytes.len(),
+                                    shape,
+                                ));
+                                *current_offset += bytes.len();
                             }
                         }
-                        Err(_) => {}
                     }
                 }
             }
@@ -912,7 +915,7 @@ fn collect_weights(
         // 3. Recurse
         for attr in &node.attribute {
             if let Some(g) = &attr.g {
-                collect_weights(g, bin_data, offset_map, current_offset, int64_map)?;
+                collect_weights(g, bin_data, offset_map, current_offset, _int64_map)?;
             }
         }
     }
