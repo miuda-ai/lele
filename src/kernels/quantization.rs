@@ -1,6 +1,7 @@
 use crate::kernels::matmul;
 use crate::tensor::TensorView;
 use std::borrow::Cow;
+
 pub fn mat_mul_integer<'a, 'b, 'c>(
     a: &TensorView<'b>,
     b: &TensorView<'c>,
@@ -52,6 +53,7 @@ pub fn mat_mul_integer<'a, 'b, 'c>(
     };
     matmul(&a_view, &b_view, out)
 }
+
 pub fn dynamic_quantize_linear<'a, 'b>(
     x: &TensorView<'b>,
     out_y: &'a mut Vec<f32>,
@@ -60,9 +62,7 @@ pub fn dynamic_quantize_linear<'a, 'b>(
 ) -> (TensorView<'a>, TensorView<'a>, TensorView<'a>) {
     #[cfg(target_arch = "aarch64")]
     {
-        crate::kernels::neon::quantization::dynamic_quantize_linear(
-            x, out_y, out_scale, out_zp,
-        )
+        crate::kernels::neon::quantization::dynamic_quantize_linear(x, out_y, out_scale, out_zp)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {

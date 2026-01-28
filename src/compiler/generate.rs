@@ -1,8 +1,29 @@
 use super::{sanitize_name, Allocator, AnalysisData, Compiler};
 use crate::model::onnx_proto::{NodeProto, ValueInfoProto};
-use crate::model::tensor_to_array;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+
+pub(crate) struct OpContext<'a> {
+    pub node: &'a NodeProto,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    pub buf_expr: String,
+    pub indent: usize,
+    pub known_weights: &'a HashMap<String, (usize, usize, Vec<usize>)>,
+    pub int64_map: &'a HashMap<String, (Vec<i64>, Vec<usize>)>,
+    #[allow(dead_code)]
+    pub allocator: Option<&'a Allocator>,
+    #[allow(dead_code)]
+    pub analysis: Option<&'a AnalysisData>,
+    pub current_id: &'a mut usize,
+    pub compiler: &'a Compiler,
+}
+
+impl<'a> OpContext<'a> {
+    pub fn tab(&self) -> String {
+        "    ".repeat(self.indent)
+    }
+}
 
 pub(crate) fn collect_recursive_metrics(
     nodes: &[&NodeProto],
@@ -225,9 +246,9 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
     Ok(())
 }
 
-pub(crate) fn generate_nodes<W: Write>(
+pub(crate) fn generate_nodes(
     nodes: &[&NodeProto],
-    w: &mut W,
+    w: &mut dyn Write,
     indent: usize,
     known_weights: &HashMap<String, (usize, usize, Vec<usize>)>,
     int64_map: &HashMap<String, (Vec<i64>, Vec<usize>)>,
@@ -321,866 +342,135 @@ pub(crate) fn generate_nodes<W: Write>(
                 String::new()
             }
         };
-        // Override
+        let mut ctx = OpContext {
+            node,
+            inputs: inputs.clone(),
+            outputs: outputs.clone(),
+            buf_expr,
+            indent,
+            known_weights,
+            int64_map,
+            allocator,
+            analysis,
+            current_id,
+            compiler,
+        };
+
+        // 1. Override
         if let Some(handler) = compiler.overrides.get(op) {
-            if !buf_expr.is_empty() && !buf_expr.starts_with("&mut ws.buf_") {
+            if !ctx.buf_expr.is_empty() && !ctx.buf_expr.starts_with("&mut ws.buf_") {
                 writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[0])?;
             }
-            handler(node, &inputs, &outputs, &buf_expr, w, indent)?;
+            handler(node, &inputs, &outputs, &ctx.buf_expr, w, indent)?;
             continue;
         }
-        match op {
-            "Constant" => {
-                let name_raw = &node.output[0];
-                if let Some((offset, len, shape)) = known_weights.get(&outputs[0]) {
-                    writeln!(
-                        w,
-                        "{}let {} = self.weight({}, {}, &{:?});",
-                        tab, outputs[0], offset, len, shape
-                    )?;
-                } else if let Some((ints, shape)) = int64_map.get(name_raw) {
-                    let floats: Vec<String> =
-                        ints.iter().map(|&x| format!("{:.1}", x as f32)).collect();
-                    writeln!(
-                        w,
-                        "{}let {} = lele::tensor::TensorView::from_owned(vec![{}], vec!{:?});",
-                        tab,
-                        outputs[0],
-                        floats.join(", "),
-                        shape
-                    )?;
-                } else {
-                    let val = node
-                        .attribute
-                        .iter()
-                        .find(|a| a.name == "value")
-                        .and_then(|a| a.t.as_ref());
-                    if let Some(t) = val {
-                        if !t.float_data.is_empty() {
-                            if t.float_data.len() > 100 {
-                                writeln!(
-                                    w,
-                                    "{}let {} = lele::tensor::TensorView::empty(); // Large",
-                                    tab, outputs[0]
-                                )?;
-                            } else {
-                                writeln!(w, "{}let {} = lele::tensor::TensorView::from_owned(vec!{:?}, vec!{:?});", tab, outputs[0], t.float_data, t.dims)?;
-                            }
-                        } else if !t.raw_data.is_empty() {
-                            let floats: Vec<f32> = t
-                                .raw_data
-                                .chunks(4)
-                                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                                .collect();
-                            if floats.len() > 100 {
-                                writeln!(
-                                    w,
-                                    "{}let {} = lele::tensor::TensorView::empty(); // Large",
-                                    tab, outputs[0]
-                                )?;
-                            } else {
-                                writeln!(w, "{}let {} = lele::tensor::TensorView::from_owned(vec!{:?}, vec!{:?});", tab, outputs[0], floats, t.dims)?;
-                            }
-                        } else {
-                            writeln!(
-                                w,
-                                "{}let {} = lele::tensor::TensorView::empty();",
-                                tab, outputs[0]
-                            )?;
-                        }
-                    } else {
-                        writeln!(
-                            w,
-                            "{}let {} = lele::tensor::TensorView::empty();",
-                            tab, outputs[0]
-                        )?;
-                    }
-                }
-            }
-            "Identity" => {
-                if let Some((ints, shape)) = int64_map.get(&node.input[0]) {
-                    let floats: Vec<String> =
-                        ints.iter().map(|&x| format!("{:.1}", x as f32)).collect();
-                    writeln!(
-                        w,
-                        "{}let {} = lele::tensor::TensorView::from_owned(vec![{}], vec!{:?});",
-                        tab,
-                        outputs[0],
-                        floats.join(", "),
-                        shape
-                    )?;
-                } else {
-                    writeln!(w, "{}let {} = {}.clone();", tab, outputs[0], inputs[0])?;
-                }
-            }
-            "If" => {
-                let then_branch = node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "then_branch")
-                    .unwrap()
-                    .g
-                    .as_ref()
-                    .unwrap();
-                let else_branch = node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "else_branch")
-                    .unwrap()
-                    .g
-                    .as_ref()
-                    .unwrap();
-                let cond = &inputs[0];
-                let out_vars = outputs.join(", ");
-                writeln!(
-                    w,
-                    "{}let ({}) = if {}.data.get(0).map(|v| *v != 0.0).unwrap_or(false) {{",
-                    tab, out_vars, cond
-                )?;
-                let then_nodes: Vec<&NodeProto> = then_branch.node.iter().collect();
-                // Don't pass analysis data to subgraphs - they have their own scope and the parent's liveness info doesn't apply
-                generate_nodes(
-                    &then_nodes,
-                    w,
-                    indent + 1,
-                    known_weights,
-                    int64_map,
-                    allocator,
-                    None,
-                    current_id,
-                    compiler,
-                )?;
-                // Collect variables defined in then branch
-                let mut then_defined = HashSet::new();
-                for n in &then_nodes {
-                    for out in &n.output {
-                        if !out.is_empty() {
-                            then_defined.insert(sanitize_name(out));
-                        }
-                    }
-                }
-                let then_outs: Vec<String> = then_branch
-                    .output
-                    .iter()
-                    .map(|o| {
-                        let name = sanitize_name(&o.name);
-                        if let Some((offset, len, shape)) = known_weights.get(&name) {
-                            format!("self.weight({}, {}, &{:?}).to_owned()", offset, len, shape)
-                        } else if then_defined.contains(&name) {
-                            format!("{}.to_owned()", name)
-                        } else {
-                            // Output not defined in branch - must be from outer scope or input
-                            format!("{}.to_owned()", name)
-                        }
-                    })
-                    .collect();
-                writeln!(w, "{}    ({})", tab, then_outs.join(", "))?;
-                writeln!(w, "{}}} else {{", tab)?;
-                let else_nodes: Vec<&NodeProto> = else_branch.node.iter().collect();
-                // Don't pass analysis data to subgraphs - they have their own scope and the parent's liveness info doesn't apply
-                generate_nodes(
-                    &else_nodes,
-                    w,
-                    indent + 1,
-                    known_weights,
-                    int64_map,
-                    allocator,
-                    None,
-                    current_id,
-                    compiler,
-                )?;
-                // Collect variables defined in else branch
-                let mut else_defined = HashSet::new();
-                for n in &else_nodes {
-                    for out in &n.output {
-                        if !out.is_empty() {
-                            else_defined.insert(sanitize_name(out));
-                        }
-                    }
-                }
-                let else_outs: Vec<String> = else_branch
-                    .output
-                    .iter()
-                    .map(|o| {
-                        let name = sanitize_name(&o.name);
-                        if let Some((offset, len, shape)) = known_weights.get(&name) {
-                            format!("self.weight({}, {}, &{:?}).to_owned()", offset, len, shape)
-                        } else if else_defined.contains(&name) {
-                            format!("{}.to_owned()", name)
-                        } else {
-                            // Output not defined in branch - must be from outer scope or input
-                            format!("{}.to_owned()", name)
-                        }
-                    })
-                    .collect();
-                writeln!(w, "{}    ({})", tab, else_outs.join(", "))?;
-                writeln!(w, "{}}};", tab)?;
-            }
-            _ => {
-                if !buf_expr.is_empty() && !buf_expr.starts_with("&mut ws.buf_") {
-                    writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[0])?;
-                }
-                match op {
-                    "Add" => writeln!(
-                        w,
-                        "{}let {} = lele::kernels::add(&{}, &{}, {});",
-                        tab, outputs[0], inputs[0], inputs[1], buf_expr
-                    )?,
-                    "Sub" => writeln!(
-                        w,
-                        "{}let {} = lele::kernels::sub(&{}, &{}, {});",
-                        tab, outputs[0], inputs[0], inputs[1], buf_expr
-                    )?,
-                    "Mul" => writeln!(
-                        w,
-                        "{}let {} = lele::kernels::mul(&{}, &{}, {});",
-                        tab, outputs[0], inputs[0], inputs[1], buf_expr
-                    )?,
-                    "Div" => writeln!(
-                        w,
-                        "{}let {} = lele::kernels::div(&{}, &{}, {});",
-                        tab, outputs[0], inputs[0], inputs[1], buf_expr
-                    )?,
-                    "MatMul" => writeln!(
-                        w,
-                        "{}let {} = lele::kernels::matmul(&{}, &{}, {});",
-                        tab, outputs[0], inputs[0], inputs[1], buf_expr
-                    )?,
-                    "MatMulInteger" => {
-                        let a_zp = if inputs.len() > 2 {
-                            format!("Some(&{})", inputs[2])
-                        } else {
-                            "None".to_string()
-                        };
-                        let b_zp = if inputs.len() > 3 {
-                            format!("Some(&{})", inputs[3])
-                        } else {
-                            "None".to_string()
-                        };
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::mat_mul_integer(&{}, &{}, {}, {}, {});",
-                            tab, outputs[0], inputs[0], inputs[1], a_zp, b_zp, buf_expr
-                        )?;
-                    }
-                    "DynamicQuantizeLinear" => {
-                        writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[1])?;
-                        writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[2])?;
-                        writeln!(w, "{}let ({}, {}, {}) = lele::kernels::dynamic_quantize_linear(&{}, {}, &mut buf_{}, &mut buf_{});", tab, outputs[0], outputs[1], outputs[2], inputs[0], buf_expr, outputs[1], outputs[2])?;
-                    }
-                    "Relu" => writeln!(
-                        w,
-                        "{}let {} = lele::kernels::relu(&{}, {});",
-                        tab, outputs[0], inputs[0], buf_expr
-                    )?,
-                    "Sigmoid" => writeln!(
-                        w,
-                        "{}let {} = lele::kernels::sigmoid(&{}, {});",
-                        tab, outputs[0], inputs[0], buf_expr
-                    )?,
-                    "Softmax" => {
-                        let axis = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "axis")
-                            .map(|a| a.i)
-                            .unwrap_or(-1);
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::softmax(&{}, {}, {});",
-                            tab, outputs[0], inputs[0], axis, buf_expr
-                        )?;
-                    }
-                    "LayerNormalization" => {
-                        let epsilon = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "epsilon")
-                            .map(|a| a.f)
-                            .unwrap_or(1e-5);
-                        let axis = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "axis")
-                            .map(|a| a.i)
-                            .unwrap_or(-1);
-                        let scale = if node.input.len() > 1
-                            && !node.input[1].is_empty()
-                            && !inputs[1].is_empty()
-                        {
-                            format!("&{}", inputs[1])
-                        } else {
-                            "&lele::tensor::TensorView::empty()".to_string()
-                        };
-                        let bias = if node.input.len() > 2
-                            && !node.input[2].is_empty()
-                            && !inputs[2].is_empty()
-                        {
-                            format!("&{}", inputs[2])
-                        } else {
-                            "&lele::tensor::TensorView::empty()".to_string()
-                        };
-                        if outputs.len() > 1 {
-                            let fillers = vec!["_"; outputs.len() - 1].join(", ");
-                            let dummy_tensors =
-                                vec!["lele::tensor::TensorView::empty()"; outputs.len() - 1]
-                                    .join(", ");
-                            writeln!(w, "{}let ({}, {}) = (lele::kernels::layer_norm(&{}, {}, {}, {}, {}, {}), {});", 
-                                    tab, outputs[0], fillers, inputs[0], scale, bias, axis, epsilon, buf_expr, dummy_tensors)?;
-                        } else {
-                            writeln!(
-                                w,
-                                "{}let {} = lele::kernels::layer_norm(&{}, {}, {}, {}, {}, {});",
-                                tab, outputs[0], inputs[0], scale, bias, axis, epsilon, buf_expr
-                            )?;
-                        }
-                    }
-                    "Transpose" => {
-                        let perm = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "perm")
-                            .map(|a| a.ints.clone())
-                            .unwrap_or(vec![]);
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::transpose(&{}, &{:?}, {});",
-                            tab, outputs[0], inputs[0], perm, buf_expr
-                        )?;
-                    }
-                    "Reshape" => {
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::reshape(&{}, &{});",
-                            tab, outputs[0], inputs[0], inputs[1]
-                        )?;
-                    }
-                    "Unsqueeze" => {
-                        let axes = if node.input.len() > 1
-                            && !node.input[1].is_empty()
-                            && !inputs[1].is_empty()
-                        {
-                            format!("&lele::kernels::to_i64_vec(&{})", inputs[1])
-                        } else {
-                            let axes_attr = node
-                                .attribute
-                                .iter()
-                                .find(|a| a.name == "axes")
-                                .map(|a| a.ints.clone())
-                                .unwrap_or(vec![]);
-                            format!("&{:?}", axes_attr)
-                        };
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::unsqueeze(&{}, {});",
-                            tab, outputs[0], inputs[0], axes
-                        )?;
-                    }
-                    "Squeeze" => {
-                        let axes = if node.input.len() > 1
-                            && !node.input[1].is_empty()
-                            && !inputs[1].is_empty()
-                        {
-                            format!("Some(&lele::kernels::to_i64_vec(&{}))", inputs[1])
-                        } else {
-                            let axes_attr = node
-                                .attribute
-                                .iter()
-                                .find(|a| a.name == "axes")
-                                .map(|a| a.ints.clone());
-                            if let Some(a) = axes_attr {
-                                format!("Some(&{:?})", a)
-                            } else {
-                                "None".to_string()
-                            }
-                        };
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::squeeze(&{}, {});",
-                            tab, outputs[0], inputs[0], axes
-                        )?;
-                    }
-                    "Concat" => {
-                        let axis = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "axis")
-                            .map(|a| a.i)
-                            .unwrap_or(0);
-                        let args = inputs
-                            .iter()
-                            .map(|s| format!("&{}", s))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::concat(&[{}], {}, {});",
-                            tab, outputs[0], args, axis, buf_expr
-                        )?;
-                    }
-                    "Gather" => {
-                        let axis = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "axis")
-                            .map(|a| a.i)
-                            .unwrap_or(0);
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::gather(&{}, &{}, {}, {});",
-                            tab, outputs[0], inputs[0], inputs[1], axis, buf_expr
-                        )?;
-                    }
-                    "Shape" => {
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::shape(&{});",
-                            tab, outputs[0], inputs[0]
-                        )?;
-                    }
-                    "Cast" => {
-                        writeln!(
-                            w,
-                            "{}let {} = {}.clone(); // Cast ignored",
-                            tab, outputs[0], inputs[0]
-                        )?;
-                    }
-                    "ReduceMean" => {
-                        let axes = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "axes")
-                            .map(|a| a.ints.clone())
-                            .unwrap_or(vec![]);
-                        let keepdims = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "keepdims")
-                            .map(|a| a.i)
-                            .unwrap_or(1)
-                            != 0;
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::reduce_mean(&{}, &{:?}, {}, {});",
-                            tab, outputs[0], inputs[0], axes, keepdims, buf_expr
-                        )?;
-                    }
-                    "Equal" => writeln!(
-                        w,
-                        "{}let {} = lele::kernels::equal(&{}, &{}, {});",
-                        tab, outputs[0], inputs[0], inputs[1], buf_expr
-                    )?,
-                    "Not" => writeln!(
-                        w,
-                        "{}let {} = lele::kernels::not(&{}, {});",
-                        tab, outputs[0], inputs[0], buf_expr
-                    )?,
-                    "ConstantOfShape" => {
-                        let val = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "value")
-                            .and_then(|a| a.t.as_ref())
-                            .map(|t| {
-                                if let Ok((data, _)) = tensor_to_array(t) {
-                                    if !data.is_empty() {
-                                        return data[0];
-                                    }
-                                }
-                                0.0
-                            })
-                            .unwrap_or(0.0);
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::constant_of_shape(&{}, {:.1}, {});",
-                            tab, outputs[0], inputs[0], val, buf_expr
-                        )?;
-                    }
-                    "Slice" => {
-                        let axes = if node.input.len() > 3 {
-                            format!("&lele::kernels::to_i64_vec(&{})", inputs[3])
-                        } else {
-                            "&[]".to_string()
-                        };
-                        let steps = if node.input.len() > 4 {
-                            format!("&lele::kernels::to_i64_vec(&{})", inputs[4])
-                        } else {
-                            "&[]".to_string()
-                        };
-                        writeln!(w, "{}let {} = lele::kernels::slice(&{}, &lele::kernels::to_i64_vec(&{}), &lele::kernels::to_i64_vec(&{}), {}, {}, {});", 
-                            tab, outputs[0], inputs[0], inputs[1], inputs[2], axes, steps, buf_expr)?;
-                    }
-                    "ArgMax" => {
-                        let axis = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "axis")
-                            .map(|a| a.i)
-                            .unwrap_or(0);
-                        let keepdims = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "keepdims")
-                            .map(|a| a.i)
-                            .unwrap_or(1);
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::argmax(&{}, {}, {}, {});",
-                            tab, outputs[0], inputs[0], axis, keepdims, buf_expr
-                        )?;
-                    }
-                    "Conv" => {
-                        let dilations = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "dilations")
-                            .map(|a| a.ints.clone())
-                            .unwrap_or(vec![]);
-                        let group = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "group")
-                            .map(|a| a.i)
-                            .unwrap_or(1);
-                        let pads = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "pads")
-                            .map(|a| a.ints.clone())
-                            .unwrap_or(vec![]);
-                        let strides = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "strides")
-                            .map(|a| a.ints.clone())
-                            .unwrap_or(vec![]);
-                        let bias_arg = if inputs.len() > 2 {
-                            format!("Some(&{})", inputs[2])
-                        } else {
-                            "None".to_string()
-                        };
-                        writeln!(w, "{}let {} = lele::kernels::conv1d(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, {});", 
-                                tab, outputs[0], inputs[0], inputs[1], bias_arg, dilations, group, pads, strides, buf_expr)?;
-                    }
-                    "LSTM" => {
-                        let bias = if inputs.len() > 3 && !node.input[3].is_empty() {
-                            format!("Some(&{})", inputs[3])
-                        } else {
-                            "None".to_string()
-                        };
-                        let seq_lens = if inputs.len() > 4 && !node.input[4].is_empty() {
-                            format!("Some(&{})", inputs[4])
-                        } else {
-                            "None".to_string()
-                        };
-                        let initial_h = if inputs.len() > 5 && !node.input[5].is_empty() {
-                            format!("Some(&{})", inputs[5])
-                        } else {
-                            "None".to_string()
-                        };
-                        let initial_c = if inputs.len() > 6 && !node.input[6].is_empty() {
-                            format!("Some(&{})", inputs[6])
-                        } else {
-                            "None".to_string()
-                        };
-                        writeln!(
-                            w,
-                            "{}let mut buf_{}_h = Vec::<f32>::new();",
-                            tab, outputs[0]
-                        )?;
-                        writeln!(
-                            w,
-                            "{}let mut buf_{}_c = Vec::<f32>::new();",
-                            tab, outputs[0]
-                        )?;
-                        writeln!(w, "{}let ({}, {}, {}) = lele::kernels::lstm(&{}, &{}, &{}, {}, {}, {}, {}, {}, &mut buf_{}_h, &mut buf_{}_c);", 
-                                tab, outputs[0], outputs[1], outputs[2], inputs[0], inputs[1], inputs[2], bias, seq_lens, initial_h, initial_c, buf_expr, outputs[0], outputs[0])?;
-                    }
-                    "Size" => {
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::size(&{});",
-                            tab, outputs[0], inputs[0]
-                        )?;
-                    }
-                    "Pad" => {
-                        let mode = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "mode")
-                            .map(|a| String::from_utf8_lossy(&a.s))
-                            .unwrap_or("constant".into());
-                        let constant_value = if inputs.len() > 2
-                            && !node.input[2].is_empty()
-                            && !inputs[2].is_empty()
-                        {
-                            format!("Some(&{})", inputs[2])
-                        } else {
-                            "None".to_string()
-                        };
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::pad(&{}, &{}, {}, {:?}, {});",
-                            tab, outputs[0], inputs[0], inputs[1], constant_value, mode, buf_expr
-                        )?;
-                    }
-                    "Pow" => {
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::pow(&{}, &{}, {});",
-                            tab, outputs[0], inputs[0], inputs[1], buf_expr
-                        )?;
-                    }
-                    "Sqrt" => {
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::sqrt(&{}, {});",
-                            tab, outputs[0], inputs[0], buf_expr
-                        )?;
-                    }
-                    "Split" => {
-                        // Split can have 'split' as attribute or input
-                        let axis = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "axis")
-                            .map(|a| a.i)
-                            .unwrap_or(0);
-                        let splits = if node.input.len() > 1 && !node.input[1].is_empty() {
-                            format!("lele::kernels::to_i64_vec(&{})", inputs[1])
-                        } else {
-                            let split_attr = node
-                                .attribute
-                                .iter()
-                                .find(|a| a.name == "split")
-                                .map(|a| a.ints.clone())
-                                .unwrap_or_else(|| {
-                                    // If no split attribute, divide evenly
-                                    let num_outputs = outputs.len();
-                                    vec![0; num_outputs] // Placeholder, needs runtime shape info
-                                });
-                            format!("vec!{:?}", split_attr)
-                        };
-                        // Allocate buffers for each output
-                        for out_name in &outputs {
-                            writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, out_name)?;
-                        }
-                        // Create array binding first
-                        let buf_names: Vec<String> =
-                            outputs.iter().map(|n| format!("buf_{}", n)).collect();
-                        writeln!(
-                            w,
-                            "{}let mut split_buffers = [{}];",
-                            tab,
-                            buf_names.join(", ")
-                        )?;
-                        writeln!(w, "{}let splits_vec = {};", tab, splits)?;
-                        writeln!(w, "{}let split_results = lele::kernels::split(&{}, {}, &splits_vec, &mut split_buffers);", tab, inputs[0], axis)?;
-                        // Assign results
-                        for (i, out_name) in outputs.iter().enumerate() {
-                            writeln!(w, "{}let {} = split_results[{}].clone();", tab, out_name, i)?;
-                        }
-                    }
-                    "Where" => {
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::where_op(&{}, &{}, &{}, {});",
-                            tab, outputs[0], inputs[0], inputs[1], inputs[2], buf_expr
-                        )?;
-                    }
-                    "Range" => {
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::range(&{}, &{}, &{}, {});",
-                            tab, outputs[0], inputs[0], inputs[1], inputs[2], buf_expr
-                        )?;
-                    }
-                    "Sin" => {
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::sin(&{}, {});",
-                            tab, outputs[0], inputs[0], buf_expr
-                        )?;
-                    }
-                    "Cos" => {
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::cos(&{}, {});",
-                            tab, outputs[0], inputs[0], buf_expr
-                        )?;
-                    }
-                    "Exp" => {
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::exp(&{}, {});",
-                            tab, outputs[0], inputs[0], buf_expr
-                        )?;
-                    }
-                    "Neg" => {
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::neg(&{}, {});",
-                            tab, outputs[0], inputs[0], buf_expr
-                        )?;
-                    }
-                    "Less" => {
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::less(&{}, &{}, {});",
-                            tab, outputs[0], inputs[0], inputs[1], buf_expr
-                        )?;
-                    }
-                    "Expand" => {
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::expand(&{}, &{}, {});",
-                            tab, outputs[0], inputs[0], inputs[1], buf_expr
-                        )?;
-                    }
-                    "Tile" => {
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::tile(&{}, &{}, {});",
-                            tab, outputs[0], inputs[0], inputs[1], buf_expr
-                        )?;
-                    }
-                    "Reciprocal" => writeln!(
-                        w,
-                        "{}let {} = lele::kernels::reciprocal(&{}, {});",
-                        tab, outputs[0], inputs[0], buf_expr
-                    )?,
-                    "Erf" => writeln!(
-                        w,
-                        "{}let {} = lele::kernels::erf(&{}, {});",
-                        tab, outputs[0], inputs[0], buf_expr
-                    )?,
-                    "Softplus" => writeln!(
-                        w,
-                        "{}let {} = lele::kernels::softplus(&{}, {});",
-                        tab, outputs[0], inputs[0], buf_expr
-                    )?,
-                    "Tanh" => writeln!(
-                        w,
-                        "{}let {} = lele::kernels::tanh_kernel(&{}, {});",
-                        tab, outputs[0], inputs[0], buf_expr
-                    )?,
-                    "ReduceSum" => {
-                        let axes = if node.input.len() > 1
-                            && !node.input[1].is_empty()
-                            && !inputs[1].is_empty()
-                        {
-                            format!("&lele::kernels::to_i64_vec(&{})", inputs[1])
-                        } else {
-                            let axes_attr = node
-                                .attribute
-                                .iter()
-                                .find(|a| a.name == "axes")
-                                .map(|a| a.ints.clone())
-                                .unwrap_or(vec![]);
-                            format!("&{:?}", axes_attr)
-                        };
-                        let keepdims = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "keepdims")
-                            .map(|a| a.i)
-                            .unwrap_or(1)
-                            != 0;
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::reduce_sum(&{}, {}, {}, {});",
-                            tab, outputs[0], inputs[0], axes, keepdims, buf_expr
-                        )?;
-                    }
-                    "Clip" => {
-                        let min = if inputs.len() > 1 && !inputs[1].is_empty() {
-                            format!("Some(&{})", inputs[1])
-                        } else {
-                            "None".to_string()
-                        };
-                        let max = if inputs.len() > 2 && !inputs[2].is_empty() {
-                            format!("Some(&{})", inputs[2])
-                        } else {
-                            "None".to_string()
-                        };
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::clip(&{}, {}, {}, {});",
-                            tab, outputs[0], inputs[0], min, max, buf_expr
-                        )?;
-                    }
-                    "PRelu" => {
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::prelu(&{}, &{}, {});",
-                            tab, outputs[0], inputs[0], inputs[1], buf_expr
-                        )?;
-                    }
-                    "BatchNormalization" => {
-                        let epsilon = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "epsilon")
-                            .map(|a| a.f)
-                            .unwrap_or(1e-5);
-                        writeln!(w, "{}let {} = lele::kernels::batch_norm(&{}, &{}, &{}, &{}, &{}, {:?}, {});", 
-                            tab, outputs[0], inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], epsilon, buf_expr)?;
-                    }
-                    "Gemm" => {
-                        let alpha = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "alpha")
-                            .map(|a| a.f)
-                            .unwrap_or(1.0);
-                        let beta = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "beta")
-                            .map(|a| a.f)
-                            .unwrap_or(1.0);
-                        let trans_a = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "transA")
-                            .map(|a| a.i)
-                            .unwrap_or(0)
-                            != 0;
-                        let trans_b = node
-                            .attribute
-                            .iter()
-                            .find(|a| a.name == "transB")
-                            .map(|a| a.i)
-                            .unwrap_or(0)
-                            != 0;
-                        let c = if inputs.len() > 2 && !inputs[2].is_empty() {
-                            format!("Some(&{})", inputs[2])
-                        } else {
-                            "None".to_string()
-                        };
-                        writeln!(
-                            w,
-                            "{}let {} = lele::kernels::gemm(&{}, &{}, {}, {:?}, {:?}, {}, {}, {});",
-                            tab,
-                            outputs[0],
-                            inputs[0],
-                            inputs[1],
-                            c,
-                            alpha,
-                            beta,
-                            trans_a,
-                            trans_b,
-                            buf_expr
-                        )?;
-                    }
-                    _ => {
-                        for (idx, out_name) in outputs.iter().enumerate() {
-                            writeln!(w, "{}let {} = lele::tensor::TensorView::empty(); // Unimplemented {} out {}", tab, out_name, op, idx)?;
-                        }
-                    }
-                }
-            }
+
+        // 2. Built-in
+        if !ctx.buf_expr.is_empty()
+            && !ctx.buf_expr.starts_with("&mut ws.buf_")
+            && op != "DynamicQuantizeLinear"
+            && op != "LSTM"
+            && op != "Split"
+        {
+            writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[0])?;
+        }
+
+        if super::ops::dispatch_builtin(&mut ctx, w)? {
+            continue;
+        }
+
+        // 3. Fallback
+        for (idx, out_name) in outputs.iter().enumerate() {
+            writeln!(
+                w,
+                "{}let {} = lele::tensor::TensorView::empty(); // Unimplemented {} out {}",
+                tab, out_name, op, idx
+            )?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compiler::Compiler;
+    use crate::model::onnx_proto::NodeProto;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_custom_op_override() {
+        let mut compiler = Compiler::new();
+        compiler = compiler.with_override("CustomOp", |_node, inputs, outputs, _buf, w, indent| {
+            let tab = "    ".repeat(indent);
+            writeln!(w, "{}// Custom implementation for {}", tab, outputs[0])?;
+            writeln!(
+                w,
+                "{}let {} = custom_kernel(&{});",
+                tab, outputs[0], inputs[0]
+            )
+        });
+
+        let node = NodeProto {
+            input: vec!["input1".to_string()],
+            output: vec!["output1".to_string()],
+            op_type: "CustomOp".to_string(),
+            ..Default::default()
+        };
+
+        let mut output = Vec::new();
+        let mut current_id = 0;
+        let known_weights = HashMap::new();
+        let int64_map = HashMap::new();
+
+        generate_nodes(
+            &[&node],
+            &mut output,
+            0,
+            &known_weights,
+            &int64_map,
+            None,
+            None,
+            &mut current_id,
+            &compiler,
+        )
+        .unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        assert!(result.contains("// Custom implementation for output1"));
+        assert!(result.contains("let output1 = custom_kernel(&input1);"));
+    }
+
+    #[test]
+    fn test_builtin_dispatch() {
+        let compiler = Compiler::new();
+        let node = NodeProto {
+            input: vec!["a".to_string(), "b".to_string()],
+            output: vec!["c".to_string()],
+            op_type: "Add".to_string(),
+            ..Default::default()
+        };
+
+        let mut output = Vec::new();
+        let mut current_id = 0;
+        let known_weights = HashMap::new();
+        let int64_map = HashMap::new();
+
+        generate_nodes(
+            &[&node],
+            &mut output,
+            0,
+            &known_weights,
+            &int64_map,
+            None,
+            None,
+            &mut current_id,
+            &compiler,
+        )
+        .unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        assert!(result.contains("let mut buf_c = Vec::<f32>::new();"));
+        assert!(result.contains("let c = lele::kernels::add(&a, &b, &mut buf_c);"));
+    }
 }

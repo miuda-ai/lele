@@ -284,6 +284,7 @@ fn solve_allocation(graph: &GraphProto, outputs: &[String]) -> (Allocator, Analy
 }
 pub mod generate;
 pub mod patterns;
+pub mod ops;
 
 pub(crate) use generate::*;
 
@@ -346,6 +347,7 @@ impl Compiler {
         self.custom_methods.push(code.to_string());
         self
     }
+
     pub fn with_default_optimizations(mut self) -> Self {
         self = self.with_custom_method(include_str!("snippets/default_methods.rs"));
         for p in patterns::get_default_patterns() {
@@ -353,14 +355,17 @@ impl Compiler {
         }
         self
     }
+
     pub fn with_name(mut self, name: &str) -> Self {
         self.model_name = name.to_string();
         self
     }
+
     pub fn with_constant_folding(mut self, enabled: bool) -> Self {
         self.constant_folding = enabled;
         self
     }
+
     fn fold_constants(&self, graph: &mut GraphProto) {
         if !self.constant_folding {
             return;
@@ -579,6 +584,7 @@ impl Compiler {
             });
         }
     }
+
     pub fn compile(
         &self,
         graph: &GraphProto,
