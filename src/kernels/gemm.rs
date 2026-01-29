@@ -1,7 +1,10 @@
 use crate::kernels::utils;
 use crate::tensor::TensorView;
-use matrixmultiply::sgemm;
+use faer::linalg::matmul::matmul as faer_matmul;
+use faer::mat::{from_raw_parts, from_raw_parts_mut};
+use faer::Parallelism;
 use std::borrow::Cow;
+
 pub fn matmul<'a>(
     a: &TensorView<'_>,
     b: &TensorView<'_>,
@@ -15,10 +18,12 @@ pub fn matmul<'a>(
     let k = a.shape[a_dims - 1];
     let k_b = b.shape[b_dims - 2];
     let n = b.shape[b_dims - 1];
+
     assert_eq!(k, k_b, "MatMul K dim mismatch: {} vs {}", k, k_b);
     let batch_a: usize = a.shape[..a_dims - 2].iter().product();
     let batch_b: usize = b.shape[..b_dims - 2].iter().product();
     let final_batch = batch_a.max(batch_b);
+
     assert!(
         batch_b == 1 || batch_b == batch_a,
         "MatMul broadcast not fully supported yet"
@@ -30,34 +35,33 @@ pub fn matmul<'a>(
     };
     out_shape.push(m);
     out_shape.push(n);
+
     let output_len = final_batch * m * n;
     utils::ensure_capacity(out_buf, output_len);
+
     let out_slice: &mut [f32] =
         unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), output_len) };
     let stride_a = m * k;
     let stride_b = k * n;
     let stride_out = m * n;
+
     for b_i in 0..final_batch {
         let a_offset = if batch_a == 1 { 0 } else { b_i * stride_a };
         let b_offset = if batch_b == 1 { 0 } else { b_i * stride_b };
         let out_offset = b_i * stride_out;
+
         unsafe {
-            sgemm(
-                m,
-                k,
-                n,
-                1.0,
-                a.data.as_ptr().add(a_offset),
-                k as isize,
-                1,
-                b.data.as_ptr().add(b_offset),
-                n as isize,
-                1,
-                0.0,
+            let a_mat = from_raw_parts::<f32>(a.data.as_ptr().add(a_offset), m, k, k as isize, 1);
+            let b_mat = from_raw_parts::<f32>(b.data.as_ptr().add(b_offset), k, n, n as isize, 1);
+            let out_mat = from_raw_parts_mut::<f32>(
                 out_slice.as_mut_ptr().add(out_offset),
+                m,
+                n,
                 n as isize,
                 1,
             );
+
+            faer_matmul(out_mat, a_mat, b_mat, None, 1.0, Parallelism::None);
         }
     }
     TensorView {
@@ -172,23 +176,26 @@ pub fn gemm<'a>(
     let rsb = if trans_b { 1 } else { n as isize };
     let csb = if trans_b { k as isize } else { 1 };
     unsafe {
-        sgemm(
-            m,
-            k,
-            n,
+        let a_mat = from_raw_parts::<f32>(a.data.as_ptr(), m, k, rsa, csa);
+        let b_mat = from_raw_parts::<f32>(b.data.as_ptr(), k, n, rsb, csb);
+        let out_mat = from_raw_parts_mut::<f32>(out_buf.as_mut_ptr(), m, n, n as isize, 1);
+
+        // if use beta (=1.0 usually), we need accumulation to be Some(1.0).
+        // However, here we already filled out_buf with C*beta.
+        // So we want out = alpha * A * B + 1.0 * out_buf.
+        // faer: out <- alpha * A * B + beta * out.
+        // We set faer's beta to 1.0 because out_buf already contains the previous C term scaled.
+
+        faer_matmul(
+            out_mat,
+            a_mat,
+            b_mat,
+            Some(1.0), // beta=1.0, means accumulate into existing content
             alpha,
-            a.data.as_ptr(),
-            rsa,
-            csa,
-            b.data.as_ptr(),
-            rsb,
-            csb,
-            1.0,
-            out_buf.as_mut_ptr(),
-            n as isize,
-            1,
+            Parallelism::None,
         );
     }
+
     TensorView {
         data: Cow::Borrowed(out_buf),
         shape: Cow::Owned(vec![m, n]),

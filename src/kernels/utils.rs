@@ -8,9 +8,12 @@ pub fn compute_strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 pub fn ensure_capacity(v: &mut Vec<f32>, len: usize) {
-    if v.len() != len {
-        v.clear();
-        v.resize(len, 0.0);
+    if v.capacity() < len {
+        let extra = len - v.len();
+        v.reserve(extra);
+    }
+    unsafe {
+        v.set_len(len);
     }
 }
 pub fn get_offset(indices: &[usize], strides: &[usize]) -> usize {

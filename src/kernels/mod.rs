@@ -1,7 +1,6 @@
 pub mod activations;
 pub mod conv1d;
 pub mod gemm;
-pub mod gemv;
 pub mod manipulation;
 pub mod math;
 pub mod neon;
@@ -12,6 +11,7 @@ pub mod rnn;
 pub mod shape;
 pub mod utils;
 pub use conv1d::conv1d;
+pub use conv1d::conv1d_fused;
 pub use gemm::{gemm, matmul, matmul_fused_add};
 pub use manipulation::*;
 pub use manipulation::{split, where_op};

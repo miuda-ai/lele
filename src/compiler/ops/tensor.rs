@@ -8,15 +8,44 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
     let outputs = &ctx.outputs;
     let buf_expr = &ctx.buf_expr;
 
+    let resolve_i64 = |idx: usize, ctx: &OpContext| -> String {
+        if idx >= ctx.node.input.len() || ctx.node.input[idx].is_empty() {
+             "&[]".to_string()
+        } else {
+            let name = &ctx.node.input[idx];
+            if let Some((ints, _)) = ctx.int64_map.get(name) {
+                format!("&{:?}", ints)
+            } else {
+                format!("&lele::kernels::to_i64_vec(&{})", ctx.inputs[idx])
+            }
+        }
+    };
+
+    let resolve_i64_opt = |idx: usize, ctx: &OpContext| -> String {
+        if idx >= ctx.node.input.len() || ctx.node.input[idx].is_empty() {
+             "None".to_string()
+        } else {
+            let name = &ctx.node.input[idx];
+            if let Some((ints, _)) = ctx.int64_map.get(name) {
+                format!("Some(&{:?})", ints)
+            } else {
+                format!("Some(&lele::kernels::to_i64_vec(&{}))", ctx.inputs[idx])
+            }
+        }
+    };
+
     match op {
         "Transpose" => {
             let perm = ctx.node.attribute.iter().find(|a| a.name == "perm").map(|a| a.ints.clone()).unwrap_or(vec![]);
             writeln!(w, "{}let {} = lele::kernels::transpose(&{}, &{:?}, {});", tab, outputs[0], inputs[0], perm, buf_expr)?;
         }
-        "Reshape" => writeln!(w, "{}let {} = lele::kernels::reshape(&{}, &{});", tab, outputs[0], inputs[0], inputs[1])?,
+        "Reshape" => {
+            let shape = resolve_i64(1, ctx);
+            writeln!(w, "{}let {} = lele::kernels::reshape(&{}, {});", tab, outputs[0], inputs[0], shape)?;
+        }
         "Unsqueeze" => {
-            let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() && !inputs[1].is_empty() {
-                format!("&lele::kernels::to_i64_vec(&{})", inputs[1])
+            let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
+                resolve_i64(1, ctx)
             } else {
                 let axes_attr = ctx.node.attribute.iter().find(|a| a.name == "axes").map(|a| a.ints.clone()).unwrap_or(vec![]);
                 format!("&{:?}", axes_attr)
@@ -24,8 +53,8 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             writeln!(w, "{}let {} = lele::kernels::unsqueeze(&{}, {});", tab, outputs[0], inputs[0], axes)?;
         }
         "Squeeze" => {
-            let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() && !inputs[1].is_empty() {
-                format!("Some(&lele::kernels::to_i64_vec(&{}))", inputs[1])
+            let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
+                resolve_i64_opt(1, ctx)
             } else {
                 let axes_attr = ctx.node.attribute.iter().find(|a| a.name == "axes").map(|a| a.ints.clone());
                 if let Some(a) = axes_attr { format!("Some(&{:?})", a) } else { "None".to_string() }
@@ -57,31 +86,33 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             writeln!(w, "{}let {} = lele::kernels::constant_of_shape(&{}, {:.1}, {});", tab, outputs[0], inputs[0], val, buf_expr)?;
         }
         "Slice" => {
-            let axes = if ctx.node.input.len() > 3 { format!("&lele::kernels::to_i64_vec(&{})", inputs[3]) } else { "&[]".to_string() };
-            let steps = if ctx.node.input.len() > 4 { format!("&lele::kernels::to_i64_vec(&{})", inputs[4]) } else { "&[]".to_string() };
-            writeln!(w, "{}let {} = lele::kernels::slice(&{}, &lele::kernels::to_i64_vec(&{}), &lele::kernels::to_i64_vec(&{}), {}, {}, {});", 
-                tab, outputs[0], inputs[0], inputs[1], inputs[2], axes, steps, buf_expr)?;
+            let starts = resolve_i64(1, ctx);
+            let ends = resolve_i64(2, ctx);
+            let axes = resolve_i64(3, ctx);
+            let steps = resolve_i64(4, ctx);
+            writeln!(w, "{}let {} = lele::kernels::slice(&{}, {}, {}, {}, {}, {});", 
+                tab, outputs[0], inputs[0], starts, ends, axes, steps, buf_expr)?;
         }
-        "Expand" => writeln!(w, "{}let {} = lele::kernels::expand(&{}, &{}, {});", tab, outputs[0], inputs[0], inputs[1], buf_expr)?,
-        "Tile" => writeln!(w, "{}let {} = lele::kernels::tile(&{}, &{}, {});", tab, outputs[0], inputs[0], inputs[1], buf_expr)?,
+        "Expand" => writeln!(w, "{}let {} = lele::kernels::expand(&{}, {}, {});", tab, outputs[0], inputs[0], resolve_i64(1, ctx), buf_expr)?,
+        "Tile" => writeln!(w, "{}let {} = lele::kernels::tile(&{}, {}, {});", tab, outputs[0], inputs[0], resolve_i64(1, ctx), buf_expr)?,
         "Split" => {
             let axis = ctx.node.attribute.iter().find(|a| a.name == "axis").map(|a| a.i).unwrap_or(0);
             let splits = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
-                format!("lele::kernels::to_i64_vec(&{})", inputs[1])
+                resolve_i64(1, ctx)
             } else {
                 let split_attr = ctx.node.attribute.iter().find(|a| a.name == "split").map(|a| a.ints.clone()).unwrap_or_else(|| {
                     let num_outputs = outputs.len();
                     vec![0; num_outputs]
                 });
-                format!("vec!{:?}", split_attr)
+                format!("&{:?}", split_attr)
             };
             for out_name in outputs {
                 writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, out_name)?;
             }
             let buf_names: Vec<String> = outputs.iter().map(|n| format!("buf_{}", n)).collect();
             writeln!(w, "{}let mut split_buffers = [{}];", tab, buf_names.join(", "))?;
-            writeln!(w, "{}let splits_vec = {};", tab, splits)?;
-            writeln!(w, "{}let split_results = lele::kernels::split(&{}, {}, &splits_vec, &mut split_buffers);", tab, inputs[0], axis)?;
+            writeln!(w, "{}let splits_slice = {};", tab, splits)?;
+            writeln!(w, "{}let split_results = lele::kernels::split(&{}, {}, splits_slice, &mut split_buffers);", tab, inputs[0], axis)?;
             for (i, out_name) in outputs.iter().enumerate() {
                 writeln!(w, "{}let {} = split_results[{}].clone();", tab, out_name, i)?;
             }
@@ -89,7 +120,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
         "Pad" => {
             let mode = ctx.node.attribute.iter().find(|a| a.name == "mode").map(|a| String::from_utf8_lossy(&a.s)).unwrap_or("constant".into());
             let constant_value = if inputs.len() > 2 && !ctx.node.input[2].is_empty() && !inputs[2].is_empty() { format!("Some(&{})", inputs[2]) } else { "None".to_string() };
-            writeln!(w, "{}let {} = lele::kernels::pad(&{}, &{}, {}, {:?}, {});", tab, outputs[0], inputs[0], inputs[1], constant_value, mode, buf_expr)?;
+            writeln!(w, "{}let {} = lele::kernels::pad(&{}, {}, {}, {:?}, {});", tab, outputs[0], inputs[0], resolve_i64(1, ctx), constant_value, mode, buf_expr)?;
         }
         "DynamicQuantizeLinear" => {
             writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[1])?;

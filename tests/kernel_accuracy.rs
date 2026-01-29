@@ -131,7 +131,7 @@ fn test_where_accuracy() {
 fn test_expand_accuracy() {
     let x = vec![1.0, 2.0, 3.0];
     let x_t = TensorView::from_owned(x, vec![3, 1]);
-    let target_shape = TensorView::from_owned(vec![3.0, 4.0], vec![2]);
+    let target_shape = [3, 4];
 
     let mut out_buf = Vec::new();
     let result = expand(&x_t, &target_shape, &mut out_buf);

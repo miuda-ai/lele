@@ -1,6 +1,8 @@
 use crate::kernels::utils;
 use crate::tensor::TensorView;
 use std::borrow::Cow;
+use std::simd::StdFloat;
+
 pub fn min_max<'b, 'a>(input: &TensorView<'b>, _output: &'a mut Vec<f32>) -> (f32, f32) {
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
@@ -204,14 +206,21 @@ pub fn softplus<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> Tensor
     }
 }
 pub fn tanh_kernel<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
-    for i in 0..numel {
-        out[i] = input.data[i].tanh();
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::kernels::neon::math::tanh(input, out)
     }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: Cow::Owned(input.shape.to_vec()),
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let numel = input.data.len();
+        utils::ensure_capacity(out, numel);
+        for i in 0..numel {
+            out[i] = input.data[i].tanh();
+        }
+        TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(input.shape.to_vec()),
+        }
     }
 }
 pub fn div<'b, 'a>(
@@ -309,6 +318,73 @@ pub fn pow<'b, 'a>(
     b: &TensorView<'b>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
+    let numel = a.data.len();
+    let b_len = b.data.len();
+
+    // Check if b is effectively a constant 2.0 or 0.5
+    let b_const = if b_len == 1 {
+        Some(b.data[0])
+    } else if b_len == numel && b_len > 0 {
+        let first = b.data[0];
+        if (first == 2.0 || first == 0.5) && b.data.iter().all(|&x| x == first) {
+            Some(first)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(val_b) = b_const {
+        if numel > 1000 {
+            // println!("pow: numel={}, val_b={}", numel, val_b);
+        }
+        utils::ensure_capacity(out, numel);
+        unsafe {
+            out.set_len(numel);
+        }
+        let out_slice = out.as_mut_slice();
+        if (val_b - 2.0).abs() < 1e-6 {
+            let (prefix, middle, _suffix) = a.data.as_simd::<4>();
+            for i in 0..prefix.len() {
+                out_slice[i] = a.data[i] * a.data[i];
+            }
+            let offset_mid = prefix.len();
+            for i in 0..middle.len() {
+                let x = middle[i];
+                let y = x * x;
+                y.copy_to_slice(&mut out_slice[offset_mid + i * 4..]);
+            }
+            let offset_suf = prefix.len() + middle.len() * 4;
+            for i in offset_suf..numel {
+                out_slice[i] = a.data[i] * a.data[i];
+            }
+            return TensorView {
+                data: Cow::Borrowed(out),
+                shape: std::borrow::Cow::Owned(a.shape.to_vec()),
+            };
+        } else if (val_b - 0.5).abs() < 1e-6 {
+            let (prefix, middle, _suffix) = a.data.as_simd::<4>();
+            for i in 0..prefix.len() {
+                out_slice[i] = a.data[i].sqrt();
+            }
+            let offset_mid = prefix.len();
+            for i in 0..middle.len() {
+                let x = middle[i];
+                let y = x.sqrt();
+                y.copy_to_slice(&mut out_slice[offset_mid + i * 4..]);
+            }
+            let offset_suf = prefix.len() + middle.len() * 4;
+            for i in offset_suf..numel {
+                out_slice[i] = a.data[i].sqrt();
+            }
+            return TensorView {
+                data: Cow::Borrowed(out),
+                shape: std::borrow::Cow::Owned(a.shape.to_vec()),
+            };
+        }
+    }
+
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
         utils::ensure_capacity(out, len);
@@ -625,10 +701,10 @@ pub fn less<'b, 'a>(
 }
 pub fn expand<'b, 'a>(
     input: &TensorView<'b>,
-    shape: &TensorView,
+    shape: &[i64],
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let target_shape_vec: Vec<usize> = shape.data.iter().map(|&x| x as usize).collect();
+    let target_shape_vec: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
     let input_shape = &input.shape;
     let ndim_in = input_shape.len();
     let ndim_target = target_shape_vec.len();
@@ -697,10 +773,10 @@ pub fn expand<'b, 'a>(
 }
 pub fn tile<'b, 'a>(
     input: &TensorView<'b>,
-    repeats: &TensorView,
+    repeats: &[i64],
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let repeats_vec: Vec<usize> = repeats.data.iter().map(|&x| x as usize).collect();
+    let repeats_vec: Vec<usize> = repeats.iter().map(|&x| x as usize).collect();
     let ndim = input.shape.len();
     assert_eq!(
         repeats_vec.len(),
@@ -748,11 +824,10 @@ mod tests {
     #[test]
     fn test_expand() {
         let input_data = vec![1.0, 2.0, 3.0];
-        let shape_data = vec![1.0, 2.0, 3.0];
+        let shape_data = [1, 2, 3];
         let input = TensorView::from_slice(&input_data, vec![1, 1, 3]);
-        let shape_tensor = TensorView::from_slice(&shape_data, vec![3]);
         let mut out = Vec::new();
-        let res = expand(&input, &shape_tensor, &mut out);
+        let res = expand(&input, &shape_data, &mut out);
         assert_eq!(res.shape, vec![1, 2, 3]);
         assert_eq!(res.data, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
     }

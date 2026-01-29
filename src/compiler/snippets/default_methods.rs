@@ -1,9 +1,7 @@
     fn conv1d_relu<'c, 'd>(&self, input: lele::tensor::TensorView<'c>, weight: lele::tensor::TensorView<'c>, bias: Option<&lele::tensor::TensorView<'c>>, 
                        stride: usize, dilation: usize, groups: usize, padding: usize, output_buf: &'d mut Vec<f32>) -> lele::tensor::TensorView<'d> 
     {
-         let mut tmp = Vec::<f32>::new();
-         let conv_out = lele::kernels::conv1d(&input, &weight, bias, &[dilation as i64], groups as i64, &[padding as i64, padding as i64], &[stride as i64], &mut tmp);
-         lele::kernels::relu(&conv_out, output_buf)
+         lele::kernels::conv1d_fused(&input, &weight, bias, &[dilation as i64], groups as i64, &[padding as i64, padding as i64], &[stride as i64], true, output_buf)
     }
     fn layer_norm<'c, 'd>(&self, input: &lele::tensor::TensorView<'c>, scale: lele::tensor::TensorView<'c>, bias: lele::tensor::TensorView<'c>, 
                           epsilon: lele::tensor::TensorView<'c>, _two: lele::tensor::TensorView<'c>, output_buf: &'d mut Vec<f32>) -> lele::tensor::TensorView<'d> 

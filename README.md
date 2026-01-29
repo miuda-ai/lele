@@ -8,6 +8,19 @@ It rejects the "general-purpose runtime" approach (wrapping C++ libs like ORT or
 
 `lele` is designed to run deep learning models (specifically speech-related ones like SenseVoice, Silero VAD, and TTS) with minimal overhead. It avoids heavy runtimes like ONNX Runtime or `burn` by compiling ONNX graphs directly into optimized Rust source code.
 
+## Performance Benchmarks (2026-01-29)
+
+In-depth comparison between **lele** and **ONNX Runtime (CPU)** on macOS (Apple Silicon). All benchmarks run with single-thread affinity for fair comparison.
+
+| Model | ORT RTF (CPU) | lele RTF | Speedup |
+| :--- | :--- | :--- | :--- |
+| **Silero VAD** | 0.0031 | 0.0031 | - |
+| **SenseVoice** | **0.0318** | 0.1348 | 0.24x |
+| **Supertonic** | **0.1225** | 0.2335 | 0.52x |
+
+*Note: RTF (Real-Time Factor) is defined as (Inference Time / Audio Duration). Lower is better. `lele` optimizations currently focus on transformer/convolution patterns found in large-scale ASR models.*
+
+
 **Why Not ORT/Burn?**
 *   **Generic Overhead:** General runtimes carry massive baggage (graph optimization, dynamic shapes, thousands of unused ops) that slows down specific, small-batch audio models.
 *   **FFI Penalties:** Binding layers introduce latency and inhibit compiler inlining.
@@ -51,6 +64,7 @@ cargo run --release --bin lele_gen -- <model.onnx> <output_path.rs>
 # Supertonic TTS
 ./run_supertonic.sh
 ```
+
 
 ## Roadmap
 

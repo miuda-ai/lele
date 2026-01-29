@@ -10,14 +10,15 @@ bytes = "1.5"
 thiserror = "1.0"
 byteorder = "1.5"
 rustfft = "6.2"
-matrixmultiply = "0.3"
+faer = "0.19"
 libm = "0.2"
+ort = { version = "2.0.0-rc.0", features = ["load-dynamic"] }
+ndarray = "0.17"
 
 [build-dependencies]
 prost-build = "0.13"
 
 [dev-dependencies]
-ort = { version = "2.0.0-rc.0", features = ["load-dynamic"] }
 approx = "0.5"
 anyhow = "1.0"
 test-log = "0.2"
@@ -28,6 +29,10 @@ regex = "1.10"
 unicode-normalization = "0.1"
 rand = "0.8"
 rand_distr = "0.4"
+faer = "0.19"
+
+[profile.release]
+debug = true
 
 [[example]]
 name = "silero"

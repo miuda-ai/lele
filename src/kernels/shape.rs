@@ -1,6 +1,5 @@
 use crate::tensor::TensorView;
-pub fn reshape<'a, 'b>(input: &TensorView<'a>, shape_tensor: &TensorView<'b>) -> TensorView<'a> {
-    let target_shape_raw: Vec<i64> = shape_tensor.data.iter().map(|&x| x as i64).collect();
+pub fn reshape<'a>(input: &TensorView<'a>, target_shape_raw: &[i64]) -> TensorView<'a> {
     let total_elements = input.data.len();
     let mut new_shape = Vec::new();
     let mut known_product = 1;
@@ -139,13 +138,11 @@ mod tests {
     fn test_reshape() {
         let data = vec![1.0, 2.0, 3.0, 4.0];
         let t = TensorView::from_slice(&data, vec![2, 2]);
-        let shape_data = vec![4.0];
-        let shape_t = TensorView::from_slice(&shape_data, vec![1]);
-        let res = reshape(&t, &shape_t);
+        let shape_data = [4];
+        let res = reshape(&t, &shape_data);
         assert_eq!(res.shape, vec![4]);
-        let shape_neg = vec![1.0, -1.0];
-        let shape_neg_t = TensorView::from_slice(&shape_neg, vec![2]);
-        let res2 = reshape(&t, &shape_neg_t);
+        let shape_neg = [1, -1];
+        let res2 = reshape(&t, &shape_neg);
         assert_eq!(res2.shape, vec![1, 4]);
     }
     #[test]

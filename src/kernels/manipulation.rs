@@ -61,6 +61,19 @@ pub fn concat<'b, 'a>(
     let out_ptr = out.as_mut_ptr();
     let mut current_out_offset = 0;
 
+    // Fast path for 2 inputs along axis 0 or 1
+    if inputs.len() == 2 && axis < 2 && outer_dim == 1 {
+        let inp0 = inputs[0];
+        let inp1 = inputs[1];
+        let len0 = inp0.data.len();
+        let len1 = inp1.data.len();
+        unsafe {
+            std::ptr::copy_nonoverlapping(inp0.data.as_ptr(), out_ptr, len0);
+            std::ptr::copy_nonoverlapping(inp1.data.as_ptr(), out_ptr.add(len0), len1);
+        }
+        return TensorView::from_slice(out, out_shape);
+    }
+
     // Direct copy without allocating offset vectors
     for outer_i in 0..outer_dim {
         for inp in inputs {
@@ -121,8 +134,8 @@ pub fn slice<'b, 'a>(
                 let start_offset = start * stride;
                 let end_offset = end * stride;
 
-                out.clear();
-                out.extend_from_slice(&input.data[start_offset..end_offset]);
+                utils::ensure_capacity(out, end_offset - start_offset);
+                out.copy_from_slice(&input.data[start_offset..end_offset]);
 
                 let mut out_shape = input.shape.to_vec();
                 out_shape[0] = end - start;
@@ -216,12 +229,7 @@ pub fn slice<'b, 'a>(
     }
     let out_numel = out_shape.iter().product::<usize>();
     utils::ensure_capacity(out, out_numel);
-    unsafe {
-        out.set_len(out_numel);
-    }
-    if out_numel == 0 {
-        return TensorView::from_slice(out, out_shape);
-    }
+
     let in_strides = utils::compute_strides(&input.shape);
     let mut coords = vec![0; ndim];
     let out_slice = out.as_mut_slice();
@@ -244,12 +252,12 @@ pub fn slice<'b, 'a>(
 }
 pub fn pad<'b, 'a>(
     input: &TensorView<'b>,
-    pads: &TensorView<'b>,
+    pads: &[i64],
     constant_value: Option<&TensorView<'b>>,
     _mode: &str,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let p = pads.data.iter().map(|&x| x as usize).collect::<Vec<_>>();
+    let p = pads.iter().map(|&x| x as usize).collect::<Vec<_>>();
     let rank = input.shape.len();
     if p.len() < rank * 2 {
         panic!(
@@ -415,7 +423,11 @@ pub fn transpose<'b, 'a>(
     TensorView::from_slice(out, out_shape)
 }
 pub fn to_i64_vec(input: &TensorView) -> Vec<i64> {
-    input.data.iter().map(|&x| x as i64).collect()
+    let mut out = Vec::with_capacity(input.data.len());
+    for &val in input.data.iter() {
+        out.push(val as i64);
+    }
+    out
 }
 pub fn split<'a>(
     input: &TensorView,

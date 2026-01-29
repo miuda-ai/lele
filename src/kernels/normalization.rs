@@ -54,22 +54,96 @@ pub fn layer_norm<'b, 'a>(
     let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
     let outer_size: usize = input.shape[..axis].iter().product();
     let norm_size: usize = input.shape[axis..].iter().product();
+    
     utils::ensure_capacity(out_buf, input.data.len());
     let out_slice = unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), input.data.len()) };
+    
     let src = &input.data;
     let gamma = &scale.data;
     let beta = &bias.data;
-    for i in 0..outer_size {
-        let offset = i * norm_size;
-        let chunk = &src[offset .. offset + norm_size];
-        let out_chunk = &mut out_slice[offset .. offset + norm_size];
-        let sum: f32 = chunk.iter().sum();
-        let mean = sum / norm_size as f32;
-        let var_sum: f32 = chunk.iter().map(|&x| (x - mean) * (x - mean)).sum();
-        let var = var_sum / norm_size as f32;
-        let inv_std = 1.0 / (var + epsilon).sqrt();
-        for j in 0..norm_size {
-            out_chunk[j] = (chunk[j] - mean) * inv_std * gamma[j] + beta[j];
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        for i in 0..outer_size {
+            let offset = i * norm_size;
+            let chunk = &src[offset .. offset + norm_size];
+            let out_chunk = &mut out_slice[offset .. offset + norm_size];
+            
+            // Mean
+            let mut sum_v = unsafe { vdupq_n_f32(0.0) };
+            let mut j = 0;
+            while j + 4 <= norm_size {
+                unsafe {
+                    let v = vld1q_f32(chunk.as_ptr().add(j));
+                    sum_v = vaddq_f32(sum_v, v);
+                }
+                j += 4;
+            }
+            let mut sum = unsafe { vaddvq_f32(sum_v) };
+            while j < norm_size {
+                sum += chunk[j];
+                j += 1;
+            }
+            let mean = sum / norm_size as f32;
+            let mean_v = unsafe { vdupq_n_f32(mean) };
+
+            // Variance
+            let mut var_sum_v = unsafe { vdupq_n_f32(0.0) };
+            j = 0;
+            while j + 4 <= norm_size {
+                unsafe {
+                    let v = vld1q_f32(chunk.as_ptr().add(j));
+                    let diff = vsubq_f32(v, mean_v);
+                    var_sum_v = vfmaq_f32(var_sum_v, diff, diff);
+                }
+                j += 4;
+            }
+            let mut var_sum = unsafe { vaddvq_f32(var_sum_v) };
+            while j < norm_size {
+                let diff = chunk[j] - mean;
+                var_sum += diff * diff;
+                j += 1;
+            }
+            let var = var_sum / norm_size as f32;
+            let inv_std = 1.0 / (var + epsilon).sqrt();
+            let inv_std_v = unsafe { vdupq_n_f32(inv_std) };
+
+            // Normalize
+            j = 0;
+            while j + 4 <= norm_size {
+                unsafe {
+                    let v = vld1q_f32(chunk.as_ptr().add(j));
+                    let g = vld1q_f32(gamma.as_ptr().add(j));
+                    let b = vld1q_f32(beta.as_ptr().add(j));
+                    
+                    let diff = vsubq_f32(v, mean_v);
+                    let norm = vmulq_f32(diff, inv_std_v);
+                    let res = vfmaq_f32(b, norm, g);
+                    vst1q_f32(out_chunk.as_mut_ptr().add(j), res);
+                }
+                j += 4;
+            }
+            while j < norm_size {
+                out_chunk[j] = (chunk[j] - mean) * inv_std * gamma[j] + beta[j];
+                j += 1;
+            }
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for i in 0..outer_size {
+            let offset = i * norm_size;
+            let chunk = &src[offset .. offset + norm_size];
+            let out_chunk = &mut out_slice[offset .. offset + norm_size];
+            let sum: f32 = chunk.iter().sum();
+            let mean = sum / norm_size as f32;
+            let var_sum: f32 = chunk.iter().map(|&x| (x - mean) * (x - mean)).sum();
+            let var = var_sum / norm_size as f32;
+            let inv_std = 1.0 / (var + epsilon).sqrt();
+            for j in 0..norm_size {
+                out_chunk[j] = (chunk[j] - mean) * inv_std * gamma[j] + beta[j];
+            }
         }
     }
     TensorView {

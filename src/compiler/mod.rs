@@ -809,16 +809,44 @@ impl Compiler {
         } else {
             format!("({})", ret_types.join(", "))
         };
+        // forward (legacy)
         writeln!(
             &mut code,
             "    pub fn forward(&self, {}) -> {} {{",
             args.join(", "),
-            ret_sig
+            ret_sig.replace("'a", "'static")
         )?;
         writeln!(
             &mut code,
             "        let mut ws = {}Workspace::new();",
             struct_name
+        )?;
+        let arg_names_str = graph.input.iter().map(|i| sanitize_name(&i.name)).collect::<Vec<_>>().join(", ");
+        writeln!(
+            &mut code,
+            "        let res = self.forward_with_workspace(&mut ws, {});",
+            arg_names_str
+        )?;
+        let ret_vals_owned: Vec<String> = if graph.output.len() == 1 {
+            vec!["res.to_owned()".to_string()]
+        } else {
+            (0..graph.output.len()).map(|i| format!("res.{}.to_owned()", i)).collect()
+        };
+        let ret_str_owned = if ret_vals_owned.len() == 1 {
+            ret_vals_owned[0].clone()
+        } else {
+            format!("({})", ret_vals_owned.join(", "))
+        };
+        writeln!(&mut code, "        {}", ret_str_owned)?;
+        writeln!(&mut code, "    }}")?;
+
+        // forward_with_workspace
+        writeln!(
+            &mut code,
+            "    pub fn forward_with_workspace<'w>(&self, ws: &'w mut {}Workspace, {}) -> {} {{",
+            struct_name,
+            args.join(", ").replace("'a", "'w"),
+            ret_sig.replace("'a", "'w")
         )?;
         // Generate Body
         code.extend_from_slice(body_str.as_bytes());
@@ -829,9 +857,9 @@ impl Compiler {
             .map(|o| {
                 let name = sanitize_name(&o.name);
                 if let Some((offset, len, shape)) = weight_lookup.get(&name) {
-                    format!("self.weight({}, {}, &{:?}).to_owned()", offset, len, shape)
+                    format!("self.weight({}, {}, &{:?})", offset, len, shape)
                 } else {
-                    format!("{}.to_owned()", name)
+                    format!("{}.clone()", name)
                 }
             })
             .collect();
@@ -866,10 +894,18 @@ fn collect_weights(
     bin_data: &mut Vec<u8>,
     offset_map: &mut Vec<(String, usize, usize, Vec<usize>)>,
     current_offset: &mut usize,
-    _int64_map: &mut HashMap<String, (Vec<i64>, Vec<usize>)>,
+    int64_map: &mut HashMap<String, (Vec<i64>, Vec<usize>)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initializers
     for init in &graph.initializer {
+        // Populate int64_map for INT64 types
+        if init.data_type == 7 { // INT64
+            if let Ok((data, dims)) = tensor_to_array(init) {
+                let ints: Vec<i64> = data.iter().map(|&x| x as i64).collect();
+                int64_map.insert(init.name.clone(), (ints, dims));
+            }
+        }
+
         // Try reading as float array (converts everything to f32)
         match tensor_to_array(init) {
             Ok((data, shape)) => {
@@ -893,6 +929,16 @@ fn collect_weights(
         if node.op_type == "Constant" {
             if let Some(attr) = node.attribute.iter().find(|a| a.name == "value") {
                 if let Some(t) = &attr.t {
+                    // Populate int64_map for INT64 types
+                    if t.data_type == 7 { // INT64
+                        if let Ok((data, dims)) = tensor_to_array(t) {
+                            let ints: Vec<i64> = data.iter().map(|&x| x as i64).collect();
+                            if let Some(out_name) = node.output.first() {
+                                int64_map.insert(out_name.clone(), (ints, dims));
+                            }
+                        }
+                    }
+
                     // Convert everything to f32 weights to avoid inlining large/many constants code
                     if let Ok((data, shape)) = tensor_to_array(t) {
                         if !data.is_empty() {
@@ -921,7 +967,7 @@ fn collect_weights(
         // 3. Recurse
         for attr in &node.attribute {
             if let Some(g) = &attr.g {
-                collect_weights(g, bin_data, offset_map, current_offset, _int64_map)?;
+                collect_weights(g, bin_data, offset_map, current_offset, int64_map)?;
             }
         }
     }

@@ -220,7 +220,7 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
         if chunk_outputs.is_empty() {
             writeln!(
                 body_writer,
-                "{}self.{}(&mut ws, {});",
+                "{}self.{}(ws, {});",
                 tab,
                 func_name,
                 call_args.join(", ")
@@ -229,7 +229,7 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
             let out_vars = chunk_outputs.join(", ");
             writeln!(
                 body_writer,
-                "{}let ({}) = self.{}(&mut ws, {});",
+                "{}let ({}) = self.{}(ws, {});",
                 tab,
                 out_vars,
                 func_name,

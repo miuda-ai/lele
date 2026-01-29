@@ -12,3 +12,5 @@ Cargo.lock
 /*.wav
 *.stacks
 *_profile.json
+profile.json.gz
+.DS_Store

@@ -33,8 +33,13 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
         "Not" => writeln!(w, "{}let {} = lele::kernels::not(&{}, {});", tab, outputs[0], inputs[0], buf_expr)?,
         "PRelu" => writeln!(w, "{}let {} = lele::kernels::prelu(&{}, &{}, {});", tab, outputs[0], inputs[0], inputs[1], buf_expr)?,
         "ReduceSum" => {
-            let axes = if inputs.len() > 1 && !ctx.node.input[1].is_empty() && !inputs[1].is_empty() {
-                format!("&lele::kernels::to_i64_vec(&{})", inputs[1])
+            let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
+                let name = &ctx.node.input[1];
+                if let Some((ints, _)) = ctx.int64_map.get(name) {
+                    format!("&{:?}", ints)
+                } else {
+                    format!("&lele::kernels::to_i64_vec(&{})", inputs[1])
+                }
             } else {
                 let axes_attr = ctx.node.attribute.iter().find(|a| a.name == "axes").map(|a| a.ints.clone()).unwrap_or(vec![]);
                 format!("&{:?}", axes_attr)
