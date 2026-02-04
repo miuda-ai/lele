@@ -346,11 +346,11 @@ pub fn softplus<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> Tensor
     }
 }
 pub fn tanh_kernel<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     {
         crate::kernels::neon::math::tanh(input, out)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     {
         let numel = input.data.len();
         utils::ensure_capacity(out, numel);
@@ -449,11 +449,11 @@ pub fn equal_i64<'b, 'a, T: ElementOps>(
     }
 }
 pub fn sigmoid<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     {
         crate::kernels::neon::math::sigmoid(input, out)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     {
         let len = input.data.len();
         utils::ensure_capacity(out, len);
@@ -461,7 +461,7 @@ pub fn sigmoid<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorV
         let o_slice = out.as_mut_slice();
         for i in 0..len {
             unsafe {
-                use crate::activations;
+                use super::activations;
 
                 *o_slice.get_unchecked_mut(i) = activations::sigmoid(*i_slice.get_unchecked(i));
             }
@@ -473,11 +473,11 @@ pub fn sigmoid<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorV
     }
 }
 pub fn relu<'a, 'b>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     {
         crate::kernels::neon::math::relu(input, out)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     {
         let len = input.data.len();
         utils::ensure_capacity(out, len);

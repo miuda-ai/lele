@@ -184,6 +184,7 @@ pub fn dynamic_quantize_linear_u8<'a, 'b>(
 
     // Vectorized Min/Max
     let mut cur = 0;
+    #[cfg(target_arch = "aarch64")]
     unsafe {
         let mut v_min = vdupq_n_f32(f32::MAX);
         let mut v_max = vdupq_n_f32(f32::MIN);
@@ -228,6 +229,7 @@ pub fn dynamic_quantize_linear_u8<'a, 'b>(
 
     // Vectorized Quantization
     let mut cur = 0;
+    #[cfg(target_arch = "aarch64")]
     unsafe {
         let v_inv_scale = vdupq_n_f32(inv_scale);
         let v_zp = vdupq_n_f32(zp);
@@ -351,6 +353,7 @@ pub fn mat_mul_integer_u8<'a, 'b, 'c>(
                 let mut c = 0;
 
                 // Vectorized accumulation for col_sums
+                #[cfg(target_arch = "aarch64")]
                 unsafe {
                     while c + 16 <= n {
                         // Load 16 u8s
@@ -418,6 +421,7 @@ pub fn mat_mul_integer_u8<'a, 'b, 'c>(
             let k_aligned = k.div_ceil(4) * 4;
             let mut packed_b = vec![0u8; k_aligned * 16];
 
+            #[cfg(target_arch = "aarch64")]
             unsafe {
                 let mut k_idx = 0;
                 let mut dst_ptr = packed_b.as_mut_ptr();
@@ -468,11 +472,22 @@ pub fn mat_mul_integer_u8<'a, 'b, 'c>(
                 }
             }
 
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                // Fallback packing
+                for k_idx in 0..k {
+                    for col in 0..16 {
+                        packed_b[k_idx * 16 + col] = b_slice[k_idx * n + j + col];
+                    }
+                }
+            }
+
             // Process Rows of A against Packed B
             for i in 0..m {
                 let row_a = &a_slice[i * k..(i + 1) * k];
                 let row_out = &mut out_slice[i * n..(i + 1) * n];
 
+                #[cfg(target_arch = "aarch64")]
                 unsafe {
                     let mut acc0 = vdupq_n_u32(0);
                     let mut acc1 = vdupq_n_u32(0);
@@ -614,6 +629,29 @@ pub fn mat_mul_integer_u8<'a, 'b, 'c>(
                     vst1q_f32(ptr_out.add(4), result1);
                     vst1q_f32(ptr_out.add(8), result2);
                     vst1q_f32(ptr_out.add(12), result3);
+                }
+
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    // Fallback dot product
+                    for col in 0..16 {
+                        let mut sum: i32 = 0;
+                        for k_idx in 0..k {
+                            sum += (row_a[k_idx] as i32) * (packed_b[k_idx * 16 + col] as i32);
+                        }
+                        let mut res = row_out[j + col] + sum as f32;
+
+                        if let Some(scale_data) = scale {
+                            res *= scale_data.data[0];
+                        }
+                        if let Some(bias_data) = bias {
+                            res += bias_data.data[j + col];
+                        }
+                        if apply_relu && res < 0.0 {
+                            res = 0.0;
+                        }
+                        row_out[j + col] = res;
+                    }
                 }
             }
             j += 16;

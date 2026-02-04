@@ -117,7 +117,7 @@ fn mat_mul_integer_u8<'a, 'b, 'c>(
     apply_relu: bool,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     {
         crate::kernels::neon::quantization::mat_mul_integer_u8(
             a,
@@ -130,7 +130,7 @@ fn mat_mul_integer_u8<'a, 'b, 'c>(
             out,
         )
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     {
         use crate::kernels::utils;
         let zp_a_ref: &[u8] = a_zero_point.map(|z| z.data.as_ref()).unwrap_or(&[]);
@@ -229,7 +229,7 @@ pub fn dynamic_quantize_linear<'a, 'b>(
     TensorView<'a, f32>,
     TensorView<'a, f32>,
 ) {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     {
         crate::kernels::neon::quantization::dynamic_quantize_linear(
             x,
@@ -238,7 +238,7 @@ pub fn dynamic_quantize_linear<'a, 'b>(
             out_zp,
         )
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     {
         let len = x.data.len();
         
