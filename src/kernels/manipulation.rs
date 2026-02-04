@@ -442,7 +442,15 @@ pub fn split<'a, T: Clone + Copy + std::fmt::Debug>(
         num_splits,
         "Split: output buffers count mismatch"
     );
-    let total: i64 = splits.iter().sum();
+
+    let actual_splits = if splits.iter().all(|&s| s == 0) && num_splits > 0 {
+        let size = input.shape[axis];
+        vec![ (size / num_splits) as i64; num_splits]
+    } else {
+        splits.to_vec()
+    };
+
+    let total: i64 = actual_splits.iter().sum();
     assert_eq!(
         total, input.shape[axis] as i64,
         "Split: splits sum mismatch"
@@ -451,7 +459,7 @@ pub fn split<'a, T: Clone + Copy + std::fmt::Debug>(
     let inner_dim: usize = input.shape[axis + 1..].iter().product();
     let mut results = Vec::with_capacity(num_splits);
     let mut axis_offset = 0;
-    for (i, &split_size) in splits.iter().enumerate() {
+    for (i, &split_size) in actual_splits.iter().enumerate() {
         let split_size = split_size as usize;
         let mut out_shape = input.shape.to_vec();
         out_shape[axis] = split_size;
@@ -466,7 +474,7 @@ pub fn split<'a, T: Clone + Copy + std::fmt::Debug>(
         }
         axis_offset += split_size;
     }
-    for (i, &split_size) in splits.iter().enumerate() {
+    for (i, &split_size) in actual_splits.iter().enumerate() {
         let mut out_shape = input.shape.to_vec();
         out_shape[axis] = split_size as usize;
         results.push(TensorView::from_slice(&outputs[i], out_shape));

@@ -77,7 +77,9 @@ where
     T: Clone + Copy + std::fmt::Debug,
     F: Fn(T, T) -> T,
 {
-    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).expect("Shapes not broadcastable");
+    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap_or_else(|| {
+        panic!("Shapes not broadcastable: {:?} and {:?}", a.shape, b.shape)
+    });
     let numel = out_shape.iter().product::<usize>();
     utils::ensure_capacity(output_buf, numel);
     unsafe {

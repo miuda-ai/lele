@@ -63,6 +63,25 @@ pub fn shape<T: Clone + std::fmt::Debug>(input: &TensorView<T>) -> TensorView<'s
     let rank = input.dim();
     TensorView::from_owned(shape_data, vec![rank])
 }
+pub fn shape_slicing<T: Clone + std::fmt::Debug>(
+    input: &TensorView<T>,
+    start: i64,
+    end: Option<i64>,
+) -> TensorView<'static, i64> {
+    let rank = input.dim() as i64;
+    let start = if start < 0 { rank + start } else { start } as usize;
+    let end = if let Some(e) = end {
+        let e = if e < 0 { rank + e } else { e } as usize;
+        e.min(rank as usize)
+    } else {
+        rank as usize
+    };
+    let start = start.min(rank as usize).min(end);
+    let shape_slice = &input.shape[start..end];
+    let shape_data: Vec<i64> = shape_slice.iter().map(|&x| x as i64).collect();
+    let new_rank = shape_data.len();
+    TensorView::from_owned(shape_data, vec![new_rank])
+}
 pub fn flatten<'a, T: Clone + std::fmt::Debug>(input: &TensorView<'a, T>, axis: i64) -> TensorView<'a, T> {
     let axis = if axis < 0 {
         input.dim() as i64 + axis

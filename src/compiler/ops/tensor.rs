@@ -172,11 +172,35 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 tab, outputs[0], inputs[0], inputs[1], axis, buf_expr
             )?;
         }
-        "Shape" => writeln!(
-            w,
-            "{}let {} = lele::kernels::shape(&{});",
-            tab, outputs[0], inputs[0]
-        )?,
+        "Shape" => {
+            let start = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "start")
+                .map(|a| a.i)
+                .unwrap_or(0);
+            let end = ctx.node.attribute.iter().find(|a| a.name == "end").map(|a| a.i);
+
+            if start != 0 || end.is_some() {
+                let end_str = if let Some(e) = end {
+                    format!("Some({})", e)
+                } else {
+                    "None".to_string()
+                };
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::shape_slicing(&{}, {}, {});",
+                    tab, outputs[0], inputs[0], start, end_str
+                )?;
+            } else {
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::shape(&{});",
+                    tab, outputs[0], inputs[0]
+                )?;
+            }
+        }
         "Size" => writeln!(
             w,
             "{}let {} = lele::kernels::size(&{});",
