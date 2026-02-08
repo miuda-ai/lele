@@ -16,10 +16,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::durationpredictor::DurationPredictor;
-use crate::textencoder::TextEncoder;
-use crate::vectorestimator::VectorEstimator;
-use crate::vocoder::Vocoder;
+use crate::durationpredictor::{DurationPredictor, DurationPredictorWorkspace};
+use crate::textencoder::{TextEncoder, TextEncoderWorkspace};
+use crate::vectorestimator::{VectorEstimator, VectorEstimatorWorkspace};
+use crate::vocoder::{Vocoder, VocoderWorkspace};
 
 pub struct Style {
     pub ttl_data: Vec<f32>,
@@ -37,6 +37,12 @@ pub struct SupertonicTts<'a> {
     vocoder: Vocoder<'a>,
     voice_styles_dir: PathBuf,
     style_cache: HashMap<String, Style>,
+    
+    // Workspaces
+    te_ws: TextEncoderWorkspace,
+    dp_ws: DurationPredictorWorkspace,
+    ve_ws: VectorEstimatorWorkspace,
+    vo_ws: VocoderWorkspace,
 }
 
 impl<'a> SupertonicTts<'a> {
@@ -63,6 +69,10 @@ impl<'a> SupertonicTts<'a> {
             vocoder: Vocoder::new(vocoder_weights),
             voice_styles_dir: voice_styles_dir.to_path_buf(),
             style_cache: HashMap::new(),
+            te_ws: TextEncoderWorkspace::new(),
+            dp_ws: DurationPredictorWorkspace::new(),
+            ve_ws: VectorEstimatorWorkspace::new(),
+            vo_ws: VocoderWorkspace::new(),
         })
     }
 
@@ -158,7 +168,8 @@ impl<'a> SupertonicTts<'a> {
             let style_ttl_tv = TensorView::new(&style.ttl_data, &style.ttl_shape);
 
             // 1. Duration Predictor
-            let duration_tv = self.duration_predictor.forward(
+            let duration_tv = self.duration_predictor.forward_with_workspace(
+                &mut self.dp_ws,
                 text_ids_tv.clone(),
                 style_dp_tv,
                 text_mask_tv.clone(),
@@ -176,13 +187,16 @@ impl<'a> SupertonicTts<'a> {
             }
 
             let total_duration_seconds: f32 = duration.iter().sum();
-            println!("Debug: Total duration seconds: {}", total_duration_seconds);
             let duration_batch = vec![total_duration_seconds];
 
             // 2. Text Encoder
             let text_emb_tv =
-                self.text_encoder
-                    .forward(text_ids_tv, style_ttl_tv.clone(), text_mask_tv.clone());
+                self.text_encoder.forward_with_workspace(
+                    &mut self.te_ws,
+                    text_ids_tv,
+                    style_ttl_tv.clone(),
+                    text_mask_tv.clone()
+                );
 
             // 3. Vector Estimator (Loop)
             let (mut xt_data, xt_shape, latent_mask_data, latent_mask_shape) = sample_noisy_latent(
@@ -192,6 +206,7 @@ impl<'a> SupertonicTts<'a> {
                 self.config.ttl.chunk_compress_factor,
                 self.config.ttl.latent_dim,
             );
+            let mut xt_next = xt_data.clone();
 
             let total_step_data = vec![steps as f32; bsz];
             let total_step_shape = [bsz];
@@ -205,7 +220,8 @@ impl<'a> SupertonicTts<'a> {
                 let xt_tv = TensorView::new(&xt_data, &xt_shape);
                 let latent_mask_tv = TensorView::new(&latent_mask_data, &latent_mask_shape);
 
-                let denoised_tv = self.vector_estimator.forward(
+                let denoised_tv = self.vector_estimator.forward_with_workspace(
+                    &mut self.ve_ws,
                     xt_tv,
                     text_emb_tv.clone(),
                     style_ttl_tv.clone(),
@@ -215,12 +231,13 @@ impl<'a> SupertonicTts<'a> {
                     total_step_tv.clone(),
                 );
 
-                xt_data = denoised_tv.data.to_vec();
+                xt_next.copy_from_slice(&denoised_tv.data);
+                std::mem::swap(&mut xt_data, &mut xt_next);
             }
 
             // 4. Vocoder
             let xt_tv = TensorView::new(&xt_data, &xt_shape);
-            let audio_tv = self.vocoder.forward(xt_tv);
+            let audio_tv = self.vocoder.forward_with_workspace(&mut self.vo_ws, xt_tv);
 
             let audio_data = audio_tv.data.to_vec();
             let expected_len =

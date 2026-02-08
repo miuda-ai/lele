@@ -16,7 +16,7 @@ anyhow = "1.0"
 
 [package]
 name = "lele"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Bare-metal machine learning inference library in Rust"
 license = "MIT"
@@ -41,6 +41,7 @@ rustfft = "6.2"
 faer = "0.24.0"
 libm = "0.2"
 half = "2.7.1"
+rayon = "1.11.0"
 
 [build-dependencies]
 prost-build = "0.14.3"

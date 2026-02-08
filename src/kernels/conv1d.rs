@@ -1,7 +1,7 @@
 use crate::kernels::utils;
 use crate::tensor::TensorView;
 use faer::{
-    Accum, Par,
+    Accum,
     linalg::matmul::matmul,
     mat::{MatMut, MatRef},
 };
@@ -1081,17 +1081,32 @@ pub fn conv1d_fused<'b, 'a>(
                                 let unf_ptr = unfolded.as_mut_ptr();
                                 let in_ptr = in_data.as_ptr();
 
-                                if stride == 1 && pad_left == 0 {
-                                    // Contiguous copy for stride=1, no padding
-                                    let src_start = k_offset;
+                                if stride == 1 {
+                                    // Optimized stride=1 with padding handling
+                                    let t_in_start = -(pad_left as isize) + k_offset as isize;
                                     let dst_start = unfolded_row_offset;
-                                    let copy_len = (input_len - k_offset).min(output_len);
-                                    unsafe {
-                                        std::ptr::copy_nonoverlapping(
-                                            in_ptr.add(src_start),
-                                            unf_ptr.add(dst_start),
-                                            copy_len,
-                                        );
+                                    
+                                    // prefix zeros
+                                    let prefix_len = if t_in_start < 0 {
+                                        (-t_in_start as usize).min(output_len)
+                                    } else {
+                                        0
+                                    };
+                                    
+                                    // data copy
+                                    let src_start = if t_in_start > 0 { t_in_start as usize } else { 0 };
+                                    let data_dst_start = dst_start + prefix_len;
+                                    let available_data = if input_len > src_start { input_len - src_start } else { 0 };
+                                    let copy_len = available_data.min(output_len - prefix_len);
+                                    
+                                    if copy_len > 0 {
+                                        unsafe {
+                                            std::ptr::copy_nonoverlapping(
+                                                in_ptr.add(src_start),
+                                                unf_ptr.add(data_dst_start),
+                                                copy_len,
+                                            );
+                                        }
                                     }
                                 } else {
                                     // Strided copy
@@ -1142,7 +1157,7 @@ pub fn conv1d_fused<'b, 'a>(
                         output_len as isize,
                         1,
                     );
-                    matmul(c, Accum::Replace, a, b, 1.0f32, Par::Seq);
+                    matmul(c, Accum::Replace, a, b, 1.0f32, utils::get_parallelism(out_channels_per_group, output_len, unfolded_rows));
                 }
             }
         }

@@ -17,7 +17,8 @@ fn main() {
     let bin = std::fs::read("examples/sensevoice/src/sensevoice_weights.bin")
         .or_else(|_| std::fs::read("examples/sensevoice/sensevoice_weights.bin"))
         .or_else(|_| std::fs::read("sensevoice_weights.bin"))
-        .expect("Failed to load weights. Make sure sensevoice_weights.bin is in examples/sensevoice/src/");
+        .or_else(|_| std::fs::read("src/sensevoice_weights.bin"))
+        .expect("Failed to load weights. Make sure sensevoice_weights.bin is in the current directory or examples/sensevoice/");
 
     let model = sensevoice::SenseVoice::new(&bin);
     println!(

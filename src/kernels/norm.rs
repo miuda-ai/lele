@@ -1,6 +1,7 @@
 use crate::kernels::utils;
 use crate::tensor::TensorView;
 use std::borrow::Cow;
+
 pub fn softmax<'b, 'a>(
     input: &TensorView<'b>,
     axis: i32,
@@ -57,13 +58,14 @@ pub fn layer_norm<'b, 'a>(
     utils::ensure_capacity(out_buf, input.data.len());
     let out_slice =
         unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), input.data.len()) };
+
     #[cfg(target_arch = "x86_64")]
     unsafe {
         crate::kernels::avx::norm::layer_norm_x86(
             input.data.as_ptr(),
             scale.data.as_ptr(),
             bias.data.as_ptr(),
-            out_buf.as_mut_ptr(),
+            out_slice.as_mut_ptr(),
             norm_size,
             outer_size,
             epsilon,

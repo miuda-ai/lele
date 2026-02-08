@@ -66,7 +66,7 @@ pub fn matmul<'a>(
                 1,
             );
 
-            faer_matmul(out_mat, Accum::Replace, a_mat, b_mat, 1.0, Par::Seq);
+            faer_matmul(out_mat, Accum::Replace, a_mat, b_mat, 1.0, utils::get_parallelism(m, n, k));
         }
     }
     TensorView {
@@ -198,7 +198,7 @@ pub fn gemm<'a>(
             a_mat,
             b_mat,
             alpha,
-            Par::Seq,
+            utils::get_parallelism(m, n, k),
         );
     }
 

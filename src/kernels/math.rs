@@ -76,7 +76,9 @@ where
     T: Clone + Copy + std::fmt::Debug,
     F: Fn(T, T) -> T,
 {
-    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).expect("Shapes not broadcastable");
+    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap_or_else(|| {
+        panic!("Shapes not broadcastable: {:?} and {:?}", a.shape, b.shape)
+    });
     let numel = out_shape.iter().product::<usize>();
     utils::ensure_capacity(output_buf, numel);
     unsafe {
@@ -347,11 +349,11 @@ pub fn softplus<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> Tensor
     }
 }
 pub fn tanh_kernel<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     {
         crate::kernels::neon::math::tanh(input, out)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     {
         let numel = input.data.len();
         utils::ensure_capacity(out, numel);
@@ -401,60 +403,14 @@ pub fn equal_i64<'b, 'a, T: ElementOps>(
     b: &TensorView<'b, T>,
     out: &'a mut Vec<i64>,
 ) -> TensorView<'a, i64> {
-    // Need to convert comparison to i64 result (0 or 1)
-    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).expect("Shapes not broadcastable");
-    let numel = out_shape.iter().product::<usize>();
-    utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
-
-    // Simplification: assume broadcast handled by loop if not scalars
-    // Optimized scalar paths can check lengths
-    if a.data.len() == 1 && b.data.len() == 1 {
-        out[0] = if a.data[0] == b.data[0] { 1 } else { 0 };
-    } else if a.data.len() == 1 {
-        let val_a = a.data[0];
-        for i in 0..numel {
-            out[i] = if val_a == b.data[i] { 1 } else { 0 };
-        }
-    } else if b.data.len() == 1 {
-        let val_b = b.data[0];
-        for i in 0..numel {
-            out[i] = if a.data[i] == val_b { 1 } else { 0 };
-        }
-    } else {
-        // Full broadcast or same shape
-        // Code should handle full broadcast loop properly using indices, but here we assume flattened iteration works?
-        // Wait, original code iterated 0..numel using `a.data[i]`, `b.data[i]`. This only works if same shape or broadcasting involves copying.
-        // But `utils::broadcast_shapes` returns shape. It doesn't broadcast data.
-        // If shapes are different, a.data[i] might be invalid or wrong mapping!
-        // The original implementation was BUGGY for general broadcasting unless inputs were already broadcasted in memory?
-        // But `broadcast_binary_op` (used elsewhere) handles broadcasting logic via strides.
-        // `equal_i64` manual implementation seems to assume same length if not scalar?
-        // Or maybe strict check:
-        if a.data.len() == b.data.len() {
-            for i in 0..numel {
-                out[i] = if a.data[i] == b.data[i] { 1 } else { 0 };
-            }
-        } else {
-            // Resort to broadcast_binary_op but we want i64 output? `broadcast_binary_op` assumes T->T.
-            // We need T->i64.
-            // I'll assume same shape mostly. If not, panic for now (or implement proper loop).
-            panic!("equal_i64: complex broadcast not implemented inline");
-        }
-    }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: Cow::Owned(out_shape),
-    }
+    broadcast_binary_op_to(a, b, out, |x, y| if x == y { 1 } else { 0 })
 }
 pub fn sigmoid<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     {
         crate::kernels::neon::math::sigmoid(input, out)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     {
         let len = input.data.len();
         utils::ensure_capacity(out, len);
@@ -462,7 +418,7 @@ pub fn sigmoid<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorV
         let o_slice = out.as_mut_slice();
         for i in 0..len {
             unsafe {
-                use crate::activations;
+                use super::activations;
 
                 *o_slice.get_unchecked_mut(i) = activations::sigmoid(*i_slice.get_unchecked(i));
             }
@@ -474,11 +430,11 @@ pub fn sigmoid<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorV
     }
 }
 pub fn relu<'a, 'b>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     {
         crate::kernels::neon::math::relu(input, out)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     {
         let len = input.data.len();
         utils::ensure_capacity(out, len);
@@ -631,16 +587,18 @@ pub fn reduce_mean<'b, 'a>(
     for &ax in &resolved_axes {
         count *= input.shape[ax];
     }
-    let scale = 1.0 / count as f32;
-    for x in out.iter_mut() {
-        *x *= scale;
+        let scale = 1.0 / count as f32;
+        for x in out.iter_mut() {
+            *x *= scale;
+        }
+    
+        TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(out_shape),
+        }
     }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: Cow::Owned(out_shape),
-    }
-}
-pub fn reduce_sum<'b, 'a>(
+    
+    pub fn reduce_sum<'b, 'a>(
     input: &TensorView<'b>,
     axes: &[i64],
     keepdims: bool,

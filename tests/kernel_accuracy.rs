@@ -363,3 +363,21 @@ fn test_gather_accuracy() {
     assert_eq!(result.shape.as_ref(), &[2, 3]);
     assert_close(&result.data, &expected, 1e-6, "gather");
 }
+
+#[test]
+fn test_reduce_max_accuracy() {
+    let input = vec![1.0, 5.0, 2.0, 8.0, 3.0, 1.0, 9.0, 4.0];
+    let x = TensorView::from_owned(input, vec![2, 4]);
+
+    let mut out_buf = Vec::new();
+    // Reduce over last axis [2, 4] -> [2]
+    let result = lele::kernels::reduce_max(&x, &[1], false, &mut out_buf);
+    let expected = vec![8.0, 9.0];
+    assert_close(&result.data, &expected, 1e-6, "reduce_max_axis1");
+
+    // Reduce over first axis [2, 4] -> [4]
+    let mut out_buf2 = Vec::new();
+    let result2 = lele::kernels::reduce_max(&x, &[0], false, &mut out_buf2);
+    let expected2 = vec![3.0, 5.0, 9.0, 8.0];
+    assert_close(&result2.data, &expected2, 1e-6, "reduce_max_axis0");
+}

@@ -130,3 +130,43 @@ pub fn broadcast_shapes(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
     }
     Some(out_shape)
 }
+
+pub fn get_parallelism(m: usize, n: usize, k: usize) -> faer::Par {
+    if m * n * k > 100_000_000 {
+        if let Some(n) = std::num::NonZeroUsize::new(rayon::current_num_threads()) {
+            faer::Par::Rayon(n)
+        } else {
+            faer::Par::Seq
+        }
+    } else {
+        faer::Par::Seq
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct SendPtr<T>(pub usize, std::marker::PhantomData<T>);
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+
+impl<T> SendPtr<T> {
+    pub fn new(ptr: *mut T) -> Self {
+        Self(ptr as usize, std::marker::PhantomData)
+    }
+    pub fn as_ptr(self) -> *mut T {
+        self.0 as *mut T
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct SendConstPtr<T>(pub usize, std::marker::PhantomData<T>);
+unsafe impl<T> Send for SendConstPtr<T> {}
+unsafe impl<T> Sync for SendConstPtr<T> {}
+
+impl<T> SendConstPtr<T> {
+    pub fn new(ptr: *const T) -> Self {
+        Self(ptr as usize, std::marker::PhantomData)
+    }
+    pub fn as_ptr(self) -> *const T {
+        self.0 as *const T
+    }
+}

@@ -1,4 +1,5 @@
 use super::super::generate::OpContext;
+use crate::compiler::sanitize_name;
 use std::io::Write;
 
 pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<bool> {
@@ -98,55 +99,52 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             tab, outputs[0], inputs[0], buf_expr
         )?,
         "Equal" => {
-            // Equal can work with both f32 and i64
-            let is_i64 = ctx
-                .var_types
-                .get(&ctx.outputs[0])
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&ctx.inputs[0])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
-            if is_i64 {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::equal_i64(&{}, &{}, {});",
-                    tab, outputs[0], inputs[0], inputs[1], buf_expr
-                )?;
+            let in0_name = sanitize_name(&ctx.node.input[0]);
+            let in1_name = sanitize_name(&ctx.node.input[1]);
+            let in0_i64 = ctx.var_types.get(&in0_name).map(|t| t == "i64").unwrap_or(false);
+            let in1_i64 = ctx.var_types.get(&in1_name).map(|t| t == "i64").unwrap_or(false);
+            
+            let (arg0, arg1) = if in0_i64 == in1_i64 {
+                (inputs[0].clone(), inputs[1].clone())
+            } else if in0_i64 {
+                writeln!(w, "{}let mut temp_cast_eq_0_{} = Vec::<f32>::new();", tab, outputs[0])?;
+                writeln!(w, "{}let arg0_{} = lele::kernels::utils::cast_to_f32(&{}, &mut temp_cast_eq_0_{});", tab, outputs[0], inputs[0], outputs[0])?;
+                (format!("arg0_{}", outputs[0]), inputs[1].clone())
             } else {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::equal(&{}, &{}, {});",
-                    tab, outputs[0], inputs[0], inputs[1], buf_expr
-                )?;
-            }
+                writeln!(w, "{}let mut temp_cast_eq_1_{} = Vec::<f32>::new();", tab, outputs[0])?;
+                writeln!(w, "{}let arg1_{} = lele::kernels::utils::cast_to_f32(&{}, &mut temp_cast_eq_1_{});", tab, outputs[0], inputs[1], outputs[0])?;
+                (inputs[0].clone(), format!("arg1_{}", outputs[0]))
+            };
+
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::equal_i64(&{}, &{}, {});",
+                tab, outputs[0], arg0, arg1, buf_expr
+            )?;
         }
         "Less" => {
-            let is_i64 = ctx
-                .var_types
-                .get(&inputs[0])
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&inputs[1])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
-            if is_i64 {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::less_i64(&{}, &{}, {});",
-                    tab, outputs[0], inputs[0], inputs[1], buf_expr
-                )?;
+            let in0_name = sanitize_name(&ctx.node.input[0]);
+            let in1_name = sanitize_name(&ctx.node.input[1]);
+            let in0_i64 = ctx.var_types.get(&in0_name).map(|t| t == "i64").unwrap_or(false);
+            let in1_i64 = ctx.var_types.get(&in1_name).map(|t| t == "i64").unwrap_or(false);
+
+            let (arg0, arg1) = if in0_i64 == in1_i64 {
+                (inputs[0].clone(), inputs[1].clone())
+            } else if in0_i64 {
+                writeln!(w, "{}let mut temp_cast_lt_0_{} = Vec::<f32>::new();", tab, outputs[0])?;
+                writeln!(w, "{}let arg0_{} = lele::kernels::utils::cast_to_f32(&{}, &mut temp_cast_lt_0_{});", tab, outputs[0], inputs[0], outputs[0])?;
+                (format!("arg0_{}", outputs[0]), inputs[1].clone())
             } else {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::less(&{}, &{}, {});",
-                    tab, outputs[0], inputs[0], inputs[1], buf_expr
-                )?;
-            }
+                writeln!(w, "{}let mut temp_cast_lt_1_{} = Vec::<f32>::new();", tab, outputs[0])?;
+                writeln!(w, "{}let arg1_{} = lele::kernels::utils::cast_to_f32(&{}, &mut temp_cast_lt_1_{});", tab, outputs[0], inputs[1], outputs[0])?;
+                (inputs[0].clone(), format!("arg1_{}", outputs[0]))
+            };
+
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::less_i64(&{}, &{}, {});",
+                tab, outputs[0], arg0, arg1, buf_expr
+            )?;
         }
         "Not" => writeln!(
             w,
@@ -293,29 +291,28 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             )?;
         }
         "Greater" => {
-            let is_i64 = ctx
-                .var_types
-                .get(&inputs[0])
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&inputs[1])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
-            if is_i64 {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::less_i64(&{}, &{}, {});",
-                    tab, outputs[0], inputs[1], inputs[0], buf_expr
-                )?;
+            let in0_name = sanitize_name(&ctx.node.input[0]);
+            let in1_name = sanitize_name(&ctx.node.input[1]);
+            let in0_i64 = ctx.var_types.get(&in0_name).map(|t| t == "i64").unwrap_or(false);
+            let in1_i64 = ctx.var_types.get(&in1_name).map(|t| t == "i64").unwrap_or(false);
+
+            let (arg0, arg1) = if in0_i64 == in1_i64 {
+                (inputs[0].clone(), inputs[1].clone())
+            } else if in0_i64 {
+                writeln!(w, "{}let mut temp_cast_gt_0_{} = Vec::<f32>::new();", tab, outputs[0])?;
+                writeln!(w, "{}let arg0_{} = lele::kernels::utils::cast_to_f32(&{}, &mut temp_cast_gt_0_{});", tab, outputs[0], inputs[0], outputs[0])?;
+                (format!("arg0_{}", outputs[0]), inputs[1].clone())
             } else {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::less(&{}, &{}, {});",
-                    tab, outputs[0], inputs[1], inputs[0], buf_expr
-                )?;
-            }
+                writeln!(w, "{}let mut temp_cast_gt_1_{} = Vec::<f32>::new();", tab, outputs[0])?;
+                writeln!(w, "{}let arg1_{} = lele::kernels::utils::cast_to_f32(&{}, &mut temp_cast_gt_1_{});", tab, outputs[0], inputs[1], outputs[0])?;
+                (inputs[0].clone(), format!("arg1_{}", outputs[0]))
+            };
+
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::less_i64(&{}, &{}, {});",
+                tab, outputs[0], arg1, arg0, buf_expr
+            )?;
         }
         _ => return Ok(false),
     }

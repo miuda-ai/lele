@@ -5,7 +5,7 @@ pub mod conv1d;
 pub mod gemm;
 pub mod manipulation;
 pub mod math;
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 pub mod neon;
 pub mod norm;
 pub mod pooling;
