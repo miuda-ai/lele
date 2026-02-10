@@ -207,16 +207,26 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                     tab, outputs[0], inputs[0], outputs[0]
                 )?;
             } else if to == Some(1) {
-                writeln!(
-                    w,
-                    "{}let mut temp_cast_buf_{} = Vec::<f32>::new();",
-                    tab, outputs[0]
-                )?;
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::utils::cast_to_f32(&{}, &mut temp_cast_buf_{});",
-                    tab, outputs[0], inputs[0], outputs[0]
-                )?;
+                // Check if input is already f32, in which case cast is a no-op
+                let input_type = ctx.var_types.get(&ctx.inputs[0]).map(|s| s.as_str()).unwrap_or("f32");
+                if input_type == "f32" {
+                    writeln!(
+                        w,
+                        "{}let {} = {}.clone(); // Cast f32->f32 is no-op",
+                        tab, outputs[0], inputs[0]
+                    )?;
+                } else {
+                    writeln!(
+                        w,
+                        "{}let mut temp_cast_buf_{} = Vec::<f32>::new();",
+                        tab, outputs[0]
+                    )?;
+                    writeln!(
+                        w,
+                        "{}let {} = lele::kernels::utils::cast_to_f32(&{}, &mut temp_cast_buf_{});",
+                        tab, outputs[0], inputs[0], outputs[0]
+                    )?;
+                }
             } else {
                 writeln!(
                     w,
@@ -378,19 +388,38 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             )?;
         }
         "DynamicQuantizeLinear" => {
+            writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[0])?;
             writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[1])?;
             writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[2])?;
             writeln!(
                 w,
-                "{}let ({}, {}, {}) = lele::kernels::dynamic_quantize_linear(&{}, {}, &mut buf_{}, &mut buf_{});",
+                "{}let ({}_ref, {}_ref, {}_ref) = lele::kernels::dynamic_quantize_linear(&{}, &mut buf_{}, &mut buf_{}, &mut buf_{});",
                 tab,
                 outputs[0],
                 outputs[1],
                 outputs[2],
                 inputs[0],
-                buf_expr,
+                outputs[0],
                 outputs[1],
                 outputs[2]
+            )?;
+            // Own the outputs to release borrows on local buffers immediately.
+            // scale and zero_point are tiny scalars, so copying is cheap.
+            // quantized data is large but we need to release the buffer borrow.
+            writeln!(
+                w,
+                "{}let {} = {}_ref.to_owned();",
+                tab, outputs[0], outputs[0]
+            )?;
+            writeln!(
+                w,
+                "{}let {} = {}_ref.to_owned();",
+                tab, outputs[1], outputs[1]
+            )?;
+            writeln!(
+                w,
+                "{}let {} = {}_ref.to_owned();",
+                tab, outputs[2], outputs[2]
             )?;
         }
         "Identity" | "Constant" => {
@@ -479,6 +508,71 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                     )?;
                 }
             }
+        }
+        "TopK" => {
+            let axis = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "axis")
+                .map(|a| a.i)
+                .unwrap_or(-1);
+            let largest = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "largest")
+                .map(|a| a.i)
+                .unwrap_or(1)
+                != 0;
+            let sorted = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "sorted")
+                .map(|a| a.i)
+                .unwrap_or(1)
+                != 0;
+            // inputs[1] is k (as a tensor). We need its value at codegen time.
+            // It's typically a constant weight.
+            writeln!(
+                w,
+                "{}let mut buf_{}_values = Vec::<f32>::new();",
+                tab, outputs[0]
+            )?;
+            writeln!(
+                w,
+                "{}let mut buf_{}_indices = Vec::<f32>::new();",
+                tab, outputs[0]
+            )?;
+            writeln!(
+                w,
+                "{}let ({}, {}) = lele::kernels::topk(&{}, {}.data[0] as usize, {}, {}, {}, &mut buf_{}_values, &mut buf_{}_indices);",
+                tab,
+                outputs[0],
+                outputs[1],
+                inputs[0],
+                inputs[1],
+                axis,
+                largest,
+                sorted,
+                outputs[0],
+                outputs[0]
+            )?;
+        }
+        "GatherElements" => {
+            let axis = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "axis")
+                .map(|a| a.i)
+                .unwrap_or(0);
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::gather_elements(&{}, &{}, {}, {});",
+                tab, outputs[0], inputs[0], inputs[1], axis, buf_expr
+            )?;
         }
         _ => return Ok(false),
     }

@@ -588,6 +588,27 @@ pub fn sigmoid<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorV
     }
 }
 
+/// SiLU activation: x * sigmoid(x), combined in a single pass
+pub fn silu<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::kernels::neon::math::swish(input, out)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let len = input.data.len();
+        utils::ensure_capacity(out, len);
+        for i in 0..len {
+            let x = input.data[i];
+            out[i] = x / (1.0 + (-x).exp());
+        }
+        TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(input.shape.to_vec()),
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn sigmoid_avx2(input: *const f32, output: *mut f32, len: usize) {

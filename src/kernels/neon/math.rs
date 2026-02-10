@@ -4,6 +4,71 @@ use std::borrow::Cow;
 use std::simd::StdFloat;
 use std::simd::prelude::*;
 
+/// Fast vectorized exp approximation using NEON intrinsics.
+/// Based on Cephes/SSE2 approach: exp(x) = 2^(x * log2(e))
+/// Accuracy: max relative error ~1e-6 over [-88, 88].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn neon_exp_f32x4(
+    x: core::arch::aarch64::float32x4_t,
+) -> core::arch::aarch64::float32x4_t {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let c_exp_hi = vdupq_n_f32(88.3762626647949f32);
+        let c_exp_lo = vdupq_n_f32(-88.3762626647949f32);
+        let c_log2ef = vdupq_n_f32(1.44269504088896341f32);
+        let c_ln2_hi = vdupq_n_f32(0.693359375f32);
+        let c_ln2_lo = vdupq_n_f32(-2.12194440e-4f32);
+
+        let c_p0 = vdupq_n_f32(1.9875691500E-4);
+        let c_p1 = vdupq_n_f32(1.3981999507E-3);
+        let c_p2 = vdupq_n_f32(8.3334519073E-3);
+        let c_p3 = vdupq_n_f32(4.1665795894E-2);
+        let c_p4 = vdupq_n_f32(1.6666665459E-1);
+        let c_p5 = vdupq_n_f32(5.0000001201E-1);
+        let c_one = vdupq_n_f32(1.0);
+        let c_half = vdupq_n_f32(0.5);
+        let c_127 = vdupq_n_s32(127);
+
+        // Clamp x
+        let x = vminq_f32(vmaxq_f32(x, c_exp_lo), c_exp_hi);
+
+        // fx = x * log2(e) + 0.5  (for rounding)
+        let fx = vmlaq_f32(c_half, x, c_log2ef);
+
+        // Convert to integer (floor)
+        let fx_int = vcvtq_s32_f32(fx);
+        let fx_floor = vcvtq_f32_s32(fx_int);
+
+        // Adjust for negative: if fx_floor > fx, subtract 1
+        let mask = vcgtq_f32(fx_floor, fx);
+        let adj = vreinterpretq_f32_u32(vandq_u32(mask, vreinterpretq_u32_f32(c_one)));
+        let fx_floor = vsubq_f32(fx_floor, adj);
+        let n = vcvtq_s32_f32(fx_floor);
+
+        // x = x - fx_floor * ln2
+        let x = vmlsq_f32(x, fx_floor, c_ln2_hi);
+        let x = vmlsq_f32(x, fx_floor, c_ln2_lo);
+
+        // Polynomial approximation of exp(x) for x in [-ln2/2, ln2/2]
+        // P(x) = p0*x^5 + p1*x^4 + p2*x^3 + p3*x^2 + p4*x + p5
+        let mut y = vmlaq_f32(c_p1, c_p0, x);
+        y = vmlaq_f32(c_p2, y, x);
+        y = vmlaq_f32(c_p3, y, x);
+        y = vmlaq_f32(c_p4, y, x);
+        y = vmlaq_f32(c_p5, y, x);
+        // exp(x) ≈ 1 + x + P(x) * x^2
+        let xx = vmulq_f32(x, x);
+        y = vmlaq_f32(x, y, xx); // y = x + P(x) * x^2
+        y = vaddq_f32(y, c_one); // y = 1 + x + P(x) * x^2
+
+        // Multiply by 2^n
+        let pow2n = vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(n, c_127), 23));
+        vmulq_f32(y, pow2n)
+    }
+}
+
 #[inline(always)]
 pub(crate) fn simd_exp(x: f32x4) -> f32x4 {
     x.exp()
@@ -97,22 +162,40 @@ pub fn sigmoid<'a>(input: &TensorView<'_>, output_buf: &'a mut Vec<f32>) -> Tens
     unsafe {
         output_buf.set_len(len);
     }
-    let (prefix, middle, _suffix) = input.data.as_simd::<4>();
-    let out_slice = output_buf.as_mut_slice();
 
-    for i in 0..prefix.len() {
-        out_slice[i] = 1.0 / (1.0 + (-input.data[i]).exp());
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        let data = input.data.as_ptr();
+        let out = output_buf.as_mut_ptr();
+        let one = vdupq_n_f32(1.0);
+        let zero = vdupq_n_f32(0.0);
+
+        let mut i = 0;
+        let simd_end = len & !3;
+        while i < simd_end {
+            let x = vld1q_f32(data.add(i));
+            let neg_x = vsubq_f32(zero, x);
+            let e = neon_exp_f32x4(neg_x);
+            let sig = vdivq_f32(one, vaddq_f32(one, e));
+            vst1q_f32(out.add(i), sig);
+            i += 4;
+        }
+        while i < len {
+            let x = *data.add(i);
+            *out.add(i) = 1.0 / (1.0 + (-x).exp());
+            i += 1;
+        }
     }
-    let offset_mid = prefix.len();
-    for i in 0..middle.len() {
-        let x = middle[i];
-        let y = simd_sigmoid(x);
-        y.copy_to_slice(&mut out_slice[offset_mid + i * 4..]);
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let out_slice = output_buf.as_mut_slice();
+        for i in 0..len {
+            out_slice[i] = 1.0 / (1.0 + (-input.data[i]).exp());
+        }
     }
-    let offset_suf = prefix.len() + middle.len() * 4;
-    for i in offset_suf..len {
-        out_slice[i] = 1.0 / (1.0 + (-input.data[i]).exp());
-    }
+
     TensorView {
         data: Cow::Borrowed(output_buf),
         shape: Cow::Owned(input.shape.to_vec()),
@@ -125,24 +208,43 @@ pub fn swish<'a>(input: &TensorView<'_>, output_buf: &'a mut Vec<f32>) -> Tensor
     unsafe {
         output_buf.set_len(len);
     }
-    let (prefix, middle, _suffix) = input.data.as_simd::<4>();
-    let out_slice = output_buf.as_mut_slice();
 
-    for i in 0..prefix.len() {
-        let x = input.data[i];
-        out_slice[i] = x * (1.0 / (1.0 + (-x).exp()));
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        let data = input.data.as_ptr();
+        let out = output_buf.as_mut_ptr();
+        let one = vdupq_n_f32(1.0);
+        let zero = vdupq_n_f32(0.0);
+
+        let mut i = 0;
+        let simd_end = len & !3;
+        while i < simd_end {
+            let x = vld1q_f32(data.add(i));
+            let neg_x = vsubq_f32(zero, x);
+            let e = neon_exp_f32x4(neg_x);
+            let sig = vdivq_f32(one, vaddq_f32(one, e));
+            let result = vmulq_f32(x, sig);
+            vst1q_f32(out.add(i), result);
+            i += 4;
+        }
+        while i < len {
+            let x = *data.add(i);
+            *out.add(i) = x / (1.0 + (-x).exp());
+            i += 1;
+        }
     }
-    let offset_mid = prefix.len();
-    for i in 0..middle.len() {
-        let x = middle[i];
-        let y = x * simd_sigmoid(x);
-        y.copy_to_slice(&mut out_slice[offset_mid + i * 4..]);
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let data = &input.data;
+        let out = output_buf.as_mut_slice();
+        for i in 0..len {
+            let x = data[i];
+            out[i] = x / (1.0 + (-x).exp());
+        }
     }
-    let offset_suf = prefix.len() + middle.len() * 4;
-    for i in offset_suf..len {
-        let x = input.data[i];
-        out_slice[i] = x * (1.0 / (1.0 + (-x).exp()));
-    }
+
     TensorView {
         data: Cow::Borrowed(output_buf),
         shape: Cow::Owned(input.shape.to_vec()),

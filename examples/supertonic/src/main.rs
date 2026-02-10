@@ -144,6 +144,8 @@ impl<'a> SupertonicTts<'a> {
                 self.text_processor.call(&[chunk], &[lang.to_string()])?;
             let bsz = 1;
             let max_len = text_ids_vec[0].len();
+            println!("Debug: text_ids_vec[0] len: {}", max_len);
+            println!("Debug: text_ids_vec[0] content: {:?}", text_ids_vec[0]);
             let mut text_ids_i64 = vec![0i64; max_len];
             for (i, &id) in text_ids_vec[0].iter().enumerate() {
                 text_ids_i64[i] = id as i64;
@@ -162,11 +164,17 @@ impl<'a> SupertonicTts<'a> {
                 text_mask_tv.clone(),
             );
             let mut duration = duration_tv.data.to_vec();
+            println!("Debug: Num tokens: {}", duration.len());
+            println!(
+                "Debug: First 5 durations: {:?}",
+                duration.iter().take(5).collect::<Vec<_>>()
+            );
             for d in duration.iter_mut() {
                 *d /= speed;
             }
 
             let total_duration_seconds: f32 = duration.iter().sum();
+            println!("Debug: Total duration seconds: {}", total_duration_seconds);
             let duration_batch = vec![total_duration_seconds];
 
             // 2. Text Encoder
@@ -240,8 +248,9 @@ fn main() -> Result<()> {
     let voice_styles_dir = Path::new("examples/supertonic/voice_styles");
     let config_path = weights_dir.join("tts.json");
 
-    println!("Loading weights...");
-    let te_weights = fs::read(gen_dir.join("textencoder_weights.bin"))?;
+    println!("Loading weights... {}", gen_dir.display());
+    let te_weights = fs::read(gen_dir.join("textencoder_weights.bin"))
+        .context(format!("{}/textencoder_weights.bin", gen_dir.display()))?;
     let dp_weights = fs::read(gen_dir.join("durationpredictor_weights.bin"))?;
     let ve_weights = fs::read(gen_dir.join("vectorestimator_weights.bin"))?;
     let vo_weights = fs::read(gen_dir.join("vocoder_weights.bin"))?;

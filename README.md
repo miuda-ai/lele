@@ -1,30 +1,25 @@
-# lele: Bare-Metal Rust Audio AI Framework
+# lele: Bare-Metal Rust AI Framework
 
-**lele** is a standalone, dependency-free inference engine for audio intelligence, built from scratch in pure Rust.
+**lele** is a standalone, dependency-free inference engine for intelligence, built from scratch in pure Rust.
 
 It rejects the "general-purpose runtime" approach (wrapping C++ libs like ORT or using heavy Torch ports) in favor of **hand-crafted, domain-specific kernels**.
 
 ## Overview
 
-`lele` is designed to run deep learning models (specifically speech-related ones like SenseVoice, Silero VAD, and TTS) with minimal overhead. It avoids heavy runtimes like ONNX Runtime or `burn` by compiling ONNX graphs directly into optimized Rust source code.
+`lele` is designed to run deep learning models (specifically speech-related ones like SenseVoice, Silero VAD, and TTS, even `yolo26` ) with minimal overhead. 
 
-## Performance Benchmarks (2026-01-30)
+## Performance Benchmarks (2026-02-10)
 
 In-depth comparison between **lele** and **ONNX Runtime (CPU)** on macOS (Apple Silicon). All benchmarks run with single-thread affinity for fair comparison.
 
 | Model | ORT RTF (CPU) | lele RTF | Speedup |
 | :--- | :--- | :--- | :--- |
-| **Silero VAD** | 0.0031 | 0.0031 | - |
-| **SenseVoice** | **0.032** | 0.096 | 0.33x |
-| **Supertonic** | **0.122** | 0.232 | 0.53x |
+| **Silero VAD** | 0.0031 | 0.0018 | 1.72x |
+| **SenseVoice** | **0.032** | 0.093 | 0.34x |
+| **Supertonic** | **0.122** | 0.178| 0.68x |
+| **Yolo26** | **759.19** | 1050.56ms | 0.72x |
 
 *Note: RTF (Real-Time Factor) is defined as (Inference Time / Audio Duration). Lower is better.*
-
-
-**Why Not ORT/Burn?**
-*   **Generic Overhead:** General runtimes carry massive baggage (graph optimization, dynamic shapes, thousands of unused ops) that slows down specific, small-batch audio models.
-*   **FFI Penalties:** Binding layers introduce latency and inhibit compiler inlining.
-*   **Black Box Memory:** We need absolute control over every byte of allocation for embedded/real-time constraints.
 
 ## Key Features
 
@@ -39,6 +34,7 @@ In-depth comparison between **lele** and **ONNX Runtime (CPU)** on macOS (Apple 
 - **SenseVoiceSmall**: High-accuracy multi-lingual ASR.
 - **Silero VAD**: Reliable Voice Activity Detection.
 - **Supertonic**: Fast and high-quality Text-to-Speech.
+- **Yolo26**: Real-time object detection.
 
 ## Getting Started
 
@@ -63,6 +59,12 @@ cargo run --release --bin lele_gen -- <model.onnx> <output_path.rs>
 
 # Supertonic TTS
 ./run_supertonic.sh
+
+# Silero VAD
+./run_silero.sh
+
+# Yolo26 Object Detection
+./run_yolo26.sh
 ```
 
 

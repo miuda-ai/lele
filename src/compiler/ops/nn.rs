@@ -207,6 +207,61 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 )?;
             }
         }
+        "ConvInteger" => {
+            let dilations = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "dilations")
+                .map(|a| a.ints.clone())
+                .unwrap_or(vec![]);
+            let group = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "group")
+                .map(|a| a.i)
+                .unwrap_or(1);
+            let pads = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "pads")
+                .map(|a| a.ints.clone())
+                .unwrap_or(vec![]);
+            let strides = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "strides")
+                .map(|a| a.ints.clone())
+                .unwrap_or(vec![]);
+            let x_zero_point = if inputs.len() > 2 && !ctx.node.input[2].is_empty() {
+                format!("Some(&{})", inputs[2])
+            } else {
+                "None".to_string()
+            };
+            let w_zero_point = if inputs.len() > 3 && !ctx.node.input[3].is_empty() {
+                format!("Some(&{})", inputs[3])
+            } else {
+                "None".to_string()
+            };
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::conv_integer(&{}, &{}, {}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
+                tab,
+                outputs[0],
+                inputs[0],
+                inputs[1],
+                x_zero_point,
+                w_zero_point,
+                dilations,
+                group,
+                pads,
+                strides,
+                buf_expr
+            )?;
+        }
         "BatchNormalization" => {
             let epsilon = ctx
                 .node
@@ -228,6 +283,99 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 epsilon,
                 buf_expr
             )?;
+        }
+        "MaxPool" => {
+            let kernel_shape = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "kernel_shape")
+                .map(|a| a.ints.clone())
+                .unwrap_or(vec![]);
+            let strides = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "strides")
+                .map(|a| a.ints.clone())
+                .unwrap_or(vec![]);
+            let pads = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "pads")
+                .map(|a| a.ints.clone())
+                .unwrap_or(vec![]);
+            let dilations = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "dilations")
+                .map(|a| a.ints.clone())
+                .unwrap_or(vec![]);
+            let ceil_mode = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "ceil_mode")
+                .map(|a| a.i)
+                .unwrap_or(0)
+                != 0;
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::max_pool2d(&{}, &{:?}, &{:?}, &{:?}, &{:?}, {}, {});",
+                tab,
+                outputs[0],
+                inputs[0],
+                kernel_shape,
+                strides,
+                pads,
+                dilations,
+                ceil_mode,
+                buf_expr
+            )?;
+        }
+        "Resize" => {
+            // ONNX Resize op: inputs are [X, roi, scales] or [X, roi, scales, sizes]
+            // For YOLO, we use scales mode with nearest interpolation
+            let coord_transform = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "coordinate_transformation_mode")
+                .and_then(|a| std::str::from_utf8(&a.s).ok().map(|s| s.to_string()))
+                .unwrap_or("half_pixel".to_string());
+            
+            // Check if sizes input is provided (input[3])
+            let has_sizes = inputs.len() > 3 && !ctx.node.input[3].is_empty();
+            // Check if scales input is provided (input[2])
+            let has_scales = inputs.len() > 2 && !ctx.node.input[2].is_empty();
+            
+            if has_sizes {
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::resize_nearest(&{}, None, Some(&{}.data.iter().map(|&v| v as i64).collect::<Vec<_>>()), \"{}\", {});",
+                    tab,
+                    outputs[0],
+                    inputs[0],
+                    inputs[3],
+                    coord_transform,
+                    buf_expr
+                )?;
+            } else if has_scales {
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::resize_nearest(&{}, Some(&{}.data), None, \"{}\", {});",
+                    tab,
+                    outputs[0],
+                    inputs[0],
+                    inputs[2],
+                    coord_transform,
+                    buf_expr
+                )?;
+            } else {
+                panic!("Resize: neither scales nor sizes provided");
+            }
         }
         _ => return Ok(false),
     }

@@ -239,6 +239,19 @@ pub(crate) fn infer_variable_types(
                         }
                     }
                 }
+                "Conv" | "ConvInteger" | "Gemm" | "BatchNormalization"
+                | "LayerNormalization" => {
+                    // These ops always produce f32 output regardless of input types
+                    for out in &node.output {
+                        if !out.is_empty() {
+                            let name = sanitize_name(out);
+                            if types.get(&name) != Some(&"f32".to_string()) {
+                                types.insert(name, "f32".to_string());
+                                changed = true;
+                            }
+                        }
+                    }
+                }
                 "Cast" => {
                     let to = node.attribute.iter().find(|a| a.name == "to").map(|a| a.i);
                     let output_type = if to == Some(7) || to == Some(6) || to == Some(9) {
@@ -259,7 +272,7 @@ pub(crate) fn infer_variable_types(
                 "Reshape" | "Unsqueeze" | "Squeeze" | "Slice" | "Flatten" | "Transpose"
                 | "Identity" | "Add" | "Sub" | "Mul" | "Div" | "Tile" | "Split" | "Expand"
                 | "Pow" | "Clip" | "PRelu" | "LeakyRelu" | "Range" | "ReduceSum" | "ReduceMean"
-                | "ReduceMax" | "Pad" => {
+                | "ReduceMax" | "Pad" | "MaxPool" | "Resize" => {
                     // All data-carrying inputs and outputs share the same type
                     let relevant_inputs: Vec<String> = if op == "Pad" {
                         node.input

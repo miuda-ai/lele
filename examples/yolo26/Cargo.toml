@@ -1,0 +1,20 @@
+[package]
+name = "yolo26-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "yolo26"
+path = "src/main.rs"
+
+[[bin]]
+name = "yolo26-bench"
+path = "src/benchmark.rs"
+
+[dependencies]
+lele = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+[build-dependencies]
+lele-build = { workspace = true }

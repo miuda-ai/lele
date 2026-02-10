@@ -5,6 +5,7 @@ members = [
     "examples/sensevoice",
     "examples/silero",
     "examples/supertonic",
+    "examples/yolo26",
 ]
 resolver = "2"
 
@@ -39,6 +40,7 @@ thiserror = "2"
 byteorder = "1.5"
 rustfft = "6.2"
 faer = "0.24.0"
+gemm = { version = "0.19.0", features = ["experimental-apple-amx"] }
 libm = "0.2"
 half = "2.7.1"
 

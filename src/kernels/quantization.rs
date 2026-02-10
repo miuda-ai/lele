@@ -166,13 +166,13 @@ pub fn mat_mul_integer_prepared<'a, 'b>(
         }
     }
 
-    let a_dims = a.shape.len();
-    let m = a.shape[a_dims - 2];
-    let batch: usize = a.shape[..a_dims - 2].iter().product();
-    let batch_shape = &a.shape[..a_dims - 2];
-
     #[cfg(target_arch = "x86_64")]
     {
+        let a_dims = a.shape.len();
+        let m = a.shape[a_dims - 2];
+        let batch: usize = a.shape[..a_dims - 2].iter().product();
+        let batch_shape = &a.shape[..a_dims - 2];
+
         let total_batch = batch.max(1);
         let output_len = total_batch * m * pw.n;
         crate::kernels::utils::ensure_capacity(out, output_len);
@@ -437,6 +437,19 @@ fn mat_mul_integer_u8<'a, 'b, 'c>(
 }
 
 pub fn dynamic_quantize_linear<'a, 'b>(
+    x: &TensorView<'b, f32>,
+    out_y_storage: &'a mut Vec<f32>,
+    out_scale: &'a mut Vec<f32>,
+    out_zp: &'a mut Vec<f32>,
+) -> (
+    TensorView<'a, f32>,
+    TensorView<'a, f32>,
+    TensorView<'a, f32>,
+) {
+    dynamic_quantize_linear_inner(x, out_y_storage, out_scale, out_zp)
+}
+
+fn dynamic_quantize_linear_inner<'a, 'b>(
     x: &TensorView<'b, f32>,
     out_y_storage: &'a mut Vec<f32>,
     out_scale: &'a mut Vec<f32>,
