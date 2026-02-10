@@ -1,8 +1,13 @@
 use crate::kernels::utils;
 use crate::tensor::TensorView;
+#[cfg(not(target_arch = "wasm32"))]
 use faer::linalg::matmul::matmul as faer_matmul;
+#[cfg(not(target_arch = "wasm32"))]
 use faer::mat::{MatMut, MatRef};
+#[cfg(not(target_arch = "wasm32"))]
 use faer::{Accum, Par};
+#[cfg(target_arch = "wasm32")]
+use crate::kernels::wasm_matmul::{matmul as faer_matmul, MatMut, MatRef, Accum, Par};
 
 pub fn print_conv_stats() {}
 

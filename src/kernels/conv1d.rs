@@ -1,10 +1,13 @@
 use crate::kernels::utils;
 use crate::tensor::TensorView;
+#[cfg(not(target_arch = "wasm32"))]
 use faer::{
     Accum, Par,
     linalg::matmul::matmul,
     mat::{MatMut, MatRef},
 };
+#[cfg(target_arch = "wasm32")]
+use crate::kernels::wasm_matmul::{matmul, MatMut, MatRef, Accum, Par};
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
@@ -1244,37 +1247,109 @@ pub fn conv1d_fused<'b, 'a>(
             let out_ptr = out.as_mut_ptr();
             if let Some(b_vec) = bias {
                 if relu {
-                    // Bias + ReLU
-                    for b in 0..batch_size {
-                        for oc in 0..out_channels {
-                            let start = (b * out_channels + oc) * output_len;
-                            let b_val = b_vec.data[oc];
-                            for i in 0..output_len {
-                                let ptr = out_ptr.add(start + i);
-                                let val = *ptr + b_val;
-                                *ptr = if val > 0.0 { val } else { 0.0 };
+                    // Bias + ReLU with SIMD where available
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        use std::arch::wasm32::*;
+                        let zero = f32x4_splat(0.0);
+                        for b in 0..batch_size {
+                            for oc in 0..out_channels {
+                                let start = (b * out_channels + oc) * output_len;
+                                let b_val = b_vec.data[oc];
+                                let v_bias = f32x4_splat(b_val);
+                                let mut i = 0;
+                                while i + 4 <= output_len {
+                                    let v = v128_load(out_ptr.add(start + i) as *const v128);
+                                    let r = f32x4_max(f32x4_add(v, v_bias), zero);
+                                    v128_store(out_ptr.add(start + i) as *mut v128, r);
+                                    i += 4;
+                                }
+                                while i < output_len {
+                                    let ptr = out_ptr.add(start + i);
+                                    let val = *ptr + b_val;
+                                    *ptr = if val > 0.0 { val } else { 0.0 };
+                                    i += 1;
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        for b in 0..batch_size {
+                            for oc in 0..out_channels {
+                                let start = (b * out_channels + oc) * output_len;
+                                let b_val = b_vec.data[oc];
+                                for i in 0..output_len {
+                                    let ptr = out_ptr.add(start + i);
+                                    let val = *ptr + b_val;
+                                    *ptr = if val > 0.0 { val } else { 0.0 };
+                                }
                             }
                         }
                     }
                 } else {
                     // Bias only
-                    for b in 0..batch_size {
-                        for oc in 0..out_channels {
-                            let start = (b * out_channels + oc) * output_len;
-                            let b_val = b_vec.data[oc];
-                            for i in 0..output_len {
-                                *out_ptr.add(start + i) += b_val;
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        use std::arch::wasm32::*;
+                        for b in 0..batch_size {
+                            for oc in 0..out_channels {
+                                let start = (b * out_channels + oc) * output_len;
+                                let b_val = b_vec.data[oc];
+                                let v_bias = f32x4_splat(b_val);
+                                let mut i = 0;
+                                while i + 4 <= output_len {
+                                    let v = v128_load(out_ptr.add(start + i) as *const v128);
+                                    v128_store(out_ptr.add(start + i) as *mut v128, f32x4_add(v, v_bias));
+                                    i += 4;
+                                }
+                                while i < output_len {
+                                    *out_ptr.add(start + i) += b_val;
+                                    i += 1;
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        for b in 0..batch_size {
+                            for oc in 0..out_channels {
+                                let start = (b * out_channels + oc) * output_len;
+                                let b_val = b_vec.data[oc];
+                                for i in 0..output_len {
+                                    *out_ptr.add(start + i) += b_val;
+                                }
                             }
                         }
                     }
                 }
             } else if relu {
                 // ReLU only
-                for i in 0..(batch_size * out_channels * output_len) {
-                    let ptr = out_ptr.add(i);
-                    let val = *ptr;
-                    if val < 0.0 {
-                        *ptr = 0.0;
+                #[cfg(target_arch = "wasm32")]
+                {
+                    use std::arch::wasm32::*;
+                    let zero = f32x4_splat(0.0);
+                    let total = batch_size * out_channels * output_len;
+                    let mut i = 0;
+                    while i + 4 <= total {
+                        let v = v128_load(out_ptr.add(i) as *const v128);
+                        v128_store(out_ptr.add(i) as *mut v128, f32x4_max(v, zero));
+                        i += 4;
+                    }
+                    while i < total {
+                        let ptr = out_ptr.add(i);
+                        if *ptr < 0.0 { *ptr = 0.0; }
+                        i += 1;
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    for i in 0..(batch_size * out_channels * output_len) {
+                        let ptr = out_ptr.add(i);
+                        let val = *ptr;
+                        if val < 0.0 {
+                            *ptr = 0.0;
+                        }
                     }
                 }
             }

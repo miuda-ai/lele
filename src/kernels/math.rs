@@ -1,5 +1,7 @@
 use crate::kernels::utils;
 use crate::tensor::TensorView;
+#[cfg(target_arch = "wasm32")]
+use std::arch::wasm32::*;
 use std::borrow::Cow;
 
 pub trait ElementOps: Copy + PartialOrd + PartialEq + std::fmt::Debug + Sized + 'static {
@@ -76,7 +78,12 @@ where
     T: Clone + Copy + std::fmt::Debug,
     F: Fn(T, T) -> T,
 {
-    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).expect("Shapes not broadcastable");
+    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap_or_else(|| {
+        panic!(
+            "Shapes not broadcastable: a={:?} b={:?}",
+            &*a.shape, &*b.shape
+        )
+    });
     let numel = out_shape.iter().product::<usize>();
     utils::ensure_capacity(output_buf, numel);
     unsafe {
@@ -160,7 +167,12 @@ where
     U: Clone + Copy + std::fmt::Debug,
     F: Fn(T, T) -> U,
 {
-    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).expect("Shapes not broadcastable");
+    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap_or_else(|| {
+        panic!(
+            "Shapes not broadcastable: a={:?} b={:?}",
+            &*a.shape, &*b.shape
+        )
+    });
     let numel = out_shape.iter().product::<usize>();
     utils::ensure_capacity(output_buf, numel);
     unsafe {
@@ -433,7 +445,23 @@ pub fn tanh_kernel<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> Ten
             shape: Cow::Owned(input.shape.to_vec()),
         }
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(target_arch = "wasm32")]
+    {
+        let numel = input.data.len();
+        utils::ensure_capacity(out, numel);
+        unsafe {
+            wasm_simd_tanh(input.data.as_ptr(), out.as_mut_ptr(), numel);
+        }
+        TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(input.shape.to_vec()),
+        }
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "wasm32"
+    )))]
     {
         let numel = input.data.len();
         utils::ensure_capacity(out, numel);
@@ -502,7 +530,12 @@ pub fn equal_i64<'b, 'a, T: ElementOps>(
     out: &'a mut Vec<i64>,
 ) -> TensorView<'a, i64> {
     // Need to convert comparison to i64 result (0 or 1)
-    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).expect("Shapes not broadcastable");
+    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap_or_else(|| {
+        panic!(
+            "Shapes not broadcastable: a={:?} b={:?}",
+            &*a.shape, &*b.shape
+        )
+    });
     let numel = out_shape.iter().product::<usize>();
     utils::ensure_capacity(out, numel);
     unsafe {
@@ -568,7 +601,23 @@ pub fn sigmoid<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorV
             shape: std::borrow::Cow::Owned(input.shape.to_vec()),
         }
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(target_arch = "wasm32")]
+    {
+        let len = input.data.len();
+        utils::ensure_capacity(out, len);
+        unsafe {
+            wasm_simd_sigmoid(input.data.as_ptr(), out.as_mut_ptr(), len);
+        }
+        TensorView {
+            data: Cow::Borrowed(out),
+            shape: std::borrow::Cow::Owned(input.shape.to_vec()),
+        }
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "wasm32"
+    )))]
     {
         let len = input.data.len();
         utils::ensure_capacity(out, len);
@@ -594,7 +643,19 @@ pub fn silu<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView
     {
         crate::kernels::neon::math::swish(input, out)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "wasm32")]
+    {
+        let len = input.data.len();
+        utils::ensure_capacity(out, len);
+        unsafe {
+            wasm_simd_silu(input.data.as_ptr(), out.as_mut_ptr(), len);
+        }
+        TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(input.shape.to_vec()),
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
     {
         let len = input.data.len();
         utils::ensure_capacity(out, len);
@@ -645,7 +706,38 @@ pub fn relu<'a, 'b>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView
             shape: Cow::Owned(input.shape.to_vec()),
         }
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::arch::wasm32::*;
+        let len = input.data.len();
+        utils::ensure_capacity(out, len);
+        unsafe {
+            let inp = input.data.as_ptr();
+            let outp = out.as_mut_ptr();
+            let zero = f32x4_splat(0.0);
+            let mut i = 0;
+            while i + 4 <= len {
+                let v = v128_load(inp.add(i) as *const v128);
+                let r = f32x4_max(v, zero);
+                v128_store(outp.add(i) as *mut v128, r);
+                i += 4;
+            }
+            while i < len {
+                let v = *inp.add(i);
+                *outp.add(i) = if v > 0.0 { v } else { 0.0 };
+                i += 1;
+            }
+        }
+        TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(input.shape.to_vec()),
+        }
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "wasm32"
+    )))]
     {
         let len = input.data.len();
         utils::ensure_capacity(out, len);
@@ -1057,6 +1149,125 @@ pub fn prelu<'b, 'a>(
         };
     }
     broadcast_binary_op(input, slope, out, |x, s| if x < 0.0 { x * s } else { x })
+}
+
+// ─── WASM SIMD128 activation helpers ───────────────────────────────────────
+
+/// Fast polynomial approximation of exp(x) for WASM SIMD128.
+/// Uses the Schraudolph-style approach: clamp, scale, polynomial.
+/// Accurate to ~1e-4 relative error in [-88, 88].
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+unsafe fn wasm_simd_exp_f32x4(x: v128) -> v128 {
+    use std::arch::wasm32::*;
+    // Clamp to avoid overflow/underflow
+    let x = f32x4_max(x, f32x4_splat(-88.0));
+    let x = f32x4_min(x, f32x4_splat(88.0));
+
+    // exp(x) = 2^(x / ln2) = 2^(n + f) where n = floor(x/ln2), f = frac
+    let log2e = f32x4_splat(1.4426950408889634);
+    let ln2 = f32x4_splat(0.6931471805599453);
+
+    let t = f32x4_mul(x, log2e);
+    let n = f32x4_floor(t);
+    let f = f32x4_sub(x, f32x4_mul(n, ln2));
+
+    // Polynomial approximation of 2^f for f in [0, 1)
+    // p(f) ≈ 1 + f*ln2 + (f*ln2)^2/2 + ...
+    // Using Horner form for exp(f): 1 + f*(1 + f*(0.5 + f*(1/6 + f/24)))
+    let c4 = f32x4_splat(1.0 / 24.0);
+    let c3 = f32x4_splat(1.0 / 6.0);
+    let c2 = f32x4_splat(0.5);
+    let c1 = f32x4_splat(1.0);
+    let c0 = f32x4_splat(1.0);
+
+    let p = f32x4_add(f32x4_mul(c4, f), c3);
+    let p = f32x4_add(f32x4_mul(p, f), c2);
+    let p = f32x4_add(f32x4_mul(p, f), c1);
+    let p = f32x4_add(f32x4_mul(p, f), c0);
+
+    // Multiply by 2^n using integer arithmetic on the IEEE 754 exponent
+    // 2^n = reinterpret((n + 127) << 23) as f32
+    let n_i32 = i32x4_trunc_sat_f32x4(n);
+    let bias = i32x4_splat(127);
+    let shift = i32x4_shl(i32x4_add(n_i32, bias), 23);
+    let pow2n: v128 = shift; // reinterpret as f32x4
+
+    f32x4_mul(p, pow2n)
+}
+
+/// WASM SIMD128 tanh: tanh(x) = 1 - 2/(exp(2x)+1)
+#[cfg(target_arch = "wasm32")]
+unsafe fn wasm_simd_tanh(input: *const f32, output: *mut f32, len: usize) {
+    use std::arch::wasm32::*;
+    let mut i = 0;
+    let one = f32x4_splat(1.0);
+    let two = f32x4_splat(2.0);
+    let neg_one = f32x4_splat(-1.0);
+
+    while i + 4 <= len {
+        let x = v128_load(input.add(i) as *const v128);
+        let two_x = f32x4_mul(two, x);
+        let exp_2x = wasm_simd_exp_f32x4(two_x);
+        // tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+        let num = f32x4_sub(exp_2x, one);
+        let den = f32x4_add(exp_2x, one);
+        let result = f32x4_div(num, den);
+        // Clamp to [-1, 1] for numerical safety
+        let result = f32x4_max(result, neg_one);
+        let result = f32x4_min(result, one);
+        v128_store(output.add(i) as *mut v128, result);
+        i += 4;
+    }
+    while i < len {
+        *output.add(i) = (*input.add(i)).tanh();
+        i += 1;
+    }
+}
+
+/// WASM SIMD128 sigmoid: 1 / (1 + exp(-x))
+#[cfg(target_arch = "wasm32")]
+unsafe fn wasm_simd_sigmoid(input: *const f32, output: *mut f32, len: usize) {
+    use std::arch::wasm32::*;
+    let mut i = 0;
+    let one = f32x4_splat(1.0);
+
+    while i + 4 <= len {
+        let x = v128_load(input.add(i) as *const v128);
+        let neg_x = f32x4_neg(x);
+        let exp_neg_x = wasm_simd_exp_f32x4(neg_x);
+        let den = f32x4_add(one, exp_neg_x);
+        let result = f32x4_div(one, den);
+        v128_store(output.add(i) as *mut v128, result);
+        i += 4;
+    }
+    while i < len {
+        *output.add(i) = crate::kernels::activations::sigmoid(*input.add(i));
+        i += 1;
+    }
+}
+
+/// WASM SIMD128 silu: x * sigmoid(x) = x / (1 + exp(-x))
+#[cfg(target_arch = "wasm32")]
+unsafe fn wasm_simd_silu(input: *const f32, output: *mut f32, len: usize) {
+    use std::arch::wasm32::*;
+    let mut i = 0;
+    let one = f32x4_splat(1.0);
+
+    while i + 4 <= len {
+        let x = v128_load(input.add(i) as *const v128);
+        let neg_x = f32x4_neg(x);
+        let exp_neg_x = wasm_simd_exp_f32x4(neg_x);
+        let den = f32x4_add(one, exp_neg_x);
+        let result = f32x4_div(x, den);
+        v128_store(output.add(i) as *mut v128, result);
+        i += 4;
+    }
+    while i < len {
+        let x = *input.add(i);
+        *output.add(i) = x / (1.0 + (-x).exp());
+        i += 1;
+    }
 }
 pub fn range<'a>(
     start: &TensorView,

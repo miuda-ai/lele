@@ -1,8 +1,13 @@
 use crate::kernels::activations::{sigmoid, tanh};
 use crate::tensor::TensorView;
+#[cfg(not(target_arch = "wasm32"))]
 use faer::linalg::matmul::matmul;
+#[cfg(not(target_arch = "wasm32"))]
 use faer::mat::{MatMut, MatRef};
+#[cfg(not(target_arch = "wasm32"))]
 use faer::{Accum, Par};
+#[cfg(target_arch = "wasm32")]
+use crate::kernels::wasm_matmul::{matmul, MatMut, MatRef, Accum, Par};
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]

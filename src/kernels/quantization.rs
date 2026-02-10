@@ -251,6 +251,30 @@ pub fn mat_mul_integer_prepared<'a, 'b>(
             out,
         )
     }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        // Generic fallback: reconstruct original B layout and use existing path
+        let a_u8_view = TensorView::from_slice(&a_u8, a.shape.to_vec());
+        let mut b_u8 = vec![0u8; pw.k * pw.n];
+        for jj in 0..pw.n {
+            for kk in 0..pw.k {
+                b_u8[kk * pw.n + jj] = pw.b_t[jj * pw.k_padded + kk] ^ 0x80;
+            }
+        }
+        let b_view = TensorView::from_slice(&b_u8, vec![pw.k, pw.n]);
+        let a_zp = a_zero_point.map(|z| TensorView::from_owned(vec![z as u8], vec![1]));
+        let b_zp = b_zero_point.map(|z| TensorView::from_owned(vec![z], vec![1]));
+        mat_mul_integer_u8(
+            &a_u8_view,
+            &b_view,
+            a_zp.as_ref(),
+            b_zp.as_ref(),
+            scale,
+            bias,
+            apply_relu,
+            out,
+        )
+    }
 }
 
 // Internal function with activation parameter

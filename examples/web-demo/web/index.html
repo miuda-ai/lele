@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lele - WebAssembly ML Inference Demo</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>🎵 Lele — WASM ML Inference</h1>
+            <p class="subtitle">Bare-metal ML inference compiled to WebAssembly. No server, runs entirely in-browser.
+            </p>
+            <div id="model-stats" class="model-stats">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Model</th>
+                            <th>Task</th>
+                            <th>WASM</th>
+                            <th>Weights</th>
+                            <th>RTF</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr id="stats-sensevoice">
+                            <td class="model-name">SenseVoice</td>
+                            <td class="model-task">ASR</td>
+                            <td class="stat-wasm">—</td>
+                            <td class="stat-bin">—</td>
+                            <td class="stat-rtf">—</td>
+                        </tr>
+                        <tr id="stats-supertonic">
+                            <td class="model-name">Supertonic</td>
+                            <td class="model-task">TTS</td>
+                            <td class="stat-wasm">—</td>
+                            <td class="stat-bin">—</td>
+                            <td class="stat-rtf">—</td>
+                        </tr>
+                        <tr id="stats-yolo26">
+                            <td class="model-name">YOLO26</td>
+                            <td class="model-task">Detection</td>
+                            <td class="stat-wasm">—</td>
+                            <td class="stat-bin">—</td>
+                            <td class="stat-rtf">—</td>
+                        </tr>
+                    </tbody>
+                    <tfoot>
+                        <tr id="stats-total">
+                            <td class="model-name" colspan="2">Total</td>
+                            <td class="stat-wasm">—</td>
+                            <td class="stat-bin">—</td>
+                            <td></td>
+                        </tr>
+                    </tfoot>
+                </table>
+            </div>
+        </header>
+
+        <nav class="tabs">
+            <button class="tab active" data-tab="asr">🎤 Speech Recognition</button>
+            <button class="tab" data-tab="tts">🔊 Text-to-Speech</button>
+            <button class="tab" data-tab="detect">📷 Object Detection</button>
+        </nav>
+
+        <!-- ASR Tab -->
+        <section id="asr" class="tab-content active">
+            <div class="card">
+                <h2>SenseVoice ASR</h2>
+                <p>Upload an audio file (WAV) for automatic speech recognition.</p>
+
+                <div class="status-bar">
+                    <span id="asr-status" class="status">⏳ Loading model...</span>
+                    <span id="asr-model-size" class="badge"></span>
+                </div>
+
+                <div class="input-area">
+                    <label class="file-upload" id="asr-upload-label">
+                        <input type="file" id="asr-file" accept="audio/*" disabled>
+                        <span>📁 Choose Audio File</span>
+                    </label>
+                    <span id="asr-filename" class="filename"></span>
+                </div>
+
+                <div id="asr-audio-preview" class="audio-preview" style="display:none;">
+                    <audio id="asr-audio" controls></audio>
+                </div>
+
+                <button id="asr-run" class="btn primary" disabled>▶ Recognize Speech</button>
+
+                <div id="asr-result" class="result-area" style="display:none;">
+                    <h3>Transcription</h3>
+                    <div id="asr-text" class="result-text"></div>
+                    <div id="asr-timing" class="timing"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- TTS Tab -->
+        <section id="tts" class="tab-content">
+            <div class="card">
+                <h2>Supertonic TTS</h2>
+                <p>Enter English text to synthesize speech.</p>
+
+                <div class="status-bar">
+                    <span id="tts-status" class="status">⏳ Loading models...</span>
+                    <span id="tts-model-size" class="badge"></span>
+                </div>
+
+                <div class="input-area">
+                    <textarea id="tts-text" rows="3" placeholder="Enter English text to synthesize..."
+                        disabled>Hello, this is a test of Supertonic text to speech running in WebAssembly.</textarea>
+                </div>
+
+                <div class="controls-row">
+                    <label>Speed: <input type="range" id="tts-speed" min="0.5" max="2.0" step="0.1" value="1.0"
+                            disabled>
+                        <span id="tts-speed-val">1.0x</span></label>
+                    <label>Steps: <input type="number" id="tts-steps" min="1" max="20" value="5" disabled></label>
+                </div>
+
+                <button id="tts-run" class="btn primary" disabled>▶ Synthesize Speech</button>
+
+                <div id="tts-result" class="result-area" style="display:none;">
+                    <h3>Generated Audio</h3>
+                    <audio id="tts-audio" controls></audio>
+                    <div id="tts-timing" class="timing"></div>
+                    <a id="tts-download" class="btn secondary" download="output.wav" style="display:none;">⬇ Download
+                        WAV</a>
+                </div>
+            </div>
+        </section>
+
+        <!-- Detection Tab -->
+        <section id="detect" class="tab-content">
+            <div class="card">
+                <h2>YOLO26 Object Detection</h2>
+                <p>Upload an image to detect objects.</p>
+
+                <div class="status-bar">
+                    <span id="detect-status" class="status">⏳ Loading model...</span>
+                    <span id="detect-model-size" class="badge"></span>
+                </div>
+
+                <div class="input-area">
+                    <label class="file-upload" id="detect-upload-label">
+                        <input type="file" id="detect-file" accept="image/*" disabled>
+                        <span>📁 Choose Image</span>
+                    </label>
+                    <span id="detect-filename" class="filename"></span>
+                </div>
+
+                <button id="detect-run" class="btn primary" disabled>▶ Detect Objects</button>
+
+                <div id="detect-result" class="result-area" style="display:none;">
+                    <h3>Detection Results</h3>
+                    <div class="canvas-container">
+                        <canvas id="detect-canvas"></canvas>
+                    </div>
+                    <div id="detect-timing" class="timing"></div>
+                    <div id="detect-list" class="detection-list"></div>
+                </div>
+            </div>
+        </section>
+
+        <footer>
+            <p>Powered by <a href="https://github.com/miuda-ai/lele" target="_blank">Lele</a> — Bare-metal ML inference
+                in Rust, compiled to WebAssembly.</p>
+        </footer>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+
+</html>

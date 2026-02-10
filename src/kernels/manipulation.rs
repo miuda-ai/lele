@@ -158,12 +158,40 @@ pub fn slice<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         } else {
             1
         };
-        let start = starts[i] as isize;
-        let end = ends[i] as isize;
+        // Handle sentinel values (i64::MIN, i64::MAX) on the original i64
+        // before casting to isize. On wasm32 (isize = 32-bit), casting
+        // directly would truncate and break sentinel detection.
+        let start_i64 = starts[i];
+        let end_i64 = ends[i];
+
+        // Detect sentinels BEFORE clamping. ONNX uses i64::MAX to mean
+        // "to the end" (positive step) and i64::MIN to mean "to the
+        // very beginning" (negative step).
+        let end_is_max_sentinel = end_i64 > i64::MAX / 2;
+        let end_is_min_sentinel = end_i64 < i64::MIN / 2;
+
+        let start = if start_i64 > dim_size as i64 {
+            dim_size
+        } else if start_i64 < -(dim_size as i64) {
+            -dim_size
+        } else {
+            start_i64 as isize
+        };
+        let end = if end_is_max_sentinel {
+            dim_size
+        } else if end_is_min_sentinel {
+            -dim_size
+        } else if end_i64 > dim_size as i64 {
+            dim_size
+        } else if end_i64 < -(dim_size as i64) {
+            -dim_size
+        } else {
+            end_i64 as isize
+        };
         let norm_start = if start < 0 { start + dim_size } else { start };
-        let norm_end = if end > 2_000_000_000 {
+        let norm_end = if end_is_max_sentinel {
             if step > 0 { dim_size } else { -1 }
-        } else if end < -2_000_000_000 {
+        } else if end_is_min_sentinel {
             if step > 0 { 0 } else { -1 }
         } else if end < 0 {
             end + dim_size
@@ -235,15 +263,31 @@ pub fn pad<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     mode: &str,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
-    let p = pads.iter().map(|&x| x as usize).collect::<Vec<_>>();
+    // Safely convert i64 → usize, clamping negatives to 0
+    let raw_p: Vec<usize> = pads
+        .iter()
+        .map(|&x| if x < 0 { 0usize } else { x as usize })
+        .collect();
     let rank = input.shape.len();
-    if p.len() < rank * 2 {
-        panic!(
-            "Pad: pads length {} is less than rank {} * 2",
-            p.len(),
-            rank
-        );
-    }
+    // If pads is shorter than rank*2, it covers fewer dims.
+    // ONNX pads layout: [begin_0..begin_n, end_0..end_n].
+    // Zero-pad for the leading (batch/channel) dimensions.
+    let p = if raw_p.len() < rank * 2 {
+        let half = raw_p.len() / 2;
+        let missing = rank - half;
+        let mut full = vec![0usize; rank * 2];
+        // Copy begins into positions [missing..rank]
+        for i in 0..half {
+            full[missing + i] = raw_p[i];
+        }
+        // Copy ends into positions [rank+missing..rank*2]
+        for i in 0..half {
+            full[rank + missing + i] = raw_p[half + i];
+        }
+        full
+    } else {
+        raw_p
+    };
     let mut new_shape = input.shape.to_vec();
     for i in 0..rank {
         new_shape[i] += p[i] + p[i + rank];
@@ -449,7 +493,12 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     // Fast path: perm [0,2,1,3] for 4D tensors — copy contiguous blocks
     // [B, A, C, D] -> [B, C, A, D] — inner dim D is contiguous
     if ndim == 4 && perm == [0, 2, 1, 3] {
-        let (b, a, c, d) = (input.shape[0], input.shape[1], input.shape[2], input.shape[3]);
+        let (b, a, c, d) = (
+            input.shape[0],
+            input.shape[1],
+            input.shape[2],
+            input.shape[3],
+        );
         let out_slice = out.as_mut_slice();
         for bi in 0..b {
             for ci in 0..c {
@@ -472,7 +521,12 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     // Fast path: perm [0,2,3,1] for 4D tensors
     // [B, A, C, D] -> [B, C, D, A]
     if ndim == 4 && perm == [0, 2, 3, 1] {
-        let (b, a, c, d) = (input.shape[0], input.shape[1], input.shape[2], input.shape[3]);
+        let (b, a, c, d) = (
+            input.shape[0],
+            input.shape[1],
+            input.shape[2],
+            input.shape[3],
+        );
         let out_slice = out.as_mut_slice();
         for bi in 0..b {
             for ai in 0..a {
@@ -481,7 +535,8 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
                         let src_off = ((bi * a + ai) * c + ci) * d + di;
                         let dst_off = ((bi * c + ci) * d + di) * a + ai;
                         unsafe {
-                            *out_slice.get_unchecked_mut(dst_off) = *input.data.get_unchecked(src_off);
+                            *out_slice.get_unchecked_mut(dst_off) =
+                                *input.data.get_unchecked(src_off);
                         }
                     }
                 }
