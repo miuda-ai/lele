@@ -90,12 +90,13 @@ where
         output_buf.set_len(numel);
     }
     let dims = out_shape.len();
+    let o_slice = output_buf.as_mut_slice();
+
+    // Fast path: scalar broadcast
     if a.data.len() == 1 {
         let val_a = a.data[0];
-        let b_slice = &b.data;
-        let o_slice = output_buf.as_mut_slice();
         for i in 0..numel {
-            o_slice[i] = op(val_a, b_slice[i]);
+            o_slice[i] = op(val_a, b.data[i]);
         }
         return TensorView {
             data: Cow::Borrowed(output_buf),
@@ -104,16 +105,78 @@ where
     }
     if b.data.len() == 1 {
         let val_b = b.data[0];
-        let a_slice = &a.data;
-        let o_slice = output_buf.as_mut_slice();
         for i in 0..numel {
-            o_slice[i] = op(a_slice[i], val_b);
+            o_slice[i] = op(a.data[i], val_b);
         }
         return TensorView {
             data: Cow::Borrowed(output_buf),
             shape: Cow::Owned(out_shape),
         };
     }
+
+    // Fast path: same shape — no broadcasting needed, direct elementwise
+    if a.data.len() == numel && b.data.len() == numel {
+        let a_slice = &a.data;
+        let b_slice = &b.data;
+        for i in 0..numel {
+            unsafe {
+                *o_slice.get_unchecked_mut(i) =
+                    op(*a_slice.get_unchecked(i), *b_slice.get_unchecked(i));
+            }
+        }
+        return TensorView {
+            data: Cow::Borrowed(output_buf),
+            shape: Cow::Owned(out_shape),
+        };
+    }
+
+    // Fast path: row-broadcast b (e.g. [M,N] + [1,N] or [M,N] + [N])
+    if dims >= 2 && b.data.len() == out_shape[dims - 1] {
+        let n = out_shape[dims - 1];
+        let rows = numel / n;
+        let a_slice = &a.data;
+        let b_slice = &b.data;
+        if a.data.len() == numel {
+            for r in 0..rows {
+                let base = r * n;
+                for c in 0..n {
+                    unsafe {
+                        *o_slice.get_unchecked_mut(base + c) =
+                            op(*a_slice.get_unchecked(base + c), *b_slice.get_unchecked(c));
+                    }
+                }
+            }
+            return TensorView {
+                data: Cow::Borrowed(output_buf),
+                shape: Cow::Owned(out_shape),
+            };
+        }
+    }
+
+    // Fast path: row-broadcast a (e.g. [1,N] + [M,N])
+    if dims >= 2 && a.data.len() == out_shape[dims - 1] {
+        let n = out_shape[dims - 1];
+        let rows = numel / n;
+        let a_slice = &a.data;
+        let b_slice = &b.data;
+        if b.data.len() == numel {
+            for r in 0..rows {
+                let base = r * n;
+                for c in 0..n {
+                    unsafe {
+                        *o_slice.get_unchecked_mut(base + c) =
+                            op(*a_slice.get_unchecked(c), *b_slice.get_unchecked(base + c));
+                    }
+                }
+            }
+            return TensorView {
+                data: Cow::Borrowed(output_buf),
+                shape: Cow::Owned(out_shape),
+            };
+        }
+    }
+
+    // General broadcast: coordinate-based indexing
     let mk_strides = |shape: &[usize], target_dims: usize| -> Vec<usize> {
         let mut strides = vec![0; target_dims];
         let mut curr = 1;
@@ -406,14 +469,21 @@ pub fn reciprocal<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> Tens
     }
 }
 pub fn erf<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
-    for i in 0..numel {
-        out[i] = libm::erff(input.data[i]);
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::kernels::neon::math::erf(input, out)
     }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: Cow::Owned(input.shape.to_vec()),
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let numel = input.data.len();
+        utils::ensure_capacity(out, numel);
+        for i in 0..numel {
+            out[i] = libm::erff(input.data[i]);
+        }
+        TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(input.shape.to_vec()),
+        }
     }
 }
 pub fn softplus<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {

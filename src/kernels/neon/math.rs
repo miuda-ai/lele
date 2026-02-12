@@ -250,3 +250,72 @@ pub fn swish<'a>(input: &TensorView<'_>, output_buf: &'a mut Vec<f32>) -> Tensor
         shape: Cow::Owned(input.shape.to_vec()),
     }
 }
+
+/// NEON-vectorized erf using Abramowitz & Stegun formula 7.1.26.
+/// Max error ~1.5e-7, much faster than calling libm::erff per element.
+pub fn erf<'b, 'a>(input: &TensorView<'b>, output_buf: &'a mut Vec<f32>) -> TensorView<'a> {
+    let len = input.data.len();
+    utils::ensure_capacity(output_buf, len);
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+
+        let data = input.data.as_ptr();
+        let out = output_buf.as_mut_ptr();
+
+        // Abramowitz & Stegun constants for erf approximation (formula 7.1.26)
+        let p = vdupq_n_f32(0.3275911f32);
+        let a1 = vdupq_n_f32(0.254829592f32);
+        let a2 = vdupq_n_f32(-0.284496736f32);
+        let a3 = vdupq_n_f32(1.421413741f32);
+        let a4 = vdupq_n_f32(-1.453152027f32);
+        let a5 = vdupq_n_f32(1.061405429f32);
+        let one = vdupq_n_f32(1.0f32);
+        let neg_one = vdupq_n_f32(-1.0f32);
+
+        let mut i = 0;
+        let simd_end = len & !3;
+        while i < simd_end {
+            let x = vld1q_f32(data.add(i));
+            // sign = x >= 0 ? 1 : -1
+            let sign_mask = vcgeq_f32(x, vdupq_n_f32(0.0));
+            let sign = vbslq_f32(sign_mask, one, neg_one);
+            // x_abs = |x|
+            let x_abs = vabsq_f32(x);
+            // t = 1 / (1 + p * |x|)
+            let t = vdivq_f32(one, vfmaq_f32(one, p, x_abs));
+            // Horner's method: y = ((((a5*t + a4)*t + a3)*t + a2)*t + a1)*t
+            let mut y = a5;
+            y = vfmaq_f32(a4, y, t);
+            y = vfmaq_f32(a3, y, t);
+            y = vfmaq_f32(a2, y, t);
+            y = vfmaq_f32(a1, y, t);
+            y = vmulq_f32(y, t);
+            // exp(-x*x)
+            let neg_x2 = vnegq_f32(vmulq_f32(x_abs, x_abs));
+            let exp_val = neon_exp_f32x4(neg_x2);
+            // erf = sign * (1 - y * exp(-x²))
+            let result = vmulq_f32(sign, vsubq_f32(one, vmulq_f32(y, exp_val)));
+            vst1q_f32(out.add(i), result);
+            i += 4;
+        }
+        // Scalar tail
+        while i < len {
+            *out.add(i) = libm::erff(*data.add(i));
+            i += 1;
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for i in 0..len {
+            output_buf[i] = libm::erff(input.data[i]);
+        }
+    }
+
+    TensorView {
+        data: Cow::Borrowed(output_buf),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
+}

@@ -44,26 +44,25 @@ fn test_layernorm_accuracy() {
     };
 
     let mut out_scalar = Vec::new();
-    let mut out_neon = Vec::new();
 
+    // Test via the main norm::layer_norm which dispatches to NEON on aarch64
     norm::layer_norm(&input, &gamma_v, &beta_v, -1, 1e-5, &mut out_scalar);
-    lele::kernels::neon::normalization::layer_norm(
-        &input,
-        &gamma_v,
-        &beta_v,
-        -1,
-        1e-5,
-        &mut out_neon,
-    );
+
+    // Verify against manually computed expected values
+    // For input [0,1,2,...,9], mean=4.5, var=8.25, inv_std=1/sqrt(8.25+1e-5)
+    let mean: f32 = input_data.iter().sum::<f32>() / norm_size as f32;
+    let var: f32 = input_data.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / norm_size as f32;
+    let inv_std = 1.0 / (var + 1e-5f32).sqrt();
 
     for i in 0..norm_size {
-        let diff = (out_scalar[i] - out_neon[i]).abs();
+        let expected = (input_data[i] - mean) * inv_std * gamma[i] + beta[i];
+        let diff = (out_scalar[i] - expected).abs();
         assert!(
             diff < 1e-5,
-            "LayerNorm mismatch at index {}: scalar={}, neon={}, diff={}",
+            "LayerNorm mismatch at index {}: got={}, expected={}, diff={}",
             i,
             out_scalar[i],
-            out_neon[i],
+            expected,
             diff
         );
     }

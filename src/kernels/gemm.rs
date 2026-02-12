@@ -1,4 +1,6 @@
 use crate::kernels::utils;
+#[cfg(target_arch = "wasm32")]
+use crate::kernels::wasm_matmul::{Accum, MatMut, MatRef, Par, matmul as faer_matmul};
 use crate::tensor::TensorView;
 #[cfg(not(target_arch = "wasm32"))]
 use faer::linalg::matmul::matmul as faer_matmul;
@@ -6,8 +8,6 @@ use faer::linalg::matmul::matmul as faer_matmul;
 use faer::mat::{MatMut, MatRef};
 #[cfg(not(target_arch = "wasm32"))]
 use faer::{Accum, Par};
-#[cfg(target_arch = "wasm32")]
-use crate::kernels::wasm_matmul::{matmul as faer_matmul, MatMut, MatRef, Accum, Par};
 use std::borrow::Cow;
 
 pub fn matmul<'a>(

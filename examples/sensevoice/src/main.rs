@@ -169,14 +169,16 @@ fn main() {
 
     println!("✓ Tokenizer loaded: {} tokens", tokenizer.vocab_size());
 
-    // Decode logits to text
-    let batch_size = output.size(0);
-    let time_steps = output.size(1);
-    let vocab_size = output.size(2);
+    // Decode logits to text - handle both 2D [T, V] and 3D [B, T, V] outputs
+    let (time_steps, vocab_size) = if output.dim() == 3 {
+        (output.size(1), output.size(2))
+    } else {
+        (output.size(0), output.size(1))
+    };
 
     println!(
-        "Decoding logits [batch={}, time={}, vocab={}]...",
-        batch_size, time_steps, vocab_size
+        "Decoding logits [time={}, vocab={}]...",
+        time_steps, vocab_size
     );
 
     // Show some sample predictions for debugging
@@ -236,7 +238,7 @@ fn main() {
         100.0 * *count as f32 / time_steps as f32
     );
 
-    let texts = tokenizer.decode_greedy(&output.data, batch_size, time_steps, vocab_size);
+    let texts = tokenizer.decode_greedy(&output.data, 1, time_steps, vocab_size);
 
     println!("\n=== Transcription Result ===");
     for (i, text) in texts.iter().enumerate() {

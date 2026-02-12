@@ -663,64 +663,119 @@ where
     let cond_data = &condition.data;
     let x_data = &x.data;
     let y_data = &y.data;
+
+    // Fast path: all same shape — direct elementwise, no coordinates
     if condition.shape == x.shape && x.shape == y.shape {
         let numel = cond_data.len();
         utils::ensure_capacity(out, numel);
         unsafe {
-            out.set_len(0);
+            out.set_len(numel);
         }
+        let o = out.as_mut_slice();
         for i in 0..numel {
-            out.push(if cond_data[i].as_i64() != 0 {
-                x_data[i]
-            } else {
-                y_data[i]
-            });
+            unsafe {
+                *o.get_unchecked_mut(i) = if cond_data.get_unchecked(i).as_i64() != 0 {
+                    *x_data.get_unchecked(i)
+                } else {
+                    *y_data.get_unchecked(i)
+                };
+            }
         }
         return TensorView::from_slice(out, condition.shape.to_vec());
     }
+
     let out_shape = utils::broadcast_shapes(&condition.shape, &x.shape)
         .and_then(|s| utils::broadcast_shapes(&s, &y.shape))
         .unwrap_or_else(|| condition.shape.to_vec());
-    let out_numel = out_shape.iter().product();
+    let out_numel: usize = out_shape.iter().product();
+    let dims = out_shape.len();
     utils::ensure_capacity(out, out_numel);
     unsafe {
-        out.set_len(0);
+        out.set_len(out_numel);
     }
+    let o = out.as_mut_slice();
+
+    if x.data.len() == out_numel && y.data.len() == out_numel {
+        // Condition broadcasts, x and y are full — use stride-based cond index
+        let cond_numel = cond_data.len();
+        if cond_numel == 1 {
+            // Scalar condition
+            if cond_data[0].as_i64() != 0 {
+                o.copy_from_slice(x_data);
+            } else {
+                o.copy_from_slice(y_data);
+            }
+        } else {
+            // Condition is smaller, repeats over leading dims
+            // E.g. cond=[T,T], out=[B,H,T,T]
+            let repeat = out_numel / cond_numel;
+            for r in 0..repeat {
+                let base = r * cond_numel;
+                for i in 0..cond_numel {
+                    unsafe {
+                        let idx = base + i;
+                        *o.get_unchecked_mut(idx) = if cond_data.get_unchecked(i).as_i64() != 0 {
+                            *x_data.get_unchecked(idx)
+                        } else {
+                            *y_data.get_unchecked(idx)
+                        };
+                    }
+                }
+            }
+        }
+        return TensorView::from_slice(out, out_shape);
+    }
+
+    // General broadcast: use coordinate-based indexing (slowest path)
     let cond_strides = utils::compute_strides(&condition.shape);
     let x_strides = utils::compute_strides(&x.shape);
     let y_strides = utils::compute_strides(&y.shape);
-    let mut coords = vec![0usize; out_shape.len()];
-    for _ in 0..out_numel {
-        let cond_idx = map_broadcast_index(&coords, &condition.shape, &cond_strides);
-        let x_idx = map_broadcast_index(&coords, &x.shape, &x_strides);
-        let y_idx = map_broadcast_index(&coords, &y.shape, &y_strides);
-        out.push(if cond_data[cond_idx].as_i64() != 0 {
-            x_data[x_idx]
-        } else {
-            y_data[y_idx]
-        });
-        for d in (0..out_shape.len()).rev() {
+
+    let mk_strides = |shape: &[usize]| -> Vec<usize> {
+        let mut strides = vec![0; dims];
+        let mut curr = 1;
+        let offset = dims - shape.len();
+        for i in (0..shape.len()).rev() {
+            if shape[i] != 1 {
+                strides[offset + i] = curr;
+            }
+            curr *= shape[i];
+        }
+        strides
+    };
+    let cs = mk_strides(&condition.shape);
+    let xs = mk_strides(&x.shape);
+    let ys = mk_strides(&y.shape);
+    let mut coords = vec![0usize; dims];
+    let mut off_c = 0usize;
+    let mut off_x = 0usize;
+    let mut off_y = 0usize;
+    for j in 0..out_numel {
+        unsafe {
+            *o.get_unchecked_mut(j) = if cond_data.get_unchecked(off_c).as_i64() != 0 {
+                *x_data.get_unchecked(off_x)
+            } else {
+                *y_data.get_unchecked(off_y)
+            };
+        }
+        for d in (0..dims).rev() {
             coords[d] += 1;
             if coords[d] < out_shape[d] {
+                off_c += cs[d];
+                off_x += xs[d];
+                off_y += ys[d];
                 break;
+            } else {
+                off_c -= (coords[d] - 1) * cs[d];
+                off_x -= (coords[d] - 1) * xs[d];
+                off_y -= (coords[d] - 1) * ys[d];
+                coords[d] = 0;
             }
-            coords[d] = 0;
         }
     }
     TensorView::from_slice(out, out_shape)
 }
-fn map_broadcast_index(out_coords: &[usize], shape: &[usize], strides: &[usize]) -> usize {
-    let mut idx = 0;
-    let rank_diff = out_coords.len().saturating_sub(shape.len());
-    for (i, &coord) in out_coords.iter().skip(rank_diff).enumerate() {
-        let dim_size = if i < shape.len() { shape[i] } else { 1 };
-        let actual_coord = if dim_size == 1 { 0 } else { coord };
-        if i < strides.len() {
-            idx += actual_coord * strides[i];
-        }
-    }
-    idx
-}
+
 #[cfg(test)]
 mod tests {
     use super::*;

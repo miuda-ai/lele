@@ -1,8 +1,8 @@
 use crate::kernels::utils;
 use crate::tensor::TensorView;
-use std::borrow::Cow;
 #[cfg(target_arch = "wasm32")]
 use std::arch::wasm32::*;
+use std::borrow::Cow;
 pub fn softmax<'b, 'a>(
     input: &TensorView<'b>,
     axis: i32,
@@ -188,17 +188,38 @@ pub fn layer_norm<'b, 'a>(
         let gamma = &scale.data;
         let beta = &bias.data;
 
-        for i in 0..outer_size {
-            let offset = i * norm_size;
-            let chunk = &src[offset..offset + norm_size];
-            let out_chunk = &mut out_slice[offset..offset + norm_size];
-            let sum: f32 = chunk.iter().sum();
-            let mean = sum / norm_size as f32;
-            let var_sum: f32 = chunk.iter().map(|&x| (x - mean) * (x - mean)).sum();
-            let var = var_sum / norm_size as f32;
-            let inv_std = 1.0 / (var + epsilon).sqrt();
-            for j in 0..norm_size {
-                out_chunk[j] = (chunk[j] - mean) * inv_std * gamma[j] + beta[j];
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            crate::kernels::neon::normalization::layer_norm_neon(
+                src.as_ptr(),
+                gamma.as_ptr(),
+                beta.as_ptr(),
+                out_slice.as_mut_ptr(),
+                norm_size,
+                outer_size,
+                epsilon,
+            );
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let inv_n = 1.0 / norm_size as f32;
+            for i in 0..outer_size {
+                let offset = i * norm_size;
+                let chunk = &src[offset..offset + norm_size];
+                let out_chunk = &mut out_slice[offset..offset + norm_size];
+                let mut sum = 0.0f32;
+                let mut sumsq = 0.0f32;
+                for &x in chunk.iter() {
+                    sum += x;
+                    sumsq += x * x;
+                }
+                let mean = sum * inv_n;
+                let var = sumsq * inv_n - mean * mean;
+                let inv_std = 1.0 / (var + epsilon).sqrt();
+                for j in 0..norm_size {
+                    out_chunk[j] = (chunk[j] - mean) * inv_std * gamma[j] + beta[j];
+                }
             }
         }
     }

@@ -1,5 +1,9 @@
 use crate::tensor::TensorView;
 
+// Re-export ARM prepared weights
+#[cfg(target_arch = "aarch64")]
+pub use crate::kernels::neon::quantization::{PreparedWeightsArm, prepare_weights_arm};
+
 // MatMulInteger operation: accepts f32 tensors and converts internally to u8
 pub fn mat_mul_integer<'a, 'b, 'c>(
     a: &TensorView<'b, f32>,
@@ -229,27 +233,65 @@ pub fn mat_mul_integer_prepared<'a, 'b>(
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // Fallback: reconstruct original B layout and use existing path
-        let a_u8_view = TensorView::from_slice(&a_u8, a.shape.to_vec());
+        // Use the optimized NEON prepared kernel directly
+        let a_dims = a.shape.len();
+        let m = a.shape[a_dims - 2];
+        let batch: usize = a.shape[..a_dims - 2].iter().product();
+        let batch_shape = &a.shape[..a_dims - 2];
+
+        let total_batch = batch.max(1);
+        let output_len = total_batch * m * pw.n;
+        crate::kernels::utils::ensure_capacity(out, output_len);
+        out.resize(output_len, 0.0);
+
+        let zp_a = a_zero_point.unwrap_or(0.0) as i32;
+        let zp_b = b_zero_point.unwrap_or(0) as i32;
+        let k = pw.k;
+        let n = pw.n;
+        let stride_a = m * k;
+        let stride_out = m * n;
+
+        // Reconstruct B u8 from the x86-format PreparedWeights (transpose + XOR)
         let mut b_u8 = vec![0u8; pw.k * pw.n];
         for jj in 0..pw.n {
             for kk in 0..pw.k {
                 b_u8[kk * pw.n + jj] = pw.b_t[jj * pw.k_padded + kk] ^ 0x80;
             }
         }
-        let b_view = TensorView::from_slice(&b_u8, vec![pw.k, pw.n]);
-        let a_zp = a_zero_point.map(|z| TensorView::from_owned(vec![z as u8], vec![1]));
-        let b_zp = b_zero_point.map(|z| TensorView::from_owned(vec![z], vec![1]));
-        mat_mul_integer_u8(
-            &a_u8_view,
-            &b_view,
-            a_zp.as_ref(),
-            b_zp.as_ref(),
-            scale,
-            bias,
-            apply_relu,
-            out,
-        )
+
+        // Create ARM prepared weights from reconstructed B
+        let pw_arm = crate::kernels::neon::quantization::prepare_weights_arm(&b_u8, k, n);
+
+        for b_i in 0..total_batch {
+            let a_batch = &a_u8[b_i * stride_a..(b_i + 1) * stride_a];
+
+            if total_batch == 1 {
+                crate::kernels::neon::quantization::mat_mul_integer_prepared_neon(
+                    a_batch, m, k, &pw_arm, zp_a, zp_b, scale, bias, apply_relu, out,
+                );
+            } else {
+                let mut batch_out = vec![0f32; stride_out];
+                crate::kernels::neon::quantization::mat_mul_integer_prepared_neon(
+                    a_batch,
+                    m,
+                    k,
+                    &pw_arm,
+                    zp_a,
+                    zp_b,
+                    scale,
+                    bias,
+                    apply_relu,
+                    &mut batch_out,
+                );
+                let out_offset = b_i * stride_out;
+                out[out_offset..out_offset + stride_out].copy_from_slice(&batch_out);
+            }
+        }
+
+        let mut output_shape = batch_shape.to_vec();
+        output_shape.push(m);
+        output_shape.push(n);
+        TensorView::from_slice(out, output_shape)
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
@@ -458,6 +500,204 @@ fn mat_mul_integer_u8<'a, 'b, 'c>(
 
         TensorView::from_slice(out, output_shape)
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn fused_dq_gemm_prepared_arm<'a>(
+    input: &TensorView<'_, f32>,
+    pw_arm: &PreparedWeightsArm,
+    b_zero_point: Option<u8>,
+    weight_scale: &TensorView<'_, f32>,
+    bias: Option<&TensorView<'_, f32>>,
+    apply_relu: bool,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a, f32> {
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH: RefCell<(Vec<u8>, Vec<f32>)> = RefCell::new((Vec::new(), Vec::new()));
+    }
+
+    let a_dims = input.shape.len();
+    let m = input.shape[a_dims - 2];
+    let k = input.shape[a_dims - 1];
+    let batch_shape = &input.shape[..a_dims.saturating_sub(2)];
+    let batch: usize = batch_shape.iter().product();
+    let total_batch = batch.max(1);
+    let zp_b = b_zero_point.unwrap_or(0) as i32;
+    let n = pw_arm.n;
+
+    if total_batch <= 1 {
+        // Fast path: no batching
+        SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let (a_u8, scale_buf) = &mut *scratch;
+
+            crate::kernels::neon::quantization::fused_dq_gemm_neon(
+                &input.data,
+                m,
+                k,
+                pw_arm,
+                zp_b,
+                &weight_scale.data,
+                bias.map(|b| &*b.data),
+                apply_relu,
+                a_u8,
+                scale_buf,
+                out,
+            );
+        });
+        // Preserve batch dimensions in output shape
+        if batch_shape.is_empty() {
+            TensorView::from_slice(out, vec![m, n])
+        } else {
+            let mut output_shape = batch_shape.to_vec();
+            output_shape.push(m);
+            output_shape.push(n);
+            TensorView::from_slice(out, output_shape)
+        }
+    } else {
+        // Batch path
+        let stride_in = m * k;
+        let stride_out = m * n;
+        let output_len = total_batch * stride_out;
+        crate::kernels::utils::ensure_capacity(out, output_len);
+        out.resize(output_len, 0.0);
+
+        SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let (a_u8, scale_buf) = &mut *scratch;
+
+            for b_i in 0..total_batch {
+                let batch_start = b_i * stride_in;
+                let batch_end = batch_start + stride_in;
+                let batch_data = &input.data[batch_start..batch_end];
+
+                let mut batch_out = vec![0f32; stride_out];
+                // Create a temporary TensorView-like slice for this batch
+                crate::kernels::neon::quantization::fused_dq_gemm_neon(
+                    batch_data,
+                    m,
+                    k,
+                    pw_arm,
+                    zp_b,
+                    &weight_scale.data,
+                    bias.map(|b| &*b.data),
+                    apply_relu,
+                    a_u8,
+                    scale_buf,
+                    &mut batch_out,
+                );
+                let out_offset = b_i * stride_out;
+                out[out_offset..out_offset + stride_out].copy_from_slice(&batch_out);
+            }
+        });
+
+        let mut output_shape = batch_shape.to_vec();
+        output_shape.push(m);
+        output_shape.push(n);
+        TensorView::from_slice(out, output_shape)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn mat_mul_integer_prepared_arm<'a, 'b>(
+    a: &TensorView<'b, f32>,
+    pw_arm: &PreparedWeightsArm,
+    a_zero_point: Option<f32>,
+    b_zero_point: Option<u8>,
+    scale: Option<&TensorView<'b, f32>>,
+    bias: Option<&TensorView<'b, f32>>,
+    apply_relu: bool,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a, f32> {
+    // Convert A from f32 to u8
+    let len = a.data.len();
+    let mut a_u8: Vec<u8> = Vec::with_capacity(len);
+    unsafe {
+        a_u8.set_len(len);
+        let src = a.data.as_ptr();
+        let dst = a_u8.as_mut_ptr();
+        // NEON vectorized f32→u8 conversion
+        let mut i = 0;
+        while i + 16 <= len {
+            use core::arch::aarch64::*;
+            let v0 = vld1q_f32(src.add(i));
+            let v1 = vld1q_f32(src.add(i + 4));
+            let v2 = vld1q_f32(src.add(i + 8));
+            let v3 = vld1q_f32(src.add(i + 12));
+            let u0 = vcvtq_u32_f32(v0);
+            let u1 = vcvtq_u32_f32(v1);
+            let u2 = vcvtq_u32_f32(v2);
+            let u3 = vcvtq_u32_f32(v3);
+            let n0 = vqmovn_u32(u0);
+            let n1 = vqmovn_u32(u1);
+            let n2 = vqmovn_u32(u2);
+            let n3 = vqmovn_u32(u3);
+            let nn0 = vcombine_u16(n0, n1);
+            let nn1 = vcombine_u16(n2, n3);
+            let b0 = vqmovn_u16(nn0);
+            let b1 = vqmovn_u16(nn1);
+            let res = vcombine_u8(b0, b1);
+            vst1q_u8(dst.add(i), res);
+            i += 16;
+        }
+        while i < len {
+            *dst.add(i) = *src.add(i) as u8;
+            i += 1;
+        }
+    }
+
+    let a_dims = a.shape.len();
+    let m = a.shape[a_dims - 2];
+    let k = a.shape[a_dims - 1];
+    let batch: usize = a.shape[..a_dims - 2].iter().product();
+    let batch_shape = &a.shape[..a_dims - 2];
+
+    let total_batch = batch.max(1);
+    let zp_a = a_zero_point.unwrap_or(0.0) as i32;
+    let zp_b = b_zero_point.unwrap_or(0) as i32;
+    let n = pw_arm.n;
+    let stride_a = m * k;
+    let stride_out = m * n;
+    let output_len = total_batch * stride_out;
+    crate::kernels::utils::ensure_capacity(out, output_len);
+    out.resize(output_len, 0.0);
+
+    for b_i in 0..total_batch {
+        let a_batch = &a_u8[b_i * stride_a..(b_i + 1) * stride_a];
+
+        if total_batch == 1 {
+            crate::kernels::neon::quantization::mat_mul_integer_prepared_neon(
+                a_batch, m, k, pw_arm, zp_a, zp_b, scale, bias, apply_relu, out,
+            );
+        } else {
+            let mut batch_out = vec![0f32; stride_out];
+            crate::kernels::neon::quantization::mat_mul_integer_prepared_neon(
+                a_batch,
+                m,
+                k,
+                pw_arm,
+                zp_a,
+                zp_b,
+                scale,
+                bias,
+                apply_relu,
+                &mut batch_out,
+            );
+            let out_offset = b_i * stride_out;
+            out[out_offset..out_offset + stride_out].copy_from_slice(&batch_out);
+        }
+    }
+
+    let mut output_shape = batch_shape.to_vec();
+    output_shape.push(m);
+    output_shape.push(n);
+    TensorView::from_slice(out, output_shape)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn prepare_weights_arm_from_i8(b_i8_bytes: &[u8], k: usize, n: usize) -> PreparedWeightsArm {
+    prepare_weights_arm(b_i8_bytes, k, n)
 }
 
 pub fn dynamic_quantize_linear<'a, 'b>(

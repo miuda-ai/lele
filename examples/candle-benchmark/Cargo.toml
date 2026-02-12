@@ -1,0 +1,19 @@
+[package]
+name = "candle-benchmark"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+lele = { path = "../.." }
+candle-core = "0.8.2"
+candle-nn = "0.8.2"
+anyhow = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

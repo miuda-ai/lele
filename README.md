@@ -8,15 +8,15 @@ It rejects the "general-purpose runtime" approach (wrapping C++ libs like ORT or
 
 `lele` is designed to run deep learning models (specifically speech-related ones like SenseVoice, Silero VAD, and TTS, even `yolo26` ) with minimal overhead. 
 
-## Performance Benchmarks (2026-02-10)
+## Performance Benchmarks (2026-02-12)
 
 In-depth comparison between **lele** and **ONNX Runtime (CPU)** on macOS (Apple Silicon). All benchmarks run with single-thread affinity for fair comparison.
 
 | Model | ORT RTF (CPU) | lele RTF | Speedup |
 | :--- | :--- | :--- | :--- |
-| **Silero VAD** | 0.0031 | 0.0018 | 1.72x |
-| **SenseVoice** | **0.032** | 0.093 | 0.34x |
-| **Supertonic** | **0.122** | 0.178| 0.68x |
+| **Silero VAD** | 0.0031 | 0.0016 | 1.93x |
+| **SenseVoice** | **0.032** | 0.051 | 0.63x |
+| **Supertonic** | **0.122** | 0.134 | 0.91x |
 | **Yolo26** | **759.19** | 1050.56ms | 0.72x |
 
 *Note: RTF (Real-Time Factor) is defined as (Inference Time / Audio Duration). Lower is better.*

@@ -239,8 +239,7 @@ pub(crate) fn infer_variable_types(
                         }
                     }
                 }
-                "Conv" | "ConvInteger" | "Gemm" | "BatchNormalization"
-                | "LayerNormalization" => {
+                "Conv" | "ConvInteger" | "Gemm" | "BatchNormalization" | "LayerNormalization" => {
                     // These ops always produce f32 output regardless of input types
                     for out in &node.output {
                         if !out.is_empty() {

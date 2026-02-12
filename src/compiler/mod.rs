@@ -815,17 +815,140 @@ impl Compiler {
             nodes = new_nodes;
         }
         // --- END OPTIMIZATION ---
+
+        {
+            let mut chains: Vec<[usize; 6]> = Vec::new();
+            let mut in_chain: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+            for (i, node) in nodes.iter().enumerate() {
+                if node.op_type != "DynamicQuantizeLinear" || in_chain.contains(&i) {
+                    continue;
+                }
+                if node.output.len() < 3 {
+                    continue;
+                }
+                let q = &node.output[0];
+                let s = &node.output[1];
+                let z = &node.output[2];
+                if q.is_empty() || s.is_empty() || z.is_empty() {
+                    continue;
+                }
+
+                let window = std::cmp::min(i + 30, nodes.len());
+
+                // Find Mul(scale, weight_scale) → combined_scale
+                let mul_scales = (i + 1..window).find(|&j| {
+                    nodes[j].op_type == "Mul" && nodes[j].input.iter().any(|inp| inp == s)
+                });
+                // Find MMI(quantized, ..., zero_point)
+                let mmi = (i + 1..window).find(|&j| {
+                    nodes[j].op_type == "MatMulInteger"
+                        && nodes[j].input.len() >= 3
+                        && nodes[j].input[0] == *q
+                        && nodes[j].input[2] == *z
+                });
+                let (mul_scales_idx, mmi_idx) = match (mul_scales, mmi) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => continue,
+                };
+
+                let mm_out = &nodes[mmi_idx].output[0];
+                let combined_scale = &nodes[mul_scales_idx].output[0];
+
+                // Find Cast(MMI.output)
+                let cast_idx = match (mmi_idx + 1..window)
+                    .find(|&j| nodes[j].op_type == "Cast" && nodes[j].input[0] == *mm_out)
+                {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let cast_out = &nodes[cast_idx].output[0];
+
+                // Find Mul(cast_out, combined_scale)
+                let mul_dq_idx = match (cast_idx + 1..window).find(|&j| {
+                    nodes[j].op_type == "Mul"
+                        && nodes[j].input.iter().any(|inp| inp == cast_out)
+                        && nodes[j].input.iter().any(|inp| inp == combined_scale)
+                }) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                let dequant = &nodes[mul_dq_idx].output[0];
+
+                // Find Add(bias, dequant)
+                let add_idx = match (mul_dq_idx + 1..window).find(|&j| {
+                    nodes[j].op_type == "Add" && nodes[j].input.iter().any(|inp| inp == dequant)
+                }) {
+                    Some(a) => a,
+                    None => continue,
+                };
+
+                let chain = [i, mul_scales_idx, mmi_idx, cast_idx, mul_dq_idx, add_idx];
+
+                // Safety: verify no interleaved node depends on any chain output
+                let chain_set: std::collections::HashSet<usize> = chain.iter().copied().collect();
+                let chain_outputs: std::collections::HashSet<&str> = chain
+                    .iter()
+                    .flat_map(|&idx| nodes[idx].output.iter().map(|s| s.as_str()))
+                    .collect();
+
+                let mut safe = true;
+                for j in i..=add_idx {
+                    if !chain_set.contains(&j)
+                        && nodes[j]
+                            .input
+                            .iter()
+                            .any(|inp| chain_outputs.contains(inp.as_str()))
+                    {
+                        safe = false;
+                        break;
+                    }
+                }
+                if safe {
+                    chains.push(chain);
+                    in_chain.extend(chain.iter());
+                }
+            }
+
+            if !chains.is_empty() {
+                let mut result: Vec<&NodeProto> = Vec::with_capacity(nodes.len());
+                let mut emitted = vec![false; nodes.len()];
+
+                for i in 0..nodes.len() {
+                    if emitted[i] {
+                        continue;
+                    }
+                    if let Some(chain) = chains.iter().find(|c| c[0] == i) {
+                        let chain_set: std::collections::HashSet<usize> =
+                            chain.iter().copied().collect();
+                        let chain_end = chain[5];
+                        // Emit non-chain nodes first (in original order)
+                        for j in i..=chain_end {
+                            if !chain_set.contains(&j) && !emitted[j] {
+                                result.push(nodes[j]);
+                                emitted[j] = true;
+                            }
+                        }
+                        // Emit chain nodes consecutively
+                        for &idx in chain {
+                            result.push(nodes[idx]);
+                            emitted[idx] = true;
+                        }
+                    } else {
+                        result.push(nodes[i]);
+                        emitted[i] = true;
+                    }
+                }
+                nodes = result;
+            }
+        }
+
         // Run Allocation/Liveness FIRST
         let output_names: Vec<String> = graph.output.iter().map(|o| o.name.clone()).collect();
-        // Warn: Allocation uses graph.node internally!
-        // We need to pass our reordered nodes to solve_allocation?
-        // solve_allocation takes &GraphProto.
-        // We can create a temporary GraphProto
+
         let mut temp_graph = graph.clone();
         temp_graph.node = nodes.iter().map(|&n| n.clone()).collect();
         let (allocator, analysis) = solve_allocation(&temp_graph, &output_names);
-        // Generate Body FIRST to determine used buffers
-        // We use generate_partitioned_graph instead of generate_graph_body to split the code
         let mut chunk_functions = Vec::new(); // Will hold the code for fn chunk_0(...) { ... }
         let mut body_buffer = Vec::new(); // Will hold the code for forward() body
         let mut current_id = 0;
@@ -903,13 +1026,23 @@ impl Compiler {
         writeln!(&mut code, "\npub struct {}<'a> {{", struct_name)?;
         writeln!(&mut code, "    data: &'a [u8],")?;
         writeln!(&mut code, "    _phantom: std::marker::PhantomData<&'a ()>,")?;
+        writeln!(&mut code, "    #[cfg(target_arch = \"aarch64\")]")?;
+        writeln!(
+            &mut code,
+            "    prepared_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::PreparedWeightsArm>>>,"
+        )?;
         writeln!(&mut code, "}}")?;
         writeln!(&mut code, "\nimpl<'a> {}<'a> {{", struct_name)?;
         writeln!(&mut code, "    pub fn new(data: &'a [u8]) -> Self {{")?;
+        writeln!(&mut code, "        Self {{")?;
+        writeln!(&mut code, "            data,")?;
+        writeln!(&mut code, "            _phantom: std::marker::PhantomData,")?;
+        writeln!(&mut code, "            #[cfg(target_arch = \"aarch64\")]")?;
         writeln!(
             &mut code,
-            "        Self {{ data, _phantom: std::marker::PhantomData }}"
+            "            prepared_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
         )?;
+        writeln!(&mut code, "        }}")?;
         writeln!(&mut code, "    }}")?;
         for method in &self.custom_methods {
             writeln!(&mut code, "{}", method)?;
@@ -918,6 +1051,41 @@ impl Compiler {
         for func in &chunk_functions {
             writeln!(&mut code, "{}", func)?;
         }
+
+        // ARM prepared weights helper
+        writeln!(&mut code, "    #[cfg(target_arch = \"aarch64\")]")?;
+        writeln!(
+            &mut code,
+            "    fn get_prepared_weight(&self, offset: usize, len: usize, k: usize, n: usize) -> std::sync::Arc<lele::kernels::PreparedWeightsArm> {{"
+        )?;
+        writeln!(&mut code, "        let key = (offset, len);")?;
+        writeln!(&mut code, "        {{")?;
+        writeln!(
+            &mut code,
+            "            let cache = self.prepared_weights_cache.borrow();"
+        )?;
+        writeln!(
+            &mut code,
+            "            if let Some(pw) = cache.get(&key) {{"
+        )?;
+        writeln!(&mut code, "                return pw.clone();")?;
+        writeln!(&mut code, "            }}")?;
+        writeln!(&mut code, "        }}")?;
+        writeln!(
+            &mut code,
+            "        let raw_bytes = &self.data[offset..offset+len];"
+        )?;
+        writeln!(
+            &mut code,
+            "        let pw = std::sync::Arc::new(lele::kernels::prepare_weights_arm(raw_bytes, k, n));"
+        )?;
+        writeln!(
+            &mut code,
+            "        self.prepared_weights_cache.borrow_mut().insert(key, pw.clone());"
+        )?;
+        writeln!(&mut code, "        pw")?;
+        writeln!(&mut code, "    }}")?;
+
         // Helpers for weights
         writeln!(
             &mut code,
@@ -1007,6 +1175,14 @@ impl Compiler {
             &mut code,
             "        TensorView::from_bytes_f16(&self.data[offset..offset+len], shape.to_vec())"
         )?;
+        writeln!(&mut code, "    }}")?;
+
+        // Raw byte accessors for prepared weights (no f32 conversion)
+        writeln!(
+            &mut code,
+            "    fn weight_u8_raw(&self, offset: usize, len: usize) -> &'a [u8] {{"
+        )?;
+        writeln!(&mut code, "        &self.data[offset..offset+len]")?;
         writeln!(&mut code, "    }}")?;
 
         // Inference Function

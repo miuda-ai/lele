@@ -6,6 +6,7 @@ members = [
     "examples/silero",
     "examples/supertonic",
     "examples/yolo26",
+    "examples/candle-benchmark",
     "examples/web-demo",
     "examples/web-demo/crates/sensevoice-wasm",
     "examples/web-demo/crates/yolo26-wasm",

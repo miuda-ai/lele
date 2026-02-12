@@ -227,6 +227,37 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 // Always allocate a new buffer for ReLU pattern since allocator doesn't know about patterns
                 writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, output_name)?;
                 let buf_expr = format!("&mut buf_{}", output_name);
+
+                // Check if we can use ARM prepared weights path
+                let weight_name = sanitize_name(&nodes[2].input[1]);
+                if let Some((o, l, sh, dt)) = weights.get(&weight_name) {
+                    if (*dt == 3 || *dt == 2) && sh.len() == 2 {
+                        let k = sh[0];
+                        let n = sh[1];
+                        writeln!(
+                            w,
+                            "{}#[cfg(target_arch = \"aarch64\")]",
+                            tab
+                        )?;
+                        writeln!(
+                            w,
+                            "{}let {} = self.linear_quantized_relu_arm(&{}, {}, {}, {}, {}, {}, {}, {}, {});",
+                            tab, output_name, input, *o, *l, k, n, weight_scale, weight_zero, bias, buf_expr
+                        )?;
+                        writeln!(
+                            w,
+                            "{}#[cfg(not(target_arch = \"aarch64\"))]",
+                            tab
+                        )?;
+                        writeln!(
+                            w,
+                            "{}let {} = self.linear_quantized_relu(&{}, {}, {}, {}, {}, {});",
+                            tab, output_name, input, weight_int8, weight_scale, weight_zero, bias, buf_expr
+                        )?;
+                        return Ok(());
+                    }
+                }
+
                 writeln!(
                     w,
                     "{}let {} = self.linear_quantized_relu(&{}, {}, {}, {}, {}, {});",
@@ -341,6 +372,38 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, output_name)?;
                     format!("&mut buf_{}", output_name)
                 };
+
+                // Check if we can use ARM prepared weights path
+                let weight_name = sanitize_name(&nodes[2].input[1]);
+                if let Some((o, l, sh, dt)) = weights.get(&weight_name) {
+                    if (*dt == 3 || *dt == 2) && sh.len() == 2 {
+                        // ARM-optimized path: use pre-packed weights
+                        let k = sh[0];
+                        let n = sh[1];
+                        writeln!(
+                            w,
+                            "{}#[cfg(target_arch = \"aarch64\")]",
+                            tab
+                        )?;
+                        writeln!(
+                            w,
+                            "{}let {} = self.linear_quantized_arm(&{}, {}, {}, {}, {}, {}, {}, {}, {});",
+                            tab, output_name, input, *o, *l, k, n, weight_scale, weight_zero, bias, buf_expr
+                        )?;
+                        writeln!(
+                            w,
+                            "{}#[cfg(not(target_arch = \"aarch64\"))]",
+                            tab
+                        )?;
+                        writeln!(
+                            w,
+                            "{}let {} = self.linear_quantized(&{}, {}, {}, {}, {}, {});",
+                            tab, output_name, input, weight_int8, weight_scale, weight_zero, bias, buf_expr
+                        )?;
+                        return Ok(());
+                    }
+                }
+
                 writeln!(
                     w,
                     "{}let {} = self.linear_quantized(&{}, {}, {}, {}, {}, {});",

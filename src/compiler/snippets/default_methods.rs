@@ -93,6 +93,85 @@ fn linear_quantized_relu<'c, 'd>(
     )
 }
 
+#[cfg(target_arch = "aarch64")]
+fn linear_quantized_arm<'c, 'd>(
+    &self,
+    input: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_k: usize,
+    weight_n: usize,
+    weight_scale: lele::tensor::TensorView<'c, f32>,
+    weight_zero: lele::tensor::TensorView<'c, f32>,
+    bias: lele::tensor::TensorView<'c, f32>,
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n);
+    let zp_b = weight_zero.data.first().map(|&v| v as u8);
+
+    lele::kernels::fused_dq_gemm_prepared_arm(
+        input,
+        &pw,
+        zp_b,
+        &weight_scale,
+        Some(&bias),
+        false,
+        output_buf,
+    )
+}
+
+/// ARM-optimized quantized linear + ReLU with pre-packed weights.
+/// Uses fused DynQuant+GEMM: eliminates f32 intermediate buffer, per-call u8
+/// allocation, and separate f32→u8 conversion pass.
+#[cfg(target_arch = "aarch64")]
+fn linear_quantized_relu_arm<'c, 'd>(
+    &self,
+    input: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_k: usize,
+    weight_n: usize,
+    weight_scale: lele::tensor::TensorView<'c, f32>,
+    weight_zero: lele::tensor::TensorView<'c, f32>,
+    bias: lele::tensor::TensorView<'c, f32>,
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n);
+    let zp_b = weight_zero.data.first().map(|&v| v as u8);
+
+    lele::kernels::fused_dq_gemm_prepared_arm(
+        input,
+        &pw,
+        zp_b,
+        &weight_scale,
+        Some(&bias),
+        true,
+        output_buf,
+    )
+}
+
+/// ARM-optimized MatMulInteger with pre-packed weight cache.
+/// Used for unfused MatMulInteger nodes where B is a static model weight.
+/// Eliminates: per-call B packing, B u8→f32→u8 roundtrip, heap alloc.
+#[cfg(target_arch = "aarch64")]
+fn mat_mul_integer_arm<'c, 'd>(
+    &self,
+    a: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_k: usize,
+    weight_n: usize,
+    a_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    b_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n);
+    let zp_a = a_zero_point.and_then(|z| z.data.first().cloned());
+    let zp_b = b_zero_point.and_then(|z| z.data.first()).map(|&v| v as u8);
+
+    lele::kernels::mat_mul_integer_prepared_arm(a, &pw, zp_a, zp_b, None, None, false, output_buf)
+}
+
 // Helper for pre-quantized inputs (used in attention where input is already quantized)
 #[inline]
 fn linear_quantized_prequant<'c, 'd>(
@@ -108,7 +187,7 @@ fn linear_quantized_prequant<'c, 'd>(
     scale_buf: &'d mut Vec<f32>,
 ) -> lele::tensor::TensorView<'d, f32> {
     let combined_scale = lele::kernels::mul(input_scale, &weight_scale, scale_buf);
-    
+
     // FUSED: MatMul + Scale + Bias in one operation
     lele::kernels::mat_mul_integer_with_scale_bias(
         input_quantized,
@@ -142,15 +221,15 @@ fn embedding_concat<'c, 'd>(
     // Then concatenate weight and the constant along axis 0
     let const_shape: Vec<usize> = shape.data.iter().map(|&x| x as usize).collect();
     let const_len: usize = const_shape.iter().product();
-    
+
     output_buf.clear();
     output_buf.reserve(weight.data.len() + const_len);
     output_buf.extend_from_slice(&weight.data);
     output_buf.resize(weight.data.len() + const_len, value);
-    
+
     let mut out_shape = weight.shape.to_vec();
     out_shape[0] += const_shape[0];
-    
+
     lele::tensor::TensorView {
         data: std::borrow::Cow::Borrowed(output_buf),
         shape: std::borrow::Cow::Owned(out_shape),
