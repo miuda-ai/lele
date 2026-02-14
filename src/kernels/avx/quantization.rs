@@ -12,6 +12,7 @@ use crate::tensor::TensorView;
 struct BWeightCacheEntry {
     k: usize,
     n: usize,
+    #[allow(dead_code)]
     k_padded: usize,
     // Content fingerprint: 4 elements sampled from the weight data.
     // Uniquely identifies a weight matrix regardless of pointer address.
@@ -63,7 +64,9 @@ unsafe fn b_cache_lookup_or_insert(
     // Create fresh entry
     let mut b_t = vec![0u8; n * k_padded];
     let mut col_sums = vec![0i32; n];
-    transpose_b_from_f32_avx2(b_f32, k, n, b_t.as_mut_ptr(), k_padded, col_sums.as_mut_ptr());
+    unsafe {
+        transpose_b_from_f32_avx2(b_f32, k, n, b_t.as_mut_ptr(), k_padded, col_sums.as_mut_ptr());
+    }
     b_cache.push(BWeightCacheEntry { k, n, k_padded, fp0, fp1, fp2, fp3, b_t, col_sums });
     b_cache.len() - 1
 }
@@ -1560,8 +1563,10 @@ pub unsafe fn row_sum_u8_avx2(a_row: &[u8]) -> i32 {
     let mut sad_acc = _mm256_setzero_si256();
     let mut kk = 0;
     while kk + 32 <= k {
-        let va = _mm256_loadu_si256(a_row.as_ptr().add(kk) as *const __m256i);
-        sad_acc = _mm256_add_epi64(sad_acc, _mm256_sad_epu8(va, zero_vec));
+        unsafe {
+            let va = _mm256_loadu_si256(a_row.as_ptr().add(kk) as *const __m256i);
+            sad_acc = _mm256_add_epi64(sad_acc, _mm256_sad_epu8(va, zero_vec));
+        }
         kk += 32;
     }
     let hi = _mm256_extracti128_si256(sad_acc, 1);

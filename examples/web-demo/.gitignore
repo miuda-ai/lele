@@ -1,4 +1,4 @@
-./onnx/
+onnx/*.json
 ./web/models/
 ./web/pkg/
 gen/

@@ -727,9 +727,6 @@ where
     }
 
     // General broadcast: use coordinate-based indexing (slowest path)
-    let cond_strides = utils::compute_strides(&condition.shape);
-    let x_strides = utils::compute_strides(&x.shape);
-    let y_strides = utils::compute_strides(&y.shape);
 
     let mk_strides = |shape: &[usize]| -> Vec<usize> {
         let mut strides = vec![0; dims];

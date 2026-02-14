@@ -231,6 +231,7 @@ pub fn prepare_weights(b_data: &[u8], k: usize, n: usize) -> PreparedWeights {
     }
 }
 
+#[allow(dead_code)]
 fn prepare_weights_scalar(b_data: &[u8], k: usize, n: usize, k_padded: usize) -> PreparedWeights {
     let mut b_t = vec![0u8; n * k_padded];
     let mut col_sums_b_u8 = vec![0i32; n];
@@ -271,37 +272,41 @@ unsafe fn prepare_weights_avx2(
     // Allocate output. Only zero the padding region (k..k_padded) per row later.
     let total = n * k_padded;
     let mut b_t = Vec::<u8>::with_capacity(total);
-    b_t.set_len(total);
+    unsafe { b_t.set_len(total) };
     let mut col_sums_b_u8 = vec![0i32; n];
 
     // --- Pass 1: column sums (row-sequential reads, AVX2 u8→i32 accumulation) ---
     let sums = col_sums_b_u8.as_mut_ptr();
     for kk in 0..k {
-        let row = b_data.as_ptr().add(kk * n);
+        let row = unsafe { b_data.as_ptr().add(kk * n) };
         let mut jj = 0usize;
         while jj + 32 <= n {
-            let v = _mm256_loadu_si256(row.add(jj) as *const __m256i);
-            let lo_128 = _mm256_castsi256_si128(v);
-            let hi_128 = _mm256_extracti128_si256(v, 1);
+            unsafe {
+                let v = _mm256_loadu_si256(row.add(jj) as *const __m256i);
+                let lo_128 = _mm256_castsi256_si128(v);
+                let hi_128 = _mm256_extracti128_si256(v, 1);
 
-            let s0 = _mm256_cvtepu8_epi32(lo_128);
-            let s1 = _mm256_cvtepu8_epi32(_mm_srli_si128(lo_128, 8));
-            let s2 = _mm256_cvtepu8_epi32(hi_128);
-            let s3 = _mm256_cvtepu8_epi32(_mm_srli_si128(hi_128, 8));
+                let s0 = _mm256_cvtepu8_epi32(lo_128);
+                let s1 = _mm256_cvtepu8_epi32(_mm_srli_si128(lo_128, 8));
+                let s2 = _mm256_cvtepu8_epi32(hi_128);
+                let s3 = _mm256_cvtepu8_epi32(_mm_srli_si128(hi_128, 8));
 
-            let a0 = _mm256_loadu_si256(sums.add(jj) as *const __m256i);
-            let a1 = _mm256_loadu_si256(sums.add(jj + 8) as *const __m256i);
-            let a2 = _mm256_loadu_si256(sums.add(jj + 16) as *const __m256i);
-            let a3 = _mm256_loadu_si256(sums.add(jj + 24) as *const __m256i);
+                let a0 = _mm256_loadu_si256(sums.add(jj) as *const __m256i);
+                let a1 = _mm256_loadu_si256(sums.add(jj + 8) as *const __m256i);
+                let a2 = _mm256_loadu_si256(sums.add(jj + 16) as *const __m256i);
+                let a3 = _mm256_loadu_si256(sums.add(jj + 24) as *const __m256i);
 
-            _mm256_storeu_si256(sums.add(jj) as *mut __m256i, _mm256_add_epi32(a0, s0));
-            _mm256_storeu_si256(sums.add(jj + 8) as *mut __m256i, _mm256_add_epi32(a1, s1));
-            _mm256_storeu_si256(sums.add(jj + 16) as *mut __m256i, _mm256_add_epi32(a2, s2));
-            _mm256_storeu_si256(sums.add(jj + 24) as *mut __m256i, _mm256_add_epi32(a3, s3));
+                _mm256_storeu_si256(sums.add(jj) as *mut __m256i, _mm256_add_epi32(a0, s0));
+                _mm256_storeu_si256(sums.add(jj + 8) as *mut __m256i, _mm256_add_epi32(a1, s1));
+                _mm256_storeu_si256(sums.add(jj + 16) as *mut __m256i, _mm256_add_epi32(a2, s2));
+                _mm256_storeu_si256(sums.add(jj + 24) as *mut __m256i, _mm256_add_epi32(a3, s3));
+            }
             jj += 32;
         }
         while jj < n {
-            *sums.add(jj) += *row.add(jj) as i32;
+            unsafe {
+                *sums.add(jj) += *row.add(jj) as i32;
+            }
             jj += 1;
         }
     }
@@ -315,81 +320,83 @@ unsafe fn prepare_weights_avx2(
     // Input: src_ptrs[0..8] point to the 8 bytes in each row
     // Output: dst_ptrs[0..8] point to where each transposed column goes
     macro_rules! transpose_8x8_xor {
-        ($src:expr, $src_stride:expr, $dst:expr, $dst_stride:expr) => {{
-            // Load 8 rows of 8 bytes each into the low 64 bits of __m128i
-            let r0 = _mm_xor_si128(
-                _mm_loadl_epi64($src.add(0 * $src_stride) as *const __m128i),
-                xor_mask_128,
-            );
-            let r1 = _mm_xor_si128(
-                _mm_loadl_epi64($src.add(1 * $src_stride) as *const __m128i),
-                xor_mask_128,
-            );
-            let r2 = _mm_xor_si128(
-                _mm_loadl_epi64($src.add(2 * $src_stride) as *const __m128i),
-                xor_mask_128,
-            );
-            let r3 = _mm_xor_si128(
-                _mm_loadl_epi64($src.add(3 * $src_stride) as *const __m128i),
-                xor_mask_128,
-            );
-            let r4 = _mm_xor_si128(
-                _mm_loadl_epi64($src.add(4 * $src_stride) as *const __m128i),
-                xor_mask_128,
-            );
-            let r5 = _mm_xor_si128(
-                _mm_loadl_epi64($src.add(5 * $src_stride) as *const __m128i),
-                xor_mask_128,
-            );
-            let r6 = _mm_xor_si128(
-                _mm_loadl_epi64($src.add(6 * $src_stride) as *const __m128i),
-                xor_mask_128,
-            );
-            let r7 = _mm_xor_si128(
-                _mm_loadl_epi64($src.add(7 * $src_stride) as *const __m128i),
-                xor_mask_128,
-            );
+        ($src:expr, $src_stride:expr, $dst:expr, $dst_stride:expr) => {
+            unsafe {
+                // Load 8 rows of 8 bytes each into the low 64 bits of __m128i
+                let r0 = _mm_xor_si128(
+                    _mm_loadl_epi64($src.add(0 * $src_stride) as *const __m128i),
+                    xor_mask_128,
+                );
+                let r1 = _mm_xor_si128(
+                    _mm_loadl_epi64($src.add(1 * $src_stride) as *const __m128i),
+                    xor_mask_128,
+                );
+                let r2 = _mm_xor_si128(
+                    _mm_loadl_epi64($src.add(2 * $src_stride) as *const __m128i),
+                    xor_mask_128,
+                );
+                let r3 = _mm_xor_si128(
+                    _mm_loadl_epi64($src.add(3 * $src_stride) as *const __m128i),
+                    xor_mask_128,
+                );
+                let r4 = _mm_xor_si128(
+                    _mm_loadl_epi64($src.add(4 * $src_stride) as *const __m128i),
+                    xor_mask_128,
+                );
+                let r5 = _mm_xor_si128(
+                    _mm_loadl_epi64($src.add(5 * $src_stride) as *const __m128i),
+                    xor_mask_128,
+                );
+                let r6 = _mm_xor_si128(
+                    _mm_loadl_epi64($src.add(6 * $src_stride) as *const __m128i),
+                    xor_mask_128,
+                );
+                let r7 = _mm_xor_si128(
+                    _mm_loadl_epi64($src.add(7 * $src_stride) as *const __m128i),
+                    xor_mask_128,
+                );
 
-            // Step 1: interleave bytes (8-bit)
-            let t0 = _mm_unpacklo_epi8(r0, r1); // [a00 a10 a01 a11 ... a07 a17]
-            let t2 = _mm_unpacklo_epi8(r2, r3);
-            let t4 = _mm_unpacklo_epi8(r4, r5);
-            let t6 = _mm_unpacklo_epi8(r6, r7);
+                // Step 1: interleave bytes (8-bit)
+                let t0 = _mm_unpacklo_epi8(r0, r1); // [a00 a10 a01 a11 ... a07 a17]
+                let t2 = _mm_unpacklo_epi8(r2, r3);
+                let t4 = _mm_unpacklo_epi8(r4, r5);
+                let t6 = _mm_unpacklo_epi8(r6, r7);
 
-            // Step 2: interleave 16-bit words
-            let u0 = _mm_unpacklo_epi16(t0, t2); // [a00 a10 a20 a30 a01 a11 a21 a31 | ...]
-            let u1 = _mm_unpackhi_epi16(t0, t2);
-            let u4 = _mm_unpacklo_epi16(t4, t6);
-            let u5 = _mm_unpackhi_epi16(t4, t6);
+                // Step 2: interleave 16-bit words
+                let u0 = _mm_unpacklo_epi16(t0, t2); // [a00 a10 a20 a30 a01 a11 a21 a31 | ...]
+                let u1 = _mm_unpackhi_epi16(t0, t2);
+                let u4 = _mm_unpacklo_epi16(t4, t6);
+                let u5 = _mm_unpackhi_epi16(t4, t6);
 
-            // Step 3: interleave 32-bit dwords → each result has 2 transposed columns
-            let c01 = _mm_unpacklo_epi32(u0, u4); // col0 (low 64) | col1 (high 64)
-            let c23 = _mm_unpackhi_epi32(u0, u4);
-            let c45 = _mm_unpacklo_epi32(u1, u5);
-            let c67 = _mm_unpackhi_epi32(u1, u5);
+                // Step 3: interleave 32-bit dwords → each result has 2 transposed columns
+                let c01 = _mm_unpacklo_epi32(u0, u4); // col0 (low 64) | col1 (high 64)
+                let c23 = _mm_unpackhi_epi32(u0, u4);
+                let c45 = _mm_unpacklo_epi32(u1, u5);
+                let c67 = _mm_unpackhi_epi32(u1, u5);
 
-            // Store: each transposed column is 8 consecutive bytes in the output
-            _mm_storel_epi64($dst.add(0 * $dst_stride) as *mut __m128i, c01);
-            _mm_storel_epi64(
-                $dst.add(1 * $dst_stride) as *mut __m128i,
-                _mm_srli_si128(c01, 8),
-            );
-            _mm_storel_epi64($dst.add(2 * $dst_stride) as *mut __m128i, c23);
-            _mm_storel_epi64(
-                $dst.add(3 * $dst_stride) as *mut __m128i,
-                _mm_srli_si128(c23, 8),
-            );
-            _mm_storel_epi64($dst.add(4 * $dst_stride) as *mut __m128i, c45);
-            _mm_storel_epi64(
-                $dst.add(5 * $dst_stride) as *mut __m128i,
-                _mm_srli_si128(c45, 8),
-            );
-            _mm_storel_epi64($dst.add(6 * $dst_stride) as *mut __m128i, c67);
-            _mm_storel_epi64(
-                $dst.add(7 * $dst_stride) as *mut __m128i,
-                _mm_srli_si128(c67, 8),
-            );
-        }};
+                // Store: each transposed column is 8 consecutive bytes in the output
+                _mm_storel_epi64($dst.add(0 * $dst_stride) as *mut __m128i, c01);
+                _mm_storel_epi64(
+                    $dst.add(1 * $dst_stride) as *mut __m128i,
+                    _mm_srli_si128(c01, 8),
+                );
+                _mm_storel_epi64($dst.add(2 * $dst_stride) as *mut __m128i, c23);
+                _mm_storel_epi64(
+                    $dst.add(3 * $dst_stride) as *mut __m128i,
+                    _mm_srli_si128(c23, 8),
+                );
+                _mm_storel_epi64($dst.add(4 * $dst_stride) as *mut __m128i, c45);
+                _mm_storel_epi64(
+                    $dst.add(5 * $dst_stride) as *mut __m128i,
+                    _mm_srli_si128(c45, 8),
+                );
+                _mm_storel_epi64($dst.add(6 * $dst_stride) as *mut __m128i, c67);
+                _mm_storel_epi64(
+                    $dst.add(7 * $dst_stride) as *mut __m128i,
+                    _mm_srli_si128(c67, 8),
+                );
+            }
+        }
     }
 
     // Process 8×8 blocks
@@ -398,22 +405,26 @@ unsafe fn prepare_weights_avx2(
 
     for kk_base in (0..k8).step_by(8) {
         for jj_base in (0..n8).step_by(8) {
-            let src = b_data.as_ptr().add(kk_base * n + jj_base);
-            let dst = b_t_ptr.add(jj_base * k_padded + kk_base);
+            let src = unsafe { b_data.as_ptr().add(kk_base * n + jj_base) };
+            let dst = unsafe { b_t_ptr.add(jj_base * k_padded + kk_base) };
             transpose_8x8_xor!(src, n, dst, k_padded);
         }
         // Remainder N columns (< 8)
         for jj in n8..n {
             for dk in 0..8usize {
                 let kk = kk_base + dk;
-                *b_t_ptr.add(jj * k_padded + kk) = *b_data.as_ptr().add(kk * n + jj) ^ 0x80;
+                unsafe {
+                    *b_t_ptr.add(jj * k_padded + kk) = *b_data.as_ptr().add(kk * n + jj) ^ 0x80;
+                }
             }
         }
     }
     // Remainder K rows (< 8)
     for kk in k8..k {
         for jj in 0..n {
-            *b_t_ptr.add(jj * k_padded + kk) = *b_data.as_ptr().add(kk * n + jj) ^ 0x80;
+            unsafe {
+                *b_t_ptr.add(jj * k_padded + kk) = *b_data.as_ptr().add(kk * n + jj) ^ 0x80;
+            }
         }
     }
 
@@ -421,7 +432,9 @@ unsafe fn prepare_weights_avx2(
     if k_padded > k {
         let pad = k_padded - k;
         for jj in 0..n {
-            std::ptr::write_bytes(b_t_ptr.add(jj * k_padded + k), 0, pad);
+            unsafe {
+                std::ptr::write_bytes(b_t_ptr.add(jj * k_padded + k), 0, pad);
+            }
         }
     }
 
@@ -626,13 +639,13 @@ pub fn fused_dq_gemm_prepared_x86<'a>(
                                 corr_128_minus_zpb,
                                 scale_data_ptr.map(|p| {
                                     if scale_len == 1 {
-                                        unsafe { p }
+                                        p
                                     } else {
-                                        unsafe { p.add(n_start) }
+                                        p.add(n_start)
                                     }
                                 }),
                                 scale_len,
-                                bias_data_ptr.map(|p| unsafe { p.add(n_start) }),
+                                bias_data_ptr.map(|p| p.add(n_start)),
                                 apply_relu,
                                 row_sums[i],
                                 row_sums[i + 1],
@@ -659,13 +672,13 @@ pub fn fused_dq_gemm_prepared_x86<'a>(
                                 corr_128_minus_zpb,
                                 scale_data_ptr.map(|p| {
                                     if scale_len == 1 {
-                                        unsafe { p }
+                                        p
                                     } else {
-                                        unsafe { p.add(n_start) }
+                                        p.add(n_start)
                                     }
                                 }),
                                 scale_len,
-                                bias_data_ptr.map(|p| unsafe { p.add(n_start) }),
+                                bias_data_ptr.map(|p| p.add(n_start)),
                                 apply_relu,
                                 &mut out_batch[i * n + n_start..i * n + n_end],
                             );

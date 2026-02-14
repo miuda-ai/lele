@@ -51,7 +51,11 @@ fn test_layernorm_accuracy() {
     // Verify against manually computed expected values
     // For input [0,1,2,...,9], mean=4.5, var=8.25, inv_std=1/sqrt(8.25+1e-5)
     let mean: f32 = input_data.iter().sum::<f32>() / norm_size as f32;
-    let var: f32 = input_data.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / norm_size as f32;
+    let var: f32 = input_data
+        .iter()
+        .map(|x| (x - mean) * (x - mean))
+        .sum::<f32>()
+        / norm_size as f32;
     let inv_std = 1.0 / (var + 1e-5f32).sqrt();
 
     for i in 0..norm_size {
