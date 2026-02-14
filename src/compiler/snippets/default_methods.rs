@@ -42,24 +42,8 @@ fn linear_quantized<'c, 'd>(
     bias: lele::tensor::TensorView<'c, f32>,
     output_buf: &'d mut Vec<f32>,
 ) -> lele::tensor::TensorView<'d, f32> {
-    let mut buf_q = Vec::<f32>::new();
-    let mut buf_s = Vec::<f32>::new();
-    let mut buf_z = Vec::<f32>::new();
-    let (q, s, z) =
-        lele::kernels::dynamic_quantize_linear(input, &mut buf_q, &mut buf_s, &mut buf_z);
-
-    let mut buf_sm = Vec::<f32>::new();
-    let combined_scale = lele::kernels::mul(&s, &weight_scale, &mut buf_sm);
-
-    // FUSED: MatMul + Scale + Bias in one operation
-    lele::kernels::mat_mul_integer_with_scale_bias(
-        &q,
-        &weight_int8,
-        Some(&z),
-        Some(&weight_zero),
-        Some(&combined_scale),
-        Some(&bias),
-        output_buf,
+    lele::kernels::fused_quantized_linear(
+        input, &weight_int8, &weight_scale, &weight_zero, &bias, false, output_buf,
     )
 }
 
@@ -72,24 +56,8 @@ fn linear_quantized_relu<'c, 'd>(
     bias: lele::tensor::TensorView<'c, f32>,
     output_buf: &'d mut Vec<f32>,
 ) -> lele::tensor::TensorView<'d, f32> {
-    let mut buf_q = Vec::<f32>::new();
-    let mut buf_s = Vec::<f32>::new();
-    let mut buf_z = Vec::<f32>::new();
-    let (q, s, z) =
-        lele::kernels::dynamic_quantize_linear(input, &mut buf_q, &mut buf_s, &mut buf_z);
-
-    let mut buf_sm = Vec::<f32>::new();
-    let combined_scale = lele::kernels::mul(&s, &weight_scale, &mut buf_sm);
-
-    // FUSED: MatMul + Scale + Bias + ReLU in one operation
-    lele::kernels::mat_mul_integer_with_scale_bias_relu(
-        &q,
-        &weight_int8,
-        Some(&z),
-        Some(&weight_zero),
-        Some(&combined_scale),
-        Some(&bias),
-        output_buf,
+    lele::kernels::fused_quantized_linear(
+        input, &weight_int8, &weight_scale, &weight_zero, &bias, true, output_buf,
     )
 }
 

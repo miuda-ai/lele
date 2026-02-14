@@ -131,8 +131,8 @@ impl<'a> TensorView<'a, f32> {
     pub fn from_bytes_f32(bytes: &'a [u8], shape: &'a [usize]) -> Self {
         // Ensure 4-byte alignment for f32
         if bytes.as_ptr() as usize % 4 == 0 {
-            let f32_slice = unsafe { 
-                std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4) 
+            let f32_slice = unsafe {
+                std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4)
             };
             TensorView::new(f32_slice, shape)
         } else {
@@ -148,14 +148,40 @@ impl<'a> TensorView<'a, f32> {
 
     /// Create a TensorView<f32> from u8 byte slice (cast each byte to f32)
     pub fn from_bytes_u8(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, f32> {
-        let f32_vec: Vec<f32> = bytes.iter().map(|&x| x as f32).collect();
-        TensorView::from_owned(f32_vec, shape)
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        thread_local! {
+            static CACHE: RefCell<HashMap<usize, Vec<f32>>> = RefCell::new(HashMap::new());
+        }
+        CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let key = bytes.as_ptr() as usize;
+            let vec = cache
+                .entry(key)
+                .or_insert_with(|| bytes.iter().map(|&x| x as f32).collect());
+            let data: &'static [f32] =
+                unsafe { std::slice::from_raw_parts(vec.as_ptr(), vec.len()) };
+            TensorView::from_slice(data, shape)
+        })
     }
 
     /// Create a TensorView<f32> from i8 byte slice (cast each byte to i8 then f32)
     pub fn from_bytes_i8(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, f32> {
-        let f32_vec: Vec<f32> = bytes.iter().map(|&x| x as i8 as f32).collect();
-        TensorView::from_owned(f32_vec, shape)
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        thread_local! {
+            static CACHE: RefCell<HashMap<usize, Vec<f32>>> = RefCell::new(HashMap::new());
+        }
+        CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let key = bytes.as_ptr() as usize;
+            let vec = cache
+                .entry(key)
+                .or_insert_with(|| bytes.iter().map(|&x| x as i8 as f32).collect());
+            let data: &'static [f32] =
+                unsafe { std::slice::from_raw_parts(vec.as_ptr(), vec.len()) };
+            TensorView::from_slice(data, shape)
+        })
     }
 
     /// Create a TensorView<f32> from f16 byte slice
@@ -173,7 +199,9 @@ impl<'a> TensorView<'a, f32> {
     pub fn from_bytes_i64_as_f32(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, f32> {
         let mut i64_vec = Vec::with_capacity(bytes.len() / 8);
         for chunk in bytes.chunks_exact(8) {
-            let bytes_arr: [u8; 8] = [chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7]];
+            let bytes_arr: [u8; 8] = [
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ];
             i64_vec.push(i64::from_le_bytes(bytes_arr));
         }
         let f32_vec: Vec<f32> = i64_vec.iter().map(|&x| x as f32).collect();
@@ -197,7 +225,9 @@ impl<'a> TensorView<'a, i64> {
     pub fn from_bytes_i64(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, i64> {
         let mut i64_vec = Vec::with_capacity(bytes.len() / 8);
         for chunk in bytes.chunks_exact(8) {
-            let bytes_arr: [u8; 8] = [chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7]];
+            let bytes_arr: [u8; 8] = [
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ];
             i64_vec.push(i64::from_le_bytes(bytes_arr));
         }
         TensorView::from_owned(i64_vec, shape)

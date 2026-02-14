@@ -1051,6 +1051,256 @@ fn benchmark_erf() -> Result<()> {
     Ok(())
 }
 
+fn benchmark_int8_gemm() -> Result<()> {
+    println!("\n\n=== Int8 Quantized GEMM (SenseVoice workload) ===");
+
+    // SenseVoice actual GEMM shapes: M=93 (seq_len after feature extraction)
+    let test_cases: Vec<(usize, usize, usize, usize, bool, &str)> = vec![
+        (93, 512, 512, 69, false, "Attn Out Proj (93×512×512) ×69"),
+        (93, 512, 2048, 69, true, "FFN Up+ReLU (93×512×2048) ×69"),
+        (93, 2048, 512, 68, false, "FFN Down (93×2048×512) ×68"),
+        (93, 512, 1536, 67, false, "Attn QKV (93×512×1536) ×67"),
+        (93, 512, 25055, 1, false, "Final Logits (93×512×25055) ×1"),
+    ];
+
+    let warmup = 5;
+    let iterations = 20;
+
+    // Also compute total estimated time for all calls combined
+    let mut total_time_all_calls = 0.0f64;
+
+    for (m, k, n, num_calls, apply_relu, name) in &test_cases {
+        let m = *m;
+        let k = *k;
+        let n = *n;
+        let num_calls = *num_calls;
+        let apply_relu = *apply_relu;
+        println!("\n{}", name);
+
+        // Generate random-ish u8 weights [K, N] and f32 input [M, K]
+        let b_u8: Vec<u8> = (0..k * n).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+        let a_f32: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) / (m * k) as f32) * 2.0 - 1.0)
+            .collect();
+        let weight_scale: Vec<f32> = (0..n)
+            .map(|i| 0.01 + (i as f32) * 0.0001)
+            .collect();
+        let bias_data: Vec<f32> = vec![0.1; n];
+
+        let a_shape = vec![m, k];
+        let ws_shape = vec![n];
+        let bias_shape = vec![n];
+
+        let a_view = lele::tensor::TensorView::new(&a_f32, &a_shape);
+        let ws_view = lele::tensor::TensorView::new(&weight_scale, &ws_shape);
+        let bias_view = lele::tensor::TensorView::new(&bias_data, &bias_shape);
+
+        // Prepare weights (one-time cost, cached in real model)
+        let pw = lele::kernels::quantization::prepare_weights(&b_u8, k, n);
+
+        // Warmup
+        for _ in 0..warmup {
+            let mut out = Vec::new();
+            let _ = lele::kernels::quantization::fused_dq_gemm_prepared_x86(
+                &a_view,
+                &pw,
+                Some(128),
+                &ws_view,
+                Some(&bias_view),
+                apply_relu,
+                &mut out,
+            );
+        }
+
+        // Benchmark single call
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let mut out = Vec::new();
+            let _ = lele::kernels::quantization::fused_dq_gemm_prepared_x86(
+                &a_view,
+                &pw,
+                Some(128),
+                &ws_view,
+                Some(&bias_view),
+                apply_relu,
+                &mut out,
+            );
+        }
+        let single_time = start.elapsed().as_secs_f64() / iterations as f64;
+
+        let total_for_calls = single_time * num_calls as f64;
+        total_time_all_calls += total_for_calls;
+
+        // Integer ops: M * K * N * 2 (multiply + accumulate)
+        let ops = 2.0 * m as f64 * k as f64 * n as f64;
+        let gops = ops / single_time / 1e9;
+        println!("  Single call: {:.3} ms", single_time * 1000.0);
+        println!(
+            "  All {} calls: {:.3} ms",
+            num_calls,
+            total_for_calls * 1000.0
+        );
+        println!("  Int8 GOPS:   {:.2}", gops);
+    }
+
+    println!("\n  ──────────────────────────────────────");
+    println!(
+        "  TOTAL estimated int8 GEMM time: {:.1} ms (out of ~570ms inference)",
+        total_time_all_calls * 1000.0
+    );
+    println!(
+        "  Target (ORT-level): ~{:.0} ms",
+        total_time_all_calls * 1000.0 * 272.0 / 570.0
+    );
+
+    Ok(())
+}
+
+fn benchmark_dynamic_quantize() -> Result<()> {
+    println!("\n\n=== Dynamic Quantize Linear (f32 → u8) ===");
+
+    // SenseVoice: input is [93, K] where K ∈ {512, 560, 2048}
+    let test_cases = vec![
+        (93 * 512, "SenseVoice (93×512 = 47.6K)"),
+        (93 * 2048, "SenseVoice FFN (93×2048 = 190.5K)"),
+        (256 * 1024, "Large (256×1024 = 256K)"),
+    ];
+
+    let warmup = 10;
+    let iterations = 100;
+
+    for (size, name) in test_cases {
+        println!("\n{}", name);
+
+        let data: Vec<f32> = (0..size)
+            .map(|i| ((i as f32) / size as f32) * 4.0 - 2.0)
+            .collect();
+        let shape = vec![size];
+        let input = lele::tensor::TensorView::new(&data, &shape);
+
+        let mut out_y = Vec::new();
+        let mut out_s = Vec::new();
+        let mut out_z = Vec::new();
+
+        // Warmup
+        for _ in 0..warmup {
+            out_y.clear();
+            out_s.clear();
+            out_z.clear();
+            let _ = lele::kernels::quantization::dynamic_quantize_linear(
+                &input, &mut out_y, &mut out_s, &mut out_z,
+            );
+        }
+
+        // Benchmark
+        let start = Instant::now();
+        for _ in 0..iterations {
+            out_y.clear();
+            out_s.clear();
+            out_z.clear();
+            let _ = lele::kernels::quantization::dynamic_quantize_linear(
+                &input, &mut out_y, &mut out_s, &mut out_z,
+            );
+        }
+        let time = start.elapsed().as_secs_f64() / iterations as f64;
+
+        let bytes = size as f64 * 4.0 + size as f64; // read f32 + write u8(as f32)
+        let gbps = bytes / time / 1e9;
+        println!("  Time: {:.3} ms ({:.1} µs)", time * 1000.0, time * 1e6);
+        println!("  Throughput: {:.2} GB/s", gbps);
+    }
+
+    Ok(())
+}
+
+fn benchmark_transpose() -> Result<()> {
+    println!("\n\n=== Transpose (heavily used in attention) ===");
+
+    // SenseVoice attention: lots of transposes with various shapes
+    let test_cases = vec![
+        (vec![1, 93, 8, 64], vec![0, 2, 1, 3], "Attn reshape (1,93,8,64)→(1,8,93,64)"),
+        (vec![1, 8, 93, 64], vec![0, 1, 3, 2], "Attn K^T (1,8,93,64)→(1,8,64,93)"),
+        (vec![1, 8, 93, 93], vec![0, 2, 1, 3], "Attn out (1,8,93,93)→(1,93,8,93)"),
+        (vec![93, 512], vec![1, 0], "2D transpose (93,512)→(512,93)"),
+        (vec![93, 1536], vec![1, 0], "2D transpose (93,1536)→(1536,93)"),
+    ];
+
+    let warmup = 10;
+    let iterations = 100;
+
+    for (shape, perm, name) in &test_cases {
+        println!("\n{}", name);
+
+        let size: usize = shape.iter().product();
+        let data: Vec<f32> = (0..size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
+
+        let input = lele::tensor::TensorView::new(&data, shape);
+
+        // Warmup
+        for _ in 0..warmup {
+            let mut out = Vec::new();
+            let _ = lele::kernels::manipulation::transpose(&input, perm, &mut out);
+        }
+
+        // Benchmark
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let mut out = Vec::new();
+            let _ = lele::kernels::manipulation::transpose(&input, perm, &mut out);
+        }
+        let time = start.elapsed().as_secs_f64() / iterations as f64;
+
+        let bytes = size as f64 * 4.0 * 2.0; // read + write
+        let gbps = bytes / time / 1e9;
+        println!("  Time: {:.3} ms ({:.1} µs)", time * 1000.0, time * 1e6);
+        println!("  Throughput: {:.2} GB/s", gbps);
+    }
+
+    Ok(())
+}
+
+fn benchmark_prepare_weights() -> Result<()> {
+    println!("\n\n=== Prepare Weights (one-time weight packing) ===");
+
+    let test_cases = vec![
+        (512, 512, "K=512×N=512"),
+        (512, 1536, "K=512×N=1536"),
+        (512, 2048, "K=512×N=2048"),
+        (2048, 512, "K=2048×N=512"),
+        (512, 25055, "K=512×N=25055 (logits)"),
+    ];
+
+    let warmup = 5;
+    let iterations = 50;
+
+    for (k, n, name) in test_cases {
+        println!("\n{}", name);
+
+        let b_u8: Vec<u8> = (0..k * n).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+
+        // Warmup
+        for _ in 0..warmup {
+            let _ = lele::kernels::quantization::prepare_weights(&b_u8, k, n);
+        }
+
+        // Benchmark
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = lele::kernels::quantization::prepare_weights(&b_u8, k, n);
+        }
+        let time = start.elapsed().as_secs_f64() / iterations as f64;
+
+        let bytes = (k * n) as f64 * 2.0; // read + write
+        let gbps = bytes / time / 1e9;
+        println!("  Time: {:.3} ms ({:.1} µs)", time * 1000.0, time * 1e6);
+        println!("  Throughput: {:.2} GB/s", gbps);
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║          Lele vs Candle Performance Benchmark               ║");
@@ -1061,11 +1311,17 @@ fn main() -> Result<()> {
     #[cfg(target_arch = "x86_64")]
     println!("\nPlatform: x86_64");
 
+    // === SenseVoice critical path benchmarks ===
+    benchmark_int8_gemm()?;
+    benchmark_dynamic_quantize()?;
+    benchmark_prepare_weights()?;
+    benchmark_transpose()?;
+
+    // === General operator benchmarks ===
     benchmark_matmul()?;
     benchmark_mul()?;
     benchmark_silu()?;
     benchmark_softmax()?;
-    // benchmark_conv1d()?;  // Skipped: Candle's conv1d has capacity issues
     benchmark_layer_norm()?;
     benchmark_erf()?;
     // benchmark_conv1d()?;  // Skipped: Candle's conv1d has capacity issues

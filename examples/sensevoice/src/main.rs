@@ -140,10 +140,21 @@ fn main() {
     let start = Instant::now();
 
     let output = model
-        .forward(speech, speech_lengths, language, text_norm)
+        .forward(speech.clone(), speech_lengths.clone(), language.clone(), text_norm.clone())
         .into_logits();
 
     let elapsed = start.elapsed();
+    println!(
+        "✓ Inference (cold, includes weight prep): {:.2}ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
+
+    // Warm run — all weights cached
+    let start2 = Instant::now();
+    let output = model
+        .forward(speech, speech_lengths, language, text_norm)
+        .into_logits();
+    let elapsed = start2.elapsed();
     let e2e_elapsed = e2e_start.elapsed();
 
     let audio_duration_sec = audio.len() as f64 / sample_rate as f64;

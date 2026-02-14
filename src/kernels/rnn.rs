@@ -23,38 +23,23 @@ unsafe fn lstm_gates_avx2(
     unsafe {
         let mut k = 0;
         while k + 8 <= hidden_size {
-            // Compute sigmoid/tanh using exact scalar math to avoid
-            // recurrent error accumulation, then load results via SIMD
-            // for the gate arithmetic.
-            let mut i_buf = [0.0f32; 8];
-            let mut o_buf = [0.0f32; 8];
-            let mut f_buf = [0.0f32; 8];
-            let mut c_buf = [0.0f32; 8];
+            // Load gate values directly and compute sigmoid/tanh with AVX2 SIMD
+            let i_raw = _mm256_loadu_ps(gates.as_ptr().add(k));
+            let o_raw = _mm256_loadu_ps(gates.as_ptr().add(hidden_size + k));
+            let f_raw = _mm256_loadu_ps(gates.as_ptr().add(2 * hidden_size + k));
+            let c_raw = _mm256_loadu_ps(gates.as_ptr().add(3 * hidden_size + k));
 
-            for j in 0..8 {
-                i_buf[j] = sigmoid(gates[k + j]);
-                o_buf[j] = sigmoid(gates[hidden_size + k + j]);
-                f_buf[j] = sigmoid(gates[2 * hidden_size + k + j]);
-                c_buf[j] = tanh(gates[3 * hidden_size + k + j]);
-            }
-
-            let i_gate = _mm256_loadu_ps(i_buf.as_ptr());
-            let o_gate = _mm256_loadu_ps(o_buf.as_ptr());
-            let f_gate = _mm256_loadu_ps(f_buf.as_ptr());
-            let c_gate = _mm256_loadu_ps(c_buf.as_ptr());
+            let i_gate = crate::kernels::avx::math::avx2_sigmoid_ps(i_raw);
+            let o_gate = crate::kernels::avx::math::avx2_sigmoid_ps(o_raw);
+            let f_gate = crate::kernels::avx::math::avx2_sigmoid_ps(f_raw);
+            let c_gate = crate::kernels::avx::math::avx2_tanh_ps(c_raw);
 
             let prev_c = _mm256_loadu_ps(out_c.as_ptr().add(k));
             // ct = f_gate * prev_c + i_gate * c_gate
             let ct = _mm256_fmadd_ps(f_gate, prev_c, _mm256_mul_ps(i_gate, c_gate));
 
-            // ht = o_gate * tanh(ct) - compute tanh(ct) using exact scalar
-            let mut ct_buf = [0.0f32; 8];
-            _mm256_storeu_ps(ct_buf.as_mut_ptr(), ct);
-            let mut tanh_ct_buf = [0.0f32; 8];
-            for j in 0..8 {
-                tanh_ct_buf[j] = tanh(ct_buf[j]);
-            }
-            let tanh_ct = _mm256_loadu_ps(tanh_ct_buf.as_ptr());
+            // ht = o_gate * tanh(ct)
+            let tanh_ct = crate::kernels::avx::math::avx2_tanh_ps(ct);
             let ht = _mm256_mul_ps(o_gate, tanh_ct);
 
             _mm256_storeu_ps(out_c.as_mut_ptr().add(k), ct);

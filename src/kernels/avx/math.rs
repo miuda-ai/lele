@@ -96,6 +96,56 @@ pub unsafe fn avx2_tanh_ps(x: __m256) -> __m256 {
         _mm256_or_ps(abs_x_result, sign_bit)
 }
 
+/// AVX2 SIMD SiLU: x * sigmoid(x) = x / (1 + exp(-x))
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[inline]
+pub unsafe fn avx2_silu_ps(x: __m256) -> __m256 {
+        let sig = unsafe { avx2_sigmoid_ps(x) };
+        _mm256_mul_ps(x, sig)
+}
+
+/// AVX2 SIMD erf approximation using Abramowitz & Stegun formula 7.1.26
+/// Maximum error ~1.5e-7 over the entire range.
+/// erf(x) = 1 - (a1*t + a2*t^2 + a3*t^3 + a4*t^4 + a5*t^5) * exp(-x^2)
+/// where t = 1 / (1 + 0.3275911 * |x|)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[inline]
+pub unsafe fn avx2_erf_ps(x: __m256) -> __m256 {
+        let sign_mask = _mm256_set1_ps(-0.0);
+        let one = _mm256_set1_ps(1.0);
+
+        // Constants from Abramowitz & Stegun
+        let p = _mm256_set1_ps(0.3275911);
+        let a1 = _mm256_set1_ps(0.254829592);
+        let a2 = _mm256_set1_ps(-0.284496736);
+        let a3 = _mm256_set1_ps(1.421413741);
+        let a4 = _mm256_set1_ps(-1.453152027);
+        let a5 = _mm256_set1_ps(1.061405429);
+
+        // Save sign and work with |x|
+        let sign_bit = _mm256_and_ps(x, sign_mask);
+        let abs_x = _mm256_andnot_ps(sign_mask, x);
+
+        // t = 1 / (1 + p * |x|)
+        let t = _mm256_div_ps(one, _mm256_fmadd_ps(p, abs_x, one));
+
+        // Horner's method: poly = a1 + t*(a2 + t*(a3 + t*(a4 + t*a5)))
+        let mut poly = _mm256_fmadd_ps(a5, t, a4);
+        poly = _mm256_fmadd_ps(poly, t, a3);
+        poly = _mm256_fmadd_ps(poly, t, a2);
+        poly = _mm256_fmadd_ps(poly, t, a1);
+
+        // result = 1 - poly * t * exp(-x^2)
+        let neg_x_sq = _mm256_xor_ps(_mm256_mul_ps(abs_x, abs_x), sign_mask);
+        let exp_val = unsafe { avx2_exp_ps(neg_x_sq) };
+        let result = _mm256_fnmadd_ps(_mm256_mul_ps(poly, t), exp_val, one);
+
+        // Restore sign: erf(-x) = -erf(x)
+        _mm256_or_ps(result, sign_bit)
+}
+
 /// Horizontal sum of __m256 into a single f32
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]

@@ -1,4 +1,6 @@
 use crate::kernels::utils;
+#[cfg(target_arch = "wasm32")]
+use crate::kernels::wasm_matmul::{Accum, MatMut, MatRef, Par, matmul};
 use crate::tensor::TensorView;
 #[cfg(not(target_arch = "wasm32"))]
 use faer::{
@@ -6,8 +8,6 @@ use faer::{
     linalg::matmul::matmul,
     mat::{MatMut, MatRef},
 };
-#[cfg(target_arch = "wasm32")]
-use crate::kernels::wasm_matmul::{matmul, MatMut, MatRef, Accum, Par};
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
@@ -1300,7 +1300,10 @@ pub fn conv1d_fused<'b, 'a>(
                                 let mut i = 0;
                                 while i + 4 <= output_len {
                                     let v = v128_load(out_ptr.add(start + i) as *const v128);
-                                    v128_store(out_ptr.add(start + i) as *mut v128, f32x4_add(v, v_bias));
+                                    v128_store(
+                                        out_ptr.add(start + i) as *mut v128,
+                                        f32x4_add(v, v_bias),
+                                    );
                                     i += 4;
                                 }
                                 while i < output_len {
@@ -1338,7 +1341,9 @@ pub fn conv1d_fused<'b, 'a>(
                     }
                     while i < total {
                         let ptr = out_ptr.add(i);
-                        if *ptr < 0.0 { *ptr = 0.0; }
+                        if *ptr < 0.0 {
+                            *ptr = 0.0;
+                        }
                         i += 1;
                     }
                 }

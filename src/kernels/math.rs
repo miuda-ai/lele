@@ -315,7 +315,7 @@ where
         shape: Cow::Owned(out_shape),
     }
 }
-pub fn add<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Debug>(
+pub fn add<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Debug + 'static>(
     a: &TensorView<'b, T>,
     b: &TensorView<'b, T>,
     out: &'a mut Vec<T>,
@@ -323,6 +323,20 @@ pub fn add<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Debug
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
         utils::ensure_capacity(out, len);
+        // Try SIMD fast path for f32
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+                let a_ptr = a.data.as_ptr() as *const f32;
+                let b_ptr = b.data.as_ptr() as *const f32;
+                let o_ptr = out.as_mut_ptr() as *mut f32;
+                unsafe { add_f32_avx2(a_ptr, b_ptr, o_ptr, len); }
+                return TensorView {
+                    data: Cow::Borrowed(out),
+                    shape: std::borrow::Cow::Owned(a.shape.to_vec()),
+                };
+            }
+        }
         let a_slice = &a.data;
         let b_slice = &b.data;
         let o_slice = out.as_mut_slice();
@@ -342,7 +356,6 @@ pub fn add<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Debug
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(dead_code)]
 unsafe fn add_f32_avx2(a: *const f32, b: *const f32, out: *mut f32, len: usize) {
     use std::arch::x86_64::*;
     unsafe {
@@ -374,34 +387,9 @@ unsafe fn add_f32_avx2(a: *const f32, b: *const f32, out: *mut f32, len: usize) 
         }
     }
 }
-pub fn mul<'b, 'a, T: Clone + Copy + std::ops::Mul<Output = T> + std::fmt::Debug>(
-    a: &TensorView<'b, T>,
-    b: &TensorView<'b, T>,
-    out: &'a mut Vec<T>,
-) -> TensorView<'a, T> {
-    if a.data.len() == b.data.len() && a.shape == b.shape {
-        let len = a.data.len();
-        utils::ensure_capacity(out, len);
-        let a_slice = &a.data;
-        let b_slice = &b.data;
-        let o_slice = out.as_mut_slice();
-        for i in 0..len {
-            unsafe {
-                *o_slice.get_unchecked_mut(i) =
-                    *a_slice.get_unchecked(i) * *b_slice.get_unchecked(i);
-            }
-        }
-        return TensorView {
-            data: Cow::Borrowed(out),
-            shape: std::borrow::Cow::Owned(a.shape.to_vec()),
-        };
-    }
-    broadcast_binary_op(a, b, out, |x, y| x * y)
-}
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(dead_code)]
 unsafe fn mul_f32_avx2(a: *const f32, b: *const f32, out: *mut f32, len: usize) {
     use std::arch::x86_64::*;
     unsafe {
@@ -433,6 +421,46 @@ unsafe fn mul_f32_avx2(a: *const f32, b: *const f32, out: *mut f32, len: usize) 
         }
     }
 }
+
+pub fn mul<'b, 'a, T: Clone + Copy + std::ops::Mul<Output = T> + std::fmt::Debug + 'static>(
+    a: &TensorView<'b, T>,
+    b: &TensorView<'b, T>,
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
+    if a.data.len() == b.data.len() && a.shape == b.shape {
+        let len = a.data.len();
+        utils::ensure_capacity(out, len);
+        // Try SIMD fast path for f32
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+                let a_ptr = a.data.as_ptr() as *const f32;
+                let b_ptr = b.data.as_ptr() as *const f32;
+                let o_ptr = out.as_mut_ptr() as *mut f32;
+                unsafe { mul_f32_avx2(a_ptr, b_ptr, o_ptr, len); }
+                return TensorView {
+                    data: Cow::Borrowed(out),
+                    shape: std::borrow::Cow::Owned(a.shape.to_vec()),
+                };
+            }
+        }
+        let a_slice = &a.data;
+        let b_slice = &b.data;
+        let o_slice = out.as_mut_slice();
+        for i in 0..len {
+            unsafe {
+                *o_slice.get_unchecked_mut(i) =
+                    *a_slice.get_unchecked(i) * *b_slice.get_unchecked(i);
+            }
+        }
+        return TensorView {
+            data: Cow::Borrowed(out),
+            shape: std::borrow::Cow::Owned(a.shape.to_vec()),
+        };
+    }
+    broadcast_binary_op(a, b, out, |x, y| x * y)
+}
+
 pub fn sub<'b, 'a, T: Clone + Copy + std::ops::Sub<Output = T> + std::fmt::Debug>(
     a: &TensorView<'b, T>,
     b: &TensorView<'b, T>,
@@ -473,7 +501,19 @@ pub fn erf<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
     {
         crate::kernels::neon::math::erf(input, out)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        let numel = input.data.len();
+        utils::ensure_capacity(out, numel);
+        unsafe {
+            erf_avx2(input.data.as_ptr(), out.as_mut_ptr(), numel);
+        }
+        TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(input.shape.to_vec()),
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         let numel = input.data.len();
         utils::ensure_capacity(out, numel);
@@ -483,6 +523,24 @@ pub fn erf<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
         TensorView {
             data: Cow::Borrowed(out),
             shape: Cow::Owned(input.shape.to_vec()),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn erf_avx2(input: *const f32, output: *mut f32, len: usize) {
+    unsafe {
+        let mut i = 0;
+        while i + 8 <= len {
+            let v = std::arch::x86_64::_mm256_loadu_ps(input.add(i));
+            let r = crate::kernels::avx::math::avx2_erf_ps(v);
+            std::arch::x86_64::_mm256_storeu_ps(output.add(i), r);
+            i += 8;
+        }
+        while i < len {
+            *output.add(i) = libm::erff(*input.add(i));
+            i += 1;
         }
     }
 }
@@ -725,7 +783,19 @@ pub fn silu<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView
             shape: Cow::Owned(input.shape.to_vec()),
         }
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        let len = input.data.len();
+        utils::ensure_capacity(out, len);
+        unsafe {
+            silu_avx2(input.data.as_ptr(), out.as_mut_ptr(), len);
+        }
+        TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(input.shape.to_vec()),
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32", target_arch = "x86_64")))]
     {
         let len = input.data.len();
         utils::ensure_capacity(out, len);
@@ -736,6 +806,25 @@ pub fn silu<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView
         TensorView {
             data: Cow::Borrowed(out),
             shape: Cow::Owned(input.shape.to_vec()),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn silu_avx2(input: *const f32, output: *mut f32, len: usize) {
+    unsafe {
+        let mut i = 0;
+        while i + 8 <= len {
+            let v = std::arch::x86_64::_mm256_loadu_ps(input.add(i));
+            let r = crate::kernels::avx::math::avx2_silu_ps(v);
+            std::arch::x86_64::_mm256_storeu_ps(output.add(i), r);
+            i += 8;
+        }
+        while i < len {
+            let x = *input.add(i);
+            *output.add(i) = x / (1.0 + (-x).exp());
+            i += 1;
         }
     }
 }

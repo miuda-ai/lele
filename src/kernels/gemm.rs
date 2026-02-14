@@ -88,10 +88,34 @@ pub fn matmul_fused_add<'a>(
     let bias_data = &bias.data;
     let out_slice = unsafe { std::slice::from_raw_parts_mut(view.data.as_ptr() as *mut f32, len) };
     if bias_data.len() == n {
-        // Optimized broadcasting loop (row-wise) to avoid expensive modulo
-        for chunk in out_slice.chunks_exact_mut(n) {
-            for (x, &b) in chunk.iter_mut().zip(bias_data.iter()) {
-                *x += b;
+        // AVX2-optimized row-wise bias addition
+        #[cfg(target_arch = "x86_64")]
+        {
+            let bias_ptr = bias_data.as_ptr();
+            for chunk in out_slice.chunks_exact_mut(n) {
+                let chunk_ptr = chunk.as_mut_ptr();
+                let mut j = 0;
+                while j + 8 <= n {
+                    unsafe {
+                        use std::arch::x86_64::*;
+                        let v = _mm256_loadu_ps(chunk_ptr.add(j));
+                        let b = _mm256_loadu_ps(bias_ptr.add(j));
+                        _mm256_storeu_ps(chunk_ptr.add(j), _mm256_add_ps(v, b));
+                    }
+                    j += 8;
+                }
+                while j < n {
+                    chunk[j] += bias_data[j];
+                    j += 1;
+                }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            for chunk in out_slice.chunks_exact_mut(n) {
+                for (x, &b) in chunk.iter_mut().zip(bias_data.iter()) {
+                    *x += b;
+                }
             }
         }
     } else if bias_data.len() == 1 {

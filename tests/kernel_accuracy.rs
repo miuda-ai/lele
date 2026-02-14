@@ -363,3 +363,37 @@ fn test_gather_accuracy() {
     assert_eq!(result.shape.as_ref(), &[2, 3]);
     assert_close(&result.data, &expected, 1e-6, "gather");
 }
+
+#[test]
+fn test_silu_accuracy() {
+    use lele::kernels::math::silu;
+
+    // Test with 17 elements (not multiple of 8) to test scalar fallback too
+    let x: Vec<f32> = (-8..=8).map(|i| i as f32 * 0.5).collect();
+    let x_t = TensorView::from_owned(x.clone(), vec![17]);
+
+    let mut out_buf = Vec::new();
+    let result = silu(&x_t, &mut out_buf);
+
+    // Reference: silu(x) = x / (1 + exp(-x))
+    let expected: Vec<f32> = x.iter().map(|&v| v / (1.0 + (-v).exp())).collect();
+
+    assert_close(&result.data, &expected, 1e-5, "silu");
+}
+
+#[test]
+fn test_erf_accuracy() {
+    use lele::kernels::math::erf;
+
+    // Test with 19 elements (not multiple of 8) to test scalar fallback
+    let x: Vec<f32> = (-9..=9).map(|i| i as f32 * 0.5).collect();
+    let x_t = TensorView::from_owned(x.clone(), vec![19]);
+
+    let mut out_buf = Vec::new();
+    let result = erf(&x_t, &mut out_buf);
+
+    // Reference using libm
+    let expected: Vec<f32> = x.iter().map(|&v| libm::erff(v)).collect();
+
+    assert_close(&result.data, &expected, 2e-6, "erf");
+}
