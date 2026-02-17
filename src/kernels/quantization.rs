@@ -396,7 +396,7 @@ unsafe fn prepare_weights_avx2(
                     _mm_srli_si128(c67, 8),
                 );
             }
-        }
+        };
     }
 
     // Process 8×8 blocks
@@ -637,13 +637,11 @@ pub fn fused_dq_gemm_prepared_x86<'a>(
                                 zp_b,
                                 k_zp_b,
                                 corr_128_minus_zpb,
-                                scale_data_ptr.map(|p| {
-                                    if scale_len == 1 {
-                                        p
-                                    } else {
-                                        p.add(n_start)
-                                    }
-                                }),
+                                scale_data_ptr.map(
+                                    |p| {
+                                        if scale_len == 1 { p } else { p.add(n_start) }
+                                    },
+                                ),
                                 scale_len,
                                 bias_data_ptr.map(|p| p.add(n_start)),
                                 apply_relu,
@@ -670,13 +668,11 @@ pub fn fused_dq_gemm_prepared_x86<'a>(
                                 zp_b,
                                 k_zp_b,
                                 corr_128_minus_zpb,
-                                scale_data_ptr.map(|p| {
-                                    if scale_len == 1 {
-                                        p
-                                    } else {
-                                        p.add(n_start)
-                                    }
-                                }),
+                                scale_data_ptr.map(
+                                    |p| {
+                                        if scale_len == 1 { p } else { p.add(n_start) }
+                                    },
+                                ),
                                 scale_len,
                                 bias_data_ptr.map(|p| p.add(n_start)),
                                 apply_relu,

@@ -237,12 +237,19 @@ fn solve_allocation(graph: &GraphProto, outputs: &[String]) -> (Allocator, Analy
                         input_bufs
                             .extend(inps.iter().filter_map(|n| all_allocations.get(n)).cloned());
                     }
-                    // Also check inputs of the previous node to avoid immediate reuse in fused ops (e.g. Conv+Relu)
-                    if id > 0
-                        && let Some(inps) = visitor.node_inputs.get(&(id - 1))
-                    {
-                        input_bufs
-                            .extend(inps.iter().filter_map(|n| all_allocations.get(n)).cloned());
+                    // Check inputs of preceding nodes to avoid buffer conflicts in fused
+                    // patterns (e.g. Conv+Sigmoid+Mul → Conv2d+SiLU consumes 3 nodes,
+                    // Triple SiLU consumes 6 nodes)
+                    for prev in 1..=5 {
+                        if id >= prev {
+                            if let Some(inps) = visitor.node_inputs.get(&(id - prev)) {
+                                input_bufs.extend(
+                                    inps.iter()
+                                        .filter_map(|n| all_allocations.get(n))
+                                        .cloned(),
+                                );
+                            }
+                        }
                     }
                     let mut deferred = Vec::new();
                     let mut selected_buf = None;

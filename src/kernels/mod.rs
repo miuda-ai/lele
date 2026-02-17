@@ -19,9 +19,9 @@ pub mod wasm_matmul;
 pub use conv1d::conv1d;
 pub use conv1d::conv1d_fused;
 pub use conv2d::{
-    conv_integer, conv_integer_from_f32, conv_integer_from_f32_multi, fused_scale_bias,
-    fused_scale_bias_silu, gather_elements, max_pool2d, print_conv_stats, reset_conv_stats,
-    resize_nearest, topk,
+    conv_integer, conv_integer_from_f32, conv_integer_from_f32_multi, conv2d, conv2d_fused,
+    conv2d_silu, fused_scale_bias, fused_scale_bias_silu, gather_elements, max_pool2d,
+    print_conv_stats, reset_conv_stats, resize_nearest, topk,
 };
 pub use gemm::{gemm, matmul, matmul_fused_add};
 pub use manipulation::*;

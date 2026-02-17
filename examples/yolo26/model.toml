@@ -1,8 +1,11 @@
 [model]
-source = "local"
+source = "hf-hub"
+repo = "onnx-community/yolo26n-ONNX"
+revision = "main"
 
 [[model.files]]
-path = "yolo26.onnx"
+file = "onnx/model.onnx"
+dest = "yolo26.onnx"
 
 [codegen]
 class_name = "Yolo26"

@@ -5,6 +5,9 @@ edition = "2021"
 publish = false
 build = "build.rs"
 
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

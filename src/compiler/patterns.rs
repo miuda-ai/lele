@@ -234,25 +234,34 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     if (*dt == 3 || *dt == 2) && sh.len() == 2 {
                         let k = sh[0];
                         let n = sh[1];
-                        writeln!(
-                            w,
-                            "{}#[cfg(target_arch = \"aarch64\")]",
-                            tab
-                        )?;
+                        writeln!(w, "{}#[cfg(target_arch = \"aarch64\")]", tab)?;
                         writeln!(
                             w,
                             "{}let {} = self.linear_quantized_relu_arm(&{}, {}, {}, {}, {}, {}, {}, {}, {});",
-                            tab, output_name, input, *o, *l, k, n, weight_scale, weight_zero, bias, buf_expr
+                            tab,
+                            output_name,
+                            input,
+                            *o,
+                            *l,
+                            k,
+                            n,
+                            weight_scale,
+                            weight_zero,
+                            bias,
+                            buf_expr
                         )?;
-                        writeln!(
-                            w,
-                            "{}#[cfg(not(target_arch = \"aarch64\"))]",
-                            tab
-                        )?;
+                        writeln!(w, "{}#[cfg(not(target_arch = \"aarch64\"))]", tab)?;
                         writeln!(
                             w,
                             "{}let {} = self.linear_quantized_relu(&{}, {}, {}, {}, {}, {});",
-                            tab, output_name, input, weight_int8, weight_scale, weight_zero, bias, buf_expr
+                            tab,
+                            output_name,
+                            input,
+                            weight_int8,
+                            weight_scale,
+                            weight_zero,
+                            bias,
+                            buf_expr
                         )?;
                         return Ok(());
                     }
@@ -380,25 +389,34 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         // ARM-optimized path: use pre-packed weights
                         let k = sh[0];
                         let n = sh[1];
-                        writeln!(
-                            w,
-                            "{}#[cfg(target_arch = \"aarch64\")]",
-                            tab
-                        )?;
+                        writeln!(w, "{}#[cfg(target_arch = \"aarch64\")]", tab)?;
                         writeln!(
                             w,
                             "{}let {} = self.linear_quantized_arm(&{}, {}, {}, {}, {}, {}, {}, {}, {});",
-                            tab, output_name, input, *o, *l, k, n, weight_scale, weight_zero, bias, buf_expr
+                            tab,
+                            output_name,
+                            input,
+                            *o,
+                            *l,
+                            k,
+                            n,
+                            weight_scale,
+                            weight_zero,
+                            bias,
+                            buf_expr
                         )?;
-                        writeln!(
-                            w,
-                            "{}#[cfg(not(target_arch = \"aarch64\"))]",
-                            tab
-                        )?;
+                        writeln!(w, "{}#[cfg(not(target_arch = \"aarch64\"))]", tab)?;
                         writeln!(
                             w,
                             "{}let {} = self.linear_quantized(&{}, {}, {}, {}, {}, {});",
-                            tab, output_name, input, weight_int8, weight_scale, weight_zero, bias, buf_expr
+                            tab,
+                            output_name,
+                            input,
+                            weight_int8,
+                            weight_scale,
+                            weight_zero,
+                            bias,
+                            buf_expr
                         )?;
                         return Ok(());
                     }
@@ -550,6 +568,17 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     && n1.op_type == "Relu"
                     && n0.output.first() == n1.input.first()
                 {
+                    // Check kernel_shape attribute to distinguish conv1d vs conv2d
+                    let kernel_shape = n0
+                        .attribute
+                        .iter()
+                        .find(|a| a.name == "kernel_shape")
+                        .map(|a| a.ints.len())
+                        .unwrap_or(1);
+                    // Only fuse for 1D convolutions; 2D conv+relu handled separately
+                    if kernel_shape >= 2 {
+                        return None;
+                    }
                     return Some(2);
                 }
                 None
@@ -659,6 +688,372 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     groups,
                     padding,
                     buf_expr
+                )?;
+                Ok(())
+            }),
+        },
+        // Conv2d + Sigmoid + Mul → Conv2d with fused SiLU
+        // Matches: Conv(x) → Sigmoid(conv_out) → Mul(conv_out, sigmoid_out)
+        Pattern {
+            name: "Conv2d + SiLU".to_string(),
+            matcher: Box::new(|nodes: &[&NodeProto]| -> Option<usize> {
+                if nodes.len() < 3 {
+                    return None;
+                }
+                let n0 = nodes[0];
+                let n1 = nodes[1];
+                let n2 = nodes[2];
+                if n0.op_type != "Conv" || n1.op_type != "Sigmoid" || n2.op_type != "Mul" {
+                    return None;
+                }
+                // Check kernel_shape — only fuse for 2D convolutions
+                let kernel_shape_len = n0
+                    .attribute
+                    .iter()
+                    .find(|a| a.name == "kernel_shape")
+                    .map(|a| a.ints.len())
+                    .unwrap_or(1);
+                if kernel_shape_len < 2 {
+                    return None;
+                }
+                let conv_out = &n0.output[0];
+                // Sigmoid input must be conv output
+                if n1.input.first() != Some(conv_out) {
+                    return None;
+                }
+                let sig_out = &n1.output[0];
+                // Mul must take conv_out and sigmoid_out (SiLU = x * sigmoid(x))
+                let is_silu = (n2.input.get(0) == Some(conv_out)
+                    && n2.input.get(1) == Some(sig_out))
+                    || (n2.input.get(0) == Some(sig_out) && n2.input.get(1) == Some(conv_out));
+                if !is_silu {
+                    return None;
+                }
+                Some(3)
+            }),
+            generator: Box::new(|nodes, weights, allocator, w, indent| {
+                let conv = nodes[0];
+                let tab = "    ".repeat(indent);
+                let input = &conv.input[0];
+                let weight = &conv.input[1];
+                let input_s = sanitize_name(input);
+                let weight_s = sanitize_name(weight);
+                let get_expr =
+                    |name_s: &str,
+                     ws: &std::collections::HashMap<String, (usize, usize, Vec<usize>, i32)>|
+                     -> String {
+                        if let Some((o, l, s, dt)) = ws.get(name_s) {
+                            let loader = match *dt {
+                                1 => "weight_f32",
+                                2 => "weight_u8",
+                                3 => "weight_i8",
+                                6 => "weight_i32",
+                                7 => "weight_i64",
+                                10 => "weight_f16",
+                                _ => "weight_f32",
+                            };
+                            format!("self.{}({}, {}, &{:?})", loader, o, l, s)
+                        } else {
+                            name_s.to_string()
+                        }
+                    };
+                let input_expr = get_expr(&input_s, weights);
+                let weight_expr = get_expr(&weight_s, weights);
+                let bias = if conv.input.len() > 2 && !conv.input[2].is_empty() {
+                    let b_s = sanitize_name(&conv.input[2]);
+                    let b_expr = get_expr(&b_s, weights);
+                    format!("Some(&{})", b_expr)
+                } else {
+                    "None".to_string()
+                };
+                let mut dilations = vec![1i64, 1];
+                let mut group = 1i64;
+                let mut pads = vec![0i64, 0, 0, 0];
+                let mut strides = vec![1i64, 1];
+                for attr in &conv.attribute {
+                    match attr.name.as_str() {
+                        "dilations" => dilations = attr.ints.clone(),
+                        "group" => group = attr.i,
+                        "pads" => pads = attr.ints.clone(),
+                        "strides" => strides = attr.ints.clone(),
+                        _ => {}
+                    }
+                }
+                let output_name = sanitize_name(&nodes[2].output[0]);
+                // Use the Sigmoid node's buffer for the conv2d intermediate output
+                let conv_out_name = sanitize_name(&nodes[0].output[0]);
+                let conv_buf = if let Some(alloc) = allocator {
+                    if let Some(&idx) = alloc.tensor_to_buffer.get(&nodes[0].output[0]) {
+                        format!("&mut ws.buf_{}", idx)
+                    } else {
+                        writeln!(
+                            w,
+                            "{}let mut buf_{} = Vec::<f32>::new();",
+                            tab, conv_out_name
+                        )?;
+                        format!("&mut buf_{}", conv_out_name)
+                    }
+                } else {
+                    writeln!(
+                        w,
+                        "{}let mut buf_{} = Vec::<f32>::new();",
+                        tab, conv_out_name
+                    )?;
+                    format!("&mut buf_{}", conv_out_name)
+                };
+                let silu_buf = if let Some(alloc) = allocator {
+                    if let Some(&idx) = alloc.tensor_to_buffer.get(&nodes[2].output[0]) {
+                        format!("&mut ws.buf_{}", idx)
+                    } else {
+                        writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, output_name)?;
+                        format!("&mut buf_{}", output_name)
+                    }
+                } else {
+                    writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, output_name)?;
+                    format!("&mut buf_{}", output_name)
+                };
+                // Emit Conv2d, then vectorized SiLU (avoids scalar SiLU in bias loop)
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::conv2d(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
+                    tab,
+                    conv_out_name,
+                    input_expr,
+                    weight_expr,
+                    bias,
+                    dilations,
+                    group,
+                    pads,
+                    strides,
+                    conv_buf
+                )?;
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::silu(&{}, {});",
+                    tab, output_name, conv_out_name, silu_buf
+                )?;
+                Ok(())
+            }),
+        },
+        // Interleaved triple SiLU: Sig(A) → Sig(B) → Sig(C) → Mul(A,sigA) → Mul(B,sigB) → Mul(C,sigC)
+        Pattern {
+            name: "Triple SiLU".to_string(),
+            matcher: Box::new(|nodes: &[&NodeProto]| -> Option<usize> {
+                if nodes.len() < 6 {
+                    return None;
+                }
+                let (n0, n1, n2, n3, n4, n5) =
+                    (nodes[0], nodes[1], nodes[2], nodes[3], nodes[4], nodes[5]);
+                if n0.op_type != "Sigmoid"
+                    || n1.op_type != "Sigmoid"
+                    || n2.op_type != "Sigmoid"
+                    || n3.op_type != "Mul"
+                    || n4.op_type != "Mul"
+                    || n5.op_type != "Mul"
+                {
+                    return None;
+                }
+                // Check SiLU pattern for each pair
+                let check_silu = |sig: &NodeProto, mul: &NodeProto| -> bool {
+                    let sig_in = &sig.input[0];
+                    let sig_out = &sig.output[0];
+                    (mul.input.get(0) == Some(sig_in) && mul.input.get(1) == Some(sig_out))
+                        || (mul.input.get(0) == Some(sig_out) && mul.input.get(1) == Some(sig_in))
+                };
+                if check_silu(n0, n3) && check_silu(n1, n4) && check_silu(n2, n5) {
+                    Some(6)
+                } else {
+                    None
+                }
+            }),
+            generator: Box::new(|nodes, weights, allocator, w, indent| {
+                let tab = "    ".repeat(indent);
+                let get_input = |node_idx: usize| -> String {
+                    let input_s = sanitize_name(&nodes[node_idx].input[0]);
+                    if let Some((o, l, s, dt)) = weights.get(&input_s) {
+                        let loader = match *dt {
+                            1 => "weight_f32",
+                            2 => "weight_u8",
+                            3 => "weight_i8",
+                            6 => "weight_i32",
+                            7 => "weight_i64",
+                            10 => "weight_f16",
+                            _ => "weight_f32",
+                        };
+                        format!("self.{}({}, {}, &{:?})", loader, o, l, s)
+                    } else {
+                        input_s
+                    }
+                };
+                let get_buf = |out_key: &str,
+                               name: &str,
+                               tab: &str,
+                               w: &mut dyn std::io::Write,
+                               allocator: Option<&super::Allocator>|
+                 -> std::io::Result<String> {
+                    if let Some(alloc) = allocator {
+                        if let Some(&idx) = alloc.tensor_to_buffer.get(out_key) {
+                            return Ok(format!("&mut ws.buf_{}", idx));
+                        }
+                    }
+                    writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, name)?;
+                    Ok(format!("&mut buf_{}", name))
+                };
+                // Three SiLU calls: (sig[0]+mul[3]), (sig[1]+mul[4]), (sig[2]+mul[5])
+                for (sig_idx, mul_idx) in [(0, 3), (1, 4), (2, 5)] {
+                    let input = get_input(sig_idx);
+                    let out_name = sanitize_name(&nodes[mul_idx].output[0]);
+                    let buf = get_buf(&nodes[mul_idx].output[0], &out_name, &tab, w, allocator)?;
+                    writeln!(
+                        w,
+                        "{}let {} = lele::kernels::silu(&{}, {});",
+                        tab, out_name, input, buf
+                    )?;
+                }
+                Ok(())
+            }),
+        },
+        // Interleaved double SiLU: Sigmoid(A) → Sigmoid(B) → Mul(A, sig_A) → Mul(B, sig_B)
+        // Common in YOLO architectures where the ONNX exporter batches Sigmoids
+        Pattern {
+            name: "Double SiLU".to_string(),
+            matcher: Box::new(|nodes: &[&NodeProto]| -> Option<usize> {
+                if nodes.len() < 4 {
+                    return None;
+                }
+                let (n0, n1, n2, n3) = (nodes[0], nodes[1], nodes[2], nodes[3]);
+                if n0.op_type != "Sigmoid"
+                    || n1.op_type != "Sigmoid"
+                    || n2.op_type != "Mul"
+                    || n3.op_type != "Mul"
+                {
+                    return None;
+                }
+                let sig_a_in = &n0.input[0];
+                let sig_a_out = &n0.output[0];
+                let sig_b_in = &n1.input[0];
+                let sig_b_out = &n1.output[0];
+                // Mul(A, sig_A)
+                let mul_a_ok = (n2.input.get(0) == Some(sig_a_in)
+                    && n2.input.get(1) == Some(sig_a_out))
+                    || (n2.input.get(0) == Some(sig_a_out) && n2.input.get(1) == Some(sig_a_in));
+                // Mul(B, sig_B)
+                let mul_b_ok = (n3.input.get(0) == Some(sig_b_in)
+                    && n3.input.get(1) == Some(sig_b_out))
+                    || (n3.input.get(0) == Some(sig_b_out) && n3.input.get(1) == Some(sig_b_in));
+                if mul_a_ok && mul_b_ok { Some(4) } else { None }
+            }),
+            generator: Box::new(|nodes, weights, allocator, w, indent| {
+                let tab = "    ".repeat(indent);
+                let get_input = |node_idx: usize| -> String {
+                    let input_s = sanitize_name(&nodes[node_idx].input[0]);
+                    if let Some((o, l, s, dt)) = weights.get(&input_s) {
+                        let loader = match *dt {
+                            1 => "weight_f32",
+                            2 => "weight_u8",
+                            3 => "weight_i8",
+                            6 => "weight_i32",
+                            7 => "weight_i64",
+                            10 => "weight_f16",
+                            _ => "weight_f32",
+                        };
+                        format!("self.{}({}, {}, &{:?})", loader, o, l, s)
+                    } else {
+                        input_s
+                    }
+                };
+                let get_buf = |out_key: &str,
+                               name: &str,
+                               tab: &str,
+                               w: &mut dyn std::io::Write,
+                               allocator: Option<&super::Allocator>|
+                 -> std::io::Result<String> {
+                    if let Some(alloc) = allocator {
+                        if let Some(&idx) = alloc.tensor_to_buffer.get(out_key) {
+                            return Ok(format!("&mut ws.buf_{}", idx));
+                        }
+                    }
+                    writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, name)?;
+                    Ok(format!("&mut buf_{}", name))
+                };
+                // SiLU for first pair (nodes[0] Sigmoid + nodes[2] Mul)
+                let input_a = get_input(0);
+                let out_a = sanitize_name(&nodes[2].output[0]);
+                let buf_a = get_buf(&nodes[2].output[0], &out_a, &tab, w, allocator)?;
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::silu(&{}, {});",
+                    tab, out_a, input_a, buf_a
+                )?;
+                // SiLU for second pair (nodes[1] Sigmoid + nodes[3] Mul)
+                let input_b = get_input(1);
+                let out_b = sanitize_name(&nodes[3].output[0]);
+                let buf_b = get_buf(&nodes[3].output[0], &out_b, &tab, w, allocator)?;
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::silu(&{}, {});",
+                    tab, out_b, input_b, buf_b
+                )?;
+                Ok(())
+            }),
+        },
+        // Sigmoid + Mul → SiLU (standalone, not preceded by Conv)
+        // Matches: Sigmoid(x) → Mul(x, sigmoid_out)
+        Pattern {
+            name: "SiLU".to_string(),
+            matcher: Box::new(|nodes: &[&NodeProto]| -> Option<usize> {
+                if nodes.len() < 2 {
+                    return None;
+                }
+                let n0 = nodes[0];
+                let n1 = nodes[1];
+                if n0.op_type != "Sigmoid" || n1.op_type != "Mul" {
+                    return None;
+                }
+                let sig_input = &n0.input[0];
+                let sig_out = &n0.output[0];
+                // Mul must take original input and sigmoid output
+                let is_silu = (n1.input.get(0) == Some(sig_input)
+                    && n1.input.get(1) == Some(sig_out))
+                    || (n1.input.get(0) == Some(sig_out) && n1.input.get(1) == Some(sig_input));
+                if !is_silu {
+                    return None;
+                }
+                Some(2)
+            }),
+            generator: Box::new(|nodes, weights, allocator, w, indent| {
+                let tab = "    ".repeat(indent);
+                let input_s = sanitize_name(&nodes[0].input[0]);
+                let input_expr = if let Some((o, l, s, dt)) = weights.get(&input_s) {
+                    let loader = match *dt {
+                        1 => "weight_f32",
+                        2 => "weight_u8",
+                        3 => "weight_i8",
+                        6 => "weight_i32",
+                        7 => "weight_i64",
+                        10 => "weight_f16",
+                        _ => "weight_f32",
+                    };
+                    format!("self.{}({}, {}, &{:?})", loader, o, l, s)
+                } else {
+                    input_s
+                };
+                let output_name = sanitize_name(&nodes[1].output[0]);
+                let buf_expr = if let Some(alloc) = allocator {
+                    if let Some(&idx) = alloc.tensor_to_buffer.get(&nodes[1].output[0]) {
+                        format!("&mut ws.buf_{}", idx)
+                    } else {
+                        writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, output_name)?;
+                        format!("&mut buf_{}", output_name)
+                    }
+                } else {
+                    writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, output_name)?;
+                    format!("&mut buf_{}", output_name)
+                };
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::silu(&{}, {});",
+                    tab, output_name, input_expr, buf_expr
                 )?;
                 Ok(())
             }),

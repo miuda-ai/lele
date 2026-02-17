@@ -1,4 +1,6 @@
 use crate::kernels::utils;
+#[cfg(target_arch = "wasm32")]
+use crate::kernels::wasm_matmul::{Accum, MatMut, MatRef, Par, matmul as faer_matmul};
 use crate::tensor::TensorView;
 #[cfg(not(target_arch = "wasm32"))]
 use faer::linalg::matmul::matmul as faer_matmul;
@@ -6,8 +8,6 @@ use faer::linalg::matmul::matmul as faer_matmul;
 use faer::mat::{MatMut, MatRef};
 #[cfg(not(target_arch = "wasm32"))]
 use faer::{Accum, Par};
-#[cfg(target_arch = "wasm32")]
-use crate::kernels::wasm_matmul::{matmul as faer_matmul, MatMut, MatRef, Accum, Par};
 
 pub fn print_conv_stats() {}
 
@@ -27,7 +27,41 @@ pub fn conv2d<'b, 'a>(
     strides: &[i64],
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    conv2d_fused(input, weights, bias, dilations, group, pads, strides, false, out)
+    conv2d_fused(
+        input, weights, bias, dilations, group, pads, strides, false, out,
+    )
+}
+
+/// 2D Convolution with fused SiLU activation (x * sigmoid(x)).
+/// Avoids separate sigmoid + mul passes over the output.
+pub fn conv2d_silu<'b, 'a>(
+    input: &TensorView<'b>,
+    weights: &TensorView<'b>,
+    bias: Option<&TensorView<'b>>,
+    dilations: &[i64],
+    group: i64,
+    pads: &[i64],
+    strides: &[i64],
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    conv2d_activation(
+        input,
+        weights,
+        bias,
+        dilations,
+        group,
+        pads,
+        strides,
+        Activation::SiLU,
+        out,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Activation {
+    None,
+    Relu,
+    SiLU,
 }
 
 /// 2D Convolution with optional fused ReLU activation.
@@ -42,11 +76,41 @@ pub fn conv2d_fused<'b, 'a>(
     relu: bool,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
+    let act = if relu {
+        Activation::Relu
+    } else {
+        Activation::None
+    };
+    conv2d_activation(
+        input, weights, bias, dilations, group, pads, strides, act, out,
+    )
+}
+
+fn conv2d_activation<'b, 'a>(
+    input: &TensorView<'b>,
+    weights: &TensorView<'b>,
+    bias: Option<&TensorView<'b>>,
+    dilations: &[i64],
+    group: i64,
+    pads: &[i64],
+    strides: &[i64],
+    act: Activation,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let _relu = act == Activation::Relu;
     let in_shape = &input.shape;
     let w_shape = &weights.shape;
 
-    assert!(in_shape.len() == 4, "Conv2d: expected rank-4 input [N,C,H,W], got rank {}", in_shape.len());
-    assert!(w_shape.len() == 4, "Conv2d: expected rank-4 weight [C_out,C_in/g,kH,kW], got rank {}", w_shape.len());
+    assert!(
+        in_shape.len() == 4,
+        "Conv2d: expected rank-4 input [N,C,H,W], got rank {}",
+        in_shape.len()
+    );
+    assert!(
+        w_shape.len() == 4,
+        "Conv2d: expected rank-4 weight [C_out,C_in/g,kH,kW], got rank {}",
+        w_shape.len()
+    );
 
     let batch_size = in_shape[0];
     let in_channels = in_shape[1];
@@ -57,16 +121,64 @@ pub fn conv2d_fused<'b, 'a>(
     let kernel_h = w_shape[2];
     let kernel_w = w_shape[3];
 
-    let dilation_h = if dilations.len() >= 2 { dilations[0] as usize } else if dilations.len() == 1 { dilations[0] as usize } else { 1 };
-    let dilation_w = if dilations.len() >= 2 { dilations[1] as usize } else if dilations.len() == 1 { dilations[0] as usize } else { 1 };
+    let dilation_h = if dilations.len() >= 2 {
+        dilations[0] as usize
+    } else if dilations.len() == 1 {
+        dilations[0] as usize
+    } else {
+        1
+    };
+    let dilation_w = if dilations.len() >= 2 {
+        dilations[1] as usize
+    } else if dilations.len() == 1 {
+        dilations[0] as usize
+    } else {
+        1
+    };
 
-    let stride_h = if strides.len() >= 2 { strides[0] as usize } else if strides.len() == 1 { strides[0] as usize } else { 1 };
-    let stride_w = if strides.len() >= 2 { strides[1] as usize } else if strides.len() == 1 { strides[0] as usize } else { 1 };
+    let stride_h = if strides.len() >= 2 {
+        strides[0] as usize
+    } else if strides.len() == 1 {
+        strides[0] as usize
+    } else {
+        1
+    };
+    let stride_w = if strides.len() >= 2 {
+        strides[1] as usize
+    } else if strides.len() == 1 {
+        strides[0] as usize
+    } else {
+        1
+    };
 
-    let pad_top = if pads.len() >= 4 { pads[0] as usize } else if pads.len() >= 2 { pads[0] as usize } else { 0 };
-    let pad_left = if pads.len() >= 4 { pads[1] as usize } else if pads.len() >= 2 { pads[1] as usize } else { 0 };
-    let pad_bottom = if pads.len() >= 4 { pads[2] as usize } else if pads.len() >= 2 { pads[0] as usize } else { 0 };
-    let pad_right = if pads.len() >= 4 { pads[3] as usize } else if pads.len() >= 2 { pads[1] as usize } else { 0 };
+    let pad_top = if pads.len() >= 4 {
+        pads[0] as usize
+    } else if pads.len() >= 2 {
+        pads[0] as usize
+    } else {
+        0
+    };
+    let pad_left = if pads.len() >= 4 {
+        pads[1] as usize
+    } else if pads.len() >= 2 {
+        pads[1] as usize
+    } else {
+        0
+    };
+    let pad_bottom = if pads.len() >= 4 {
+        pads[2] as usize
+    } else if pads.len() >= 2 {
+        pads[0] as usize
+    } else {
+        0
+    };
+    let pad_right = if pads.len() >= 4 {
+        pads[3] as usize
+    } else if pads.len() >= 2 {
+        pads[1] as usize
+    } else {
+        0
+    };
 
     let out_h = (in_h + pad_top + pad_bottom - dilation_h * (kernel_h - 1) - 1) / stride_h + 1;
     let out_w = (in_w + pad_left + pad_right - dilation_w * (kernel_w - 1) - 1) / stride_w + 1;
@@ -77,14 +189,22 @@ pub fn conv2d_fused<'b, 'a>(
 
     let total_output = batch_size * out_channels * out_h * out_w;
     utils::ensure_capacity(out, total_output);
-    unsafe { out.set_len(total_output); }
+    unsafe {
+        out.set_len(total_output);
+    }
 
     let input_data = &input.data;
     let weight_data = &weights.data;
 
     // Fast path: 1x1 convolution with stride 1, no padding, groups=1
-    if kernel_h == 1 && kernel_w == 1 && stride_h == 1 && stride_w == 1
-        && pad_top == 0 && pad_left == 0 && pad_bottom == 0 && pad_right == 0
+    if kernel_h == 1
+        && kernel_w == 1
+        && stride_h == 1
+        && stride_w == 1
+        && pad_top == 0
+        && pad_left == 0
+        && pad_bottom == 0
+        && pad_right == 0
         && groups == 1
     {
         let spatial = in_h * in_w;
@@ -98,27 +218,49 @@ pub fn conv2d_fused<'b, 'a>(
                 let out_ptr = out.as_mut_ptr().add(o_offset);
 
                 let w_mat = MatRef::<f32>::from_raw_parts(
-                    w_ptr, out_channels, in_channels, in_channels as isize, 1,
+                    w_ptr,
+                    out_channels,
+                    in_channels,
+                    in_channels as isize,
+                    1,
                 );
                 let in_mat = MatRef::<f32>::from_raw_parts(
-                    in_ptr, in_channels, spatial, spatial as isize, 1,
+                    in_ptr,
+                    in_channels,
+                    spatial,
+                    spatial as isize,
+                    1,
                 );
                 let out_mat = MatMut::<f32>::from_raw_parts_mut(
-                    out_ptr, out_channels, spatial, spatial as isize, 1,
+                    out_ptr,
+                    out_channels,
+                    spatial,
+                    spatial as isize,
+                    1,
                 );
 
                 faer_matmul(out_mat, Accum::Replace, w_mat, in_mat, 1.0, Par::Seq);
             }
 
-            // Apply bias and optional ReLU
-            if bias.is_some() || relu {
+            // Apply bias and optional activation
+            if bias.is_some() || act != Activation::None {
                 for oc in 0..out_channels {
                     let bias_val = if let Some(b) = bias { b.data[oc] } else { 0.0 };
                     let row_start = o_offset + oc * spatial;
-                    if bias_val != 0.0 || relu {
+                    if bias_val != 0.0 || act != Activation::None {
                         for j in 0..spatial {
                             let val = out[row_start + j] + bias_val;
-                            out[row_start + j] = if relu && val < 0.0 { 0.0 } else { val };
+                            out[row_start + j] = match act {
+                                Activation::Relu => {
+                                    if val < 0.0 {
+                                        0.0
+                                    } else {
+                                        val
+                                    }
+                                }
+                                Activation::SiLU => val / (1.0 + (-val).exp()),
+                                Activation::None => val,
+                            };
                         }
                     }
                 }
@@ -135,77 +277,108 @@ pub fn conv2d_fused<'b, 'a>(
         static COL_BUF: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
     }
     COL_BUF.with(|buf_cell| {
-    let mut col_buf_ref = buf_cell.borrow_mut();
-    let needed = col_rows * col_cols;
-    if col_buf_ref.len() < needed {
-        col_buf_ref.resize(needed, 0.0);
-    }
-    let col_buf = &mut col_buf_ref[..needed];
+        let mut col_buf_ref = buf_cell.borrow_mut();
+        let needed = col_rows * col_cols;
+        if col_buf_ref.len() < needed {
+            col_buf_ref.resize(needed, 0.0);
+        }
+        let col_buf = &mut col_buf_ref[..needed];
 
-    for n in 0..batch_size {
-        for g in 0..groups {
-            let in_ch_start = g * in_channels_per_group;
-            let out_ch_start = g * out_channels_per_group;
+        for n in 0..batch_size {
+            for g in 0..groups {
+                let in_ch_start = g * in_channels_per_group;
+                let out_ch_start = g * out_channels_per_group;
 
-            // im2col: unfold input patch into column matrix
-            im2col(
-                input_data,
-                n, in_ch_start, in_channels_per_group,
-                in_h, in_w, in_channels,
-                kernel_h, kernel_w,
-                stride_h, stride_w,
-                pad_top, pad_left,
-                dilation_h, dilation_w,
-                out_h, out_w,
-                col_buf,
-            );
-
-            // GEMM: weight_matrix [out_channels_per_group, col_rows] x col_matrix [col_rows, col_cols]
-            // = output [out_channels_per_group, out_h * out_w]
-            let w_offset = out_ch_start * (in_channels_per_group * kernel_h * kernel_w);
-            let o_offset = (n * out_channels + out_ch_start) * out_h * out_w;
-
-            // Use faer for fast GEMM
-            unsafe {
-                let w_ptr = weight_data.as_ptr().add(w_offset);
-                let col_ptr = col_buf.as_ptr();
-                let out_ptr = out.as_mut_ptr().add(o_offset);
-
-                // Weight: [out_channels_per_group, col_rows] row-major
-                let w_mat = MatRef::<f32>::from_raw_parts(
-                    w_ptr, out_channels_per_group, col_rows, col_rows as isize, 1,
-                );
-                // Col: [col_rows, col_cols] row-major
-                let col_mat = MatRef::<f32>::from_raw_parts(
-                    col_ptr, col_rows, col_cols, col_cols as isize, 1,
-                );
-                // Out: [out_channels_per_group, col_cols] row-major
-                let out_mat = MatMut::<f32>::from_raw_parts_mut(
-                    out_ptr, out_channels_per_group, col_cols, col_cols as isize, 1,
+                // im2col: unfold input patch into column matrix
+                im2col(
+                    input_data,
+                    n,
+                    in_ch_start,
+                    in_channels_per_group,
+                    in_h,
+                    in_w,
+                    in_channels,
+                    kernel_h,
+                    kernel_w,
+                    stride_h,
+                    stride_w,
+                    pad_top,
+                    pad_left,
+                    dilation_h,
+                    dilation_w,
+                    out_h,
+                    out_w,
+                    col_buf,
                 );
 
-                faer_matmul(out_mat, Accum::Replace, w_mat, col_mat, 1.0, Par::Seq);
-            }
+                // GEMM: weight_matrix [out_channels_per_group, col_rows] x col_matrix [col_rows, col_cols]
+                // = output [out_channels_per_group, out_h * out_w]
+                let w_offset = out_ch_start * (in_channels_per_group * kernel_h * kernel_w);
+                let o_offset = (n * out_channels + out_ch_start) * out_h * out_w;
 
-            // Apply bias and optional ReLU
-            if bias.is_some() || relu {
-                for oc in 0..out_channels_per_group {
-                    let o_row_start = o_offset + oc * col_cols;
-                    let bias_val = if let Some(b) = bias {
-                        b.data[out_ch_start + oc]
-                    } else {
-                        0.0
-                    };
-                    if bias_val != 0.0 || relu {
-                        for j in 0..col_cols {
-                            let val = out[o_row_start + j] + bias_val;
-                            out[o_row_start + j] = if relu && val < 0.0 { 0.0 } else { val };
+                // Use faer for fast GEMM
+                unsafe {
+                    let w_ptr = weight_data.as_ptr().add(w_offset);
+                    let col_ptr = col_buf.as_ptr();
+                    let out_ptr = out.as_mut_ptr().add(o_offset);
+
+                    // Weight: [out_channels_per_group, col_rows] row-major
+                    let w_mat = MatRef::<f32>::from_raw_parts(
+                        w_ptr,
+                        out_channels_per_group,
+                        col_rows,
+                        col_rows as isize,
+                        1,
+                    );
+                    // Col: [col_rows, col_cols] row-major
+                    let col_mat = MatRef::<f32>::from_raw_parts(
+                        col_ptr,
+                        col_rows,
+                        col_cols,
+                        col_cols as isize,
+                        1,
+                    );
+                    // Out: [out_channels_per_group, col_cols] row-major
+                    let out_mat = MatMut::<f32>::from_raw_parts_mut(
+                        out_ptr,
+                        out_channels_per_group,
+                        col_cols,
+                        col_cols as isize,
+                        1,
+                    );
+
+                    faer_matmul(out_mat, Accum::Replace, w_mat, col_mat, 1.0, Par::Seq);
+                }
+
+                // Apply bias and optional activation
+                if bias.is_some() || act != Activation::None {
+                    for oc in 0..out_channels_per_group {
+                        let o_row_start = o_offset + oc * col_cols;
+                        let bias_val = if let Some(b) = bias {
+                            b.data[out_ch_start + oc]
+                        } else {
+                            0.0
+                        };
+                        if bias_val != 0.0 || act != Activation::None {
+                            for j in 0..col_cols {
+                                let val = out[o_row_start + j] + bias_val;
+                                out[o_row_start + j] = match act {
+                                    Activation::Relu => {
+                                        if val < 0.0 {
+                                            0.0
+                                        } else {
+                                            val
+                                        }
+                                    }
+                                    Activation::SiLU => val / (1.0 + (-val).exp()),
+                                    Activation::None => val,
+                                };
+                            }
                         }
                     }
                 }
             }
         }
-    }
     }); // COL_BUF.with
 
     TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w])
@@ -372,18 +545,50 @@ pub fn max_pool2d<'b, 'a>(
     let in_w = shape[3];
 
     let kh = kernel_shape[0] as usize;
-    let kw = if kernel_shape.len() > 1 { kernel_shape[1] as usize } else { kh };
+    let kw = if kernel_shape.len() > 1 {
+        kernel_shape[1] as usize
+    } else {
+        kh
+    };
 
-    let sh = if strides.is_empty() { 1 } else { strides[0] as usize };
-    let sw = if strides.len() > 1 { strides[1] as usize } else { sh };
+    let sh = if strides.is_empty() {
+        1
+    } else {
+        strides[0] as usize
+    };
+    let sw = if strides.len() > 1 {
+        strides[1] as usize
+    } else {
+        sh
+    };
 
     let pad_top = if pads.is_empty() { 0 } else { pads[0] as usize };
-    let pad_left = if pads.len() > 1 { pads[1] as usize } else { pad_top };
-    let pad_bottom = if pads.len() > 2 { pads[2] as usize } else { pad_top };
-    let pad_right = if pads.len() > 3 { pads[3] as usize } else { pad_left };
+    let pad_left = if pads.len() > 1 {
+        pads[1] as usize
+    } else {
+        pad_top
+    };
+    let pad_bottom = if pads.len() > 2 {
+        pads[2] as usize
+    } else {
+        pad_top
+    };
+    let pad_right = if pads.len() > 3 {
+        pads[3] as usize
+    } else {
+        pad_left
+    };
 
-    let dh = if dilations.is_empty() { 1 } else { dilations[0] as usize };
-    let dw = if dilations.len() > 1 { dilations[1] as usize } else { dh };
+    let dh = if dilations.is_empty() {
+        1
+    } else {
+        dilations[0] as usize
+    };
+    let dw = if dilations.len() > 1 {
+        dilations[1] as usize
+    } else {
+        dh
+    };
 
     let effective_kh = dh * (kh - 1) + 1;
     let effective_kw = dw * (kw - 1) + 1;
@@ -401,7 +606,9 @@ pub fn max_pool2d<'b, 'a>(
 
     let total = batch * channels * out_h * out_w;
     utils::ensure_capacity(out, total);
-    unsafe { out.set_len(total); }
+    unsafe {
+        out.set_len(total);
+    }
 
     let data = &input.data;
 
@@ -414,12 +621,18 @@ pub fn max_pool2d<'b, 'a>(
                     let mut max_val = f32::NEG_INFINITY;
                     for ki in 0..kh {
                         let ih = (oh * sh + ki * dh) as isize - pad_top as isize;
-                        if ih < 0 || ih >= in_h as isize { continue; }
+                        if ih < 0 || ih >= in_h as isize {
+                            continue;
+                        }
                         for kj in 0..kw {
                             let iw = (ow * sw + kj * dw) as isize - pad_left as isize;
-                            if iw < 0 || iw >= in_w as isize { continue; }
+                            if iw < 0 || iw >= in_w as isize {
+                                continue;
+                            }
                             let val = data[in_offset + ih as usize * in_w + iw as usize];
-                            if val > max_val { max_val = val; }
+                            if val > max_val {
+                                max_val = val;
+                            }
                         }
                     }
                     out[out_offset + oh * out_w + ow] = max_val;
@@ -465,7 +678,9 @@ pub fn resize_nearest<'b, 'a>(
 
     let total = batch * channels * out_h * out_w;
     utils::ensure_capacity(out, total);
-    unsafe { out.set_len(total); }
+    unsafe {
+        out.set_len(total);
+    }
 
     let data = &input.data;
 
@@ -482,13 +697,19 @@ pub fn resize_nearest<'b, 'a>(
                     (oh as f32 * h_scale).floor().min((in_h - 1) as f32) as usize
                 } else {
                     // half_pixel: ih = round((oh+0.5)*scale - 0.5)
-                    ((oh as f32 + 0.5) * h_scale - 0.5).round().max(0.0).min((in_h - 1) as f32) as usize
+                    ((oh as f32 + 0.5) * h_scale - 0.5)
+                        .round()
+                        .max(0.0)
+                        .min((in_h - 1) as f32) as usize
                 };
                 for ow in 0..out_w {
                     let iw = if coordinate_transform_mode == "asymmetric" {
                         (ow as f32 * w_scale).floor().min((in_w - 1) as f32) as usize
                     } else {
-                        ((ow as f32 + 0.5) * w_scale - 0.5).round().max(0.0).min((in_w - 1) as f32) as usize
+                        ((ow as f32 + 0.5) * w_scale - 0.5)
+                            .round()
+                            .max(0.0)
+                            .min((in_w - 1) as f32) as usize
                     };
                     out[out_offset + oh * out_w + ow] = data[in_offset + ih * in_w + iw];
                 }
@@ -532,9 +753,8 @@ pub fn topk<'a>(
         let out_start = o * k;
 
         // Create index-value pairs
-        let mut pairs: Vec<(usize, f32)> = (0..last_dim)
-            .map(|i| (i, data[row_start + i]))
-            .collect();
+        let mut pairs: Vec<(usize, f32)> =
+            (0..last_dim).map(|i| (i, data[row_start + i])).collect();
 
         if largest {
             pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -563,11 +783,17 @@ pub fn gather_elements<'a>(
     let shape = &input.shape;
     let idx_shape = &indices.shape;
     let rank = shape.len();
-    let axis = if axis < 0 { (rank as i64 + axis) as usize } else { axis as usize };
+    let axis = if axis < 0 {
+        (rank as i64 + axis) as usize
+    } else {
+        axis as usize
+    };
 
     let total: usize = idx_shape.iter().product();
     utils::ensure_capacity(out, total);
-    unsafe { out.set_len(total); }
+    unsafe {
+        out.set_len(total);
+    }
 
     let data = &input.data;
     let idx_data = &indices.data;
@@ -616,7 +842,7 @@ pub fn gather_elements<'a>(
 
 /// 2D Convolution with zero-point subtraction fused into im2col.
 /// Avoids allocating separate dequantized copies of input/weights.
-/// Computes: (input - x_zp) conv (weight - w_zp) 
+/// Computes: (input - x_zp) conv (weight - w_zp)
 fn conv2d_with_zero_points<'b, 'a>(
     input: &TensorView<'b>,
     weights: &TensorView<'b>,
@@ -644,14 +870,62 @@ fn conv2d_with_zero_points<'b, 'a>(
     let kernel_h = w_shape[2];
     let kernel_w = w_shape[3];
 
-    let dilation_h = if dilations.len() >= 2 { dilations[0] as usize } else if dilations.len() == 1 { dilations[0] as usize } else { 1 };
-    let dilation_w = if dilations.len() >= 2 { dilations[1] as usize } else if dilations.len() == 1 { dilations[0] as usize } else { 1 };
-    let stride_h = if strides.len() >= 2 { strides[0] as usize } else if strides.len() == 1 { strides[0] as usize } else { 1 };
-    let stride_w = if strides.len() >= 2 { strides[1] as usize } else if strides.len() == 1 { strides[0] as usize } else { 1 };
-    let pad_top = if pads.len() >= 4 { pads[0] as usize } else if pads.len() >= 2 { pads[0] as usize } else { 0 };
-    let pad_left = if pads.len() >= 4 { pads[1] as usize } else if pads.len() >= 2 { pads[1] as usize } else { 0 };
-    let pad_bottom = if pads.len() >= 4 { pads[2] as usize } else if pads.len() >= 2 { pads[0] as usize } else { 0 };
-    let pad_right = if pads.len() >= 4 { pads[3] as usize } else if pads.len() >= 2 { pads[1] as usize } else { 0 };
+    let dilation_h = if dilations.len() >= 2 {
+        dilations[0] as usize
+    } else if dilations.len() == 1 {
+        dilations[0] as usize
+    } else {
+        1
+    };
+    let dilation_w = if dilations.len() >= 2 {
+        dilations[1] as usize
+    } else if dilations.len() == 1 {
+        dilations[0] as usize
+    } else {
+        1
+    };
+    let stride_h = if strides.len() >= 2 {
+        strides[0] as usize
+    } else if strides.len() == 1 {
+        strides[0] as usize
+    } else {
+        1
+    };
+    let stride_w = if strides.len() >= 2 {
+        strides[1] as usize
+    } else if strides.len() == 1 {
+        strides[0] as usize
+    } else {
+        1
+    };
+    let pad_top = if pads.len() >= 4 {
+        pads[0] as usize
+    } else if pads.len() >= 2 {
+        pads[0] as usize
+    } else {
+        0
+    };
+    let pad_left = if pads.len() >= 4 {
+        pads[1] as usize
+    } else if pads.len() >= 2 {
+        pads[1] as usize
+    } else {
+        0
+    };
+    let pad_bottom = if pads.len() >= 4 {
+        pads[2] as usize
+    } else if pads.len() >= 2 {
+        pads[0] as usize
+    } else {
+        0
+    };
+    let pad_right = if pads.len() >= 4 {
+        pads[3] as usize
+    } else if pads.len() >= 2 {
+        pads[1] as usize
+    } else {
+        0
+    };
 
     let out_h = (in_h + pad_top + pad_bottom - dilation_h * (kernel_h - 1) - 1) / stride_h + 1;
     let out_w = (in_w + pad_left + pad_right - dilation_w * (kernel_w - 1) - 1) / stride_w + 1;
@@ -662,7 +936,9 @@ fn conv2d_with_zero_points<'b, 'a>(
 
     let total_output = batch_size * out_channels * out_h * out_w;
     utils::ensure_capacity(out, total_output);
-    unsafe { out.set_len(total_output); }
+    unsafe {
+        out.set_len(total_output);
+    }
 
     let input_data = &input.data;
     let weight_data = &weights.data;
@@ -671,7 +947,7 @@ fn conv2d_with_zero_points<'b, 'a>(
     thread_local! {
         static W_ADJ_BUF: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
     }
-    
+
     // Use a raw pointer to extend the thread-local borrow safely.
     // Safety: the thread-local buffer lives for the thread's lifetime,
     // and we only access it within this function call (single-threaded context).
@@ -681,7 +957,9 @@ fn conv2d_with_zero_points<'b, 'a>(
         W_ADJ_BUF.with(|buf_cell| {
             let mut adj = buf_cell.borrow_mut();
             utils::ensure_capacity(&mut adj, w_len);
-            unsafe { adj.set_len(w_len); }
+            unsafe {
+                adj.set_len(w_len);
+            }
             #[cfg(target_arch = "aarch64")]
             unsafe {
                 let zp_vec = core::arch::aarch64::vdupq_n_f32(w_zp);
@@ -694,10 +972,22 @@ fn conv2d_with_zero_points<'b, 'a>(
                     let v1 = core::arch::aarch64::vld1q_f32(src.add(i + 4));
                     let v2 = core::arch::aarch64::vld1q_f32(src.add(i + 8));
                     let v3 = core::arch::aarch64::vld1q_f32(src.add(i + 12));
-                    core::arch::aarch64::vst1q_f32(dst.add(i), core::arch::aarch64::vsubq_f32(v0, zp_vec));
-                    core::arch::aarch64::vst1q_f32(dst.add(i + 4), core::arch::aarch64::vsubq_f32(v1, zp_vec));
-                    core::arch::aarch64::vst1q_f32(dst.add(i + 8), core::arch::aarch64::vsubq_f32(v2, zp_vec));
-                    core::arch::aarch64::vst1q_f32(dst.add(i + 12), core::arch::aarch64::vsubq_f32(v3, zp_vec));
+                    core::arch::aarch64::vst1q_f32(
+                        dst.add(i),
+                        core::arch::aarch64::vsubq_f32(v0, zp_vec),
+                    );
+                    core::arch::aarch64::vst1q_f32(
+                        dst.add(i + 4),
+                        core::arch::aarch64::vsubq_f32(v1, zp_vec),
+                    );
+                    core::arch::aarch64::vst1q_f32(
+                        dst.add(i + 8),
+                        core::arch::aarch64::vsubq_f32(v2, zp_vec),
+                    );
+                    core::arch::aarch64::vst1q_f32(
+                        dst.add(i + 12),
+                        core::arch::aarch64::vsubq_f32(v3, zp_vec),
+                    );
                     i += 16;
                 }
                 while i < w_len {
@@ -721,8 +1011,14 @@ fn conv2d_with_zero_points<'b, 'a>(
     let col_cols = out_h * out_w;
 
     // Fast path: 1x1 convolution with stride 1, no padding, groups=1
-    if kernel_h == 1 && kernel_w == 1 && stride_h == 1 && stride_w == 1
-        && pad_top == 0 && pad_left == 0 && pad_bottom == 0 && pad_right == 0
+    if kernel_h == 1
+        && kernel_w == 1
+        && stride_h == 1
+        && stride_w == 1
+        && pad_top == 0
+        && pad_left == 0
+        && pad_bottom == 0
+        && pad_right == 0
         && groups == 1
     {
         let spatial = in_h * in_w;
@@ -731,7 +1027,7 @@ fn conv2d_with_zero_points<'b, 'a>(
         thread_local! {
             static INPUT_ADJ_BUF: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
         }
-        
+
         for n in 0..batch_size {
             let in_offset = n * in_channels * spatial;
             let o_offset = n * out_channels * spatial;
@@ -743,13 +1039,25 @@ fn conv2d_with_zero_points<'b, 'a>(
                     let out_ptr = out.as_mut_ptr().add(o_offset);
 
                     let w_mat = MatRef::<f32>::from_raw_parts(
-                        w_ptr, out_channels, in_channels, in_channels as isize, 1,
+                        w_ptr,
+                        out_channels,
+                        in_channels,
+                        in_channels as isize,
+                        1,
                     );
                     let in_mat = MatRef::<f32>::from_raw_parts(
-                        in_ptr, in_channels, spatial, spatial as isize, 1,
+                        in_ptr,
+                        in_channels,
+                        spatial,
+                        spatial as isize,
+                        1,
                     );
                     let out_mat = MatMut::<f32>::from_raw_parts_mut(
-                        out_ptr, out_channels, spatial, spatial as isize, 1,
+                        out_ptr,
+                        out_channels,
+                        spatial,
+                        spatial as isize,
+                        1,
                     );
 
                     faer_matmul(out_mat, Accum::Replace, w_mat, in_mat, 1.0, Par::Seq);
@@ -759,7 +1067,9 @@ fn conv2d_with_zero_points<'b, 'a>(
                     let mut input_adj = buf_cell.borrow_mut();
                     let needed = in_channels * spatial;
                     utils::ensure_capacity(&mut input_adj, needed);
-                    unsafe { input_adj.set_len(needed); }
+                    unsafe {
+                        input_adj.set_len(needed);
+                    }
                     #[cfg(target_arch = "aarch64")]
                     unsafe {
                         use core::arch::aarch64::*;
@@ -791,13 +1101,25 @@ fn conv2d_with_zero_points<'b, 'a>(
                         let out_ptr = out.as_mut_ptr().add(o_offset);
 
                         let w_mat = MatRef::<f32>::from_raw_parts(
-                            w_ptr, out_channels, in_channels, in_channels as isize, 1,
+                            w_ptr,
+                            out_channels,
+                            in_channels,
+                            in_channels as isize,
+                            1,
                         );
                         let in_mat = MatRef::<f32>::from_raw_parts(
-                            in_ptr, in_channels, spatial, spatial as isize, 1,
+                            in_ptr,
+                            in_channels,
+                            spatial,
+                            spatial as isize,
+                            1,
                         );
                         let out_mat = MatMut::<f32>::from_raw_parts_mut(
-                            out_ptr, out_channels, spatial, spatial as isize, 1,
+                            out_ptr,
+                            out_channels,
+                            spatial,
+                            spatial as isize,
+                            1,
                         );
 
                         faer_matmul(out_mat, Accum::Replace, w_mat, in_mat, 1.0, Par::Seq);
@@ -828,59 +1150,84 @@ fn conv2d_with_zero_points<'b, 'a>(
     }
 
     COL_BUF_ZP.with(|buf_cell| {
-    let mut col_buf_ref = buf_cell.borrow_mut();
-    let needed = col_rows * col_cols;
-    if col_buf_ref.len() < needed {
-        col_buf_ref.resize(needed, 0.0);
-    }
-    let col_buf = &mut col_buf_ref[..needed];
+        let mut col_buf_ref = buf_cell.borrow_mut();
+        let needed = col_rows * col_cols;
+        if col_buf_ref.len() < needed {
+            col_buf_ref.resize(needed, 0.0);
+        }
+        let col_buf = &mut col_buf_ref[..needed];
 
-    for n in 0..batch_size {
-        for g in 0..groups {
-            let in_ch_start = g * in_channels_per_group;
-            let out_ch_start = g * out_channels_per_group;
+        for n in 0..batch_size {
+            for g in 0..groups {
+                let in_ch_start = g * in_channels_per_group;
+                let out_ch_start = g * out_channels_per_group;
 
-            im2col_with_zp(
-                input_data, n, in_ch_start, in_channels_per_group,
-                in_h, in_w, in_channels,
-                kernel_h, kernel_w, stride_h, stride_w,
-                pad_top, pad_left, dilation_h, dilation_w,
-                out_h, out_w, x_zp,
-                col_buf,
-            );
-            let w_offset = out_ch_start * col_rows;
-            let o_offset = (n * out_channels + out_ch_start) * out_h * out_w;
-
-            unsafe {
-                let w_ptr = w_data.as_ptr().add(w_offset);
-                let col_ptr = col_buf.as_ptr();
-                let out_ptr = out.as_mut_ptr().add(o_offset);
-
-                let w_mat = MatRef::<f32>::from_raw_parts(
-                    w_ptr, out_channels_per_group, col_rows, col_rows as isize, 1,
+                im2col_with_zp(
+                    input_data,
+                    n,
+                    in_ch_start,
+                    in_channels_per_group,
+                    in_h,
+                    in_w,
+                    in_channels,
+                    kernel_h,
+                    kernel_w,
+                    stride_h,
+                    stride_w,
+                    pad_top,
+                    pad_left,
+                    dilation_h,
+                    dilation_w,
+                    out_h,
+                    out_w,
+                    x_zp,
+                    col_buf,
                 );
-                let col_mat = MatRef::<f32>::from_raw_parts(
-                    col_ptr, col_rows, col_cols, col_cols as isize, 1,
-                );
-                let out_mat = MatMut::<f32>::from_raw_parts_mut(
-                    out_ptr, out_channels_per_group, col_cols, col_cols as isize, 1,
-                );
+                let w_offset = out_ch_start * col_rows;
+                let o_offset = (n * out_channels + out_ch_start) * out_h * out_w;
 
-                faer_matmul(out_mat, Accum::Replace, w_mat, col_mat, 1.0, Par::Seq);
-            }
-            if let Some(b) = bias {
-                for oc in 0..out_channels_per_group {
-                    let o_row_start = o_offset + oc * col_cols;
-                    let bias_val = b.data[out_ch_start + oc];
-                    if bias_val != 0.0 {
-                        for j in 0..col_cols {
-                            out[o_row_start + j] += bias_val;
+                unsafe {
+                    let w_ptr = w_data.as_ptr().add(w_offset);
+                    let col_ptr = col_buf.as_ptr();
+                    let out_ptr = out.as_mut_ptr().add(o_offset);
+
+                    let w_mat = MatRef::<f32>::from_raw_parts(
+                        w_ptr,
+                        out_channels_per_group,
+                        col_rows,
+                        col_rows as isize,
+                        1,
+                    );
+                    let col_mat = MatRef::<f32>::from_raw_parts(
+                        col_ptr,
+                        col_rows,
+                        col_cols,
+                        col_cols as isize,
+                        1,
+                    );
+                    let out_mat = MatMut::<f32>::from_raw_parts_mut(
+                        out_ptr,
+                        out_channels_per_group,
+                        col_cols,
+                        col_cols as isize,
+                        1,
+                    );
+
+                    faer_matmul(out_mat, Accum::Replace, w_mat, col_mat, 1.0, Par::Seq);
+                }
+                if let Some(b) = bias {
+                    for oc in 0..out_channels_per_group {
+                        let o_row_start = o_offset + oc * col_cols;
+                        let bias_val = b.data[out_ch_start + oc];
+                        if bias_val != 0.0 {
+                            for j in 0..col_cols {
+                                out[o_row_start + j] += bias_val;
+                            }
                         }
                     }
                 }
             }
         }
-    }
     }); // end COL_BUF_ZP.with
 
     TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w])
@@ -971,15 +1318,30 @@ fn im2col_with_zp(
                                     let v1 = core::arch::aarch64::vld1q_f32(src.add(j + 4));
                                     let v2 = core::arch::aarch64::vld1q_f32(src.add(j + 8));
                                     let v3 = core::arch::aarch64::vld1q_f32(src.add(j + 12));
-                                    core::arch::aarch64::vst1q_f32(dst.add(j), core::arch::aarch64::vsubq_f32(v0, zp_vec));
-                                    core::arch::aarch64::vst1q_f32(dst.add(j + 4), core::arch::aarch64::vsubq_f32(v1, zp_vec));
-                                    core::arch::aarch64::vst1q_f32(dst.add(j + 8), core::arch::aarch64::vsubq_f32(v2, zp_vec));
-                                    core::arch::aarch64::vst1q_f32(dst.add(j + 12), core::arch::aarch64::vsubq_f32(v3, zp_vec));
+                                    core::arch::aarch64::vst1q_f32(
+                                        dst.add(j),
+                                        core::arch::aarch64::vsubq_f32(v0, zp_vec),
+                                    );
+                                    core::arch::aarch64::vst1q_f32(
+                                        dst.add(j + 4),
+                                        core::arch::aarch64::vsubq_f32(v1, zp_vec),
+                                    );
+                                    core::arch::aarch64::vst1q_f32(
+                                        dst.add(j + 8),
+                                        core::arch::aarch64::vsubq_f32(v2, zp_vec),
+                                    );
+                                    core::arch::aarch64::vst1q_f32(
+                                        dst.add(j + 12),
+                                        core::arch::aarch64::vsubq_f32(v3, zp_vec),
+                                    );
                                     j += 16;
                                 }
                                 while j + 4 <= count {
                                     let v = core::arch::aarch64::vld1q_f32(src.add(j));
-                                    core::arch::aarch64::vst1q_f32(dst.add(j), core::arch::aarch64::vsubq_f32(v, zp_vec));
+                                    core::arch::aarch64::vst1q_f32(
+                                        dst.add(j),
+                                        core::arch::aarch64::vsubq_f32(v, zp_vec),
+                                    );
                                     j += 4;
                                 }
                                 while j < count {
@@ -1041,12 +1403,11 @@ fn im2col_with_zp(
                             let iw = (ow * stride_w + kw * dilation_w) as isize - pad_left as isize;
                             unsafe {
                                 let col_idx = col_oh_offset + ow;
-                                *col.get_unchecked_mut(col_idx) =
-                                    if iw >= 0 && iw < in_w as isize {
-                                        *input.get_unchecked(row_offset + iw as usize) - x_zp
-                                    } else {
-                                        neg_zp
-                                    };
+                                *col.get_unchecked_mut(col_idx) = if iw >= 0 && iw < in_w as isize {
+                                    *input.get_unchecked(row_offset + iw as usize) - x_zp
+                                } else {
+                                    neg_zp
+                                };
                             }
                         }
                     }
@@ -1058,7 +1419,7 @@ fn im2col_with_zp(
 
 /// Integer Convolution (ConvInteger) for quantized models.
 /// Performs convolution on quantized int8/uint8 inputs with int8 weights, producing int32 output.
-/// 
+///
 /// This implementation fuses zero-point subtraction into im2col to avoid
 /// allocating separate dequantized copies of the entire input and weight tensors.
 ///
@@ -1084,7 +1445,9 @@ pub fn conv_integer<'b, 'a>(
     } else {
         0.0
     };
-    conv2d_with_zero_points(input, weights, None, dilations, group, pads, strides, x_zp, w_zp, out)
+    conv2d_with_zero_points(
+        input, weights, None, dilations, group, pads, strides, x_zp, w_zp, out,
+    )
 }
 
 /// Fused DQL + conv_integer: takes f32 input, internally quantizes using a
@@ -1184,7 +1547,9 @@ pub fn conv_integer_from_f32<'b, 'a>(
     DQL_BUF.with(|buf_cell| {
         let mut dql_buf = buf_cell.borrow_mut();
         utils::ensure_capacity(&mut dql_buf, len);
-        unsafe { dql_buf.set_len(len); }
+        unsafe {
+            dql_buf.set_len(len);
+        }
 
         // Quantize
         #[cfg(target_arch = "aarch64")]
@@ -1237,7 +1602,16 @@ pub fn conv_integer_from_f32<'b, 'a>(
         // Create TensorView borrowing the thread-local buffer
         let quantized_view = TensorView::from_slice(&dql_buf, input_shape.to_vec());
         let result = conv2d_with_zero_points(
-            &quantized_view, weights, None, dilations, group, pads, strides, zp, w_zp, out,
+            &quantized_view,
+            weights,
+            None,
+            dilations,
+            group,
+            pads,
+            strides,
+            zp,
+            w_zp,
+            out,
         );
         // Return the shape from result, dropping the borrow
         let out_shape = result.shape.to_vec();
@@ -1358,7 +1732,9 @@ pub fn conv_integer_from_f32_multi<'b, 'a>(
     DQL_BUF_MULTI.with(|buf_cell| {
         let mut dql_buf = buf_cell.borrow_mut();
         utils::ensure_capacity(&mut dql_buf, total_len);
-        unsafe { dql_buf.set_len(total_len); }
+        unsafe {
+            dql_buf.set_len(total_len);
+        }
 
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -1391,10 +1767,22 @@ pub fn conv_integer_from_f32_multi<'b, 'a>(
                         let s1 = vrndnq_f32(vaddq_f32(vmulq_f32(v1, inv_scale_vec), zp_vec));
                         let s2 = vrndnq_f32(vaddq_f32(vmulq_f32(v2, inv_scale_vec), zp_vec));
                         let s3 = vrndnq_f32(vaddq_f32(vmulq_f32(v3, inv_scale_vec), zp_vec));
-                        vst1q_f32(dst_ptr.add(i), vminq_f32(vmaxq_f32(s0, zero_vec), max_clamp));
-                        vst1q_f32(dst_ptr.add(i + 4), vminq_f32(vmaxq_f32(s1, zero_vec), max_clamp));
-                        vst1q_f32(dst_ptr.add(i + 8), vminq_f32(vmaxq_f32(s2, zero_vec), max_clamp));
-                        vst1q_f32(dst_ptr.add(i + 12), vminq_f32(vmaxq_f32(s3, zero_vec), max_clamp));
+                        vst1q_f32(
+                            dst_ptr.add(i),
+                            vminq_f32(vmaxq_f32(s0, zero_vec), max_clamp),
+                        );
+                        vst1q_f32(
+                            dst_ptr.add(i + 4),
+                            vminq_f32(vmaxq_f32(s1, zero_vec), max_clamp),
+                        );
+                        vst1q_f32(
+                            dst_ptr.add(i + 8),
+                            vminq_f32(vmaxq_f32(s2, zero_vec), max_clamp),
+                        );
+                        vst1q_f32(
+                            dst_ptr.add(i + 12),
+                            vminq_f32(vmaxq_f32(s3, zero_vec), max_clamp),
+                        );
                         i += 16;
                     }
                     while i + 4 <= copy_len {
@@ -1423,7 +1811,9 @@ pub fn conv_integer_from_f32_multi<'b, 'a>(
                     let src_start = n * src_spatial;
                     let dst_start = (n * total_channels + ch_offset) * spatial;
                     for i in 0..src_spatial {
-                        dql_buf[dst_start + i] = (src.data[src_start + i] * inv_scale + zp).round().clamp(0.0, 255.0);
+                        dql_buf[dst_start + i] = (src.data[src_start + i] * inv_scale + zp)
+                            .round()
+                            .clamp(0.0, 255.0);
                     }
                     ch_offset += src_ch;
                 }
@@ -1434,12 +1824,16 @@ pub fn conv_integer_from_f32_multi<'b, 'a>(
         let input_shape = vec![batch_size, total_channels, height, width];
         let quantized_view = TensorView::from_slice(&dql_buf, input_shape);
         let result = conv2d_with_zero_points(
-            &quantized_view, weights, None,
-            &[1, 1],  // dilations (1×1 conv)
-            1,         // groups
+            &quantized_view,
+            weights,
+            None,
+            &[1, 1],       // dilations (1×1 conv)
+            1,             // groups
             &[0, 0, 0, 0], // pads
-            &[1, 1],  // strides
-            zp, w_zp, out,
+            &[1, 1],       // strides
+            zp,
+            w_zp,
+            out,
         );
         let out_shape = result.shape.to_vec();
         (TensorView::from_slice(out, out_shape), scale)
@@ -1467,7 +1861,7 @@ pub fn fused_scale_bias_silu(data: &mut [f32], shape: &[usize], scale: f32, bias
                 let bias_v = vdupq_n_f32(bias[c]);
                 let offset = (n * channels + c) * spatial;
                 let ptr = data.as_mut_ptr().add(offset);
-                
+
                 let mut i = 0;
                 let simd_end = spatial & !15;
                 // Process 16 elements at a time (4x unrolled)
@@ -1588,7 +1982,7 @@ fn conv_integer_gemm_i16(
     m: usize,        // output_channels
     k: usize,        // input_channels
     n: usize,        // spatial
-    out: &mut [f32],  // [M, N] row-major
+    out: &mut [f32], // [M, N] row-major
 ) {
     #[cfg(target_arch = "aarch64")]
     {
@@ -1634,51 +2028,51 @@ fn conv_integer_gemm_i16_neon(
 ) {
     // For the 1x1 conv case, weights are [M, K] and input is [K, N].
     // We compute C[i,j] = sum_over_k(W[i,k] * I[k,j])
-    // 
+    //
     // The input layout is [K, N] row-major, so I[k,j] = input[k*n + j]
     // This means consecutive j values are contiguous in memory for the same k.
     //
     // Strategy: for each output channel, iterate over K, loading 1 weight value
     // and broadcasting it across 8 spatial positions of input.
-    
+
     unsafe {
         use core::arch::aarch64::*;
-        
+
         for oc in 0..m {
             let w_row = weights.as_ptr().add(oc * k);
             let o_row = out.as_mut_ptr().add(oc * n);
-            
+
             let mut j = 0;
             // Process 8 spatial positions at a time
             while j + 8 <= n {
                 let mut acc0 = vdupq_n_s32(0);
                 let mut acc1 = vdupq_n_s32(0);
-                
+
                 for ic in 0..k {
                     let w_val = *w_row.add(ic);
                     let w_vec = vdupq_n_s16(w_val);
                     let in_ptr = input.as_ptr().add(ic * n + j);
-                    
-                    let in_lo = vld1_s16(in_ptr);          // 4 i16 values
-                    let in_hi = vld1_s16(in_ptr.add(4));   // 4 i16 values
-                    
+
+                    let in_lo = vld1_s16(in_ptr); // 4 i16 values
+                    let in_hi = vld1_s16(in_ptr.add(4)); // 4 i16 values
+
                     acc0 = vmlal_s16(acc0, vget_low_s16(w_vec), in_lo);
                     acc1 = vmlal_s16(acc1, vget_low_s16(w_vec), in_hi);
                 }
-                
+
                 // Convert i32 accumulators to f32 and store
                 let f0 = vcvtq_f32_s32(acc0);
                 let f1 = vcvtq_f32_s32(acc1);
                 vst1q_f32(o_row.add(j), f0);
                 vst1q_f32(o_row.add(j + 4), f1);
-                
+
                 j += 8;
             }
-            
+
             // Process 4 at a time
             while j + 4 <= n {
                 let mut acc0 = vdupq_n_s32(0);
-                
+
                 for ic in 0..k {
                     let w_val = *w_row.add(ic);
                     let w_vec = vdup_n_s16(w_val);
@@ -1686,12 +2080,12 @@ fn conv_integer_gemm_i16_neon(
                     let in_lo = vld1_s16(in_ptr);
                     acc0 = vmlal_s16(acc0, w_vec, in_lo);
                 }
-                
+
                 let f0 = vcvtq_f32_s32(acc0);
                 vst1q_f32(o_row.add(j), f0);
                 j += 4;
             }
-            
+
             // Handle remaining spatial positions
             while j < n {
                 let mut acc: i32 = 0;

@@ -43,11 +43,21 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
             } else {
                 "None".to_string()
             };
+            // Determine conv1d vs conv2d based on weight tensor rank
+            let weight_name = &ctx.node.input[1];
+            let weight_name_s = super::super::sanitize_name(weight_name);
+            let weight_rank = ctx
+                .known_weights
+                .get(&weight_name_s)
+                .map(|(_, _, shape, _)| shape.len())
+                .unwrap_or(3);
+            let kernel_fn = if weight_rank >= 4 { "conv2d" } else { "conv1d" };
             writeln!(
                 w,
-                "{}let {} = lele::kernels::conv1d(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
+                "{}let {} = lele::kernels::{}(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
                 tab,
                 outputs[0],
+                kernel_fn,
                 inputs[0],
                 inputs[1],
                 bias_arg,
@@ -345,33 +355,23 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 .find(|a| a.name == "coordinate_transformation_mode")
                 .and_then(|a| std::str::from_utf8(&a.s).ok().map(|s| s.to_string()))
                 .unwrap_or("half_pixel".to_string());
-            
+
             // Check if sizes input is provided (input[3])
             let has_sizes = inputs.len() > 3 && !ctx.node.input[3].is_empty();
             // Check if scales input is provided (input[2])
             let has_scales = inputs.len() > 2 && !ctx.node.input[2].is_empty();
-            
+
             if has_sizes {
                 writeln!(
                     w,
                     "{}let {} = lele::kernels::resize_nearest(&{}, None, Some(&{}.data.iter().map(|&v| v as i64).collect::<Vec<_>>()), \"{}\", {});",
-                    tab,
-                    outputs[0],
-                    inputs[0],
-                    inputs[3],
-                    coord_transform,
-                    buf_expr
+                    tab, outputs[0], inputs[0], inputs[3], coord_transform, buf_expr
                 )?;
             } else if has_scales {
                 writeln!(
                     w,
                     "{}let {} = lele::kernels::resize_nearest(&{}, Some(&{}.data), None, \"{}\", {});",
-                    tab,
-                    outputs[0],
-                    inputs[0],
-                    inputs[2],
-                    coord_transform,
-                    buf_expr
+                    tab, outputs[0], inputs[0], inputs[2], coord_transform, buf_expr
                 )?;
             } else {
                 panic!("Resize: neither scales nor sizes provided");
