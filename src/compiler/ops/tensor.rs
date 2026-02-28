@@ -208,7 +208,11 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 )?;
             } else if to == Some(1) {
                 // Check if input is already f32, in which case cast is a no-op
-                let input_type = ctx.var_types.get(&ctx.inputs[0]).map(|s| s.as_str()).unwrap_or("f32");
+                let input_type = ctx
+                    .var_types
+                    .get(&ctx.inputs[0])
+                    .map(|s| s.as_str())
+                    .unwrap_or("f32");
                 if input_type == "f32" {
                     writeln!(
                         w,
@@ -320,24 +324,21 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                     });
                 format!("&{:?}", split_attr)
             };
-            for out_name in outputs {
-                writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, out_name)?;
-            }
-            let buf_names: Vec<String> = outputs.iter().map(|n| format!("buf_{}", n)).collect();
-            writeln!(
-                w,
-                "{}let mut split_buffers = [{}];",
-                tab,
-                buf_names.join(", ")
-            )?;
+            // Use split_owned which returns owned TensorViews directly,
+            // avoiding the overhead of creating local buffers and cloning
             writeln!(w, "{}let splits_slice = {};", tab, splits)?;
             writeln!(
                 w,
-                "{}let split_results = lele::kernels::split(&{}, {}, splits_slice, &mut split_buffers);",
+                "{}let mut split_results = lele::kernels::split_owned(&{}, {}, splits_slice);",
                 tab, inputs[0], axis
             )?;
-            for (i, out_name) in outputs.iter().enumerate() {
-                writeln!(w, "{}let {} = split_results[{}].clone();", tab, out_name, i)?;
+            // Extract results in reverse order using swap_remove for O(1) extraction
+            for (i, out_name) in outputs.iter().enumerate().rev() {
+                writeln!(
+                    w,
+                    "{}let {} = split_results.swap_remove({});",
+                    tab, out_name, i
+                )?;
             }
         }
         "Pad" => {

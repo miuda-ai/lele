@@ -319,3 +319,250 @@ pub fn erf<'b, 'a>(input: &TensorView<'b>, output_buf: &'a mut Vec<f32>) -> Tens
         shape: Cow::Owned(input.shape.to_vec()),
     }
 }
+
+/// Standard GELU: x * 0.5 * (1 + erf(x / sqrt(2)))
+/// NEON-vectorized using our fast erf approximation.
+pub fn gelu<'b, 'a>(input: &TensorView<'b>, output_buf: &'a mut Vec<f32>) -> TensorView<'a> {
+    let len = input.data.len();
+    utils::ensure_capacity(output_buf, len);
+    unsafe {
+        output_buf.set_len(len);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+
+        let data = input.data.as_ptr();
+        let out = output_buf.as_mut_ptr();
+
+        // Constants for GELU
+        let p = vdupq_n_f32(0.3275911f32);
+        let a1 = vdupq_n_f32(0.254829592f32);
+        let a2 = vdupq_n_f32(-0.284496736f32);
+        let a3 = vdupq_n_f32(1.421413741f32);
+        let a4 = vdupq_n_f32(-1.453152027f32);
+        let a5 = vdupq_n_f32(1.061405429f32);
+        let one = vdupq_n_f32(1.0f32);
+        let neg_one = vdupq_n_f32(-1.0f32);
+        let half = vdupq_n_f32(0.5f32);
+        let inv_sqrt2 = vdupq_n_f32(0.7071067811865475f32); // 1/sqrt(2)
+
+        let mut i = 0;
+        let simd_end = len & !3;
+        while i < simd_end {
+            let x = vld1q_f32(data.add(i));
+
+            // Compute erf(x / sqrt(2))
+            let x_scaled = vmulq_f32(x, inv_sqrt2);
+            let sign_mask = vcgeq_f32(x_scaled, vdupq_n_f32(0.0));
+            let sign = vbslq_f32(sign_mask, one, neg_one);
+            let x_abs = vabsq_f32(x_scaled);
+            let t = vdivq_f32(one, vfmaq_f32(one, p, x_abs));
+            let mut y = a5;
+            y = vfmaq_f32(a4, y, t);
+            y = vfmaq_f32(a3, y, t);
+            y = vfmaq_f32(a2, y, t);
+            y = vfmaq_f32(a1, y, t);
+            y = vmulq_f32(y, t);
+            let neg_x2 = vnegq_f32(vmulq_f32(x_abs, x_abs));
+            let exp_val = neon_exp_f32x4(neg_x2);
+            let erf_val = vmulq_f32(sign, vsubq_f32(one, vmulq_f32(y, exp_val)));
+
+            // GELU = x * 0.5 * (1 + erf)
+            let result = vmulq_f32(x, vmulq_f32(half, vaddq_f32(one, erf_val)));
+            vst1q_f32(out.add(i), result);
+            i += 4;
+        }
+        // Scalar tail
+        while i < len {
+            let x = *data.add(i);
+            let erf_val = libm::erff(x * 0.7071067811865475);
+            *out.add(i) = x * 0.5 * (1.0 + erf_val);
+            i += 1;
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for i in 0..len {
+            let x = input.data[i];
+            let erf_val = libm::erff(x * 0.7071067811865475);
+            output_buf[i] = x * 0.5 * (1.0 + erf_val);
+        }
+    }
+
+    TensorView {
+        data: Cow::Borrowed(output_buf),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
+}
+
+/// Fast GELU approximation (used in GPT-2, BERT):
+/// fast_gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+/// This is faster than standard GELU and commonly used in transformers.
+pub fn fast_gelu<'b, 'a>(input: &TensorView<'b>, output_buf: &'a mut Vec<f32>) -> TensorView<'a> {
+    let len = input.data.len();
+    utils::ensure_capacity(output_buf, len);
+    unsafe {
+        output_buf.set_len(len);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+
+        let data = input.data.as_ptr();
+        let out = output_buf.as_mut_ptr();
+
+        // Constants for FastGELU
+        let half = vdupq_n_f32(0.5f32);
+        let one = vdupq_n_f32(1.0f32);
+        let sqrt_2_over_pi = vdupq_n_f32(0.7978845608028654f32); // sqrt(2/pi)
+        let coeff = vdupq_n_f32(0.044715f32);
+
+        let mut i = 0;
+        let simd_end = len & !3;
+        while i < simd_end {
+            let x = vld1q_f32(data.add(i));
+
+            // x^3
+            let x2 = vmulq_f32(x, x);
+            let x3 = vmulq_f32(x2, x);
+
+            // inner = sqrt(2/pi) * (x + 0.044715 * x^3)
+            let inner = vfmaq_f32(x, coeff, x3);
+            let inner = vmulq_f32(sqrt_2_over_pi, inner);
+
+            // tanh(inner) using exp
+            // tanh(y) = (e^y - e^-y) / (e^y + e^-y) = (e^(2y) - 1) / (e^(2y) + 1)
+            let two_inner = vmulq_f32(vdupq_n_f32(2.0), inner);
+            let e2y = neon_exp_f32x4(two_inner);
+            let tanh_val = vdivq_f32(vsubq_f32(e2y, one), vaddq_f32(e2y, one));
+
+            // result = 0.5 * x * (1 + tanh(inner))
+            let result = vmulq_f32(x, vmulq_f32(half, vaddq_f32(one, tanh_val)));
+            vst1q_f32(out.add(i), result);
+            i += 4;
+        }
+        // Scalar tail
+        while i < len {
+            let x = *data.add(i);
+            let inner = 0.7978845608028654 * (x + 0.044715 * x * x * x);
+            let tanh_val = inner.tanh();
+            *out.add(i) = 0.5 * x * (1.0 + tanh_val);
+            i += 1;
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for i in 0..len {
+            let x = input.data[i];
+            let inner = 0.7978845608028654 * (x + 0.044715 * x * x * x);
+            let tanh_val = inner.tanh();
+            output_buf[i] = 0.5 * x * (1.0 + tanh_val);
+        }
+    }
+
+    TensorView {
+        data: Cow::Borrowed(output_buf),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
+}
+// ─── NEON element-wise binary helpers ────────────────────────────────────────
+
+/// NEON f32 add: out[i] = a[i] + b[i], 4x unrolled
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub unsafe fn add_f32(a: *const f32, b: *const f32, out: *mut f32, len: usize) {
+    use core::arch::aarch64::*;
+    let mut i = 0;
+    while i + 16 <= len {
+        let va0 = vld1q_f32(a.add(i));
+        let vb0 = vld1q_f32(b.add(i));
+        let va1 = vld1q_f32(a.add(i + 4));
+        let vb1 = vld1q_f32(b.add(i + 4));
+        let va2 = vld1q_f32(a.add(i + 8));
+        let vb2 = vld1q_f32(b.add(i + 8));
+        let va3 = vld1q_f32(a.add(i + 12));
+        let vb3 = vld1q_f32(b.add(i + 12));
+        vst1q_f32(out.add(i), vaddq_f32(va0, vb0));
+        vst1q_f32(out.add(i + 4), vaddq_f32(va1, vb1));
+        vst1q_f32(out.add(i + 8), vaddq_f32(va2, vb2));
+        vst1q_f32(out.add(i + 12), vaddq_f32(va3, vb3));
+        i += 16;
+    }
+    while i + 4 <= len {
+        let va = vld1q_f32(a.add(i));
+        let vb = vld1q_f32(b.add(i));
+        vst1q_f32(out.add(i), vaddq_f32(va, vb));
+        i += 4;
+    }
+    while i < len {
+        *out.add(i) = *a.add(i) + *b.add(i);
+        i += 1;
+    }
+}
+
+/// NEON f32 mul: out[i] = a[i] * b[i], 4x unrolled
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub unsafe fn mul_f32(a: *const f32, b: *const f32, out: *mut f32, len: usize) {
+    use core::arch::aarch64::*;
+    let mut i = 0;
+    while i + 16 <= len {
+        let va0 = vld1q_f32(a.add(i));
+        let vb0 = vld1q_f32(b.add(i));
+        let va1 = vld1q_f32(a.add(i + 4));
+        let vb1 = vld1q_f32(b.add(i + 4));
+        let va2 = vld1q_f32(a.add(i + 8));
+        let vb2 = vld1q_f32(b.add(i + 8));
+        let va3 = vld1q_f32(a.add(i + 12));
+        let vb3 = vld1q_f32(b.add(i + 12));
+        vst1q_f32(out.add(i), vmulq_f32(va0, vb0));
+        vst1q_f32(out.add(i + 4), vmulq_f32(va1, vb1));
+        vst1q_f32(out.add(i + 8), vmulq_f32(va2, vb2));
+        vst1q_f32(out.add(i + 12), vmulq_f32(va3, vb3));
+        i += 16;
+    }
+    while i + 4 <= len {
+        let va = vld1q_f32(a.add(i));
+        let vb = vld1q_f32(b.add(i));
+        vst1q_f32(out.add(i), vmulq_f32(va, vb));
+        i += 4;
+    }
+    while i < len {
+        *out.add(i) = *a.add(i) * *b.add(i);
+        i += 1;
+    }
+}
+
+/// NEON scalar-broadcast mul: out[i] = data[i] * scalar
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub unsafe fn mul_scalar_f32(data: *const f32, scalar: f32, out: *mut f32, len: usize) {
+    use core::arch::aarch64::*;
+    let mut i = 0;
+    let vs = vdupq_n_f32(scalar);
+    while i + 16 <= len {
+        let v0 = vld1q_f32(data.add(i));
+        let v1 = vld1q_f32(data.add(i + 4));
+        let v2 = vld1q_f32(data.add(i + 8));
+        let v3 = vld1q_f32(data.add(i + 12));
+        vst1q_f32(out.add(i), vmulq_f32(v0, vs));
+        vst1q_f32(out.add(i + 4), vmulq_f32(v1, vs));
+        vst1q_f32(out.add(i + 8), vmulq_f32(v2, vs));
+        vst1q_f32(out.add(i + 12), vmulq_f32(v3, vs));
+        i += 16;
+    }
+    while i + 4 <= len {
+        let v = vld1q_f32(data.add(i));
+        vst1q_f32(out.add(i), vmulq_f32(v, vs));
+        i += 4;
+    }
+    while i < len {
+        *out.add(i) = *data.add(i) * scalar;
+        i += 1;
+    }
+}

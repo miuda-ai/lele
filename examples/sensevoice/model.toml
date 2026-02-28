@@ -1,15 +1,8 @@
 [model]
-source = "hf-hub"
-repo = "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09"
-revision = "main"
+source = "local"
 
 [[model.files]]
-file = "model.int8.onnx"
-dest = "sensevoice.int8.onnx"
-
-[[model.files]]
-file = "tokens.txt"
-dest = "sensevoice.int8.tokens.txt"
+path = "sensevoice.int8.onnx"
 
 [codegen]
 class_name = "SenseVoice"

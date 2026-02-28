@@ -7,16 +7,16 @@ import initSenseVoice, {
     SenseVoiceEngine,
     decode_wav,
     encode_wav as sv_encode_wav,
-} from './pkg/sensevoice/sensevoice_wasm.js';
+} from './pkg/sensevoice-wasm/sensevoice_wasm.js';
 
 import initYolo26, {
     Yolo26Engine,
-} from './pkg/yolo26/yolo26_wasm.js';
+} from './pkg/yolo26-wasm/yolo26_wasm.js';
 
 import initSupertonic, {
     SupertonicEngine,
     encode_wav,
-} from './pkg/supertonic/supertonic_wasm.js';
+} from './pkg/supertonic-wasm/supertonic_wasm.js';
 
 // ── State ──
 let asrEngine = null;
@@ -501,9 +501,9 @@ async function main() {
     }
 
     Promise.all([
-        getWasmSize('./pkg/sensevoice/sensevoice_wasm_bg.wasm'),
-        getWasmSize('./pkg/supertonic/supertonic_wasm_bg.wasm'),
-        getWasmSize('./pkg/yolo26/yolo26_wasm_bg.wasm'),
+        getWasmSize('./pkg/sensevoice-wasm/sensevoice_wasm_bg.wasm'),
+        getWasmSize('./pkg/supertonic-wasm/supertonic_wasm_bg.wasm'),
+        getWasmSize('./pkg/yolo26-wasm/yolo26_wasm_bg.wasm'),
     ]).then(([svSize, stSize, yoloSize]) => {
         if (svSize) modelStats.sensevoice.wasm = svSize;
         if (stSize) modelStats.supertonic.wasm = stSize;

@@ -1,5 +1,36 @@
+// Allow unsafe operations in unsafe functions without explicit unsafe blocks
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use crate::kernels::utils;
 use crate::tensor::TensorView;
+
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+
+/// Transpose a 4x4 matrix of f32 using NEON intrinsics
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn transpose_4x4_f32_neon(
+    row0: float32x4_t,
+    row1: float32x4_t,
+    row2: float32x4_t,
+    row3: float32x4_t,
+) -> (float32x4_t, float32x4_t, float32x4_t, float32x4_t) {
+    // Step 1: vtrnq transposes adjacent pairs
+    // t0.0 = [r0[0],r1[0],r0[2],r1[2]], t0.1 = [r0[1],r1[1],r0[3],r1[3]]
+    let t0 = vtrnq_f32(row0, row1);
+    // t1.0 = [r2[0],r3[0],r2[2],r3[2]], t1.1 = [r2[1],r3[1],r2[3],r3[3]]
+    let t1 = vtrnq_f32(row2, row3);
+
+    // Step 2: Combine low/high halves to get transposed columns
+    let col0 = vcombine_f32(vget_low_f32(t0.0), vget_low_f32(t1.0));
+    let col1 = vcombine_f32(vget_low_f32(t0.1), vget_low_f32(t1.1));
+    let col2 = vcombine_f32(vget_high_f32(t0.0), vget_high_f32(t1.0));
+    let col3 = vcombine_f32(vget_high_f32(t0.1), vget_high_f32(t1.1));
+
+    (col0, col1, col2, col3)
+}
+
 pub fn concat<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     inputs: &[&TensorView<'b, T>],
     axis: i64,
@@ -469,7 +500,7 @@ where
 pub fn cast<'a>(input: &TensorView<'a>, _to: i64) -> TensorView<'a> {
     input.clone()
 }
-pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
+pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
     input: &TensorView<'b, T>,
     perm: &[i64],
     out: &'a mut Vec<T>,
@@ -480,9 +511,13 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     } else {
         perm.iter().map(|&x| x as usize).collect()
     };
+
+    let input_shape = input.shape.to_vec();
+    let input_data: &[T] = input.data.as_ref();
+
     let mut out_shape = vec![0; ndim];
     for (i, &p) in perm.iter().enumerate() {
-        out_shape[i] = input.shape[p];
+        out_shape[i] = input_shape[p];
     }
     let out_numel = input.data.len();
     utils::ensure_capacity(out, out_numel);
@@ -494,10 +529,10 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     // [B, A, C, D] -> [B, C, A, D] — inner dim D is contiguous
     if ndim == 4 && perm == [0, 2, 1, 3] {
         let (b, a, c, d) = (
-            input.shape[0],
-            input.shape[1],
-            input.shape[2],
-            input.shape[3],
+            input_shape[0],
+            input_shape[1],
+            input_shape[2],
+            input_shape[3],
         );
         let out_slice = out.as_mut_slice();
         for bi in 0..b {
@@ -507,7 +542,7 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
                     let dst_off = ((bi * c + ci) * a + ai) * d;
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            input.data.as_ptr().add(src_off),
+                            input_data.as_ptr().add(src_off),
                             out_slice.as_mut_ptr().add(dst_off),
                             d,
                         );
@@ -522,11 +557,58 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     // [B, A, C, D] -> [B, C, D, A]
     if ndim == 4 && perm == [0, 2, 3, 1] {
         let (b, a, c, d) = (
-            input.shape[0],
-            input.shape[1],
-            input.shape[2],
-            input.shape[3],
+            input_shape[0],
+            input_shape[1],
+            input_shape[2],
+            input_shape[3],
         );
+
+        // Fast NEON path for f32: 4×4 block transpose on (A, C*D) matrix within each batch
+        #[cfg(target_arch = "aarch64")]
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+            let cd = c * d;
+            let in_ptr = input_data.as_ptr() as *const f32;
+            let out_ptr = out.as_mut_ptr() as *mut f32;
+            let a4 = a / 4 * 4;
+            let cd4 = cd / 4 * 4;
+
+            for bi in 0..b {
+                let base_in = bi * a * cd;
+                let base_out = bi * cd * a;
+                unsafe {
+                    // 4×4 block transpose core
+                    for ai in (0..a4).step_by(4) {
+                        for cdi in (0..cd4).step_by(4) {
+                            let r0 = vld1q_f32(in_ptr.add(base_in + ai * cd + cdi));
+                            let r1 = vld1q_f32(in_ptr.add(base_in + (ai + 1) * cd + cdi));
+                            let r2 = vld1q_f32(in_ptr.add(base_in + (ai + 2) * cd + cdi));
+                            let r3 = vld1q_f32(in_ptr.add(base_in + (ai + 3) * cd + cdi));
+                            let (t0, t1, t2, t3) = transpose_4x4_f32_neon(r0, r1, r2, r3);
+                            vst1q_f32(out_ptr.add(base_out + cdi * a + ai), t0);
+                            vst1q_f32(out_ptr.add(base_out + (cdi + 1) * a + ai), t1);
+                            vst1q_f32(out_ptr.add(base_out + (cdi + 2) * a + ai), t2);
+                            vst1q_f32(out_ptr.add(base_out + (cdi + 3) * a + ai), t3);
+                        }
+                        // Remainder columns
+                        for cdi in cd4..cd {
+                            for ai2 in ai..ai + 4 {
+                                *out_ptr.add(base_out + cdi * a + ai2) =
+                                    *in_ptr.add(base_in + ai2 * cd + cdi);
+                            }
+                        }
+                    }
+                    // Remainder rows
+                    for ai in a4..a {
+                        for cdi in 0..cd {
+                            *out_ptr.add(base_out + cdi * a + ai) =
+                                *in_ptr.add(base_in + ai * cd + cdi);
+                        }
+                    }
+                }
+            }
+            return TensorView::from_slice(out, out_shape);
+        }
+
         let out_slice = out.as_mut_slice();
         for bi in 0..b {
             for ai in 0..a {
@@ -536,7 +618,7 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
                         let dst_off = ((bi * c + ci) * d + di) * a + ai;
                         unsafe {
                             *out_slice.get_unchecked_mut(dst_off) =
-                                *input.data.get_unchecked(src_off);
+                                *input_data.get_unchecked(src_off);
                         }
                     }
                 }
@@ -548,7 +630,52 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     // Fast path: perm [0,2,1] for 3D tensors — 2D transpose within each batch
     // [B, R, C] -> [B, C, R]
     if ndim == 3 && perm == [0, 2, 1] {
-        let (b, r, c) = (input.shape[0], input.shape[1], input.shape[2]);
+        let (b, r, c) = (input_shape[0], input_shape[1], input_shape[2]);
+
+        // Fast NEON path for f32: 4×4 block transpose within each batch
+        #[cfg(target_arch = "aarch64")]
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+            let in_ptr = input_data.as_ptr() as *const f32;
+            let out_ptr = out.as_mut_ptr() as *mut f32;
+            let r4 = r / 4 * 4;
+            let c4 = c / 4 * 4;
+
+            for bi in 0..b {
+                let base_in = bi * r * c;
+                let base_out = bi * c * r;
+                unsafe {
+                    for ri in (0..r4).step_by(4) {
+                        for ci in (0..c4).step_by(4) {
+                            let r0 = vld1q_f32(in_ptr.add(base_in + ri * c + ci));
+                            let r1 = vld1q_f32(in_ptr.add(base_in + (ri + 1) * c + ci));
+                            let r2 = vld1q_f32(in_ptr.add(base_in + (ri + 2) * c + ci));
+                            let r3 = vld1q_f32(in_ptr.add(base_in + (ri + 3) * c + ci));
+                            let (t0, t1, t2, t3) = transpose_4x4_f32_neon(r0, r1, r2, r3);
+                            vst1q_f32(out_ptr.add(base_out + ci * r + ri), t0);
+                            vst1q_f32(out_ptr.add(base_out + (ci + 1) * r + ri), t1);
+                            vst1q_f32(out_ptr.add(base_out + (ci + 2) * r + ri), t2);
+                            vst1q_f32(out_ptr.add(base_out + (ci + 3) * r + ri), t3);
+                        }
+                        // Remainder columns
+                        for ci in c4..c {
+                            for ri2 in ri..ri + 4 {
+                                *out_ptr.add(base_out + ci * r + ri2) =
+                                    *in_ptr.add(base_in + ri2 * c + ci);
+                            }
+                        }
+                    }
+                    // Remainder rows
+                    for ri in r4..r {
+                        for ci in 0..c {
+                            *out_ptr.add(base_out + ci * r + ri) =
+                                *in_ptr.add(base_in + ri * c + ci);
+                        }
+                    }
+                }
+            }
+            return TensorView::from_slice(out, out_shape);
+        }
+
         let out_slice = out.as_mut_slice();
         for bi in 0..b {
             let base_in = bi * r * c;
@@ -557,7 +684,7 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
                 for ci in 0..c {
                     unsafe {
                         *out_slice.get_unchecked_mut(base_out + ci * r + ri) =
-                            *input.data.get_unchecked(base_in + ri * c + ci);
+                            *input_data.get_unchecked(base_in + ri * c + ci);
                     }
                 }
             }
@@ -565,8 +692,72 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         return TensorView::from_slice(out, out_shape);
     }
 
+    // Fast path: perm [1, 0] for 2D tensors — simple matrix transpose
+    if ndim == 2 && perm == [1, 0] {
+        let (r, c) = (input_shape[0], input_shape[1]);
+        let out_slice = out.as_mut_slice();
+
+        #[cfg(target_arch = "aarch64")]
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+            // NEON-optimized 4x4 block transpose for f32
+            let r4 = r / 4 * 4;
+            let c4 = c / 4 * 4;
+            let in_ptr = input_data.as_ptr() as *const f32;
+            let out_ptr = out_slice.as_mut_ptr() as *mut f32;
+
+            unsafe {
+                for ri in (0..r4).step_by(4) {
+                    for ci in (0..c4).step_by(4) {
+                        // Load 4x4 block
+                        let row0 = vld1q_f32(in_ptr.add(ri * c + ci));
+                        let row1 = vld1q_f32(in_ptr.add((ri + 1) * c + ci));
+                        let row2 = vld1q_f32(in_ptr.add((ri + 2) * c + ci));
+                        let row3 = vld1q_f32(in_ptr.add((ri + 3) * c + ci));
+
+                        // Transpose 4x4
+                        let (t0, t1, t2, t3) = transpose_4x4_f32_neon(row0, row1, row2, row3);
+
+                        // Store transposed (note: output is [c, r] so stride is r)
+                        vst1q_f32(out_ptr.add(ci * r + ri), t0);
+                        vst1q_f32(out_ptr.add((ci + 1) * r + ri), t1);
+                        vst1q_f32(out_ptr.add((ci + 2) * r + ri), t2);
+                        vst1q_f32(out_ptr.add((ci + 3) * r + ri), t3);
+                    }
+
+                    // Handle remaining columns
+                    for ci in c4..c {
+                        for ri2 in ri..ri + 4 {
+                            *out_slice.get_unchecked_mut(ci * r + ri2) =
+                                *input_data.get_unchecked(ri2 * c + ci);
+                        }
+                    }
+                }
+
+                // Handle remaining rows
+                for ri in r4..r {
+                    for ci in 0..c {
+                        *out_slice.get_unchecked_mut(ci * r + ri) =
+                            *input_data.get_unchecked(ri * c + ci);
+                    }
+                }
+            }
+            return TensorView::from_slice(out, out_shape);
+        }
+
+        // Non-NEON fallback (generic)
+        for ri in 0..r {
+            for ci in 0..c {
+                unsafe {
+                    *out_slice.get_unchecked_mut(ci * r + ri) =
+                        *input_data.get_unchecked(ri * c + ci);
+                }
+            }
+        }
+        return TensorView::from_slice(out, out_shape);
+    }
+
     // Generic fallback
-    let in_strides = utils::compute_strides(&input.shape);
+    let in_strides = utils::compute_strides(&input_shape);
     let mut virtual_strides = vec![0; ndim];
     for i in 0..ndim {
         virtual_strides[i] = in_strides[perm[i]];
@@ -576,7 +767,7 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     let mut in_off = 0;
     for i in 0..out_numel {
         unsafe {
-            *out_slice.get_unchecked_mut(i) = *input.data.get_unchecked(in_off);
+            *out_slice.get_unchecked_mut(i) = *input_data.get_unchecked(in_off);
         }
         for d in (0..ndim).rev() {
             coords[d] += 1;
@@ -650,6 +841,72 @@ pub fn split<'a, T: Clone + Copy + std::fmt::Debug>(
     }
     results
 }
+
+/// Split a tensor into multiple owned tensors along an axis.
+/// This is a convenience function that returns owned TensorViews directly,
+/// avoiding the need for cloning when using the output buffers pattern.
+///
+/// # Arguments
+/// * `input` - Input tensor to split
+/// * `axis` - Axis along which to split (negative values index from the end)
+/// * `splits` - Sizes of each split output
+///
+/// # Returns
+/// Vector of owned TensorViews, one for each split
+pub fn split_owned<T: Clone + Copy + std::fmt::Debug>(
+    input: &TensorView<'_, T>,
+    axis: i64,
+    splits: &[i64],
+) -> Vec<TensorView<'static, T>> {
+    let ndim = input.dim();
+    let axis = if axis < 0 {
+        (ndim as i64 + axis) as usize
+    } else {
+        axis as usize
+    };
+    assert!(axis < ndim, "Split: axis out of bounds");
+
+    let num_splits = splits.len();
+    let total: i64 = splits.iter().sum();
+    assert_eq!(
+        total, input.shape[axis] as i64,
+        "Split: splits sum mismatch"
+    );
+
+    let outer_dim: usize = input.shape[..axis].iter().product();
+    let inner_dim: usize = input.shape[axis + 1..].iter().product();
+
+    let mut results = Vec::with_capacity(num_splits);
+    let mut axis_offset = 0;
+
+    for &split_size in splits {
+        let split_size = split_size as usize;
+        let mut out_shape = input.shape.to_vec();
+        out_shape[axis] = split_size;
+        let out_numel = out_shape.iter().product::<usize>();
+
+        // Allocate owned buffer for this split
+        let mut buffer = Vec::with_capacity(out_numel);
+        unsafe {
+            buffer.set_len(out_numel);
+        }
+
+        // Copy data from input to this split's buffer
+        for outer_idx in 0..outer_dim {
+            let src_offset = outer_idx * input.shape[axis] * inner_dim + axis_offset * inner_dim;
+            let dst_offset = outer_idx * split_size * inner_dim;
+            let copy_len = split_size * inner_dim;
+            buffer[dst_offset..dst_offset + copy_len]
+                .copy_from_slice(&input.data[src_offset..src_offset + copy_len]);
+        }
+
+        // Create owned TensorView
+        results.push(TensorView::from_owned(buffer, out_shape));
+        axis_offset += split_size;
+    }
+
+    results
+}
 pub fn where_op<'b, 'a, T, C>(
     condition: &TensorView<'b, C>,
     x: &TensorView<'b, T>,
@@ -694,6 +951,39 @@ where
         out.set_len(out_numel);
     }
     let o = out.as_mut_slice();
+
+    // Fast path: scalar x, condition broadcasts, y is full-sized
+    // This is the attention mask pattern: where(mask, -inf, attention_scores)
+    if x.data.len() == 1 && y.data.len() == out_numel {
+        let x_val = x.data[0];
+        let cond_numel = cond_data.len();
+
+        if cond_numel == 1 {
+            if cond_data[0].as_i64() != 0 {
+                for v in o.iter_mut() {
+                    *v = x_val;
+                }
+            } else {
+                o.copy_from_slice(y_data);
+            }
+        } else {
+            // Condition repeats over leading dims
+            let repeat = out_numel / cond_numel;
+            // Copy y first, then overwrite where condition is true
+            o.copy_from_slice(y_data);
+            for r in 0..repeat {
+                let base = r * cond_numel;
+                for i in 0..cond_numel {
+                    unsafe {
+                        if cond_data.get_unchecked(i).as_i64() != 0 {
+                            *o.get_unchecked_mut(base + i) = x_val;
+                        }
+                    }
+                }
+            }
+        }
+        return TensorView::from_slice(out, out_shape);
+    }
 
     if x.data.len() == out_numel && y.data.len() == out_numel {
         // Condition broadcasts, x and y are full — use stride-based cond index

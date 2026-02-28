@@ -1,0 +1,15 @@
+[package]
+name = "yolo26-wasm-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "yolo26-wasm-bench"
+path = "src/main.rs"
+
+[dependencies]
+lele = { workspace = true }
+
+[build-dependencies]
+lele-build = { workspace = true }

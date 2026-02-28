@@ -15,6 +15,8 @@ pub mod rnn;
 pub mod shape;
 pub mod utils;
 #[cfg(target_arch = "wasm32")]
+pub mod wasm;
+#[cfg(target_arch = "wasm32")]
 pub mod wasm_matmul;
 pub use conv1d::conv1d;
 pub use conv1d::conv1d_fused;

@@ -1,3 +1,6 @@
+// Allow unsafe operations in unsafe functions without explicit unsafe blocks
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use crate::kernels::utils;
 use crate::tensor::TensorView;
 use core::arch::aarch64::*;
@@ -33,6 +36,108 @@ pub struct PreparedWeightsArm {
     pub n: usize,
     /// Stride per strip in bytes = k_aligned * 16
     pub strip_stride: usize,
+    /// Raw u8 weights in K×N row-major layout (for fp32 dequantization on macOS)
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub raw_b: Vec<u8>,
+    /// Lazily dequantized fp32 weights [K, N] for Accelerate cblas_sgemm
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub dequantized_f32: std::sync::OnceLock<Vec<f32>>,
+}
+
+impl PreparedWeightsArm {
+    /// Get or compute the dequantized fp32 weight matrix [K, N] row-major
+    /// w_f32[k*n+j] = (raw_b[k*n+j] as f32 - zp_b as f32) * weight_scale[j]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub fn get_dequantized_weights(
+        &self,
+        b_zero_point: Option<u8>,
+        weight_scale: &crate::tensor::TensorView<'_, f32>,
+    ) -> &[f32] {
+        self.dequantized_f32.get_or_init(|| {
+            let k = self.k;
+            let n = self.n;
+            let zp_b = b_zero_point.unwrap_or(0) as f32;
+            let ws = &weight_scale.data;
+            let per_channel = ws.len() > 1;
+            let mut out = vec![0.0f32; k * n];
+
+            if per_channel {
+                // Per-channel: w_f32[k*n+j] = (raw_b[k*n+j] - zp_b) * ws[j]
+                for kk in 0..k {
+                    let row_off = kk * n;
+                    let mut j = 0;
+                    unsafe {
+                        let zp_v = vdupq_n_f32(zp_b);
+                        while j + 4 <= n {
+                            let b_u8_0 = self.raw_b[row_off + j] as f32;
+                            let b_u8_1 = self.raw_b[row_off + j + 1] as f32;
+                            let b_u8_2 = self.raw_b[row_off + j + 2] as f32;
+                            let b_u8_3 = self.raw_b[row_off + j + 3] as f32;
+                            let b_f32 = vld1q_f32([b_u8_0, b_u8_1, b_u8_2, b_u8_3].as_ptr());
+                            let scale_v = vld1q_f32(ws.as_ptr().add(j));
+                            let result = vmulq_f32(vsubq_f32(b_f32, zp_v), scale_v);
+                            vst1q_f32(out.as_mut_ptr().add(row_off + j), result);
+                            j += 4;
+                        }
+                    }
+                    while j < n {
+                        out[row_off + j] = (self.raw_b[row_off + j] as f32 - zp_b) * ws[j];
+                        j += 1;
+                    }
+                }
+            } else {
+                // Per-tensor: w_f32[i] = (raw_b[i] - zp_b) * ws[0]
+                let scale = ws[0];
+                let total = k * n;
+                let mut i = 0;
+                unsafe {
+                    let zp_v = vdupq_n_f32(zp_b);
+                    let s_v = vdupq_n_f32(scale);
+                    while i + 16 <= total {
+                        let b0 = self.raw_b[i] as f32;
+                        let b1 = self.raw_b[i + 1] as f32;
+                        let b2 = self.raw_b[i + 2] as f32;
+                        let b3 = self.raw_b[i + 3] as f32;
+                        let b4 = self.raw_b[i + 4] as f32;
+                        let b5 = self.raw_b[i + 5] as f32;
+                        let b6 = self.raw_b[i + 6] as f32;
+                        let b7 = self.raw_b[i + 7] as f32;
+                        let b8 = self.raw_b[i + 8] as f32;
+                        let b9 = self.raw_b[i + 9] as f32;
+                        let b10 = self.raw_b[i + 10] as f32;
+                        let b11 = self.raw_b[i + 11] as f32;
+                        let b12 = self.raw_b[i + 12] as f32;
+                        let b13 = self.raw_b[i + 13] as f32;
+                        let b14 = self.raw_b[i + 14] as f32;
+                        let b15 = self.raw_b[i + 15] as f32;
+                        let v0 = vld1q_f32([b0, b1, b2, b3].as_ptr());
+                        let v1 = vld1q_f32([b4, b5, b6, b7].as_ptr());
+                        let v2 = vld1q_f32([b8, b9, b10, b11].as_ptr());
+                        let v3 = vld1q_f32([b12, b13, b14, b15].as_ptr());
+                        vst1q_f32(out.as_mut_ptr().add(i), vmulq_f32(vsubq_f32(v0, zp_v), s_v));
+                        vst1q_f32(
+                            out.as_mut_ptr().add(i + 4),
+                            vmulq_f32(vsubq_f32(v1, zp_v), s_v),
+                        );
+                        vst1q_f32(
+                            out.as_mut_ptr().add(i + 8),
+                            vmulq_f32(vsubq_f32(v2, zp_v), s_v),
+                        );
+                        vst1q_f32(
+                            out.as_mut_ptr().add(i + 12),
+                            vmulq_f32(vsubq_f32(v3, zp_v), s_v),
+                        );
+                        i += 16;
+                    }
+                }
+                while i < total {
+                    out[i] = (self.raw_b[i] as f32 - zp_b) * scale;
+                    i += 1;
+                }
+            }
+            out
+        })
+    }
 }
 
 pub fn prepare_weights_arm(b_u8: &[u8], k: usize, n: usize) -> PreparedWeightsArm {
@@ -44,7 +149,7 @@ pub fn prepare_weights_arm(b_u8: &[u8], k: usize, n: usize) -> PreparedWeightsAr
     let mut packed_b = vec![0u8; total_strips * strip_stride];
     let mut col_sums = vec![0i32; n];
 
-    // Compute column sums
+    // Compute column sums - simple loop (runs once at model load)
     for kk in 0..k {
         let row_off = kk * n;
         for jj in 0..n {
@@ -145,9 +250,14 @@ pub fn prepare_weights_arm(b_u8: &[u8], k: usize, n: usize) -> PreparedWeightsAr
         k_aligned,
         n,
         strip_stride,
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        raw_b: b_u8.to_vec(),
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        dequantized_f32: std::sync::OnceLock::new(),
     }
 }
 
+#[inline(always)]
 pub fn mat_mul_integer_prepared_neon<'a>(
     a_u8: &[u8],
     m: usize,
@@ -161,7 +271,6 @@ pub fn mat_mul_integer_prepared_neon<'a>(
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
     let n = pw.n;
-    let k_aligned = pw.k_aligned;
     let output_len = m * n;
     utils::ensure_capacity(out, output_len);
     out.resize(output_len, 0.0);
@@ -255,10 +364,89 @@ pub fn mat_mul_integer_prepared_neon<'a>(
 
                 let mut pb_ptr = pb_strip;
 
-                // Fast path: full 4-byte K-blocks (branchless)
+                // K-loop unrolled 2x: process 8 K-elements per iteration
                 let k_full_blocks = k / 4;
+                let k_pairs = k_full_blocks / 2;
                 let mut kk = 0usize;
-                for _ in 0..k_full_blocks {
+                for _ in 0..k_pairs {
+                    // K-step 0
+                    let va0 = vreinterpretq_u8_u32(vdupq_n_u32(core::ptr::read_unaligned(
+                        a0_ptr.add(kk) as *const u32,
+                    )));
+                    let va1 = vreinterpretq_u8_u32(vdupq_n_u32(core::ptr::read_unaligned(
+                        a1_ptr.add(kk) as *const u32,
+                    )));
+                    let va2 = vreinterpretq_u8_u32(vdupq_n_u32(core::ptr::read_unaligned(
+                        a2_ptr.add(kk) as *const u32,
+                    )));
+                    let va3 = vreinterpretq_u8_u32(vdupq_n_u32(core::ptr::read_unaligned(
+                        a3_ptr.add(kk) as *const u32,
+                    )));
+
+                    let vb0 = vld1q_u8(pb_ptr);
+                    let vb1 = vld1q_u8(pb_ptr.add(16));
+                    let vb2 = vld1q_u8(pb_ptr.add(32));
+                    let vb3 = vld1q_u8(pb_ptr.add(48));
+
+                    acc00 = vdotq_u32_custom(acc00, va0, vb0);
+                    acc01 = vdotq_u32_custom(acc01, va0, vb1);
+                    acc02 = vdotq_u32_custom(acc02, va0, vb2);
+                    acc03 = vdotq_u32_custom(acc03, va0, vb3);
+                    acc10 = vdotq_u32_custom(acc10, va1, vb0);
+                    acc11 = vdotq_u32_custom(acc11, va1, vb1);
+                    acc12 = vdotq_u32_custom(acc12, va1, vb2);
+                    acc13 = vdotq_u32_custom(acc13, va1, vb3);
+                    acc20 = vdotq_u32_custom(acc20, va2, vb0);
+                    acc21 = vdotq_u32_custom(acc21, va2, vb1);
+                    acc22 = vdotq_u32_custom(acc22, va2, vb2);
+                    acc23 = vdotq_u32_custom(acc23, va2, vb3);
+                    acc30 = vdotq_u32_custom(acc30, va3, vb0);
+                    acc31 = vdotq_u32_custom(acc31, va3, vb1);
+                    acc32 = vdotq_u32_custom(acc32, va3, vb2);
+                    acc33 = vdotq_u32_custom(acc33, va3, vb3);
+
+                    // K-step 1
+                    let va0 = vreinterpretq_u8_u32(vdupq_n_u32(core::ptr::read_unaligned(
+                        a0_ptr.add(kk + 4) as *const u32,
+                    )));
+                    let va1 = vreinterpretq_u8_u32(vdupq_n_u32(core::ptr::read_unaligned(
+                        a1_ptr.add(kk + 4) as *const u32,
+                    )));
+                    let va2 = vreinterpretq_u8_u32(vdupq_n_u32(core::ptr::read_unaligned(
+                        a2_ptr.add(kk + 4) as *const u32,
+                    )));
+                    let va3 = vreinterpretq_u8_u32(vdupq_n_u32(core::ptr::read_unaligned(
+                        a3_ptr.add(kk + 4) as *const u32,
+                    )));
+
+                    let vb0 = vld1q_u8(pb_ptr.add(64));
+                    let vb1 = vld1q_u8(pb_ptr.add(80));
+                    let vb2 = vld1q_u8(pb_ptr.add(96));
+                    let vb3 = vld1q_u8(pb_ptr.add(112));
+
+                    acc00 = vdotq_u32_custom(acc00, va0, vb0);
+                    acc01 = vdotq_u32_custom(acc01, va0, vb1);
+                    acc02 = vdotq_u32_custom(acc02, va0, vb2);
+                    acc03 = vdotq_u32_custom(acc03, va0, vb3);
+                    acc10 = vdotq_u32_custom(acc10, va1, vb0);
+                    acc11 = vdotq_u32_custom(acc11, va1, vb1);
+                    acc12 = vdotq_u32_custom(acc12, va1, vb2);
+                    acc13 = vdotq_u32_custom(acc13, va1, vb3);
+                    acc20 = vdotq_u32_custom(acc20, va2, vb0);
+                    acc21 = vdotq_u32_custom(acc21, va2, vb1);
+                    acc22 = vdotq_u32_custom(acc22, va2, vb2);
+                    acc23 = vdotq_u32_custom(acc23, va2, vb3);
+                    acc30 = vdotq_u32_custom(acc30, va3, vb0);
+                    acc31 = vdotq_u32_custom(acc31, va3, vb1);
+                    acc32 = vdotq_u32_custom(acc32, va3, vb2);
+                    acc33 = vdotq_u32_custom(acc33, va3, vb3);
+
+                    pb_ptr = pb_ptr.add(128);
+                    kk += 8;
+                }
+
+                // Handle odd remaining K-block if k_full_blocks is odd
+                if k_full_blocks & 1 != 0 {
                     let va0 = vreinterpretq_u8_u32(vdupq_n_u32(core::ptr::read_unaligned(
                         a0_ptr.add(kk) as *const u32,
                     )));
@@ -559,6 +747,7 @@ pub fn mat_mul_integer_prepared_neon<'a>(
     }
 }
 
+#[inline(always)]
 pub fn fused_dq_gemm_neon<'a>(
     input: &[f32], // fp32 input data, row-major [M*K]
     m: usize,

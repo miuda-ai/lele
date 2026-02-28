@@ -991,7 +991,77 @@ fn mat_mul_integer_with_scale_bias_activation<'a, 'b, 'c>(
         TensorView::from_slice(out, output_shape)
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "wasm32")]
+    {
+        // WASM SIMD path: work directly in f32 space, avoid Vec<u8> allocation.
+        // Both `a` (dynamic-quantized) and `b` (weight_int8) hold u8-range values
+        // stored as f32 — no conversion needed. Use SIMD outer-product accumulator
+        // with i,l,j loop order so inner j accesses B/C rows contiguously.
+        let a_dims = a.shape.len();
+        let b_dims = b.shape.len();
+        let m = a.shape[a_dims - 2];
+        let k = a.shape[a_dims - 1];
+        let n = b.shape[b_dims - 1];
+
+        let batch_a: usize = a.shape[..a_dims - 2].iter().product::<usize>().max(1);
+        let batch_b: usize = b.shape[..b_dims - 2].iter().product::<usize>().max(1);
+        let final_batch = batch_a.max(batch_b);
+
+        let zp_a_val = a_zero_point
+            .and_then(|z| z.data.first())
+            .copied()
+            .unwrap_or(0.0);
+        let zp_b_val = b_zero_point
+            .and_then(|z| z.data.first())
+            .copied()
+            .unwrap_or(0.0);
+
+        let output_len = final_batch * m * n;
+        crate::kernels::utils::ensure_capacity(out, output_len);
+        out.resize(output_len, 0.0);
+
+        let stride_a = m * k;
+        let stride_b = k * n;
+        let stride_out = m * n;
+
+        for b_i in 0..final_batch {
+            let a_offset = if batch_a == 1 { 0 } else { b_i * stride_a };
+            let b_offset = if batch_b == 1 { 0 } else { b_i * stride_b };
+            let out_offset = b_i * stride_out;
+            unsafe {
+                wasm_mat_mul_integer_simd(
+                    a.data[a_offset..].as_ptr(),
+                    b.data[b_offset..].as_ptr(),
+                    out[out_offset..].as_mut_ptr(),
+                    m,
+                    k,
+                    n,
+                    zp_a_val,
+                    zp_b_val,
+                );
+                wasm_apply_scale_bias_relu(
+                    out[out_offset..].as_mut_ptr(),
+                    scale.map(|s| s.data.as_ref()),
+                    bias.map(|b| b.data.as_ref()),
+                    m,
+                    n,
+                    apply_relu,
+                );
+            }
+        }
+
+        let mut output_shape = if batch_a >= batch_b {
+            a.shape[..a_dims - 2].to_vec()
+        } else {
+            b.shape[..b_dims - 2].to_vec()
+        };
+        output_shape.push(m);
+        output_shape.push(n);
+
+        TensorView::from_slice(out, output_shape)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "wasm32")))]
     {
         // Generic fallback: convert f32 tensors to u8
         let a_u8: Vec<u8> = a.data.iter().map(|&x| x as u8).collect();
@@ -1168,6 +1238,197 @@ fn mat_mul_integer_u8<'a, 'b, 'c>(
 
 #[cfg(target_arch = "aarch64")]
 pub fn fused_dq_gemm_prepared_arm<'a>(
+    input: &TensorView<'_, f32>,
+    pw_arm: &PreparedWeightsArm,
+    b_zero_point: Option<u8>,
+    weight_scale: &TensorView<'_, f32>,
+    bias: Option<&TensorView<'_, f32>>,
+    apply_relu: bool,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a, f32> {
+    // On macOS aarch64, use Apple Accelerate cblas_sgemm with dequantized fp32 weights
+    // This leverages the AMX hardware which is much faster than NEON UDOT for these sizes
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        return fused_dq_gemm_accelerate(
+            input,
+            pw_arm,
+            b_zero_point,
+            weight_scale,
+            bias,
+            apply_relu,
+            out,
+        );
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    {
+        fused_dq_gemm_prepared_arm_neon(
+            input,
+            pw_arm,
+            b_zero_point,
+            weight_scale,
+            bias,
+            apply_relu,
+            out,
+        )
+    }
+}
+
+/// Apple Accelerate AMX-based implementation: dequantize weights lazily, then use cblas_sgemm
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn fused_dq_gemm_accelerate<'a>(
+    input: &TensorView<'_, f32>,
+    pw_arm: &PreparedWeightsArm,
+    b_zero_point: Option<u8>,
+    weight_scale: &TensorView<'_, f32>,
+    bias: Option<&TensorView<'_, f32>>,
+    apply_relu: bool,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a, f32> {
+    crate::kernels::gemm::accelerate_init();
+
+    let a_dims = input.shape.len();
+    let m = input.shape[a_dims - 2];
+    let k = input.shape[a_dims - 1];
+    let batch_shape = &input.shape[..a_dims.saturating_sub(2)];
+    let batch: usize = batch_shape.iter().product();
+    let total_batch = batch.max(1);
+    let n = pw_arm.n;
+
+    // Get or compute the dequantized fp32 weight matrix [K, N]
+    let weight_f32 = pw_arm.get_dequantized_weights(b_zero_point, weight_scale);
+
+    let output_len = total_batch * m * n;
+    crate::kernels::utils::ensure_capacity(out, output_len);
+    unsafe {
+        out.set_len(output_len);
+    }
+
+    let stride_in = m * k;
+    let stride_out = m * n;
+    let has_bias = bias.is_some();
+
+    for b_i in 0..total_batch {
+        let a_offset = b_i * stride_in;
+        let out_offset = b_i * stride_out;
+
+        // C = A * B  (beta=0, no pre-fill needed)
+        unsafe {
+            crate::kernels::gemm::accelerate_sgemm(
+                m as i32,
+                n as i32,
+                k as i32,
+                1.0f32,
+                input.data.as_ptr().add(a_offset),
+                k as i32,
+                weight_f32.as_ptr(),
+                n as i32,
+                0.0f32,
+                out.as_mut_ptr().add(out_offset),
+                n as i32,
+            );
+        }
+
+        // Fused bias add + ReLU in a single vectorized pass
+        if has_bias || apply_relu {
+            let bias_data = bias.map(|b| b.data.as_ptr());
+            let out_ptr = out.as_mut_ptr();
+            unsafe {
+                use core::arch::aarch64::*;
+                let zero = vdupq_n_f32(0.0);
+                for row in 0..m {
+                    let row_offset = out_offset + row * n;
+                    let mut j = 0;
+                    if has_bias && apply_relu {
+                        let bp = bias_data.unwrap();
+                        while j + 16 <= n {
+                            let mut v0 = vld1q_f32(out_ptr.add(row_offset + j));
+                            let mut v1 = vld1q_f32(out_ptr.add(row_offset + j + 4));
+                            let mut v2 = vld1q_f32(out_ptr.add(row_offset + j + 8));
+                            let mut v3 = vld1q_f32(out_ptr.add(row_offset + j + 12));
+                            v0 = vaddq_f32(v0, vld1q_f32(bp.add(j)));
+                            v1 = vaddq_f32(v1, vld1q_f32(bp.add(j + 4)));
+                            v2 = vaddq_f32(v2, vld1q_f32(bp.add(j + 8)));
+                            v3 = vaddq_f32(v3, vld1q_f32(bp.add(j + 12)));
+                            vst1q_f32(out_ptr.add(row_offset + j), vmaxq_f32(v0, zero));
+                            vst1q_f32(out_ptr.add(row_offset + j + 4), vmaxq_f32(v1, zero));
+                            vst1q_f32(out_ptr.add(row_offset + j + 8), vmaxq_f32(v2, zero));
+                            vst1q_f32(out_ptr.add(row_offset + j + 12), vmaxq_f32(v3, zero));
+                            j += 16;
+                        }
+                        while j < n {
+                            let val = *out_ptr.add(row_offset + j) + *bp.add(j);
+                            *out_ptr.add(row_offset + j) = if val > 0.0 { val } else { 0.0 };
+                            j += 1;
+                        }
+                    } else if has_bias {
+                        let bp = bias_data.unwrap();
+                        while j + 16 <= n {
+                            let v0 = vaddq_f32(
+                                vld1q_f32(out_ptr.add(row_offset + j)),
+                                vld1q_f32(bp.add(j)),
+                            );
+                            let v1 = vaddq_f32(
+                                vld1q_f32(out_ptr.add(row_offset + j + 4)),
+                                vld1q_f32(bp.add(j + 4)),
+                            );
+                            let v2 = vaddq_f32(
+                                vld1q_f32(out_ptr.add(row_offset + j + 8)),
+                                vld1q_f32(bp.add(j + 8)),
+                            );
+                            let v3 = vaddq_f32(
+                                vld1q_f32(out_ptr.add(row_offset + j + 12)),
+                                vld1q_f32(bp.add(j + 12)),
+                            );
+                            vst1q_f32(out_ptr.add(row_offset + j), v0);
+                            vst1q_f32(out_ptr.add(row_offset + j + 4), v1);
+                            vst1q_f32(out_ptr.add(row_offset + j + 8), v2);
+                            vst1q_f32(out_ptr.add(row_offset + j + 12), v3);
+                            j += 16;
+                        }
+                        while j < n {
+                            *out_ptr.add(row_offset + j) += *bp.add(j);
+                            j += 1;
+                        }
+                    } else {
+                        // relu only
+                        while j + 16 <= n {
+                            let v0 = vld1q_f32(out_ptr.add(row_offset + j));
+                            let v1 = vld1q_f32(out_ptr.add(row_offset + j + 4));
+                            let v2 = vld1q_f32(out_ptr.add(row_offset + j + 8));
+                            let v3 = vld1q_f32(out_ptr.add(row_offset + j + 12));
+                            vst1q_f32(out_ptr.add(row_offset + j), vmaxq_f32(v0, zero));
+                            vst1q_f32(out_ptr.add(row_offset + j + 4), vmaxq_f32(v1, zero));
+                            vst1q_f32(out_ptr.add(row_offset + j + 8), vmaxq_f32(v2, zero));
+                            vst1q_f32(out_ptr.add(row_offset + j + 12), vmaxq_f32(v3, zero));
+                            j += 16;
+                        }
+                        while j < n {
+                            let val = *out_ptr.add(row_offset + j);
+                            *out_ptr.add(row_offset + j) = if val > 0.0 { val } else { 0.0 };
+                            j += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let output_shape = if batch_shape.is_empty() {
+        vec![m, n]
+    } else {
+        let mut s = batch_shape.to_vec();
+        s.push(m);
+        s.push(n);
+        s
+    };
+    TensorView::from_slice(out, output_shape)
+}
+
+/// NEON UDOT-based implementation (non-macOS or fallback)
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+fn fused_dq_gemm_prepared_arm_neon<'a>(
     input: &TensorView<'_, f32>,
     pw_arm: &PreparedWeightsArm,
     b_zero_point: Option<u8>,
@@ -1394,7 +1655,104 @@ pub fn dynamic_quantize_linear<'a, 'b>(
             )
         }
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::arch::wasm32::*;
+        let len = x.data.len();
+        let ptr = x.data.as_ptr();
+
+        // Phase 1: SIMD min/max scan
+        let mut min_v = f32x4_splat(f32::MAX);
+        let mut max_v = f32x4_splat(f32::MIN);
+        let mut i = 0usize;
+        unsafe {
+            while i + 16 <= len {
+                let v0 = v128_load(ptr.add(i) as *const v128);
+                let v1 = v128_load(ptr.add(i + 4) as *const v128);
+                let v2 = v128_load(ptr.add(i + 8) as *const v128);
+                let v3 = v128_load(ptr.add(i + 12) as *const v128);
+                min_v = f32x4_min(min_v, f32x4_min(v0, f32x4_min(v1, f32x4_min(v2, v3))));
+                max_v = f32x4_max(max_v, f32x4_max(v0, f32x4_max(v1, f32x4_max(v2, v3))));
+                i += 16;
+            }
+            while i + 4 <= len {
+                let v = v128_load(ptr.add(i) as *const v128);
+                min_v = f32x4_min(min_v, v);
+                max_v = f32x4_max(max_v, v);
+                i += 4;
+            }
+        }
+        // Horizontal reduce
+        let mut min_val = f32x4_extract_lane::<0>(min_v)
+            .min(f32x4_extract_lane::<1>(min_v))
+            .min(f32x4_extract_lane::<2>(min_v))
+            .min(f32x4_extract_lane::<3>(min_v));
+        let mut max_val = f32x4_extract_lane::<0>(max_v)
+            .max(f32x4_extract_lane::<1>(max_v))
+            .max(f32x4_extract_lane::<2>(max_v))
+            .max(f32x4_extract_lane::<3>(max_v));
+        // Handle remainder
+        for j in i..len {
+            let v = x.data[j];
+            if v < min_val {
+                min_val = v;
+            }
+            if v > max_val {
+                max_val = v;
+            }
+        }
+
+        let adjusted_max = max_val.max(0.0);
+        let adjusted_min = min_val.min(0.0);
+        let range = (adjusted_max - adjusted_min).max(1e-5);
+        let scale = range / 255.0;
+        let zp = (-adjusted_min / scale).round().clamp(0.0, 255.0);
+        let inv_scale = 1.0 / scale;
+
+        out_scale.clear();
+        out_scale.push(scale);
+        out_zp.clear();
+        out_zp.push(zp);
+
+        // Phase 2: SIMD vectorized quantization
+        out_y_storage.clear();
+        out_y_storage.resize(len, 0.0);
+        let dst = out_y_storage.as_mut_ptr();
+        let inv_scale_v = f32x4_splat(inv_scale);
+        let zp_v = f32x4_splat(zp);
+        let zero_v = f32x4_splat(0.0);
+        let max255_v = f32x4_splat(255.0);
+        let half_v = f32x4_splat(0.5);
+        let mut i = 0usize;
+        unsafe {
+            while i + 4 <= len {
+                let v = v128_load(ptr.add(i) as *const v128);
+                // round via floor(x + 0.5) to match .round() semantics
+                let q = f32x4_floor(f32x4_add(
+                    f32x4_add(f32x4_mul(v, inv_scale_v), zp_v),
+                    half_v,
+                ));
+                let q = f32x4_max(f32x4_min(q, max255_v), zero_v);
+                v128_store(dst.add(i) as *mut v128, q);
+                i += 4;
+            }
+        }
+        for j in i..len {
+            out_y_storage[j] = (x.data[j] * inv_scale + zp).round().clamp(0.0, 255.0);
+        }
+
+        return (
+            TensorView::from_slice(out_y_storage, x.shape.to_vec()),
+            TensorView::from_slice(out_scale, vec![1]),
+            TensorView::from_slice(out_zp, vec![1]),
+        );
+    }
+
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "wasm32"
+    )))]
     {
         let len = x.data.len();
 
@@ -1435,5 +1793,276 @@ pub fn dynamic_quantize_linear<'a, 'b>(
             TensorView::from_slice(out_scale, vec![1]),
             TensorView::from_slice(out_zp, vec![1]),
         )
+    }
+}
+
+// ─── WASM SIMD INT8 MatMul helpers ────────────────────────────────────────────
+
+/// WASM SIMD f32 INT8-style matmul: C = (A - zp_a) × (B - zp_b)
+///
+/// Register-tiled micro-kernel: 4 rows × 16 cols = 16 v128 accumulators.
+/// - A precompute: `a_adj = A - zp_a` computed once per row-group, reused
+///   across all N/16 j-panels (eliminates ~4.5M redundant subtracts).
+/// - zp_b correction: `C -= zp_b * row_sum(a_adj)` applied at store time.
+/// - C never touches memory during K sweep — pure register accumulation.
+///
+/// Register budget: 16 accum + 4 B loads + 4 A splats = 24 v128.
+/// Fits in ARM64 NEON (32 regs). On x86-64 (16 XMM) JIT may spill some.
+///
+/// A: [M, K] row-major f32. B: [K, N] row-major f32. C: [M, N] output.
+#[cfg(target_arch = "wasm32")]
+#[inline(never)]
+unsafe fn wasm_mat_mul_integer_simd(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+    zp_a: f32,
+    zp_b: f32,
+) {
+    use std::arch::wasm32::*;
+
+    let n16 = n & !15;
+    let m4 = m - (m % 4); // round down to multiple of 4
+
+    // Reusable buffer for pre-adjusted A values (avoids redundant zp_a subtracts)
+    let mut a_adj_buf = vec![0.0f32; 4 * k];
+
+    // ── Main loop: 4 rows at a time ──────────────────────────────────────
+    let mut i = 0;
+    while i < m4 {
+        // Pre-compute a_adj[r][l] = A[i+r, l] - zp_a and row_sums
+        let mut row_sums = [0.0f32; 4];
+        for r in 0..4 {
+            let a_row = a.add((i + r) * k);
+            let base = r * k;
+            let mut sum = 0.0f32;
+            for l in 0..k {
+                let v = *a_row.add(l) - zp_a;
+                *a_adj_buf.as_mut_ptr().add(base + l) = v;
+                sum += v;
+            }
+            row_sums[r] = sum;
+        }
+
+        let corr0 = f32x4_splat(zp_b * row_sums[0]);
+        let corr1 = f32x4_splat(zp_b * row_sums[1]);
+        let corr2 = f32x4_splat(zp_b * row_sums[2]);
+        let corr3 = f32x4_splat(zp_b * row_sums[3]);
+
+        let cr0 = c.add(i * n);
+        let cr1 = c.add((i + 1) * n);
+        let cr2 = c.add((i + 2) * n);
+        let cr3 = c.add((i + 3) * n);
+
+        let a0 = a_adj_buf.as_ptr();
+        let a1 = a0.add(k);
+        let a2 = a0.add(2 * k);
+        let a3 = a0.add(3 * k);
+
+        // Process 16 columns at a time — all accumulators in registers
+        let mut j = 0;
+        while j < n16 {
+            let mut c00 = f32x4_splat(0.0);
+            let mut c01 = f32x4_splat(0.0);
+            let mut c02 = f32x4_splat(0.0);
+            let mut c03 = f32x4_splat(0.0);
+            let mut c10 = f32x4_splat(0.0);
+            let mut c11 = f32x4_splat(0.0);
+            let mut c12 = f32x4_splat(0.0);
+            let mut c13 = f32x4_splat(0.0);
+            let mut c20 = f32x4_splat(0.0);
+            let mut c21 = f32x4_splat(0.0);
+            let mut c22 = f32x4_splat(0.0);
+            let mut c23 = f32x4_splat(0.0);
+            let mut c30 = f32x4_splat(0.0);
+            let mut c31 = f32x4_splat(0.0);
+            let mut c32 = f32x4_splat(0.0);
+            let mut c33 = f32x4_splat(0.0);
+
+            for l in 0..k {
+                let av0 = f32x4_splat(*a0.add(l));
+                let av1 = f32x4_splat(*a1.add(l));
+                let av2 = f32x4_splat(*a2.add(l));
+                let av3 = f32x4_splat(*a3.add(l));
+                let bp = b.add(l * n + j);
+                let b0 = v128_load(bp as *const v128);
+                let b1 = v128_load(bp.add(4) as *const v128);
+                let b2 = v128_load(bp.add(8) as *const v128);
+                let b3 = v128_load(bp.add(12) as *const v128);
+
+                c00 = f32x4_add(c00, f32x4_mul(av0, b0));
+                c01 = f32x4_add(c01, f32x4_mul(av0, b1));
+                c02 = f32x4_add(c02, f32x4_mul(av0, b2));
+                c03 = f32x4_add(c03, f32x4_mul(av0, b3));
+                c10 = f32x4_add(c10, f32x4_mul(av1, b0));
+                c11 = f32x4_add(c11, f32x4_mul(av1, b1));
+                c12 = f32x4_add(c12, f32x4_mul(av1, b2));
+                c13 = f32x4_add(c13, f32x4_mul(av1, b3));
+                c20 = f32x4_add(c20, f32x4_mul(av2, b0));
+                c21 = f32x4_add(c21, f32x4_mul(av2, b1));
+                c22 = f32x4_add(c22, f32x4_mul(av2, b2));
+                c23 = f32x4_add(c23, f32x4_mul(av2, b3));
+                c30 = f32x4_add(c30, f32x4_mul(av3, b0));
+                c31 = f32x4_add(c31, f32x4_mul(av3, b1));
+                c32 = f32x4_add(c32, f32x4_mul(av3, b2));
+                c33 = f32x4_add(c33, f32x4_mul(av3, b3));
+            }
+
+            // Apply correction and store
+            v128_store(cr0.add(j) as *mut v128, f32x4_sub(c00, corr0));
+            v128_store(cr0.add(j + 4) as *mut v128, f32x4_sub(c01, corr0));
+            v128_store(cr0.add(j + 8) as *mut v128, f32x4_sub(c02, corr0));
+            v128_store(cr0.add(j + 12) as *mut v128, f32x4_sub(c03, corr0));
+            v128_store(cr1.add(j) as *mut v128, f32x4_sub(c10, corr1));
+            v128_store(cr1.add(j + 4) as *mut v128, f32x4_sub(c11, corr1));
+            v128_store(cr1.add(j + 8) as *mut v128, f32x4_sub(c12, corr1));
+            v128_store(cr1.add(j + 12) as *mut v128, f32x4_sub(c13, corr1));
+            v128_store(cr2.add(j) as *mut v128, f32x4_sub(c20, corr2));
+            v128_store(cr2.add(j + 4) as *mut v128, f32x4_sub(c21, corr2));
+            v128_store(cr2.add(j + 8) as *mut v128, f32x4_sub(c22, corr2));
+            v128_store(cr2.add(j + 12) as *mut v128, f32x4_sub(c23, corr2));
+            v128_store(cr3.add(j) as *mut v128, f32x4_sub(c30, corr3));
+            v128_store(cr3.add(j + 4) as *mut v128, f32x4_sub(c31, corr3));
+            v128_store(cr3.add(j + 8) as *mut v128, f32x4_sub(c32, corr3));
+            v128_store(cr3.add(j + 12) as *mut v128, f32x4_sub(c33, corr3));
+
+            j += 16;
+        }
+
+        // Remainder columns (< 16) — 4-row scalar
+        while j < n {
+            let mut cv0: f32 = 0.0;
+            let mut cv1: f32 = 0.0;
+            let mut cv2: f32 = 0.0;
+            let mut cv3: f32 = 0.0;
+            for l in 0..k {
+                let bv = *b.add(l * n + j);
+                cv0 += *a0.add(l) * bv;
+                cv1 += *a1.add(l) * bv;
+                cv2 += *a2.add(l) * bv;
+                cv3 += *a3.add(l) * bv;
+            }
+            *cr0.add(j) = cv0 - zp_b * row_sums[0];
+            *cr1.add(j) = cv1 - zp_b * row_sums[1];
+            *cr2.add(j) = cv2 - zp_b * row_sums[2];
+            *cr3.add(j) = cv3 - zp_b * row_sums[3];
+            j += 1;
+        }
+
+        i += 4;
+    }
+
+    // ── Remainder rows (m % 4) — one row at a time with register tiling ──
+    while i < m {
+        let c_row = c.add(i * n);
+        let a_row = a.add(i * k);
+
+        // Pre-compute a_adj into first row of buffer
+        let mut row_sum: f32 = 0.0;
+        let abuf = a_adj_buf.as_mut_ptr();
+        for l in 0..k {
+            let v = *a_row.add(l) - zp_a;
+            *abuf.add(l) = v;
+            row_sum += v;
+        }
+        let corr = f32x4_splat(zp_b * row_sum);
+        let ap = a_adj_buf.as_ptr();
+
+        let mut j = 0;
+        while j < n16 {
+            let mut c0 = f32x4_splat(0.0);
+            let mut c1 = f32x4_splat(0.0);
+            let mut c2 = f32x4_splat(0.0);
+            let mut c3 = f32x4_splat(0.0);
+
+            for l in 0..k {
+                let a_v = f32x4_splat(*ap.add(l));
+                let bp = b.add(l * n + j);
+                let b0 = v128_load(bp as *const v128);
+                let b1 = v128_load(bp.add(4) as *const v128);
+                let b2 = v128_load(bp.add(8) as *const v128);
+                let b3 = v128_load(bp.add(12) as *const v128);
+                c0 = f32x4_add(c0, f32x4_mul(a_v, b0));
+                c1 = f32x4_add(c1, f32x4_mul(a_v, b1));
+                c2 = f32x4_add(c2, f32x4_mul(a_v, b2));
+                c3 = f32x4_add(c3, f32x4_mul(a_v, b3));
+            }
+
+            v128_store(c_row.add(j) as *mut v128, f32x4_sub(c0, corr));
+            v128_store(c_row.add(j + 4) as *mut v128, f32x4_sub(c1, corr));
+            v128_store(c_row.add(j + 8) as *mut v128, f32x4_sub(c2, corr));
+            v128_store(c_row.add(j + 12) as *mut v128, f32x4_sub(c3, corr));
+            j += 16;
+        }
+        while j < n {
+            let mut cv: f32 = 0.0;
+            for l in 0..k {
+                cv += *ap.add(l) * *b.add(l * n + j);
+            }
+            *c_row.add(j) = cv - zp_b * row_sum;
+            j += 1;
+        }
+
+        i += 1;
+    }
+}
+
+/// Apply per-column scale and bias (and optional ReLU) to output matrix in-place.
+/// scale: None = no scaling, Some([1]) = scalar, Some([N]) = per-column.
+/// bias:  None = no bias,    Some([N]) = per-column.
+#[cfg(target_arch = "wasm32")]
+unsafe fn wasm_apply_scale_bias_relu(
+    c: *mut f32,
+    scale: Option<&[f32]>,
+    bias: Option<&[f32]>,
+    m: usize,
+    n: usize,
+    apply_relu: bool,
+) {
+    use std::arch::wasm32::*;
+    if scale.is_none() && bias.is_none() && !apply_relu {
+        return;
+    }
+    let zero_v = f32x4_splat(0.0);
+    for i in 0..m {
+        let c_row = c.add(i * n);
+        let mut j = 0;
+        while j + 4 <= n {
+            let mut cv = v128_load(c_row.add(j) as *const v128);
+            if let Some(s) = scale {
+                let sv = if s.len() == 1 {
+                    f32x4_splat(s[0])
+                } else {
+                    v128_load(s.as_ptr().add(j) as *const v128)
+                };
+                cv = f32x4_mul(cv, sv);
+            }
+            if let Some(b) = bias {
+                let bv = v128_load(b.as_ptr().add(j) as *const v128);
+                cv = f32x4_add(cv, bv);
+            }
+            if apply_relu {
+                cv = f32x4_max(cv, zero_v);
+            }
+            v128_store(c_row.add(j) as *mut v128, cv);
+            j += 4;
+        }
+        while j < n {
+            let mut v = *c_row.add(j);
+            if let Some(s) = scale {
+                v *= if s.len() == 1 { s[0] } else { s[j] };
+            }
+            if let Some(b) = bias {
+                v += b[j];
+            }
+            if apply_relu && v < 0.0 {
+                v = 0.0;
+            }
+            *c_row.add(j) = v;
+            j += 1;
+        }
     }
 }

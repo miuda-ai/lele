@@ -144,8 +144,6 @@ impl<'a> SupertonicTts<'a> {
                 self.text_processor.call(&[chunk], &[lang.to_string()])?;
             let bsz = 1;
             let max_len = text_ids_vec[0].len();
-            println!("Debug: text_ids_vec[0] len: {}", max_len);
-            println!("Debug: text_ids_vec[0] content: {:?}", text_ids_vec[0]);
             let mut text_ids_i64 = vec![0i64; max_len];
             for (i, &id) in text_ids_vec[0].iter().enumerate() {
                 text_ids_i64[i] = id as i64;
@@ -164,17 +162,11 @@ impl<'a> SupertonicTts<'a> {
                 text_mask_tv.clone(),
             );
             let mut duration = duration_tv.data.to_vec();
-            println!("Debug: Num tokens: {}", duration.len());
-            println!(
-                "Debug: First 5 durations: {:?}",
-                duration.iter().take(5).collect::<Vec<_>>()
-            );
             for d in duration.iter_mut() {
                 *d /= speed;
             }
 
             let total_duration_seconds: f32 = duration.iter().sum();
-            println!("Debug: Total duration seconds: {}", total_duration_seconds);
             let duration_batch = vec![total_duration_seconds];
 
             // 2. Text Encoder
@@ -216,6 +208,23 @@ impl<'a> SupertonicTts<'a> {
                 xt_data = denoised_tv.data.to_vec();
             }
 
+            // Apply latent mask (zero out positions beyond sequence length)
+            for d in 0..xt_shape[1] {
+                for t in 0..xt_shape[2] {
+                    let mask_idx = t; // mask shape is [1, latent_len]
+                    let latent_idx = d * xt_shape[2] + t;
+                    xt_data[latent_idx] *= latent_mask_data[mask_idx];
+                }
+            }
+
+            // Denormalize for vocoder: the flow-matching model outputs latents
+            // in normalized space (std≈scale). Divide by scale to recover raw
+            // latent space (std≈1.0) that the vocoder/AE-decoder expects.
+            let normalizer_scale = self.config.ttl.normalizer.scale;
+            for v in xt_data.iter_mut() {
+                *v /= normalizer_scale;
+            }
+
             // 4. Vocoder
             let xt_tv = TensorView::new(&xt_data, &xt_shape);
             let audio_tv = self.vocoder.forward(xt_tv);
@@ -225,7 +234,10 @@ impl<'a> SupertonicTts<'a> {
                 (total_duration_seconds * self.config.ae.sample_rate as f32) as usize;
             let actual_len = audio_data.len().min(expected_len);
 
-            full_audio.extend_from_slice(&audio_data[..actual_len]);
+            // Clip to [-1, 1] to prevent distortion from slight overflows
+            for &sample in &audio_data[..actual_len] {
+                full_audio.push(sample.clamp(-1.0, 1.0));
+            }
         }
 
         Ok(full_audio)

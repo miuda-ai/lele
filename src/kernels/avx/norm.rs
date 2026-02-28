@@ -90,3 +90,67 @@ pub unsafe fn layer_norm_x86(
         }
     }
 }
+
+/// AVX2 softmax over a contiguous slice (inner_size == 1 case).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn softmax(src: &[f32], dst: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let len = src.len();
+    let simd_end = (len / 8) * 8;
+    let src_ptr = src.as_ptr();
+    let dst_ptr = dst.as_mut_ptr();
+
+    // 1. Find max
+    let mut max_vec = _mm256_set1_ps(f32::MIN);
+    let mut j = 0;
+    while j < simd_end {
+        let v = _mm256_loadu_ps(src_ptr.add(j));
+        max_vec = _mm256_max_ps(max_vec, v);
+        j += 8;
+    }
+    let mut max_val = {
+        let hi = _mm256_extractf128_ps(max_vec, 1);
+        let lo = _mm256_castps256_ps128(max_vec);
+        let m128 = _mm_max_ps(lo, hi);
+        let m64 = _mm_max_ps(m128, _mm_movehl_ps(m128, m128));
+        let m32 = _mm_max_ss(m64, _mm_shuffle_ps(m64, m64, 1));
+        _mm_cvtss_f32(m32)
+    };
+    for k in simd_end..len {
+        max_val = max_val.max(*src_ptr.add(k));
+    }
+
+    // 2. exp(x - max) and sum
+    let max_broadcast = _mm256_set1_ps(max_val);
+    let mut sum_vec = _mm256_setzero_ps();
+    j = 0;
+    while j < simd_end {
+        let v = _mm256_loadu_ps(src_ptr.add(j));
+        let shifted = _mm256_sub_ps(v, max_broadcast);
+        let exp_val = crate::kernels::avx::math::avx2_exp_ps(shifted);
+        _mm256_storeu_ps(dst_ptr.add(j), exp_val);
+        sum_vec = _mm256_add_ps(sum_vec, exp_val);
+        j += 8;
+    }
+    let mut sum = crate::kernels::avx::math::hsum_ps(sum_vec);
+    for k in simd_end..len {
+        let e = (*src_ptr.add(k) - max_val).exp();
+        *dst_ptr.add(k) = e;
+        sum += e;
+    }
+
+    // 3. Normalize
+    let inv_sum = 1.0 / sum;
+    let inv_sum_vec = _mm256_set1_ps(inv_sum);
+    j = 0;
+    while j < simd_end {
+        let v = _mm256_loadu_ps(dst_ptr.add(j));
+        let normalized = _mm256_mul_ps(v, inv_sum_vec);
+        _mm256_storeu_ps(dst_ptr.add(j), normalized);
+        j += 8;
+    }
+    for k in simd_end..len {
+        *dst_ptr.add(k) *= inv_sum;
+    }
+}

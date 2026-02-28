@@ -146,8 +146,8 @@ def main():
     
     # 4. Vocoder
     voc_start = time.time()
-    # Normalize
-    curr_latent_norm = curr_latent * 0.25
+    # Denormalize: divide by scale to recover raw latent space for vocoder
+    curr_latent_norm = curr_latent / 0.25
     
     voc_in = get_input_names(voc_sess)
     # ['latent']

@@ -84,19 +84,11 @@ fn main() {
 
     let start = Instant::now();
     let normalized_features = cmvn.compute(&features);
+    let cmvn_time = start.elapsed().as_secs_f64() * 1000.0;
     println!(
         "✓ CMVN normalized: shape {:?}, took {:.2}ms",
-        normalized_features.shape,
-        start.elapsed().as_secs_f64() * 1000.0
+        normalized_features.shape, cmvn_time
     );
-    // Dump features for Python verification
-    use std::io::Write;
-    let mut file = std::fs::File::create("features.bin").unwrap();
-    for x in normalized_features.data.iter() {
-        file.write_all(&x.to_le_bytes()).unwrap();
-    }
-    println!("✓ Dumped features to features.bin");
-
     // Debug: Print feature statistics
     let feat_min = normalized_features
         .data
@@ -135,40 +127,38 @@ fn main() {
     println!("  language: {:?} (3=Chinese)", language.shape);
     println!("  text_norm: {:?}", text_norm.shape);
 
-    // Run inference
-    println!("\nRunning forward pass...");
+    // Clone inputs for benchmark (need to do this before first forward which moves them)
+    let speech_bench = speech.to_owned();
+    let speech_lengths_bench = speech_lengths.to_owned();
+    let language_bench = language.to_owned();
+    let text_norm_bench = text_norm.to_owned();
+
+    // Run inference - single pass for accurate RTF measurement
     let start = Instant::now();
 
     let output = model
-        .forward(speech.clone(), speech_lengths.clone(), language.clone(), text_norm.clone())
-        .into_logits();
-
-    let elapsed = start.elapsed();
-    println!(
-        "✓ Inference (cold, includes weight prep): {:.2}ms",
-        elapsed.as_secs_f64() * 1000.0
-    );
-
-    // Warm run — all weights cached
-    let start2 = Instant::now();
-    let output = model
         .forward(speech, speech_lengths, language, text_norm)
         .into_logits();
-    let elapsed = start2.elapsed();
+
+    let inference_elapsed = start.elapsed();
     let e2e_elapsed = e2e_start.elapsed();
 
     let audio_duration_sec = audio.len() as f64 / sample_rate as f64;
-    let rtf = elapsed.as_secs_f64() / audio_duration_sec;
+    let model_rtf = inference_elapsed.as_secs_f64() / audio_duration_sec;
     let e2e_rtf = e2e_elapsed.as_secs_f64() / audio_duration_sec;
 
     println!(
         "✓ Inference completed in {:.2}ms",
-        elapsed.as_secs_f64() * 1000.0
+        inference_elapsed.as_secs_f64() * 1000.0
     );
-    println!("✓ Model RTF: {:.4}", rtf);
+    println!("✓ Model RTF: {:.4}", model_rtf);
     println!(
-        "✓ Total RTF: {:.4} (Audio: {:.2}s)",
+        "✓ Total pipeline RTF: {:.4} (Audio: {:.2}s)",
         e2e_rtf, audio_duration_sec
+    );
+    println!(
+        "✓ Pipeline overhead: {:.1}%",
+        (e2e_rtf - model_rtf) / e2e_rtf * 100.0
     );
     println!("✓ Output shape: {:?}", output.shape);
 
@@ -192,69 +182,54 @@ fn main() {
         time_steps, vocab_size
     );
 
-    // Show some sample predictions for debugging
-    println!("\nSample token predictions:");
-    for t in 0..time_steps {
-        let offset = t * vocab_size;
-        let logit_slice = &output.data[offset..offset + vocab_size];
-
-        // Get top 1 prediction
-        let (max_idx, max_val) = logit_slice
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .unwrap();
-
-        if max_idx != 0 {
-            println!("  t={}: {} ({:.2})", t, max_idx, max_val);
-        }
-    }
-
-    // Also show logits statistics
-    let logits_min = output.data.iter().cloned().fold(f32::INFINITY, f32::min);
-    let logits_max = output
-        .data
-        .iter()
-        .cloned()
-        .fold(f32::NEG_INFINITY, f32::max);
-    let logits_mean = output.data.iter().sum::<f32>() / output.data.len() as f32;
-    println!(
-        "\nLogits stats: min={:.2}, max={:.2}, mean={:.2}",
-        logits_min, logits_max, logits_mean
-    );
-
-    // Check if one token dominates across all time steps
-    let mut token_counts = vec![0; vocab_size];
-    for t in 0..time_steps {
-        let offset = t * vocab_size;
-        let logit_slice = &output.data[offset..offset + vocab_size];
-        let token_id = logit_slice
-            .iter()
-            .enumerate()
-            .max_by(|(_, a): &(usize, &f32), (_, b): &(usize, &f32)| a.partial_cmp(b).unwrap())
-            .map(|(idx, _)| idx)
-            .unwrap();
-        token_counts[token_id] += 1;
-    }
-    let (most_common_token, count) = token_counts
-        .iter()
-        .enumerate()
-        .max_by_key(|&(_, count)| count)
-        .unwrap();
-    println!(
-        "Most common predicted token: {} ({}/{} time steps = {:.1}%)",
-        most_common_token,
-        count,
-        time_steps,
-        100.0 * *count as f32 / time_steps as f32
-    );
-
+    // Decode the output
+    let start = Instant::now();
     let texts = tokenizer.decode_greedy(&output.data, 1, time_steps, vocab_size);
+    println!(
+        "✓ Decoding took {:.2}ms",
+        start.elapsed().as_secs_f64() * 1000.0
+    );
 
     println!("\n=== Transcription Result ===");
     for (i, text) in texts.iter().enumerate() {
         println!("Batch {}: \"{}\"", i, text);
     }
+
+    // Benchmark: Run multiple iterations to show steady-state performance
+    println!("\n=== Performance Benchmark ===");
+    println!("Running 10 warm iterations...");
+
+    let mut times = Vec::new();
+    for _ in 0..10 {
+        let bench_start = Instant::now();
+        let _ = model
+            .forward(
+                speech_bench.clone(),
+                speech_lengths_bench.clone(),
+                language_bench.clone(),
+                text_norm_bench.clone(),
+            )
+            .into_logits();
+        times.push(bench_start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    let avg_time: f64 = times.iter().sum::<f64>() / times.len() as f64;
+    let min_time = times.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_time = times.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let avg_rtf = avg_time / 1000.0 / audio_duration_sec;
+    let min_rtf = min_time / 1000.0 / audio_duration_sec;
+
+    println!(
+        "✓ Average inference: {:.2}ms (RTF: {:.4})",
+        avg_time, avg_rtf
+    );
+    println!(
+        "✓ Min/Max: {:.2}ms / {:.2}ms (RTF: {:.4} / {:.4})",
+        min_time,
+        max_time,
+        min_rtf,
+        max_time / 1000.0 / audio_duration_sec
+    );
 
     println!("\n=== Success! ===");
     println!("SenseVoice full pipeline completed successfully.");

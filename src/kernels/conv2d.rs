@@ -2,12 +2,72 @@ use crate::kernels::utils;
 #[cfg(target_arch = "wasm32")]
 use crate::kernels::wasm_matmul::{Accum, MatMut, MatRef, Par, matmul as faer_matmul};
 use crate::tensor::TensorView;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(
+    target_arch = "wasm32",
+    all(target_arch = "aarch64", target_os = "macos")
+)))]
 use faer::linalg::matmul::matmul as faer_matmul;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(
+    target_arch = "wasm32",
+    all(target_arch = "aarch64", target_os = "macos")
+)))]
 use faer::mat::{MatMut, MatRef};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(
+    target_arch = "wasm32",
+    all(target_arch = "aarch64", target_os = "macos")
+)))]
 use faer::{Accum, Par};
+
+// Apple Accelerate framework bindings for AMX-accelerated GEMM on macOS aarch64
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+mod accelerate {
+    pub const CBLAS_ROW_MAJOR: i32 = 101;
+    pub const CBLAS_NO_TRANS: i32 = 111;
+
+    unsafe extern "C" {
+        pub fn cblas_sgemm(
+            order: i32,
+            trans_a: i32,
+            trans_b: i32,
+            m: i32,
+            n: i32,
+            k: i32,
+            alpha: f32,
+            a: *const f32,
+            lda: i32,
+            b: *const f32,
+            ldb: i32,
+            beta: f32,
+            c: *mut f32,
+            ldc: i32,
+        );
+    }
+}
+
+/// Thin wrapper: C = A * B (row-major, no-transpose, no bias accumulation)
+/// A: [M, K], B: [K, N], C: [M, N]
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[inline(always)]
+unsafe fn accel_sgemm(m: usize, n: usize, k: usize, a: *const f32, b: *const f32, c: *mut f32) {
+    unsafe {
+        accelerate::cblas_sgemm(
+            accelerate::CBLAS_ROW_MAJOR,
+            accelerate::CBLAS_NO_TRANS,
+            accelerate::CBLAS_NO_TRANS,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0_f32,
+            a,
+            k as i32,
+            b,
+            n as i32,
+            0.0_f32,
+            c,
+            n as i32,
+        );
+    }
+}
 
 pub fn print_conv_stats() {}
 
@@ -217,29 +277,34 @@ fn conv2d_activation<'b, 'a>(
                 let in_ptr = input_data.as_ptr().add(in_offset);
                 let out_ptr = out.as_mut_ptr().add(o_offset);
 
-                let w_mat = MatRef::<f32>::from_raw_parts(
-                    w_ptr,
-                    out_channels,
-                    in_channels,
-                    in_channels as isize,
-                    1,
-                );
-                let in_mat = MatRef::<f32>::from_raw_parts(
-                    in_ptr,
-                    in_channels,
-                    spatial,
-                    spatial as isize,
-                    1,
-                );
-                let out_mat = MatMut::<f32>::from_raw_parts_mut(
-                    out_ptr,
-                    out_channels,
-                    spatial,
-                    spatial as isize,
-                    1,
-                );
+                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                accel_sgemm(out_channels, spatial, in_channels, w_ptr, in_ptr, out_ptr);
 
-                faer_matmul(out_mat, Accum::Replace, w_mat, in_mat, 1.0, Par::Seq);
+                #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+                {
+                    let w_mat = MatRef::<f32>::from_raw_parts(
+                        w_ptr,
+                        out_channels,
+                        in_channels,
+                        in_channels as isize,
+                        1,
+                    );
+                    let in_mat = MatRef::<f32>::from_raw_parts(
+                        in_ptr,
+                        in_channels,
+                        spatial,
+                        spatial as isize,
+                        1,
+                    );
+                    let out_mat = MatMut::<f32>::from_raw_parts_mut(
+                        out_ptr,
+                        out_channels,
+                        spatial,
+                        spatial as isize,
+                        1,
+                    );
+                    faer_matmul(out_mat, Accum::Replace, w_mat, in_mat, 1.0, Par::Seq);
+                }
             }
 
             // Apply bias and optional activation
@@ -322,32 +387,37 @@ fn conv2d_activation<'b, 'a>(
                     let col_ptr = col_buf.as_ptr();
                     let out_ptr = out.as_mut_ptr().add(o_offset);
 
-                    // Weight: [out_channels_per_group, col_rows] row-major
-                    let w_mat = MatRef::<f32>::from_raw_parts(
-                        w_ptr,
-                        out_channels_per_group,
-                        col_rows,
-                        col_rows as isize,
-                        1,
-                    );
-                    // Col: [col_rows, col_cols] row-major
-                    let col_mat = MatRef::<f32>::from_raw_parts(
-                        col_ptr,
-                        col_rows,
-                        col_cols,
-                        col_cols as isize,
-                        1,
-                    );
-                    // Out: [out_channels_per_group, col_cols] row-major
-                    let out_mat = MatMut::<f32>::from_raw_parts_mut(
-                        out_ptr,
-                        out_channels_per_group,
-                        col_cols,
-                        col_cols as isize,
-                        1,
-                    );
+                    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                    accel_sgemm(out_channels_per_group, col_cols, col_rows, w_ptr, col_ptr, out_ptr);
 
-                    faer_matmul(out_mat, Accum::Replace, w_mat, col_mat, 1.0, Par::Seq);
+                    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+                    {
+                        // Weight: [out_channels_per_group, col_rows] row-major
+                        let w_mat = MatRef::<f32>::from_raw_parts(
+                            w_ptr,
+                            out_channels_per_group,
+                            col_rows,
+                            col_rows as isize,
+                            1,
+                        );
+                        // Col: [col_rows, col_cols] row-major
+                        let col_mat = MatRef::<f32>::from_raw_parts(
+                            col_ptr,
+                            col_rows,
+                            col_cols,
+                            col_cols as isize,
+                            1,
+                        );
+                        // Out: [out_channels_per_group, col_cols] row-major
+                        let out_mat = MatMut::<f32>::from_raw_parts_mut(
+                            out_ptr,
+                            out_channels_per_group,
+                            col_cols,
+                            col_cols as isize,
+                            1,
+                        );
+                        faer_matmul(out_mat, Accum::Replace, w_mat, col_mat, 1.0, Par::Seq);
+                    }
                 }
 
                 // Apply bias and optional activation
@@ -997,6 +1067,36 @@ fn conv2d_with_zero_points<'b, 'a>(
             }
             #[cfg(not(target_arch = "aarch64"))]
             {
+                #[cfg(target_arch = "wasm32")]
+                unsafe {
+                    use std::arch::wasm32::*;
+                    let zp_v = f32x4_splat(w_zp);
+                    let src = weight_data.as_ptr();
+                    let dst = adj.as_mut_ptr();
+                    let mut i = 0usize;
+                    let simd_end = w_len & !15;
+                    while i < simd_end {
+                        let v0 = v128_load(src.add(i)       as *const v128);
+                        let v1 = v128_load(src.add(i +  4)  as *const v128);
+                        let v2 = v128_load(src.add(i +  8)  as *const v128);
+                        let v3 = v128_load(src.add(i + 12)  as *const v128);
+                        v128_store(dst.add(i)       as *mut v128, f32x4_sub(v0, zp_v));
+                        v128_store(dst.add(i +  4)  as *mut v128, f32x4_sub(v1, zp_v));
+                        v128_store(dst.add(i +  8)  as *mut v128, f32x4_sub(v2, zp_v));
+                        v128_store(dst.add(i + 12)  as *mut v128, f32x4_sub(v3, zp_v));
+                        i += 16;
+                    }
+                    while i + 4 <= w_len {
+                        let v = v128_load(src.add(i) as *const v128);
+                        v128_store(dst.add(i) as *mut v128, f32x4_sub(v, zp_v));
+                        i += 4;
+                    }
+                    while i < w_len {
+                        *dst.add(i) = *src.add(i) - w_zp;
+                        i += 1;
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
                 for i in 0..w_len {
                     adj[i] = weight_data[i] - w_zp;
                 }
@@ -1038,29 +1138,34 @@ fn conv2d_with_zero_points<'b, 'a>(
                     let in_ptr = input_data.as_ptr().add(in_offset);
                     let out_ptr = out.as_mut_ptr().add(o_offset);
 
-                    let w_mat = MatRef::<f32>::from_raw_parts(
-                        w_ptr,
-                        out_channels,
-                        in_channels,
-                        in_channels as isize,
-                        1,
-                    );
-                    let in_mat = MatRef::<f32>::from_raw_parts(
-                        in_ptr,
-                        in_channels,
-                        spatial,
-                        spatial as isize,
-                        1,
-                    );
-                    let out_mat = MatMut::<f32>::from_raw_parts_mut(
-                        out_ptr,
-                        out_channels,
-                        spatial,
-                        spatial as isize,
-                        1,
-                    );
+                    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                    accel_sgemm(out_channels, spatial, in_channels, w_ptr, in_ptr, out_ptr);
 
-                    faer_matmul(out_mat, Accum::Replace, w_mat, in_mat, 1.0, Par::Seq);
+                    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+                    {
+                        let w_mat = MatRef::<f32>::from_raw_parts(
+                            w_ptr,
+                            out_channels,
+                            in_channels,
+                            in_channels as isize,
+                            1,
+                        );
+                        let in_mat = MatRef::<f32>::from_raw_parts(
+                            in_ptr,
+                            in_channels,
+                            spatial,
+                            spatial as isize,
+                            1,
+                        );
+                        let out_mat = MatMut::<f32>::from_raw_parts_mut(
+                            out_ptr,
+                            out_channels,
+                            spatial,
+                            spatial as isize,
+                            1,
+                        );
+                        faer_matmul(out_mat, Accum::Replace, w_mat, in_mat, 1.0, Par::Seq);
+                    }
                 }
             } else {
                 INPUT_ADJ_BUF.with(|buf_cell| {
@@ -1090,6 +1195,36 @@ fn conv2d_with_zero_points<'b, 'a>(
                     }
                     #[cfg(not(target_arch = "aarch64"))]
                     {
+                        #[cfg(target_arch = "wasm32")]
+                        unsafe {
+                            use std::arch::wasm32::*;
+                            let zp_v = f32x4_splat(x_zp);
+                            let src = input_data.as_ptr().add(in_offset);
+                            let dst = input_adj.as_mut_ptr();
+                            let mut i = 0usize;
+                            let simd_end = needed & !15;
+                            while i < simd_end {
+                                let v0 = v128_load(src.add(i)       as *const v128);
+                                let v1 = v128_load(src.add(i +  4)  as *const v128);
+                                let v2 = v128_load(src.add(i +  8)  as *const v128);
+                                let v3 = v128_load(src.add(i + 12)  as *const v128);
+                                v128_store(dst.add(i)       as *mut v128, f32x4_sub(v0, zp_v));
+                                v128_store(dst.add(i +  4)  as *mut v128, f32x4_sub(v1, zp_v));
+                                v128_store(dst.add(i +  8)  as *mut v128, f32x4_sub(v2, zp_v));
+                                v128_store(dst.add(i + 12)  as *mut v128, f32x4_sub(v3, zp_v));
+                                i += 16;
+                            }
+                            while i + 4 <= needed {
+                                let v = v128_load(src.add(i) as *const v128);
+                                v128_store(dst.add(i) as *mut v128, f32x4_sub(v, zp_v));
+                                i += 4;
+                            }
+                            while i < needed {
+                                *dst.add(i) = *src.add(i) - x_zp;
+                                i += 1;
+                            }
+                        }
+                        #[cfg(not(target_arch = "wasm32"))]
                         for i in 0..needed {
                             input_adj[i] = input_data[in_offset + i] - x_zp;
                         }
@@ -1100,29 +1235,34 @@ fn conv2d_with_zero_points<'b, 'a>(
                         let in_ptr = input_adj.as_ptr();
                         let out_ptr = out.as_mut_ptr().add(o_offset);
 
-                        let w_mat = MatRef::<f32>::from_raw_parts(
-                            w_ptr,
-                            out_channels,
-                            in_channels,
-                            in_channels as isize,
-                            1,
-                        );
-                        let in_mat = MatRef::<f32>::from_raw_parts(
-                            in_ptr,
-                            in_channels,
-                            spatial,
-                            spatial as isize,
-                            1,
-                        );
-                        let out_mat = MatMut::<f32>::from_raw_parts_mut(
-                            out_ptr,
-                            out_channels,
-                            spatial,
-                            spatial as isize,
-                            1,
-                        );
+                        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                        accel_sgemm(out_channels, spatial, in_channels, w_ptr, in_ptr, out_ptr);
 
-                        faer_matmul(out_mat, Accum::Replace, w_mat, in_mat, 1.0, Par::Seq);
+                        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+                        {
+                            let w_mat = MatRef::<f32>::from_raw_parts(
+                                w_ptr,
+                                out_channels,
+                                in_channels,
+                                in_channels as isize,
+                                1,
+                            );
+                            let in_mat = MatRef::<f32>::from_raw_parts(
+                                in_ptr,
+                                in_channels,
+                                spatial,
+                                spatial as isize,
+                                1,
+                            );
+                            let out_mat = MatMut::<f32>::from_raw_parts_mut(
+                                out_ptr,
+                                out_channels,
+                                spatial,
+                                spatial as isize,
+                                1,
+                            );
+                            faer_matmul(out_mat, Accum::Replace, w_mat, in_mat, 1.0, Par::Seq);
+                        }
                     }
                 });
             }
@@ -1191,29 +1331,34 @@ fn conv2d_with_zero_points<'b, 'a>(
                     let col_ptr = col_buf.as_ptr();
                     let out_ptr = out.as_mut_ptr().add(o_offset);
 
-                    let w_mat = MatRef::<f32>::from_raw_parts(
-                        w_ptr,
-                        out_channels_per_group,
-                        col_rows,
-                        col_rows as isize,
-                        1,
-                    );
-                    let col_mat = MatRef::<f32>::from_raw_parts(
-                        col_ptr,
-                        col_rows,
-                        col_cols,
-                        col_cols as isize,
-                        1,
-                    );
-                    let out_mat = MatMut::<f32>::from_raw_parts_mut(
-                        out_ptr,
-                        out_channels_per_group,
-                        col_cols,
-                        col_cols as isize,
-                        1,
-                    );
+                    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                    accel_sgemm(out_channels_per_group, col_cols, col_rows, w_ptr, col_ptr, out_ptr);
 
-                    faer_matmul(out_mat, Accum::Replace, w_mat, col_mat, 1.0, Par::Seq);
+                    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+                    {
+                        let w_mat = MatRef::<f32>::from_raw_parts(
+                            w_ptr,
+                            out_channels_per_group,
+                            col_rows,
+                            col_rows as isize,
+                            1,
+                        );
+                        let col_mat = MatRef::<f32>::from_raw_parts(
+                            col_ptr,
+                            col_rows,
+                            col_cols,
+                            col_cols as isize,
+                            1,
+                        );
+                        let out_mat = MatMut::<f32>::from_raw_parts_mut(
+                            out_ptr,
+                            out_channels_per_group,
+                            col_cols,
+                            col_cols as isize,
+                            1,
+                        );
+                        faer_matmul(out_mat, Accum::Replace, w_mat, col_mat, 1.0, Par::Seq);
+                    }
                 }
                 if let Some(b) = bias {
                     for oc in 0..out_channels_per_group {
@@ -1349,7 +1494,33 @@ fn im2col_with_zp(
                                     j += 1;
                                 }
                             }
-                            #[cfg(not(target_arch = "aarch64"))]
+                            #[cfg(target_arch = "wasm32")]
+                            unsafe {
+                                use std::arch::wasm32::*;
+                                let zp_v = f32x4_splat(x_zp);
+                                let mut j = 0usize;
+                                while j + 16 <= count {
+                                    let v0 = v128_load(src.add(j)      as *const v128);
+                                    let v1 = v128_load(src.add(j +  4) as *const v128);
+                                    let v2 = v128_load(src.add(j +  8) as *const v128);
+                                    let v3 = v128_load(src.add(j + 12) as *const v128);
+                                    v128_store(dst.add(j)      as *mut v128, f32x4_sub(v0, zp_v));
+                                    v128_store(dst.add(j +  4) as *mut v128, f32x4_sub(v1, zp_v));
+                                    v128_store(dst.add(j +  8) as *mut v128, f32x4_sub(v2, zp_v));
+                                    v128_store(dst.add(j + 12) as *mut v128, f32x4_sub(v3, zp_v));
+                                    j += 16;
+                                }
+                                while j + 4 <= count {
+                                    let v = v128_load(src.add(j) as *const v128);
+                                    v128_store(dst.add(j) as *mut v128, f32x4_sub(v, zp_v));
+                                    j += 4;
+                                }
+                                while j < count {
+                                    *dst.add(j) = *src.add(j) - x_zp;
+                                    j += 1;
+                                }
+                            }
+                            #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
                             {
                                 for j in 0..count {
                                     *dst.add(j) = *src.add(j) - x_zp;

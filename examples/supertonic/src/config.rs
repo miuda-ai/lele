@@ -53,6 +53,26 @@ pub struct TTLConfig {
     pub chunk_compress_factor: i32,
     #[serde(default)]
     pub latent_dim: i32,
+    #[serde(default)]
+    pub normalizer: NormalizerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NormalizerConfig {
+    #[serde(default = "NormalizerConfig::default_scale")]
+    pub scale: f32,
+}
+
+impl NormalizerConfig {
+    fn default_scale() -> f32 {
+        0.25
+    }
+}
+
+impl Default for NormalizerConfig {
+    fn default() -> Self {
+        Self { scale: 0.25 }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
