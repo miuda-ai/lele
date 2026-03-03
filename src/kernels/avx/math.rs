@@ -335,3 +335,400 @@ pub unsafe fn sqrt_kernel(input: *const f32, output: *mut f32, len: usize) {
         i += 1;
     }
 }
+
+/// AVX2 fused bias + SiLU: out[i] = silu(out[i] + bias)
+/// Operates in-place on `data` buffer. `bias` is a scalar broadcast.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn bias_silu_inplace(data: *mut f32, len: usize, bias: f32) {
+    use std::arch::x86_64::*;
+    let bias_v = _mm256_set1_ps(bias);
+    let mut i = 0;
+    while i + 16 <= len {
+        let v0 = _mm256_add_ps(_mm256_loadu_ps(data.add(i)), bias_v);
+        let v1 = _mm256_add_ps(_mm256_loadu_ps(data.add(i + 8)), bias_v);
+        _mm256_storeu_ps(data.add(i), avx2_silu_ps(v0));
+        _mm256_storeu_ps(data.add(i + 8), avx2_silu_ps(v1));
+        i += 16;
+    }
+    while i + 8 <= len {
+        let v = _mm256_add_ps(_mm256_loadu_ps(data.add(i)), bias_v);
+        _mm256_storeu_ps(data.add(i), avx2_silu_ps(v));
+        i += 8;
+    }
+    while i < len {
+        let x = *data.add(i) + bias;
+        *data.add(i) = x / (1.0 + (-x).exp());
+        i += 1;
+    }
+}
+
+/// AVX2 fused bias + ReLU: out[i] = max(0, out[i] + bias)
+/// Operates in-place on `data` buffer. `bias` is a scalar broadcast.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn bias_relu_inplace(data: *mut f32, len: usize, bias: f32) {
+    use std::arch::x86_64::*;
+    let bias_v = _mm256_set1_ps(bias);
+    let zero = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 16 <= len {
+        let v0 = _mm256_add_ps(_mm256_loadu_ps(data.add(i)), bias_v);
+        let v1 = _mm256_add_ps(_mm256_loadu_ps(data.add(i + 8)), bias_v);
+        _mm256_storeu_ps(data.add(i), _mm256_max_ps(v0, zero));
+        _mm256_storeu_ps(data.add(i + 8), _mm256_max_ps(v1, zero));
+        i += 16;
+    }
+    while i + 8 <= len {
+        let v = _mm256_add_ps(_mm256_loadu_ps(data.add(i)), bias_v);
+        _mm256_storeu_ps(data.add(i), _mm256_max_ps(v, zero));
+        i += 8;
+    }
+    while i < len {
+        let x = *data.add(i) + bias;
+        *data.add(i) = if x > 0.0 { x } else { 0.0 };
+        i += 1;
+    }
+}
+
+/// AVX2 bias-only addition: out[i] = out[i] + bias (in-place)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn bias_add_inplace(data: *mut f32, len: usize, bias: f32) {
+    use std::arch::x86_64::*;
+    let bias_v = _mm256_set1_ps(bias);
+    let mut i = 0;
+    while i + 16 <= len {
+        let v0 = _mm256_add_ps(_mm256_loadu_ps(data.add(i)), bias_v);
+        let v1 = _mm256_add_ps(_mm256_loadu_ps(data.add(i + 8)), bias_v);
+        _mm256_storeu_ps(data.add(i), v0);
+        _mm256_storeu_ps(data.add(i + 8), v1);
+        i += 16;
+    }
+    while i + 8 <= len {
+        let v = _mm256_add_ps(_mm256_loadu_ps(data.add(i)), bias_v);
+        _mm256_storeu_ps(data.add(i), v);
+        i += 8;
+    }
+    while i < len {
+        *data.add(i) += bias;
+        i += 1;
+    }
+}
+
+/// AVX2 SiLU activation only (in-place, no bias): out[i] = silu(out[i])
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn silu_inplace(data: *mut f32, len: usize) {
+    use std::arch::x86_64::*;
+    let mut i = 0;
+    while i + 16 <= len {
+        let v0 = _mm256_loadu_ps(data.add(i));
+        let v1 = _mm256_loadu_ps(data.add(i + 8));
+        _mm256_storeu_ps(data.add(i), avx2_silu_ps(v0));
+        _mm256_storeu_ps(data.add(i + 8), avx2_silu_ps(v1));
+        i += 16;
+    }
+    while i + 8 <= len {
+        let v = _mm256_loadu_ps(data.add(i));
+        _mm256_storeu_ps(data.add(i), avx2_silu_ps(v));
+        i += 8;
+    }
+    while i < len {
+        let x = *data.add(i);
+        *data.add(i) = x / (1.0 + (-x).exp());
+        i += 1;
+    }
+}
+
+/// AVX2 ReLU activation only (in-place, no bias): out[i] = max(0, out[i])
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn relu_inplace(data: *mut f32, len: usize) {
+    use std::arch::x86_64::*;
+    let zero = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 16 <= len {
+        let v0 = _mm256_loadu_ps(data.add(i));
+        let v1 = _mm256_loadu_ps(data.add(i + 8));
+        _mm256_storeu_ps(data.add(i), _mm256_max_ps(v0, zero));
+        _mm256_storeu_ps(data.add(i + 8), _mm256_max_ps(v1, zero));
+        i += 16;
+    }
+    while i + 8 <= len {
+        let v = _mm256_loadu_ps(data.add(i));
+        _mm256_storeu_ps(data.add(i), _mm256_max_ps(v, zero));
+        i += 8;
+    }
+    while i < len {
+        let x = *data.add(i);
+        *data.add(i) = if x > 0.0 { x } else { 0.0 };
+        i += 1;
+    }
+}
+
+/// Scalar broadcast multiply: out[i] = a[i] * scalar
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn mul_scalar_f32(a: *const f32, scalar: f32, out: *mut f32, len: usize) {
+    let vs = _mm256_set1_ps(scalar);
+    let mut i = 0;
+    while i + 32 <= len {
+        let v0 = _mm256_loadu_ps(a.add(i));
+        let v1 = _mm256_loadu_ps(a.add(i + 8));
+        let v2 = _mm256_loadu_ps(a.add(i + 16));
+        let v3 = _mm256_loadu_ps(a.add(i + 24));
+        _mm256_storeu_ps(out.add(i), _mm256_mul_ps(v0, vs));
+        _mm256_storeu_ps(out.add(i + 8), _mm256_mul_ps(v1, vs));
+        _mm256_storeu_ps(out.add(i + 16), _mm256_mul_ps(v2, vs));
+        _mm256_storeu_ps(out.add(i + 24), _mm256_mul_ps(v3, vs));
+        i += 32;
+    }
+    while i + 8 <= len {
+        _mm256_storeu_ps(out.add(i), _mm256_mul_ps(_mm256_loadu_ps(a.add(i)), vs));
+        i += 8;
+    }
+    while i < len {
+        *out.add(i) = *a.add(i) * scalar;
+        i += 1;
+    }
+}
+
+/// AVX2 exp buffer kernel: out[i] = exp(input[i])
+/// Uses the fast avx2_exp_ps approximation (max error ~1e-6).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn exp_kernel(input: *const f32, output: *mut f32, len: usize) {
+    let mut i = 0;
+    while i + 32 <= len {
+        let v0 = _mm256_loadu_ps(input.add(i));
+        let v1 = _mm256_loadu_ps(input.add(i + 8));
+        let v2 = _mm256_loadu_ps(input.add(i + 16));
+        let v3 = _mm256_loadu_ps(input.add(i + 24));
+        _mm256_storeu_ps(output.add(i), avx2_exp_ps(v0));
+        _mm256_storeu_ps(output.add(i + 8), avx2_exp_ps(v1));
+        _mm256_storeu_ps(output.add(i + 16), avx2_exp_ps(v2));
+        _mm256_storeu_ps(output.add(i + 24), avx2_exp_ps(v3));
+        i += 32;
+    }
+    while i + 8 <= len {
+        _mm256_storeu_ps(output.add(i), avx2_exp_ps(_mm256_loadu_ps(input.add(i))));
+        i += 8;
+    }
+    while i < len {
+        *output.add(i) = (*input.add(i)).exp();
+        i += 1;
+    }
+}
+
+/// AVX2 GELU buffer kernel: out[i] = x * 0.5 * (1 + erf(x / sqrt(2)))
+/// Uses avx2_erf_ps for accurate computation (max error ~1.5e-7).
+/// 4-way unrolled to match throughput of add_f32/mul_f32.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn gelu_kernel(input: *const f32, output: *mut f32, len: usize) {
+    let inv_sqrt2 = _mm256_set1_ps(0.7071067811865475f32);
+    let half = _mm256_set1_ps(0.5f32);
+    let one = _mm256_set1_ps(1.0f32);
+    let mut i = 0;
+    while i + 32 <= len {
+        let x0 = _mm256_loadu_ps(input.add(i));
+        let x1 = _mm256_loadu_ps(input.add(i + 8));
+        let x2 = _mm256_loadu_ps(input.add(i + 16));
+        let x3 = _mm256_loadu_ps(input.add(i + 24));
+        let r0 = _mm256_mul_ps(_mm256_mul_ps(x0, half), _mm256_add_ps(one, avx2_erf_ps(_mm256_mul_ps(x0, inv_sqrt2))));
+        let r1 = _mm256_mul_ps(_mm256_mul_ps(x1, half), _mm256_add_ps(one, avx2_erf_ps(_mm256_mul_ps(x1, inv_sqrt2))));
+        let r2 = _mm256_mul_ps(_mm256_mul_ps(x2, half), _mm256_add_ps(one, avx2_erf_ps(_mm256_mul_ps(x2, inv_sqrt2))));
+        let r3 = _mm256_mul_ps(_mm256_mul_ps(x3, half), _mm256_add_ps(one, avx2_erf_ps(_mm256_mul_ps(x3, inv_sqrt2))));
+        _mm256_storeu_ps(output.add(i), r0);
+        _mm256_storeu_ps(output.add(i + 8), r1);
+        _mm256_storeu_ps(output.add(i + 16), r2);
+        _mm256_storeu_ps(output.add(i + 24), r3);
+        i += 32;
+    }
+    while i + 8 <= len {
+        let x = _mm256_loadu_ps(input.add(i));
+        let r = _mm256_mul_ps(_mm256_mul_ps(x, half), _mm256_add_ps(one, avx2_erf_ps(_mm256_mul_ps(x, inv_sqrt2))));
+        _mm256_storeu_ps(output.add(i), r);
+        i += 8;
+    }
+    while i < len {
+        let x = *input.add(i);
+        *output.add(i) = x * 0.5 * (1.0 + libm::erff(x * 0.7071067811865475));
+        i += 1;
+    }
+}
+
+/// AVX2 fast GELU buffer kernel: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+/// Uses avx2_tanh_ps. 4-way unrolled.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn fast_gelu_kernel(input: *const f32, output: *mut f32, len: usize) {
+    let sqrt_2_over_pi = _mm256_set1_ps(0.7978845608028654f32);
+    let coeff = _mm256_set1_ps(0.044715f32);
+    let half = _mm256_set1_ps(0.5f32);
+    let one = _mm256_set1_ps(1.0f32);
+    let mut i = 0;
+    // Inline helper: fast_gelu for one __m256
+    macro_rules! fgelu {
+        ($x:expr) => {{
+            let x3 = _mm256_mul_ps(_mm256_mul_ps($x, $x), $x);
+            let inner = _mm256_mul_ps(sqrt_2_over_pi, _mm256_fmadd_ps(coeff, x3, $x));
+            _mm256_mul_ps(_mm256_mul_ps($x, half), _mm256_add_ps(one, avx2_tanh_ps(inner)))
+        }};
+    }
+    while i + 32 <= len {
+        let x0 = _mm256_loadu_ps(input.add(i));
+        let x1 = _mm256_loadu_ps(input.add(i + 8));
+        let x2 = _mm256_loadu_ps(input.add(i + 16));
+        let x3 = _mm256_loadu_ps(input.add(i + 24));
+        _mm256_storeu_ps(output.add(i), fgelu!(x0));
+        _mm256_storeu_ps(output.add(i + 8), fgelu!(x1));
+        _mm256_storeu_ps(output.add(i + 16), fgelu!(x2));
+        _mm256_storeu_ps(output.add(i + 24), fgelu!(x3));
+        i += 32;
+    }
+    while i + 8 <= len {
+        let x = _mm256_loadu_ps(input.add(i));
+        _mm256_storeu_ps(output.add(i), fgelu!(x));
+        i += 8;
+    }
+    while i < len {
+        let x = *input.add(i);
+        let inner = 0.7978845608028654 * (x + 0.044715 * x * x * x);
+        *output.add(i) = 0.5 * x * (1.0 + inner.tanh());
+        i += 1;
+    }
+}
+
+/// AVX2 f32 div: out[i] = a[i] / b[i]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn div_f32(a: *const f32, b: *const f32, out: *mut f32, len: usize) {
+    let mut i = 0;
+    while i + 32 <= len {
+        let va0 = _mm256_loadu_ps(a.add(i));
+        let vb0 = _mm256_loadu_ps(b.add(i));
+        let va1 = _mm256_loadu_ps(a.add(i + 8));
+        let vb1 = _mm256_loadu_ps(b.add(i + 8));
+        let va2 = _mm256_loadu_ps(a.add(i + 16));
+        let vb2 = _mm256_loadu_ps(b.add(i + 16));
+        let va3 = _mm256_loadu_ps(a.add(i + 24));
+        let vb3 = _mm256_loadu_ps(b.add(i + 24));
+        _mm256_storeu_ps(out.add(i), _mm256_div_ps(va0, vb0));
+        _mm256_storeu_ps(out.add(i + 8), _mm256_div_ps(va1, vb1));
+        _mm256_storeu_ps(out.add(i + 16), _mm256_div_ps(va2, vb2));
+        _mm256_storeu_ps(out.add(i + 24), _mm256_div_ps(va3, vb3));
+        i += 32;
+    }
+    while i + 8 <= len {
+        let va = _mm256_loadu_ps(a.add(i));
+        let vb = _mm256_loadu_ps(b.add(i));
+        _mm256_storeu_ps(out.add(i), _mm256_div_ps(va, vb));
+        i += 8;
+    }
+    while i < len {
+        *out.add(i) = *a.add(i) / *b.add(i);
+        i += 1;
+    }
+}
+
+/// AVX2 sub: out[i] = a[i] - b[i]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn sub_f32(a: *const f32, b: *const f32, out: *mut f32, len: usize) {
+    let mut i = 0;
+    while i + 32 <= len {
+        let va0 = _mm256_loadu_ps(a.add(i));
+        let vb0 = _mm256_loadu_ps(b.add(i));
+        let va1 = _mm256_loadu_ps(a.add(i + 8));
+        let vb1 = _mm256_loadu_ps(b.add(i + 8));
+        let va2 = _mm256_loadu_ps(a.add(i + 16));
+        let vb2 = _mm256_loadu_ps(b.add(i + 16));
+        let va3 = _mm256_loadu_ps(a.add(i + 24));
+        let vb3 = _mm256_loadu_ps(b.add(i + 24));
+        _mm256_storeu_ps(out.add(i), _mm256_sub_ps(va0, vb0));
+        _mm256_storeu_ps(out.add(i + 8), _mm256_sub_ps(va1, vb1));
+        _mm256_storeu_ps(out.add(i + 16), _mm256_sub_ps(va2, vb2));
+        _mm256_storeu_ps(out.add(i + 24), _mm256_sub_ps(va3, vb3));
+        i += 32;
+    }
+    while i + 8 <= len {
+        let va = _mm256_loadu_ps(a.add(i));
+        let vb = _mm256_loadu_ps(b.add(i));
+        _mm256_storeu_ps(out.add(i), _mm256_sub_ps(va, vb));
+        i += 8;
+    }
+    while i < len {
+        *out.add(i) = *a.add(i) - *b.add(i);
+        i += 1;
+    }
+}
+
+/// Scalar broadcast add: out[i] = a[i] + scalar
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn add_scalar_f32(a: *const f32, scalar: f32, out: *mut f32, len: usize) {
+    let vs = _mm256_set1_ps(scalar);
+    let mut i = 0;
+    while i + 32 <= len {
+        let v0 = _mm256_loadu_ps(a.add(i));
+        let v1 = _mm256_loadu_ps(a.add(i + 8));
+        let v2 = _mm256_loadu_ps(a.add(i + 16));
+        let v3 = _mm256_loadu_ps(a.add(i + 24));
+        _mm256_storeu_ps(out.add(i), _mm256_add_ps(v0, vs));
+        _mm256_storeu_ps(out.add(i + 8), _mm256_add_ps(v1, vs));
+        _mm256_storeu_ps(out.add(i + 16), _mm256_add_ps(v2, vs));
+        _mm256_storeu_ps(out.add(i + 24), _mm256_add_ps(v3, vs));
+        i += 32;
+    }
+    while i + 8 <= len {
+        _mm256_storeu_ps(out.add(i), _mm256_add_ps(_mm256_loadu_ps(a.add(i)), vs));
+        i += 8;
+    }
+    while i < len {
+        *out.add(i) = *a.add(i) + scalar;
+        i += 1;
+    }
+}
+
+/// AVX2 memset: fill memory with zeros
+#[target_feature(enable = "avx2")]
+pub unsafe fn memset_zero_f32(ptr: *mut f32, len: usize) {
+    let zero = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= len {
+        _mm256_storeu_ps(ptr.add(i), zero);
+        i += 8;
+    }
+    while i < len {
+        *ptr.add(i) = 0.0;
+        i += 1;
+    }
+}
+
+/// AVX2 memory copy (non-temporal hint for large copies)
+#[target_feature(enable = "avx2")]
+pub unsafe fn copy_f32(src: *const f32, dst: *mut f32, len: usize) {
+    let mut i = 0;
+    // Use non-temporal hint for large copies to avoid cache pollution
+    while i + 32 <= len {
+        let v0 = _mm256_loadu_ps(src.add(i));
+        let v1 = _mm256_loadu_ps(src.add(i + 8));
+        let v2 = _mm256_loadu_ps(src.add(i + 16));
+        let v3 = _mm256_loadu_ps(src.add(i + 24));
+        _mm256_storeu_ps(dst.add(i), v0);
+        _mm256_storeu_ps(dst.add(i + 8), v1);
+        _mm256_storeu_ps(dst.add(i + 16), v2);
+        _mm256_storeu_ps(dst.add(i + 24), v3);
+        i += 32;
+    }
+    while i + 8 <= len {
+        _mm256_storeu_ps(dst.add(i), _mm256_loadu_ps(src.add(i)));
+        i += 8;
+    }
+    while i < len {
+        *dst.add(i) = *src.add(i);
+        i += 1;
+    }
+}

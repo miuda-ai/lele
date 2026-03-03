@@ -7,6 +7,9 @@ use crate::tensor::TensorView;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 /// Transpose a 4x4 matrix of f32 using NEON intrinsics
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -31,11 +34,83 @@ unsafe fn transpose_4x4_f32_neon(
     (col0, col1, col2, col3)
 }
 
+/// Transpose an 8×8 block of f32 using AVX2 intrinsics.
+/// Reads from 8 source rows (each row has stride `src_stride`),
+/// writes to 8 destination rows (each row has stride `dst_stride`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn transpose_8x8_f32_avx2(
+    src: *const f32,
+    src_stride: usize,
+    dst: *mut f32,
+    dst_stride: usize,
+) {
+    // Load 8 rows
+    let r0 = _mm256_loadu_ps(src);
+    let r1 = _mm256_loadu_ps(src.add(src_stride));
+    let r2 = _mm256_loadu_ps(src.add(src_stride * 2));
+    let r3 = _mm256_loadu_ps(src.add(src_stride * 3));
+    let r4 = _mm256_loadu_ps(src.add(src_stride * 4));
+    let r5 = _mm256_loadu_ps(src.add(src_stride * 5));
+    let r6 = _mm256_loadu_ps(src.add(src_stride * 6));
+    let r7 = _mm256_loadu_ps(src.add(src_stride * 7));
+
+    // Stage 1: interleave 32-bit floats
+    let t0 = _mm256_unpacklo_ps(r0, r1);
+    let t1 = _mm256_unpackhi_ps(r0, r1);
+    let t2 = _mm256_unpacklo_ps(r2, r3);
+    let t3 = _mm256_unpackhi_ps(r2, r3);
+    let t4 = _mm256_unpacklo_ps(r4, r5);
+    let t5 = _mm256_unpackhi_ps(r4, r5);
+    let t6 = _mm256_unpacklo_ps(r6, r7);
+    let t7 = _mm256_unpackhi_ps(r6, r7);
+
+    // Stage 2: interleave 64-bit groups
+    let s0 = _mm256_shuffle_ps(t0, t2, 0x44);
+    let s1 = _mm256_shuffle_ps(t0, t2, 0xEE);
+    let s2 = _mm256_shuffle_ps(t1, t3, 0x44);
+    let s3 = _mm256_shuffle_ps(t1, t3, 0xEE);
+    let s4 = _mm256_shuffle_ps(t4, t6, 0x44);
+    let s5 = _mm256_shuffle_ps(t4, t6, 0xEE);
+    let s6 = _mm256_shuffle_ps(t5, t7, 0x44);
+    let s7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+
+    // Stage 3: swap 128-bit halves
+    _mm256_storeu_ps(dst, _mm256_permute2f128_ps(s0, s4, 0x20));
+    _mm256_storeu_ps(dst.add(dst_stride), _mm256_permute2f128_ps(s1, s5, 0x20));
+    _mm256_storeu_ps(
+        dst.add(dst_stride * 2),
+        _mm256_permute2f128_ps(s2, s6, 0x20),
+    );
+    _mm256_storeu_ps(
+        dst.add(dst_stride * 3),
+        _mm256_permute2f128_ps(s3, s7, 0x20),
+    );
+    _mm256_storeu_ps(
+        dst.add(dst_stride * 4),
+        _mm256_permute2f128_ps(s0, s4, 0x31),
+    );
+    _mm256_storeu_ps(
+        dst.add(dst_stride * 5),
+        _mm256_permute2f128_ps(s1, s5, 0x31),
+    );
+    _mm256_storeu_ps(
+        dst.add(dst_stride * 6),
+        _mm256_permute2f128_ps(s2, s6, 0x31),
+    );
+    _mm256_storeu_ps(
+        dst.add(dst_stride * 7),
+        _mm256_permute2f128_ps(s3, s7, 0x31),
+    );
+}
+
 pub fn concat<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     inputs: &[&TensorView<'b, T>],
     axis: i64,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
+    let _t = std::time::Instant::now();
     if inputs.is_empty() {
         return TensorView::empty();
     }
@@ -112,6 +187,7 @@ pub fn concat<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
             current_out_offset += copy_len;
         }
     }
+    crate::profiling::add_concat(_t.elapsed().as_nanos() as u64);
     TensorView::from_slice(out, out_shape)
 }
 pub fn slice<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
@@ -294,6 +370,7 @@ pub fn pad<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     mode: &str,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
+    let _t = std::time::Instant::now();
     // Safely convert i64 → usize, clamping negatives to 0
     let raw_p: Vec<usize> = pads
         .iter()
@@ -392,6 +469,7 @@ pub fn pad<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     if mode == "edge" {
         pad_edge_inplace(out, &input.shape, &new_shape, &p, rank);
     }
+    crate::profiling::add_pad(_t.elapsed().as_nanos() as u64);
     TensorView::from_slice(out, new_shape)
 }
 
@@ -505,6 +583,16 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
     perm: &[i64],
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
+    let _t = std::time::Instant::now();
+    let result = transpose_inner(input, perm, out);
+    crate::profiling::add_transpose(_t.elapsed().as_nanos() as u64);
+    result
+}
+fn transpose_inner<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
+    input: &TensorView<'b, T>,
+    perm: &[i64],
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
     let ndim = input.dim();
     let perm: Vec<usize> = if perm.is_empty() {
         (0..ndim).rev().collect()
@@ -609,6 +697,47 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
             return TensorView::from_slice(out, out_shape);
         }
 
+        // AVX2 path for f32: 8×8 block transpose on (A, C*D) matrix
+        #[cfg(target_arch = "x86_64")]
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+            let cd = c * d;
+            let in_ptr = input_data.as_ptr() as *const f32;
+            let out_ptr = out.as_mut_ptr() as *mut f32;
+            let a8 = a / 8 * 8;
+            let cd8 = cd / 8 * 8;
+
+            for bi in 0..b {
+                let base_in = bi * a * cd;
+                let base_out = bi * cd * a;
+                unsafe {
+                    for ai in (0..a8).step_by(8) {
+                        for cdi in (0..cd8).step_by(8) {
+                            transpose_8x8_f32_avx2(
+                                in_ptr.add(base_in + ai * cd + cdi),
+                                cd,
+                                out_ptr.add(base_out + cdi * a + ai),
+                                a,
+                            );
+                        }
+                        for cdi in cd8..cd {
+                            for ai2 in ai..ai + 8 {
+                                *out_ptr.add(base_out + cdi * a + ai2) =
+                                    *in_ptr.add(base_in + ai2 * cd + cdi);
+                            }
+                        }
+                    }
+                    for ai in a8..a {
+                        for cdi in 0..cd {
+                            *out_ptr.add(base_out + cdi * a + ai) =
+                                *in_ptr.add(base_in + ai * cd + cdi);
+                        }
+                    }
+                }
+            }
+            return TensorView::from_slice(out, out_shape);
+        }
+
+        // Scalar fallback
         let out_slice = out.as_mut_slice();
         for bi in 0..b {
             for ai in 0..a {
@@ -676,6 +805,48 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
             return TensorView::from_slice(out, out_shape);
         }
 
+        // Fast AVX2 path for f32: 8×8 block transpose within each batch
+        #[cfg(target_arch = "x86_64")]
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+            let in_ptr = input_data.as_ptr() as *const f32;
+            let out_ptr = out.as_mut_ptr() as *mut f32;
+            let r8 = r / 8 * 8;
+            let c8 = c / 8 * 8;
+
+            for bi in 0..b {
+                let base_in = bi * r * c;
+                let base_out = bi * c * r;
+                unsafe {
+                    for ri in (0..r8).step_by(8) {
+                        for ci in (0..c8).step_by(8) {
+                            transpose_8x8_f32_avx2(
+                                in_ptr.add(base_in + ri * c + ci),
+                                c,
+                                out_ptr.add(base_out + ci * r + ri),
+                                r,
+                            );
+                        }
+                        // Remainder columns (< 8)
+                        for ci in c8..c {
+                            for ri2 in ri..ri + 8 {
+                                *out_ptr.add(base_out + ci * r + ri2) =
+                                    *in_ptr.add(base_in + ri2 * c + ci);
+                            }
+                        }
+                    }
+                    // Remainder rows (< 8)
+                    for ri in r8..r {
+                        for ci in 0..c {
+                            *out_ptr.add(base_out + ci * r + ri) =
+                                *in_ptr.add(base_in + ri * c + ci);
+                        }
+                    }
+                }
+            }
+            return TensorView::from_slice(out, out_shape);
+        }
+
+        // Scalar fallback for non-SIMD or non-f32
         let out_slice = out.as_mut_slice();
         for bi in 0..b {
             let base_in = bi * r * c;
@@ -744,7 +915,44 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
             return TensorView::from_slice(out, out_shape);
         }
 
-        // Non-NEON fallback (generic)
+        // AVX2-optimized 8×8 block transpose for f32
+        #[cfg(target_arch = "x86_64")]
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+            let r8 = r / 8 * 8;
+            let c8 = c / 8 * 8;
+            let in_ptr = input_data.as_ptr() as *const f32;
+            let out_ptr = out_slice.as_mut_ptr() as *mut f32;
+
+            unsafe {
+                for ri in (0..r8).step_by(8) {
+                    for ci in (0..c8).step_by(8) {
+                        transpose_8x8_f32_avx2(
+                            in_ptr.add(ri * c + ci),
+                            c,
+                            out_ptr.add(ci * r + ri),
+                            r,
+                        );
+                    }
+                    // Remainder columns
+                    for ci in c8..c {
+                        for ri2 in ri..ri + 8 {
+                            *out_slice.get_unchecked_mut(ci * r + ri2) =
+                                *input_data.get_unchecked(ri2 * c + ci);
+                        }
+                    }
+                }
+                // Remainder rows
+                for ri in r8..r {
+                    for ci in 0..c {
+                        *out_slice.get_unchecked_mut(ci * r + ri) =
+                            *input_data.get_unchecked(ri * c + ci);
+                    }
+                }
+            }
+            return TensorView::from_slice(out, out_shape);
+        }
+
+        // Non-SIMD fallback (generic)
         for ri in 0..r {
             for ci in 0..c {
                 unsafe {
@@ -858,6 +1066,7 @@ pub fn split_owned<T: Clone + Copy + std::fmt::Debug>(
     axis: i64,
     splits: &[i64],
 ) -> Vec<TensorView<'static, T>> {
+    let _t = std::time::Instant::now();
     let ndim = input.dim();
     let axis = if axis < 0 {
         (ndim as i64 + axis) as usize
@@ -905,9 +1114,25 @@ pub fn split_owned<T: Clone + Copy + std::fmt::Debug>(
         axis_offset += split_size;
     }
 
+    crate::profiling::add_split(_t.elapsed().as_nanos() as u64);
     results
 }
 pub fn where_op<'b, 'a, T, C>(
+    condition: &TensorView<'b, C>,
+    x: &TensorView<'b, T>,
+    y: &TensorView<'b, T>,
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T>
+where
+    T: Clone + Copy + std::fmt::Debug,
+    C: Clone + Copy + std::fmt::Debug + crate::kernels::utils::AsI64,
+{
+    let _t = std::time::Instant::now();
+    let result = where_op_inner(condition, x, y, out);
+    crate::profiling::add_where_op(_t.elapsed().as_nanos() as u64);
+    result
+}
+fn where_op_inner<'b, 'a, T, C>(
     condition: &TensorView<'b, C>,
     x: &TensorView<'b, T>,
     y: &TensorView<'b, T>,

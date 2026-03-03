@@ -91,6 +91,22 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 tab, outputs[0], inputs[0], shape
             )?;
         }
+        "Flatten" => {
+            // Flatten: reshape to 2D [batch_size, -1]
+            // axis parameter determines where to flatten (default is 1)
+            let axis = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "axis")
+                .map(|a| a.i)
+                .unwrap_or(1) as usize;
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::flatten(&{}, {});",
+                tab, outputs[0], inputs[0], axis
+            )?;
+        }
         "Unsqueeze" => {
             let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
                 resolve_i64_with_temp(1, ctx, w, &tab)?

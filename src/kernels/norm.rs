@@ -163,6 +163,7 @@ pub fn layer_norm<'b, 'a>(
     epsilon: f32,
     out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
+    let _t = std::time::Instant::now();
     let ndim = input.shape.len();
     let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
     let outer_size: usize = input.shape[..axis].iter().product();
@@ -237,6 +238,7 @@ pub fn layer_norm<'b, 'a>(
             }
         }
     }
+    crate::profiling::add_layernorm(_t.elapsed().as_nanos() as u64);
     TensorView {
         data: Cow::Borrowed(out_slice),
         shape: std::borrow::Cow::Owned(input.shape.to_vec()),
@@ -271,6 +273,17 @@ pub fn batch_norm<'b, 'a>(
                 let offset = (ni * c + ci) * spatial_size;
                 let scale_val = s[ci] / (v[ci] + epsilon).sqrt();
                 let bias_val = b[ci] - m[ci] * scale_val;
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    crate::kernels::avx::norm::batch_norm_spatial_x86(
+                        src.as_ptr().add(offset),
+                        out_slice.as_mut_ptr().add(offset),
+                        scale_val,
+                        bias_val,
+                        spatial_size,
+                    );
+                }
+                #[cfg(not(target_arch = "x86_64"))]
                 for i in 0..spatial_size {
                     out_slice[offset + i] = src[offset + i] * scale_val + bias_val;
                 }
@@ -293,8 +306,20 @@ pub fn batch_norm<'b, 'a>(
             for j in 0..c {
                 let scale_val = s[j] / (v[j] + epsilon).sqrt();
                 let bias_val = b[j] - m[j] * scale_val;
+                let offset = (i * c + j) * inner_size;
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    crate::kernels::avx::norm::batch_norm_spatial_x86(
+                        src.as_ptr().add(offset),
+                        out_slice.as_mut_ptr().add(offset),
+                        scale_val,
+                        bias_val,
+                        inner_size,
+                    );
+                }
+                #[cfg(not(target_arch = "x86_64"))]
                 for k in 0..inner_size {
-                    let idx = (i * c + j) * inner_size + k;
+                    let idx = offset + k;
                     out_slice[idx] = src[idx] * scale_val + bias_val;
                 }
             }
@@ -333,7 +358,19 @@ pub fn rms_norm<'b, 'a>(
         );
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        crate::kernels::avx::norm::rms_norm_x86(
+            input.data.as_ptr(),
+            weight.data.as_ptr(),
+            out_slice.as_mut_ptr(),
+            norm_size,
+            outer_size,
+            epsilon,
+        );
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         let src = &input.data;
         let w = &weight.data;

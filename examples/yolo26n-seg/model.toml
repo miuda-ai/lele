@@ -1,0 +1,10 @@
+[model]
+source = "local"
+
+[[model.files]]
+path = "yolo26n-seg.onnx"
+
+[codegen]
+class_name = "Yolo26Seg"
+model_file = "yolo26n-seg.onnx"
+custom_methods = []

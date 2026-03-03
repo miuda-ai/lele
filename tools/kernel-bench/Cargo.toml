@@ -1,0 +1,11 @@
+[package]
+name = "kernel-bench"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "kernel_bench"
+crate-type = ["cdylib"]
+
+[dependencies]
+lele = { path = "../.." }

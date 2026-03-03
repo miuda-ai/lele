@@ -36,6 +36,7 @@ fn main() {
     // Benchmark
     println!("Benchmarking ({} runs)...", n_runs);
     let mut times = Vec::with_capacity(n_runs);
+    lele::profiling::reset();
     for _ in 0..n_runs {
         let start = Instant::now();
         let _ = model.forward_with_workspace(&mut ws, input.clone());
@@ -57,4 +58,7 @@ fn main() {
     for (i, t) in times.iter().enumerate() {
         println!("  run {}: {:.2}ms", i + 1, t);
     }
+
+    eprintln!("\n(profiling totals for {} runs)", n_runs);
+    lele::profiling::print_report();
 }

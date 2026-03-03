@@ -133,6 +133,7 @@ pub fn softmax<'b, 'a>(
     axis: i32,
     out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
+    let _t = std::time::Instant::now();
     let ndim = input.shape.len();
     let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
     assert!(axis < ndim);
@@ -257,6 +258,7 @@ pub fn softmax<'b, 'a>(
     } else {
         unimplemented!("Softmax only supported on last dimension for now");
     }
+    crate::profiling::add_softmax(_t.elapsed().as_nanos() as u64);
     TensorView {
         data: Cow::Borrowed(out_slice),
         shape: std::borrow::Cow::Owned(input.shape.to_vec()),

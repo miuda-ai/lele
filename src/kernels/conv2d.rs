@@ -87,9 +87,9 @@ pub fn conv2d<'b, 'a>(
     strides: &[i64],
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    conv2d_fused(
+    return conv2d_fused(
         input, weights, bias, dilations, group, pads, strides, false, out,
-    )
+    );
 }
 
 /// 2D Convolution with fused SiLU activation (x * sigmoid(x)).
@@ -104,7 +104,7 @@ pub fn conv2d_silu<'b, 'a>(
     strides: &[i64],
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    conv2d_activation(
+    return conv2d_activation(
         input,
         weights,
         bias,
@@ -114,7 +114,7 @@ pub fn conv2d_silu<'b, 'a>(
         strides,
         Activation::SiLU,
         out,
-    )
+    );
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -141,9 +141,9 @@ pub fn conv2d_fused<'b, 'a>(
     } else {
         Activation::None
     };
-    conv2d_activation(
+    return conv2d_activation(
         input, weights, bias, dilations, group, pads, strides, act, out,
-    )
+    );
 }
 
 fn conv2d_activation<'b, 'a>(
@@ -157,6 +157,7 @@ fn conv2d_activation<'b, 'a>(
     act: Activation,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
+    let _t = std::time::Instant::now();
     let _relu = act == Activation::Relu;
     let in_shape = &input.shape;
     let w_shape = &weights.shape;
@@ -307,8 +308,58 @@ fn conv2d_activation<'b, 'a>(
                 }
             }
 
-            // Apply bias and optional activation
-            if bias.is_some() || act != Activation::None {
+            // Apply bias and optional activation using SIMD when available
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                    for oc in 0..out_channels {
+                        let bias_val = if let Some(b) = bias { b.data[oc] } else { 0.0 };
+                        let row_start = o_offset + oc * spatial;
+                        let ptr = unsafe { out.as_mut_ptr().add(row_start) };
+                        unsafe {
+                            match act {
+                                Activation::SiLU => {
+                                    if bias_val != 0.0 {
+                                        crate::kernels::avx::math::bias_silu_inplace(ptr, spatial, bias_val);
+                                    } else {
+                                        crate::kernels::avx::math::silu_inplace(ptr, spatial);
+                                    }
+                                }
+                                Activation::Relu => {
+                                    if bias_val != 0.0 {
+                                        crate::kernels::avx::math::bias_relu_inplace(ptr, spatial, bias_val);
+                                    } else {
+                                        crate::kernels::avx::math::relu_inplace(ptr, spatial);
+                                    }
+                                }
+                                Activation::None => {
+                                    if bias_val != 0.0 {
+                                        crate::kernels::avx::math::bias_add_inplace(ptr, spatial, bias_val);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Scalar fallback
+                    for oc in 0..out_channels {
+                        let bias_val = if let Some(b) = bias { b.data[oc] } else { 0.0 };
+                        let row_start = o_offset + oc * spatial;
+                        if bias_val != 0.0 || act != Activation::None {
+                            for j in 0..spatial {
+                                let val = out[row_start + j] + bias_val;
+                                out[row_start + j] = match act {
+                                    Activation::Relu => if val < 0.0 { 0.0 } else { val },
+                                    Activation::SiLU => val / (1.0 + (-val).exp()),
+                                    Activation::None => val,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
                 for oc in 0..out_channels {
                     let bias_val = if let Some(b) = bias { b.data[oc] } else { 0.0 };
                     let row_start = o_offset + oc * spatial;
@@ -316,13 +367,7 @@ fn conv2d_activation<'b, 'a>(
                         for j in 0..spatial {
                             let val = out[row_start + j] + bias_val;
                             out[row_start + j] = match act {
-                                Activation::Relu => {
-                                    if val < 0.0 {
-                                        0.0
-                                    } else {
-                                        val
-                                    }
-                                }
+                                Activation::Relu => if val < 0.0 { 0.0 } else { val },
                                 Activation::SiLU => val / (1.0 + (-val).exp()),
                                 Activation::None => val,
                             };
@@ -331,6 +376,7 @@ fn conv2d_activation<'b, 'a>(
                 }
             }
         }
+        crate::profiling::add_conv2d(_t.elapsed().as_nanos() as u64);
         return TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w]);
     }
 
@@ -420,26 +466,66 @@ fn conv2d_activation<'b, 'a>(
                     }
                 }
 
-                // Apply bias and optional activation
-                if bias.is_some() || act != Activation::None {
-                    for oc in 0..out_channels_per_group {
-                        let o_row_start = o_offset + oc * col_cols;
-                        let bias_val = if let Some(b) = bias {
-                            b.data[out_ch_start + oc]
-                        } else {
-                            0.0
-                        };
-                        if bias_val != 0.0 || act != Activation::None {
-                            for j in 0..col_cols {
-                                let val = out[o_row_start + j] + bias_val;
-                                out[o_row_start + j] = match act {
-                                    Activation::Relu => {
-                                        if val < 0.0 {
-                                            0.0
+                // Apply bias and optional activation using SIMD when available
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                        for oc in 0..out_channels_per_group {
+                            let bias_val = if let Some(b) = bias { b.data[out_ch_start + oc] } else { 0.0 };
+                            let row_start = o_offset + oc * col_cols;
+                            let ptr = unsafe { out.as_mut_ptr().add(row_start) };
+                            unsafe {
+                                match act {
+                                    Activation::SiLU => {
+                                        if bias_val != 0.0 {
+                                            crate::kernels::avx::math::bias_silu_inplace(ptr, col_cols, bias_val);
                                         } else {
-                                            val
+                                            crate::kernels::avx::math::silu_inplace(ptr, col_cols);
                                         }
                                     }
+                                    Activation::Relu => {
+                                        if bias_val != 0.0 {
+                                            crate::kernels::avx::math::bias_relu_inplace(ptr, col_cols, bias_val);
+                                        } else {
+                                            crate::kernels::avx::math::relu_inplace(ptr, col_cols);
+                                        }
+                                    }
+                                    Activation::None => {
+                                        if bias_val != 0.0 {
+                                            crate::kernels::avx::math::bias_add_inplace(ptr, col_cols, bias_val);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Scalar fallback
+                        for oc in 0..out_channels_per_group {
+                            let bias_val = if let Some(b) = bias { b.data[out_ch_start + oc] } else { 0.0 };
+                            let row_start = o_offset + oc * col_cols;
+                            if bias_val != 0.0 || act != Activation::None {
+                                for j in 0..col_cols {
+                                    let val = out[row_start + j] + bias_val;
+                                    out[row_start + j] = match act {
+                                        Activation::Relu => if val < 0.0 { 0.0 } else { val },
+                                        Activation::SiLU => val / (1.0 + (-val).exp()),
+                                        Activation::None => val,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    for oc in 0..out_channels_per_group {
+                        let bias_val = if let Some(b) = bias { b.data[out_ch_start + oc] } else { 0.0 };
+                        let row_start = o_offset + oc * col_cols;
+                        if bias_val != 0.0 || act != Activation::None {
+                            for j in 0..col_cols {
+                                let val = out[row_start + j] + bias_val;
+                                out[row_start + j] = match act {
+                                    Activation::Relu => if val < 0.0 { 0.0 } else { val },
                                     Activation::SiLU => val / (1.0 + (-val).exp()),
                                     Activation::None => val,
                                 };
@@ -451,6 +537,7 @@ fn conv2d_activation<'b, 'a>(
         }
     }); // COL_BUF.with
 
+    crate::profiling::add_conv2d(_t.elapsed().as_nanos() as u64);
     TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w])
 }
 
@@ -479,17 +566,28 @@ fn im2col(
     let spatial_cols = out_h * out_w;
     let batch_offset = batch_idx * total_channels * in_h * in_w;
 
-    // Common case: stride=1, dilation=1, 3x3 kernel — use optimized path
+    // Common case: stride=1, dilation=1 — use optimized path
     if stride_h == 1 && stride_w == 1 && dilation_h == 1 && dilation_w == 1 {
+        // For small kernels with padding, use AVX2 for zeroing when on x86_64
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && out_w >= 8 {
+            // Use AVX2 optimized path
+            unsafe {
+                crate::kernels::avx::conv2d::im2col_avx2(
+                    input, batch_offset, ch_start, channels, in_h, in_w,
+                    kernel_h, kernel_w, pad_top, pad_left, out_h, out_w, spatial_cols, col,
+                );
+            }
+            return;
+        }
+
+        // Scalar fallback
         for c in 0..channels {
             let ch_offset = batch_offset + (ch_start + c) * in_h * in_w;
             for kh in 0..kernel_h {
                 for kw in 0..kernel_w {
                     let col_row_offset = ((c * kernel_h + kh) * kernel_w + kw) * spatial_cols;
 
-                    // Compute the valid range of oh values (where ih is in bounds)
-                    // ih = oh + kh - pad_top; valid when 0 <= ih < in_h
-                    // oh >= pad_top - kh  and  oh < in_h + pad_top - kh
                     let oh_start = if kh < pad_top { pad_top - kh } else { 0 };
                     let oh_end = (in_h + pad_top).saturating_sub(kh).min(out_h);
 
@@ -511,8 +609,6 @@ fn im2col(
                         let in_row_offset = ch_offset + ih * in_w;
                         let col_base = col_row_offset + oh * out_w;
 
-                        // Compute valid ow range
-                        // iw = ow + kw - pad_left; valid when 0 <= iw < in_w
                         let ow_start = if kw < pad_left { pad_left - kw } else { 0 };
                         let ow_end = (in_w + pad_left).saturating_sub(kw).min(out_w);
 
@@ -524,7 +620,7 @@ fn im2col(
                             for ow in 0..ow_start {
                                 *col_ptr.add(ow) = 0.0;
                             }
-                            // Copy valid region (contiguous with stride=1, dilation=1)
+                            // Copy valid region
                             let iw_start = (ow_start + kw) as isize - pad_left as isize;
                             let count = ow_end - ow_start;
                             std::ptr::copy_nonoverlapping(
@@ -2325,4 +2421,136 @@ fn im2col_i16(
             }
         }
     }
+}
+
+/// 2D Transpose Convolution (ConvTranspose / Deconvolution).
+/// Input shape: [N, C_in, H, W]
+/// Weight shape: [C_in, C_out/groups, kH, kW] - note: transposed compared to Conv
+/// Output shape: [N, C_out, H_out, W_out]
+///
+/// Output size formula:
+/// output_size = (input_size - 1) * strides - 2 * pads + dilations * (kernel_size - 1) + output_padding + 1
+pub fn conv_transpose<'b, 'a>(
+    input: &TensorView<'b>,
+    weights: &TensorView<'b>,
+    bias: Option<&TensorView<'b>>,
+    dilations: &[i64],
+    group: i64,
+    pads: &[i64],
+    strides: &[i64],
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let in_shape = &input.shape;
+    let w_shape = &weights.shape;
+
+    assert!(
+        in_shape.len() == 4,
+        "ConvTranspose: expected rank-4 input [N,C,H,W], got rank {}",
+        in_shape.len()
+    );
+    assert!(
+        w_shape.len() == 4,
+        "ConvTranspose: expected rank-4 weight [C_in,C_out/g,kH,kW], got rank {}",
+        w_shape.len()
+    );
+
+    let batch_size = in_shape[0];
+    let in_channels = in_shape[1];
+    let in_h = in_shape[2];
+    let in_w = in_shape[3];
+
+    let kernel_h = w_shape[2] as usize;
+    let kernel_w = w_shape[3] as usize;
+    let out_channels = (w_shape[1] as i64 * group) as usize;
+
+    let stride_h = strides.get(0).copied().unwrap_or(1) as usize;
+    let stride_w = strides.get(1).copied().unwrap_or(1) as usize;
+    let dilation_h = dilations.get(0).copied().unwrap_or(1) as usize;
+    let dilation_w = dilations.get(1).copied().unwrap_or(1) as usize;
+    let pad_top = pads.get(0).copied().unwrap_or(0) as usize;
+    let pad_left = pads.get(1).copied().unwrap_or(0) as usize;
+    let pad_bottom = pads.get(2).copied().unwrap_or(pad_top as i64) as usize;
+    let pad_right = pads.get(3).copied().unwrap_or(pad_left as i64) as usize;
+
+    // Calculate output size
+    let out_h = (in_h - 1) * stride_h
+        .saturating_sub(pad_top + pad_bottom)
+        .saturating_add(dilation_h * (kernel_h - 1))
+        .saturating_add(1);
+    let out_w = (in_w - 1) * stride_w
+        .saturating_sub(pad_left + pad_right)
+        .saturating_add(dilation_w * (kernel_w - 1))
+        .saturating_add(1);
+    let out_size = batch_size * out_channels * out_h * out_w;
+    if out.len() != out_size {
+        out.resize(out_size, 0.0);
+    } else {
+        out.fill(0.0);
+    }
+
+    // Groups are not supported for simplicity in this implementation
+    assert!(group == 1, "ConvTranspose: group > 1 not supported yet");
+
+    let in_channels_per_group = in_channels as usize / group as usize;
+    let out_channels_per_group = out_channels as usize / group as usize;
+
+    for n in 0..batch_size {
+        let batch_offset = n * out_channels * out_h * out_w;
+
+        // ConvTranspose weight layout: [C_in, C_out, kH, kW] (ONNX convention)
+        for ic in 0..in_channels {
+            let in_ch_offset = n * in_channels * in_h * in_w + ic * in_h * in_w;
+
+            for oc in 0..out_channels {
+                // Weight offset: [C_in, C_out, kH, kW] -> ic * out_channels * kH * kW + oc * kH * kW
+                let weight_offset = ic * out_channels * kernel_h * kernel_w
+                    + oc * kernel_h * kernel_w;
+
+                for kh in 0..kernel_h {
+                    for kw in 0..kernel_w {
+                        // Output position for this kernel element
+                        let oh_start = kh * dilation_h;
+                        let ow_start = kw * dilation_w;
+
+                        for ih in 0..in_h {
+                            let oh = ih * stride_h + oh_start;
+                            if oh >= pad_top && oh < out_h + pad_top {
+                                let oh_valid = oh - pad_top;
+                                for iw in 0..in_w {
+                                    let ow = iw * stride_w + ow_start;
+                                    if ow >= pad_left && ow < out_w + pad_left {
+                                        let ow_valid = ow - pad_left;
+
+                                        // Input value
+                                        let in_val = input.data[in_ch_offset + ih * in_w + iw];
+
+                                        // Weight value
+                                        let w_val = weights.data[weight_offset + kh * kernel_w + kw];
+
+                                        // Accumulate to output
+                                        let out_idx = batch_offset + oc * out_h * out_w + oh_valid * out_w + ow_valid;
+                                        out[out_idx] += in_val * w_val;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add bias if present (after all convolutions)
+        if let Some(b) = bias {
+            for oc in 0..out_channels {
+                let ch_offset = batch_offset + oc * out_h * out_w;
+                for oh in 0..out_h {
+                    for ow in 0..out_w {
+                        out[ch_offset + oh * out_w + ow] += b.data[oc];
+                    }
+                }
+            }
+        }
+    }
+
+    TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w])
 }

@@ -29,6 +29,11 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             "{}let {} = lele::kernels::div(&{}, &{}, {});",
             tab, outputs[0], inputs[0], inputs[1], buf_expr
         )?,
+        "Mod" => writeln!(
+            w,
+            "{}let {} = lele::kernels::mod_f32(&{}, &{}, {});",
+            tab, outputs[0], inputs[0], inputs[1], buf_expr
+        )?,
         "MatMul" => writeln!(
             w,
             "{}let {} = lele::kernels::matmul(&{}, &{}, {});",

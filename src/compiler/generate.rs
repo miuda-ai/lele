@@ -846,8 +846,14 @@ pub(crate) fn generate_nodes(
             .map(|s| {
                 let name = sanitize_name(s);
                 if let Some((offset, len, shape, data_type)) = known_weights.get(&name) {
-                    let target_type = var_types.get(&name).map(|s| s.as_str()).unwrap_or("f32");
-                    if target_type == "i64" {
+                    // For Div and Mod operations, force f32 type
+                    let force_f32 = matches!(op, "Div" | "Mod");
+                    let target_type = if force_f32 {
+                        "f32"
+                    } else {
+                        var_types.get(&name).map(|s| s.as_str()).unwrap_or("f32")
+                    };
+                    if target_type == "i64" && !force_f32 {
                         match data_type {
                             7 => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape),
                             6 => format!("self.weight_i32_i64({}, {}, &{:?})", offset, len, shape),
@@ -892,11 +898,17 @@ pub(crate) fn generate_nodes(
             // writeln!(w, "{}// Op {} {} skipped (unused)", tab, op, outputs.join(","))?;
             continue;
         }
-        let is_i64 = outputs
-            .get(0)
-            .and_then(|out| var_types.get(out))
-            .map(|t| t == "i64")
-            .unwrap_or(false);
+        // For Div and Mod operations, force f32 type since these ops only support f32
+        let force_f32 = matches!(op, "Div" | "Mod");
+        let is_i64 = if force_f32 {
+            false
+        } else {
+            outputs
+                .get(0)
+                .and_then(|out| var_types.get(out))
+                .map(|t| t == "i64")
+                .unwrap_or(false)
+        };
         let buf_expr = if let Some(alloc) = allocator {
             if !node.output.is_empty() {
                 if let Some(&idx) = alloc.tensor_to_buffer.get(&node.output[0]) {

@@ -812,12 +812,12 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, output_name)?;
                     format!("&mut buf_{}", output_name)
                 };
-                // Emit Conv2d, then vectorized SiLU (avoids scalar SiLU in bias loop)
+                // Emit fused Conv2d + SiLU (single pass: GEMM output → bias → silu → store)
                 writeln!(
                     w,
-                    "{}let {} = lele::kernels::conv2d(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
+                    "{}let {} = lele::kernels::conv2d_silu(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
                     tab,
-                    conv_out_name,
+                    output_name,
                     input_expr,
                     weight_expr,
                     bias,
@@ -825,12 +825,7 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     group,
                     pads,
                     strides,
-                    conv_buf
-                )?;
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::silu(&{}, {});",
-                    tab, output_name, conv_out_name, silu_buf
+                    silu_buf
                 )?;
                 Ok(())
             }),

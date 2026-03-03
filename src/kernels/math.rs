@@ -399,6 +399,16 @@ pub fn add<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Debug
     b: &TensorView<'b, T>,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
+    let _t = std::time::Instant::now();
+    let result = add_inner(a, b, out);
+    crate::profiling::add_elementwise(_t.elapsed().as_nanos() as u64);
+    result
+}
+fn add_inner<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Debug + 'static>(
+    a: &TensorView<'b, T>,
+    b: &TensorView<'b, T>,
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
         utils::ensure_capacity(out, len);
@@ -462,6 +472,36 @@ pub fn add<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Debug
             shape: std::borrow::Cow::Owned(a.shape.to_vec()),
         };
     }
+    // x86_64 AVX2 scalar broadcast for f32 add
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+            if a.data.len() == 1 || b.data.len() == 1 {
+                let (scalar_val, tensor, out_shape) = if a.data.len() == 1 {
+                    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap();
+                    (unsafe { *(a.data.as_ptr() as *const f32) }, b, out_shape)
+                } else {
+                    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap();
+                    (unsafe { *(b.data.as_ptr() as *const f32) }, a, out_shape)
+                };
+                let len = tensor.data.len();
+                let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
+                utils::ensure_capacity(out_f32, len);
+                unsafe {
+                    crate::kernels::avx::math::add_scalar_f32(
+                        tensor.data.as_ptr() as *const f32,
+                        scalar_val,
+                        out_f32.as_mut_ptr(),
+                        len,
+                    );
+                }
+                return TensorView {
+                    data: Cow::Borrowed(out),
+                    shape: Cow::Owned(out_shape),
+                };
+            }
+        }
+    }
     // WASM SIMD fast paths for common broadcast patterns (f32 only).
     #[cfg(target_arch = "wasm32")]
     {
@@ -477,7 +517,9 @@ pub fn add<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Debug
                 let len = tensor.data.len();
                 let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
                 utils::ensure_capacity(out_f32, len);
-                unsafe { out_f32.set_len(len); }
+                unsafe {
+                    out_f32.set_len(len);
+                }
                 unsafe {
                     crate::kernels::wasm::math::add_scalar_f32(
                         tensor.data.as_ptr() as *const f32,
@@ -499,7 +541,9 @@ pub fn add<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Debug
                 let numel = out_shape.iter().product::<usize>();
                 let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
                 utils::ensure_capacity(out_f32, numel);
-                unsafe { out_f32.set_len(numel); }
+                unsafe {
+                    out_f32.set_len(numel);
+                }
                 // Case A: a is full [1,C,H,W], b is [C]
                 if a.data.len() == numel && b.data.len() == c {
                     unsafe {
@@ -539,6 +583,16 @@ pub fn add<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Debug
 }
 
 pub fn mul<'b, 'a, T: Clone + Copy + std::ops::Mul<Output = T> + std::fmt::Debug + 'static>(
+    a: &TensorView<'b, T>,
+    b: &TensorView<'b, T>,
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
+    let _t = std::time::Instant::now();
+    let result = mul_inner(a, b, out);
+    crate::profiling::add_elementwise(_t.elapsed().as_nanos() as u64);
+    result
+}
+fn mul_inner<'b, 'a, T: Clone + Copy + std::ops::Mul<Output = T> + std::fmt::Debug + 'static>(
     a: &TensorView<'b, T>,
     b: &TensorView<'b, T>,
     out: &'a mut Vec<T>,
@@ -606,6 +660,36 @@ pub fn mul<'b, 'a, T: Clone + Copy + std::ops::Mul<Output = T> + std::fmt::Debug
             shape: std::borrow::Cow::Owned(a.shape.to_vec()),
         };
     }
+    // x86_64 AVX2 scalar broadcast for f32 (handles scalar * tensor and tensor * scalar)
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+            if a.data.len() == 1 || b.data.len() == 1 {
+                let (scalar_val, tensor, out_shape) = if a.data.len() == 1 {
+                    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap();
+                    (unsafe { *(a.data.as_ptr() as *const f32) }, b, out_shape)
+                } else {
+                    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap();
+                    (unsafe { *(b.data.as_ptr() as *const f32) }, a, out_shape)
+                };
+                let len = tensor.data.len();
+                let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
+                utils::ensure_capacity(out_f32, len);
+                unsafe {
+                    crate::kernels::avx::math::mul_scalar_f32(
+                        tensor.data.as_ptr() as *const f32,
+                        scalar_val,
+                        out_f32.as_mut_ptr(),
+                        len,
+                    );
+                }
+                return TensorView {
+                    data: Cow::Borrowed(out),
+                    shape: Cow::Owned(out_shape),
+                };
+            }
+        }
+    }
     // NEON scalar broadcast for f32 (handles scalar * tensor and tensor * scalar)
     #[cfg(target_arch = "aarch64")]
     {
@@ -651,7 +735,9 @@ pub fn mul<'b, 'a, T: Clone + Copy + std::ops::Mul<Output = T> + std::fmt::Debug
                 let len = tensor.data.len();
                 let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
                 utils::ensure_capacity(out_f32, len);
-                unsafe { out_f32.set_len(len); }
+                unsafe {
+                    out_f32.set_len(len);
+                }
                 unsafe {
                     crate::kernels::wasm::math::mul_scalar_f32(
                         tensor.data.as_ptr() as *const f32,
@@ -673,7 +759,9 @@ pub fn mul<'b, 'a, T: Clone + Copy + std::ops::Mul<Output = T> + std::fmt::Debug
                 let numel = out_shape.iter().product::<usize>();
                 let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
                 utils::ensure_capacity(out_f32, numel);
-                unsafe { out_f32.set_len(numel); }
+                unsafe {
+                    out_f32.set_len(numel);
+                }
                 // Case A: a is full [1,C,H,W], b is [C]
                 if a.data.len() == numel && b.data.len() == c {
                     unsafe {
@@ -717,9 +805,26 @@ pub fn sub<'b, 'a, T: Clone + Copy + std::ops::Sub<Output = T> + std::fmt::Debug
     b: &TensorView<'b, T>,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
+    let _t = std::time::Instant::now();
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
         utils::ensure_capacity(out, len);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+                let a_ptr = a.data.as_ptr() as *const f32;
+                let b_ptr = b.data.as_ptr() as *const f32;
+                let o_ptr = out.as_mut_ptr() as *mut f32;
+                unsafe {
+                    crate::kernels::avx::math::sub_f32(a_ptr, b_ptr, o_ptr, len);
+                }
+                crate::profiling::add_unary(_t.elapsed().as_nanos() as u64);
+                return TensorView {
+                    data: Cow::Borrowed(out),
+                    shape: std::borrow::Cow::Owned(a.shape.to_vec()),
+                };
+            }
+        }
         #[cfg(target_arch = "wasm32")]
         {
             if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
@@ -729,6 +834,7 @@ pub fn sub<'b, 'a, T: Clone + Copy + std::ops::Sub<Output = T> + std::fmt::Debug
                 unsafe {
                     crate::kernels::wasm::math::sub_f32(a_ptr, b_ptr, o_ptr, len);
                 }
+                crate::profiling::add_unary(_t.elapsed().as_nanos() as u64);
                 return TensorView {
                     data: Cow::Borrowed(out),
                     shape: std::borrow::Cow::Owned(a.shape.to_vec()),
@@ -744,12 +850,15 @@ pub fn sub<'b, 'a, T: Clone + Copy + std::ops::Sub<Output = T> + std::fmt::Debug
                     *a_slice.get_unchecked(i) - *b_slice.get_unchecked(i);
             }
         }
+        crate::profiling::add_unary(_t.elapsed().as_nanos() as u64);
         return TensorView {
             data: Cow::Borrowed(out),
             shape: std::borrow::Cow::Owned(a.shape.to_vec()),
         };
     }
-    broadcast_binary_op(a, b, out, |x, y| x - y)
+    let _r = broadcast_binary_op(a, b, out, |x, y| x - y);
+    crate::profiling::add_unary(_t.elapsed().as_nanos() as u64);
+    _r
 }
 pub fn reciprocal<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
@@ -769,11 +878,23 @@ pub fn gelu<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView
     {
         crate::kernels::neon::math::gelu(input, out)
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let numel = input.data.len();
+        utils::ensure_capacity(out, numel);
+        unsafe {
+            crate::kernels::avx::math::gelu_kernel(input.data.as_ptr(), out.as_mut_ptr(), numel);
+        }
+        TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(input.shape.to_vec()),
+        }
+    }
     #[cfg(target_arch = "wasm32")]
     {
         crate::kernels::wasm::math::gelu_kernel(input, out)
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "wasm32")))]
     {
         let numel = input.data.len();
         utils::ensure_capacity(out, numel);
@@ -797,11 +918,27 @@ pub fn fast_gelu<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> Tenso
     {
         crate::kernels::neon::math::fast_gelu(input, out)
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let numel = input.data.len();
+        utils::ensure_capacity(out, numel);
+        unsafe {
+            crate::kernels::avx::math::fast_gelu_kernel(
+                input.data.as_ptr(),
+                out.as_mut_ptr(),
+                numel,
+            );
+        }
+        TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(input.shape.to_vec()),
+        }
+    }
     #[cfg(target_arch = "wasm32")]
     {
         crate::kernels::wasm::math::fast_gelu_kernel(input, out)
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "wasm32")))]
     {
         let numel = input.data.len();
         utils::ensure_capacity(out, numel);
@@ -821,9 +958,12 @@ pub fn fast_gelu<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> Tenso
 }
 
 pub fn erf<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
+    let _t = std::time::Instant::now();
     #[cfg(target_arch = "aarch64")]
     {
-        crate::kernels::neon::math::erf(input, out)
+        let _r = crate::kernels::neon::math::erf(input, out);
+        crate::profiling::add_erf(_t.elapsed().as_nanos() as u64);
+        _r
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -832,6 +972,7 @@ pub fn erf<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
         unsafe {
             crate::kernels::avx::math::erf_kernel(input.data.as_ptr(), out.as_mut_ptr(), numel);
         }
+        crate::profiling::add_erf(_t.elapsed().as_nanos() as u64);
         TensorView {
             data: Cow::Borrowed(out),
             shape: Cow::Owned(input.shape.to_vec()),
@@ -844,6 +985,7 @@ pub fn erf<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
         unsafe {
             crate::kernels::wasm::math::erf(input.data.as_ptr(), out.as_mut_ptr(), numel);
         }
+        crate::profiling::add_erf(_t.elapsed().as_nanos() as u64);
         TensorView {
             data: Cow::Borrowed(out),
             shape: Cow::Owned(input.shape.to_vec()),
@@ -860,6 +1002,7 @@ pub fn erf<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
         for i in 0..numel {
             out[i] = libm::erff(input.data[i]);
         }
+        crate::profiling::add_erf(_t.elapsed().as_nanos() as u64);
         TensorView {
             data: Cow::Borrowed(out),
             shape: Cow::Owned(input.shape.to_vec()),
@@ -880,9 +1023,12 @@ pub fn softplus<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> Tensor
     }
 }
 pub fn tanh_kernel<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
+    let _t = std::time::Instant::now();
     #[cfg(target_arch = "aarch64")]
     {
-        crate::kernels::neon::math::tanh(input, out)
+        let _r = crate::kernels::neon::math::tanh(input, out);
+        crate::profiling::add_unary(_t.elapsed().as_nanos() as u64);
+        _r
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -891,6 +1037,7 @@ pub fn tanh_kernel<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> Ten
         unsafe {
             crate::kernels::avx::math::tanh_kernel(input.data.as_ptr(), out.as_mut_ptr(), numel);
         }
+        crate::profiling::add_unary(_t.elapsed().as_nanos() as u64);
         TensorView {
             data: Cow::Borrowed(out),
             shape: Cow::Owned(input.shape.to_vec()),
@@ -931,9 +1078,26 @@ pub fn div<'b, 'a, T: Clone + Copy + std::ops::Div<Output = T> + std::fmt::Debug
     b: &TensorView<'b, T>,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
+    let _t = std::time::Instant::now();
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
         utils::ensure_capacity(out, len);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+                let a_ptr = a.data.as_ptr() as *const f32;
+                let b_ptr = b.data.as_ptr() as *const f32;
+                let o_ptr = out.as_mut_ptr() as *mut f32;
+                unsafe {
+                    crate::kernels::avx::math::div_f32(a_ptr, b_ptr, o_ptr, len);
+                }
+                crate::profiling::add_unary(_t.elapsed().as_nanos() as u64);
+                return TensorView {
+                    data: Cow::Borrowed(out),
+                    shape: std::borrow::Cow::Owned(a.shape.to_vec()),
+                };
+            }
+        }
         #[cfg(target_arch = "wasm32")]
         {
             if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
@@ -943,6 +1107,7 @@ pub fn div<'b, 'a, T: Clone + Copy + std::ops::Div<Output = T> + std::fmt::Debug
                 unsafe {
                     crate::kernels::wasm::math::div_f32(a_ptr, b_ptr, o_ptr, len);
                 }
+                crate::profiling::add_unary(_t.elapsed().as_nanos() as u64);
                 return TensorView {
                     data: Cow::Borrowed(out),
                     shape: std::borrow::Cow::Owned(a.shape.to_vec()),
@@ -958,12 +1123,47 @@ pub fn div<'b, 'a, T: Clone + Copy + std::ops::Div<Output = T> + std::fmt::Debug
                     *a_slice.get_unchecked(i) / *b_slice.get_unchecked(i);
             }
         }
+        crate::profiling::add_unary(_t.elapsed().as_nanos() as u64);
         return TensorView {
             data: Cow::Borrowed(out),
             shape: std::borrow::Cow::Owned(a.shape.to_vec()),
         };
     }
-    broadcast_binary_op(a, b, out, |x, y| x / y)
+    let _r = broadcast_binary_op(a, b, out, |x, y| x / y);
+    crate::profiling::add_unary(_t.elapsed().as_nanos() as u64);
+    _r
+}
+
+/// Modulo operation: a % b (floating point)
+pub fn mod_f32<'b, 'a>(
+    a: &TensorView<'b>,
+    b: &TensorView<'b>,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let _t = std::time::Instant::now();
+    let len = a.data.len();
+    utils::ensure_capacity(out, len);
+    unsafe {
+        let a_ptr = a.data.as_ptr();
+        let b_ptr = b.data.as_ptr();
+        let o_ptr = out.as_mut_ptr();
+        for i in 0..len {
+            let ai = *a_ptr.add(i);
+            let bi = *b_ptr.add(i);
+            // Handle division by zero
+            if bi == 0.0 {
+                *o_ptr.add(i) = 0.0;
+            } else {
+                // f32 modulo using remainder
+                *o_ptr.add(i) = ai - bi * (ai / bi).floor();
+            }
+        }
+    }
+    crate::profiling::add_unary(_t.elapsed().as_nanos() as u64);
+    TensorView {
+        data: Cow::Borrowed(out),
+        shape: std::borrow::Cow::Owned(a.shape.to_vec()),
+    }
 }
 pub fn equal<'b, 'a>(
     a: &TensorView<'b>,
@@ -1621,11 +1821,21 @@ pub fn exp<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
     unsafe {
         out.set_len(numel);
     }
-    let out_slice = out.as_mut_slice();
-    for i in 0..numel {
-        out_slice[i] = input.data[i].exp();
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe {
+            crate::kernels::avx::math::exp_kernel(input.data.as_ptr(), out.as_mut_ptr(), numel);
+        }
+        return TensorView::from_slice(out, input.shape.to_vec());
     }
-    TensorView::from_slice(out, input.shape.to_vec())
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let out_slice = out.as_mut_slice();
+        for i in 0..numel {
+            out_slice[i] = input.data[i].exp();
+        }
+        TensorView::from_slice(out, input.shape.to_vec())
+    }
 }
 pub fn neg<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();

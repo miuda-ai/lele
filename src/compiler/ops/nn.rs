@@ -377,6 +377,55 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 panic!("Resize: neither scales nor sizes provided");
             }
         }
+        "ConvTranspose" => {
+            let dilations = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "dilations")
+                .map(|a| a.ints.clone())
+                .unwrap_or(vec![]);
+            let group = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "group")
+                .map(|a| a.i)
+                .unwrap_or(1);
+            let pads = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "pads")
+                .map(|a| a.ints.clone())
+                .unwrap_or(vec![]);
+            let strides = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "strides")
+                .map(|a| a.ints.clone())
+                .unwrap_or(vec![]);
+            let bias_arg = if inputs.len() > 2 {
+                format!("Some(&{})", inputs[2])
+            } else {
+                "None".to_string()
+            };
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::conv_transpose(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
+                tab,
+                outputs[0],
+                inputs[0],
+                inputs[1],
+                bias_arg,
+                dilations,
+                group,
+                pads,
+                strides,
+                buf_expr
+            )?;
+        }
         _ => return Ok(false),
     }
     Ok(true)

@@ -83,6 +83,7 @@ pub fn fused_quantized_linear<'a>(
     apply_relu: bool,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
+    let _t = std::time::Instant::now();
     #[cfg(target_arch = "x86_64")]
     {
         let input_dims = input.shape.len();
@@ -130,6 +131,7 @@ pub fn fused_quantized_linear<'a>(
         let mut output_shape = input.shape[..input_dims - 2].to_vec();
         output_shape.push(m);
         output_shape.push(n);
+        crate::profiling::add_quant_gemm(_t.elapsed().as_nanos() as u64);
         TensorView::from_slice(out, output_shape)
     }
 
@@ -934,6 +936,7 @@ fn mat_mul_integer_with_scale_bias_activation<'a, 'b, 'c>(
     apply_relu: bool,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
+    let _t = std::time::Instant::now();
     #[cfg(target_arch = "x86_64")]
     {
         // Fused x86 path: AVX2-vectorized f32→u8 + tiled B transpose + N-tiled GEMM
@@ -988,6 +991,7 @@ fn mat_mul_integer_with_scale_bias_activation<'a, 'b, 'c>(
         output_shape.push(m);
         output_shape.push(n);
 
+        crate::profiling::add_quant_gemm(_t.elapsed().as_nanos() as u64);
         TensorView::from_slice(out, output_shape)
     }
 

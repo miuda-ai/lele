@@ -844,9 +844,17 @@ pub fn conv1d<'b, 'a>(
     strides: &[i64],
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    conv1d_fused(
+    let _t = std::time::Instant::now();
+    let result = conv1d_fused(
         input, weights, bias, dilations, group, pads, strides, false, out,
-    )
+    );
+    let elapsed_us = _t.elapsed().as_micros();
+    crate::profiling::add_conv1d(_t.elapsed().as_nanos() as u64);
+    if elapsed_us > 100 {
+        eprintln!("  conv1d: in={:?} w={:?} g={} pad={:?} stride={:?} -> {:.2}ms",
+            &*input.shape, &*weights.shape, group, pads, strides, elapsed_us as f64 / 1000.0);
+    }
+    result
 }
 
 pub fn conv1d_fused<'b, 'a>(
@@ -1041,6 +1049,100 @@ pub fn conv1d_fused<'b, 'a>(
                 weights.data.as_ptr(),
                 out.as_mut_ptr(),
             );
+        }
+
+        return TensorView::from_slice(out, vec![batch_size, out_channels, output_len]);
+    }
+
+    // Fast path for K=1 pointwise convolution: direct GEMM without im2col or SCRATCH.
+    // Conv1d with kernel_size=1 is equivalent to matmul: weights[OC, IC] × input[IC, T] = output[OC, T]
+    // This avoids thread_local SCRATCH allocation and closure overhead.
+    if kernel_size == 1
+        && group == 1
+        && stride == 1
+        && dilation == 1
+        && pad_left == 0
+        && pad_right == 0
+    {
+        let out_slice = &mut out[..total_output_size];
+        for b in 0..batch_size {
+            let a_offset = b * out_channels * output_len;
+            let in_offset = b * in_channels * input_len;
+            unsafe {
+                let a = MatRef::<f32>::from_raw_parts(
+                    weights.data.as_ptr(),
+                    out_channels,
+                    in_channels,
+                    in_channels as isize,
+                    1,
+                );
+                let b_mat = MatRef::<f32>::from_raw_parts(
+                    input.data.as_ptr().add(in_offset),
+                    in_channels,
+                    output_len,
+                    output_len as isize,
+                    1,
+                );
+                let c = MatMut::<f32>::from_raw_parts_mut(
+                    out_slice.as_mut_ptr().add(a_offset),
+                    out_channels,
+                    output_len,
+                    output_len as isize,
+                    1,
+                );
+                matmul(c, Accum::Replace, a, b_mat, 1.0f32, Par::Seq);
+            }
+        }
+
+        // Fuse bias
+        if let Some(b_vec) = bias {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                crate::kernels::avx::conv1d::fuse_bias_relu_x86(
+                    out.as_mut_ptr(),
+                    Some(b_vec.data.as_ptr()),
+                    relu,
+                    batch_size,
+                    out_channels,
+                    output_len,
+                );
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let out_ptr = out.as_mut_ptr();
+                for bi in 0..batch_size {
+                    for oc in 0..out_channels {
+                        let start = (bi * out_channels + oc) * output_len;
+                        let bv = b_vec.data[oc];
+                        for i in 0..output_len {
+                            unsafe {
+                                let p = out_ptr.add(start + i);
+                                let mut v = *p + bv;
+                                if relu && v < 0.0 { v = 0.0; }
+                                *p = v;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if relu {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                crate::kernels::avx::conv1d::fuse_bias_relu_x86(
+                    out.as_mut_ptr(),
+                    None,
+                    true,
+                    batch_size,
+                    out_channels,
+                    output_len,
+                );
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                for v in out.iter_mut() {
+                    if *v < 0.0 { *v = 0.0; }
+                }
+            }
         }
 
         return TensorView::from_slice(out, vec![batch_size, out_channels, output_len]);

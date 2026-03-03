@@ -6,10 +6,12 @@ members = [
     "examples/silero",
     "examples/supertonic",
     "examples/yolo26",
+    "examples/yolo26n-seg",
     "examples/web-demo",
     "examples/web-demo/crates/sensevoice-wasm",
     "examples/web-demo/crates/yolo26-wasm",
     "examples/web-demo/crates/supertonic-wasm",
+    "tools/kernel-bench",
 ]
 resolver = "2"
 
