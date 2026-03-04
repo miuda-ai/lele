@@ -782,7 +782,7 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 let output_name = sanitize_name(&nodes[2].output[0]);
                 // Use the Sigmoid node's buffer for the conv2d intermediate output
                 let conv_out_name = sanitize_name(&nodes[0].output[0]);
-                let conv_buf = if let Some(alloc) = allocator {
+                let _conv_buf = if let Some(alloc) = allocator {
                     if let Some(&idx) = alloc.tensor_to_buffer.get(&nodes[0].output[0]) {
                         format!("&mut ws.buf_{}", idx)
                     } else {

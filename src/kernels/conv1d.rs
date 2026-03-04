@@ -850,9 +850,10 @@ pub fn conv1d<'b, 'a>(
     );
     let elapsed_us = _t.elapsed().as_micros();
     crate::profiling::add_conv1d(_t.elapsed().as_nanos() as u64);
-    if elapsed_us > 100 {
-        eprintln!("  conv1d: in={:?} w={:?} g={} pad={:?} stride={:?} -> {:.2}ms",
-            &*input.shape, &*weights.shape, group, pads, strides, elapsed_us as f64 / 1000.0);
+    // Only log if conv1d takes more than 1ms
+    if elapsed_us > 1000 {
+        eprintln!("  conv1d: in={:?} w={:?} g={} -> {:.2}ms",
+            &*input.shape, &*weights.shape, group, elapsed_us as f64 / 1000.0);
     }
     result
 }

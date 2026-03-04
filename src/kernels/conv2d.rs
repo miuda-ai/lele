@@ -320,21 +320,27 @@ fn conv2d_activation<'b, 'a>(
                             match act {
                                 Activation::SiLU => {
                                     if bias_val != 0.0 {
-                                        crate::kernels::avx::math::bias_silu_inplace(ptr, spatial, bias_val);
+                                        crate::kernels::avx::math::bias_silu_inplace(
+                                            ptr, spatial, bias_val,
+                                        );
                                     } else {
                                         crate::kernels::avx::math::silu_inplace(ptr, spatial);
                                     }
                                 }
                                 Activation::Relu => {
                                     if bias_val != 0.0 {
-                                        crate::kernels::avx::math::bias_relu_inplace(ptr, spatial, bias_val);
+                                        crate::kernels::avx::math::bias_relu_inplace(
+                                            ptr, spatial, bias_val,
+                                        );
                                     } else {
                                         crate::kernels::avx::math::relu_inplace(ptr, spatial);
                                     }
                                 }
                                 Activation::None => {
                                     if bias_val != 0.0 {
-                                        crate::kernels::avx::math::bias_add_inplace(ptr, spatial, bias_val);
+                                        crate::kernels::avx::math::bias_add_inplace(
+                                            ptr, spatial, bias_val,
+                                        );
                                     }
                                 }
                             }
@@ -349,7 +355,13 @@ fn conv2d_activation<'b, 'a>(
                             for j in 0..spatial {
                                 let val = out[row_start + j] + bias_val;
                                 out[row_start + j] = match act {
-                                    Activation::Relu => if val < 0.0 { 0.0 } else { val },
+                                    Activation::Relu => {
+                                        if val < 0.0 {
+                                            0.0
+                                        } else {
+                                            val
+                                        }
+                                    }
                                     Activation::SiLU => val / (1.0 + (-val).exp()),
                                     Activation::None => val,
                                 };
@@ -367,7 +379,13 @@ fn conv2d_activation<'b, 'a>(
                         for j in 0..spatial {
                             let val = out[row_start + j] + bias_val;
                             out[row_start + j] = match act {
-                                Activation::Relu => if val < 0.0 { 0.0 } else { val },
+                                Activation::Relu => {
+                                    if val < 0.0 {
+                                        0.0
+                                    } else {
+                                        val
+                                    }
+                                }
                                 Activation::SiLU => val / (1.0 + (-val).exp()),
                                 Activation::None => val,
                             };
@@ -434,7 +452,14 @@ fn conv2d_activation<'b, 'a>(
                     let out_ptr = out.as_mut_ptr().add(o_offset);
 
                     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-                    accel_sgemm(out_channels_per_group, col_cols, col_rows, w_ptr, col_ptr, out_ptr);
+                    accel_sgemm(
+                        out_channels_per_group,
+                        col_cols,
+                        col_rows,
+                        w_ptr,
+                        col_ptr,
+                        out_ptr,
+                    );
 
                     #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
                     {
@@ -471,28 +496,38 @@ fn conv2d_activation<'b, 'a>(
                 {
                     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                         for oc in 0..out_channels_per_group {
-                            let bias_val = if let Some(b) = bias { b.data[out_ch_start + oc] } else { 0.0 };
+                            let bias_val = if let Some(b) = bias {
+                                b.data[out_ch_start + oc]
+                            } else {
+                                0.0
+                            };
                             let row_start = o_offset + oc * col_cols;
                             let ptr = unsafe { out.as_mut_ptr().add(row_start) };
                             unsafe {
                                 match act {
                                     Activation::SiLU => {
                                         if bias_val != 0.0 {
-                                            crate::kernels::avx::math::bias_silu_inplace(ptr, col_cols, bias_val);
+                                            crate::kernels::avx::math::bias_silu_inplace(
+                                                ptr, col_cols, bias_val,
+                                            );
                                         } else {
                                             crate::kernels::avx::math::silu_inplace(ptr, col_cols);
                                         }
                                     }
                                     Activation::Relu => {
                                         if bias_val != 0.0 {
-                                            crate::kernels::avx::math::bias_relu_inplace(ptr, col_cols, bias_val);
+                                            crate::kernels::avx::math::bias_relu_inplace(
+                                                ptr, col_cols, bias_val,
+                                            );
                                         } else {
                                             crate::kernels::avx::math::relu_inplace(ptr, col_cols);
                                         }
                                     }
                                     Activation::None => {
                                         if bias_val != 0.0 {
-                                            crate::kernels::avx::math::bias_add_inplace(ptr, col_cols, bias_val);
+                                            crate::kernels::avx::math::bias_add_inplace(
+                                                ptr, col_cols, bias_val,
+                                            );
                                         }
                                     }
                                 }
@@ -501,13 +536,23 @@ fn conv2d_activation<'b, 'a>(
                     } else {
                         // Scalar fallback
                         for oc in 0..out_channels_per_group {
-                            let bias_val = if let Some(b) = bias { b.data[out_ch_start + oc] } else { 0.0 };
+                            let bias_val = if let Some(b) = bias {
+                                b.data[out_ch_start + oc]
+                            } else {
+                                0.0
+                            };
                             let row_start = o_offset + oc * col_cols;
                             if bias_val != 0.0 || act != Activation::None {
                                 for j in 0..col_cols {
                                     let val = out[row_start + j] + bias_val;
                                     out[row_start + j] = match act {
-                                        Activation::Relu => if val < 0.0 { 0.0 } else { val },
+                                        Activation::Relu => {
+                                            if val < 0.0 {
+                                                0.0
+                                            } else {
+                                                val
+                                            }
+                                        }
                                         Activation::SiLU => val / (1.0 + (-val).exp()),
                                         Activation::None => val,
                                     };
@@ -519,13 +564,23 @@ fn conv2d_activation<'b, 'a>(
                 #[cfg(not(target_arch = "x86_64"))]
                 {
                     for oc in 0..out_channels_per_group {
-                        let bias_val = if let Some(b) = bias { b.data[out_ch_start + oc] } else { 0.0 };
+                        let bias_val = if let Some(b) = bias {
+                            b.data[out_ch_start + oc]
+                        } else {
+                            0.0
+                        };
                         let row_start = o_offset + oc * col_cols;
                         if bias_val != 0.0 || act != Activation::None {
                             for j in 0..col_cols {
                                 let val = out[row_start + j] + bias_val;
                                 out[row_start + j] = match act {
-                                    Activation::Relu => if val < 0.0 { 0.0 } else { val },
+                                    Activation::Relu => {
+                                        if val < 0.0 {
+                                            0.0
+                                        } else {
+                                            val
+                                        }
+                                    }
                                     Activation::SiLU => val / (1.0 + (-val).exp()),
                                     Activation::None => val,
                                 };
@@ -574,8 +629,20 @@ fn im2col(
             // Use AVX2 optimized path
             unsafe {
                 crate::kernels::avx::conv2d::im2col_avx2(
-                    input, batch_offset, ch_start, channels, in_h, in_w,
-                    kernel_h, kernel_w, pad_top, pad_left, out_h, out_w, spatial_cols, col,
+                    input,
+                    batch_offset,
+                    ch_start,
+                    channels,
+                    in_h,
+                    in_w,
+                    kernel_h,
+                    kernel_w,
+                    pad_top,
+                    pad_left,
+                    out_h,
+                    out_w,
+                    spatial_cols,
+                    col,
                 );
             }
             return;
@@ -1172,14 +1239,14 @@ fn conv2d_with_zero_points<'b, 'a>(
                     let mut i = 0usize;
                     let simd_end = w_len & !15;
                     while i < simd_end {
-                        let v0 = v128_load(src.add(i)       as *const v128);
-                        let v1 = v128_load(src.add(i +  4)  as *const v128);
-                        let v2 = v128_load(src.add(i +  8)  as *const v128);
-                        let v3 = v128_load(src.add(i + 12)  as *const v128);
-                        v128_store(dst.add(i)       as *mut v128, f32x4_sub(v0, zp_v));
-                        v128_store(dst.add(i +  4)  as *mut v128, f32x4_sub(v1, zp_v));
-                        v128_store(dst.add(i +  8)  as *mut v128, f32x4_sub(v2, zp_v));
-                        v128_store(dst.add(i + 12)  as *mut v128, f32x4_sub(v3, zp_v));
+                        let v0 = v128_load(src.add(i) as *const v128);
+                        let v1 = v128_load(src.add(i + 4) as *const v128);
+                        let v2 = v128_load(src.add(i + 8) as *const v128);
+                        let v3 = v128_load(src.add(i + 12) as *const v128);
+                        v128_store(dst.add(i) as *mut v128, f32x4_sub(v0, zp_v));
+                        v128_store(dst.add(i + 4) as *mut v128, f32x4_sub(v1, zp_v));
+                        v128_store(dst.add(i + 8) as *mut v128, f32x4_sub(v2, zp_v));
+                        v128_store(dst.add(i + 12) as *mut v128, f32x4_sub(v3, zp_v));
                         i += 16;
                     }
                     while i + 4 <= w_len {
@@ -1300,14 +1367,14 @@ fn conv2d_with_zero_points<'b, 'a>(
                             let mut i = 0usize;
                             let simd_end = needed & !15;
                             while i < simd_end {
-                                let v0 = v128_load(src.add(i)       as *const v128);
-                                let v1 = v128_load(src.add(i +  4)  as *const v128);
-                                let v2 = v128_load(src.add(i +  8)  as *const v128);
-                                let v3 = v128_load(src.add(i + 12)  as *const v128);
-                                v128_store(dst.add(i)       as *mut v128, f32x4_sub(v0, zp_v));
-                                v128_store(dst.add(i +  4)  as *mut v128, f32x4_sub(v1, zp_v));
-                                v128_store(dst.add(i +  8)  as *mut v128, f32x4_sub(v2, zp_v));
-                                v128_store(dst.add(i + 12)  as *mut v128, f32x4_sub(v3, zp_v));
+                                let v0 = v128_load(src.add(i) as *const v128);
+                                let v1 = v128_load(src.add(i + 4) as *const v128);
+                                let v2 = v128_load(src.add(i + 8) as *const v128);
+                                let v3 = v128_load(src.add(i + 12) as *const v128);
+                                v128_store(dst.add(i) as *mut v128, f32x4_sub(v0, zp_v));
+                                v128_store(dst.add(i + 4) as *mut v128, f32x4_sub(v1, zp_v));
+                                v128_store(dst.add(i + 8) as *mut v128, f32x4_sub(v2, zp_v));
+                                v128_store(dst.add(i + 12) as *mut v128, f32x4_sub(v3, zp_v));
                                 i += 16;
                             }
                             while i + 4 <= needed {
@@ -1428,7 +1495,14 @@ fn conv2d_with_zero_points<'b, 'a>(
                     let out_ptr = out.as_mut_ptr().add(o_offset);
 
                     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-                    accel_sgemm(out_channels_per_group, col_cols, col_rows, w_ptr, col_ptr, out_ptr);
+                    accel_sgemm(
+                        out_channels_per_group,
+                        col_cols,
+                        col_rows,
+                        w_ptr,
+                        col_ptr,
+                        out_ptr,
+                    );
 
                     #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
                     {
@@ -1596,13 +1670,13 @@ fn im2col_with_zp(
                                 let zp_v = f32x4_splat(x_zp);
                                 let mut j = 0usize;
                                 while j + 16 <= count {
-                                    let v0 = v128_load(src.add(j)      as *const v128);
-                                    let v1 = v128_load(src.add(j +  4) as *const v128);
-                                    let v2 = v128_load(src.add(j +  8) as *const v128);
+                                    let v0 = v128_load(src.add(j) as *const v128);
+                                    let v1 = v128_load(src.add(j + 4) as *const v128);
+                                    let v2 = v128_load(src.add(j + 8) as *const v128);
                                     let v3 = v128_load(src.add(j + 12) as *const v128);
-                                    v128_store(dst.add(j)      as *mut v128, f32x4_sub(v0, zp_v));
-                                    v128_store(dst.add(j +  4) as *mut v128, f32x4_sub(v1, zp_v));
-                                    v128_store(dst.add(j +  8) as *mut v128, f32x4_sub(v2, zp_v));
+                                    v128_store(dst.add(j) as *mut v128, f32x4_sub(v0, zp_v));
+                                    v128_store(dst.add(j + 4) as *mut v128, f32x4_sub(v1, zp_v));
+                                    v128_store(dst.add(j + 8) as *mut v128, f32x4_sub(v2, zp_v));
                                     v128_store(dst.add(j + 12) as *mut v128, f32x4_sub(v3, zp_v));
                                     j += 16;
                                 }
@@ -2473,14 +2547,16 @@ pub fn conv_transpose<'b, 'a>(
     let pad_right = pads.get(3).copied().unwrap_or(pad_left as i64) as usize;
 
     // Calculate output size
-    let out_h = (in_h - 1) * stride_h
-        .saturating_sub(pad_top + pad_bottom)
-        .saturating_add(dilation_h * (kernel_h - 1))
-        .saturating_add(1);
-    let out_w = (in_w - 1) * stride_w
-        .saturating_sub(pad_left + pad_right)
-        .saturating_add(dilation_w * (kernel_w - 1))
-        .saturating_add(1);
+    let out_h = (in_h - 1)
+        * stride_h
+            .saturating_sub(pad_top + pad_bottom)
+            .saturating_add(dilation_h * (kernel_h - 1))
+            .saturating_add(1);
+    let out_w = (in_w - 1)
+        * stride_w
+            .saturating_sub(pad_left + pad_right)
+            .saturating_add(dilation_w * (kernel_w - 1))
+            .saturating_add(1);
     let out_size = batch_size * out_channels * out_h * out_w;
     if out.len() != out_size {
         out.resize(out_size, 0.0);
@@ -2491,8 +2567,8 @@ pub fn conv_transpose<'b, 'a>(
     // Groups are not supported for simplicity in this implementation
     assert!(group == 1, "ConvTranspose: group > 1 not supported yet");
 
-    let in_channels_per_group = in_channels as usize / group as usize;
-    let out_channels_per_group = out_channels as usize / group as usize;
+    let _in_channels_per_group = in_channels as usize / group as usize;
+    let _out_channels_per_group = out_channels as usize / group as usize;
 
     for n in 0..batch_size {
         let batch_offset = n * out_channels * out_h * out_w;
@@ -2503,8 +2579,8 @@ pub fn conv_transpose<'b, 'a>(
 
             for oc in 0..out_channels {
                 // Weight offset: [C_in, C_out, kH, kW] -> ic * out_channels * kH * kW + oc * kH * kW
-                let weight_offset = ic * out_channels * kernel_h * kernel_w
-                    + oc * kernel_h * kernel_w;
+                let weight_offset =
+                    ic * out_channels * kernel_h * kernel_w + oc * kernel_h * kernel_w;
 
                 for kh in 0..kernel_h {
                     for kw in 0..kernel_w {
@@ -2525,10 +2601,14 @@ pub fn conv_transpose<'b, 'a>(
                                         let in_val = input.data[in_ch_offset + ih * in_w + iw];
 
                                         // Weight value
-                                        let w_val = weights.data[weight_offset + kh * kernel_w + kw];
+                                        let w_val =
+                                            weights.data[weight_offset + kh * kernel_w + kw];
 
                                         // Accumulate to output
-                                        let out_idx = batch_offset + oc * out_h * out_w + oh_valid * out_w + ow_valid;
+                                        let out_idx = batch_offset
+                                            + oc * out_h * out_w
+                                            + oh_valid * out_w
+                                            + ow_valid;
                                         out[out_idx] += in_val * w_val;
                                     }
                                 }

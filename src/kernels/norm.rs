@@ -30,48 +30,83 @@ pub fn softmax<'b, 'a>(
                 let dst = &mut out_slice[start..end];
 
                 unsafe {
-                    // SIMD max finding
-                    let mut max_vec = vdupq_n_f32(f32::MIN);
+                    // SIMD max finding with 4x unrolling
+                    let mut max_vec0 = vdupq_n_f32(f32::MIN);
+                    let mut max_vec1 = vdupq_n_f32(f32::MIN);
+                    let mut max_vec2 = vdupq_n_f32(f32::MIN);
+                    let mut max_vec3 = vdupq_n_f32(f32::MIN);
                     let mut j = 0;
-                    let simd_end = (axis_size / 4) * 4;
+                    let simd_end_4x = (axis_size / 16) * 16;
 
+                    while j < simd_end_4x {
+                        max_vec0 = vmaxq_f32(max_vec0, vld1q_f32(src.as_ptr().add(j)));
+                        max_vec1 = vmaxq_f32(max_vec1, vld1q_f32(src.as_ptr().add(j + 4)));
+                        max_vec2 = vmaxq_f32(max_vec2, vld1q_f32(src.as_ptr().add(j + 8)));
+                        max_vec3 = vmaxq_f32(max_vec3, vld1q_f32(src.as_ptr().add(j + 12)));
+                        j += 16;
+                    }
+
+                    // Merge max vectors
+                    let mut max_vec = vmaxq_f32(vmaxq_f32(max_vec0, max_vec1), vmaxq_f32(max_vec2, max_vec3));
+
+                    let simd_end = (axis_size / 4) * 4;
                     while j < simd_end {
-                        let v = vld1q_f32(src.as_ptr().add(j));
-                        max_vec = vmaxq_f32(max_vec, v);
+                        max_vec = vmaxq_f32(max_vec, vld1q_f32(src.as_ptr().add(j)));
                         j += 4;
                     }
 
-                    // Horizontal max
-                    let mut max_val = vgetq_lane_f32(max_vec, 0)
-                        .max(vgetq_lane_f32(max_vec, 1))
-                        .max(vgetq_lane_f32(max_vec, 2))
-                        .max(vgetq_lane_f32(max_vec, 3));
+                    // Fast horizontal max using vector add
+                    let mut max_val = vmaxvq_f32(max_vec);
 
                     for &v in &src[simd_end..] {
                         max_val = max_val.max(v);
                     }
 
-                    // SIMD exp and sum using accurate exp
+                    // SIMD exp and sum with 4x unrolling
                     let max_broadcast = vdupq_n_f32(max_val);
-                    let mut sum_vec = vdupq_n_f32(0.0);
+                    let mut sum_vec0 = vdupq_n_f32(0.0);
+                    let mut sum_vec1 = vdupq_n_f32(0.0);
+                    let mut sum_vec2 = vdupq_n_f32(0.0);
+                    let mut sum_vec3 = vdupq_n_f32(0.0);
 
                     j = 0;
+                    while j < simd_end_4x {
+                        let v0 = vld1q_f32(src.as_ptr().add(j));
+                        let v1 = vld1q_f32(src.as_ptr().add(j + 4));
+                        let v2 = vld1q_f32(src.as_ptr().add(j + 8));
+                        let v3 = vld1q_f32(src.as_ptr().add(j + 12));
+
+                        let e0 = crate::kernels::neon::math::neon_exp_f32x4(vsubq_f32(v0, max_broadcast));
+                        let e1 = crate::kernels::neon::math::neon_exp_f32x4(vsubq_f32(v1, max_broadcast));
+                        let e2 = crate::kernels::neon::math::neon_exp_f32x4(vsubq_f32(v2, max_broadcast));
+                        let e3 = crate::kernels::neon::math::neon_exp_f32x4(vsubq_f32(v3, max_broadcast));
+
+                        vst1q_f32(dst.as_mut_ptr().add(j), e0);
+                        vst1q_f32(dst.as_mut_ptr().add(j + 4), e1);
+                        vst1q_f32(dst.as_mut_ptr().add(j + 8), e2);
+                        vst1q_f32(dst.as_mut_ptr().add(j + 12), e3);
+
+                        sum_vec0 = vaddq_f32(sum_vec0, e0);
+                        sum_vec1 = vaddq_f32(sum_vec1, e1);
+                        sum_vec2 = vaddq_f32(sum_vec2, e2);
+                        sum_vec3 = vaddq_f32(sum_vec3, e3);
+                        j += 16;
+                    }
+
+                    // Merge sum vectors
+                    let mut sum_vec = vaddq_f32(vaddq_f32(sum_vec0, sum_vec1), vaddq_f32(sum_vec2, sum_vec3));
+
                     while j < simd_end {
                         let v = vld1q_f32(src.as_ptr().add(j));
                         let shifted = vsubq_f32(v, max_broadcast);
-
-                        // Use accurate exp for numerical stability
                         let exp_val = crate::kernels::neon::math::neon_exp_f32x4(shifted);
                         vst1q_f32(dst.as_mut_ptr().add(j), exp_val);
                         sum_vec = vaddq_f32(sum_vec, exp_val);
                         j += 4;
                     }
 
-                    // Horizontal sum + remaining elements
-                    let mut sum = vgetq_lane_f32(sum_vec, 0)
-                        + vgetq_lane_f32(sum_vec, 1)
-                        + vgetq_lane_f32(sum_vec, 2)
-                        + vgetq_lane_f32(sum_vec, 3);
+                    // Fast horizontal sum using vector add
+                    let mut sum = vaddvq_f32(sum_vec);
 
                     for k in simd_end..axis_size {
                         let e = (src[k] - max_val).exp();
@@ -79,15 +114,22 @@ pub fn softmax<'b, 'a>(
                         sum += e;
                     }
 
-                    // SIMD normalization
+                    // SIMD normalization with 4x unrolling
                     let inv_sum = 1.0 / sum;
                     let inv_sum_vec = vdupq_n_f32(inv_sum);
 
                     j = 0;
+                    while j < simd_end_4x {
+                        vst1q_f32(dst.as_mut_ptr().add(j), vmulq_f32(vld1q_f32(dst.as_ptr().add(j)), inv_sum_vec));
+                        vst1q_f32(dst.as_mut_ptr().add(j + 4), vmulq_f32(vld1q_f32(dst.as_ptr().add(j + 4)), inv_sum_vec));
+                        vst1q_f32(dst.as_mut_ptr().add(j + 8), vmulq_f32(vld1q_f32(dst.as_ptr().add(j + 8)), inv_sum_vec));
+                        vst1q_f32(dst.as_mut_ptr().add(j + 12), vmulq_f32(vld1q_f32(dst.as_ptr().add(j + 12)), inv_sum_vec));
+                        j += 16;
+                    }
+
                     while j < simd_end {
                         let v = vld1q_f32(dst.as_ptr().add(j));
-                        let normalized = vmulq_f32(v, inv_sum_vec);
-                        vst1q_f32(dst.as_mut_ptr().add(j), normalized);
+                        vst1q_f32(dst.as_mut_ptr().add(j), vmulq_f32(v, inv_sum_vec));
                         j += 4;
                     }
 
