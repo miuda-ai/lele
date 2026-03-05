@@ -203,41 +203,45 @@ pub fn postprocess_segmentation(
 
     let mut detections = Vec::new();
 
-    // Output format: [bbox(4), score(1), mask_coeffs(32)] = 37 (class missing due to Mod op unimplemented)
-    const LOGIT_LEN: usize = 37;
+    // ONNX output format: [x1, y1, x2, y2, score, mask_coeffs(32)] = 38
+    // Note: coordinates are already in pixel space (relative to 640x640 input)
+    const LOGIT_LEN: usize = 38;
     const MASK_COEFF_START: usize = 5;
+
+    // Scale factors from 640x640 to original image size
+    let scale_x = img_width as f32 / 640.0;
+    let scale_y = img_height as f32 / 640.0;
 
     for i in 0..NUM_QUERIES {
         let bbox_offset = i * LOGIT_LEN;
         let score_offset = bbox_offset + 4;
 
-        // Get score
+        // Get score (already sigmoid applied based on ONNX output analysis)
         let score = logits[score_offset];
-        let score_sigmoid = 1.0 / (1.0 + (-score).exp());
 
-        if score_sigmoid < threshold {
+        if score < threshold {
             continue;
         }
 
         // Class is unknown due to Mod op not implemented, default to 0
         let class = 0;
 
-        // Get bbox (normalized cx, cy, w, h)
-        let cx = logits[bbox_offset];
-        let cy = logits[bbox_offset + 1];
-        let w = logits[bbox_offset + 2];
-        let h = logits[bbox_offset + 3];
+        // Get bbox - coordinates are [x1, y1, x2, y2] in pixel space (relative to 640x640)
+        let x1_raw = logits[bbox_offset];
+        let y1_raw = logits[bbox_offset + 1];
+        let x2_raw = logits[bbox_offset + 2];
+        let y2_raw = logits[bbox_offset + 3];
 
-        // Skip invalid boxes
-        if w <= 0.0 || h <= 0.0 {
+        // Skip invalid boxes (negative or zero area)
+        if x2_raw <= x1_raw || y2_raw <= y1_raw {
             continue;
         }
 
-        // Convert to pixel coordinates [x1, y1, x2, y2]
-        let x1 = ((cx - w / 2.0) * img_width as f32).max(0.0);
-        let y1 = ((cy - h / 2.0) * img_height as f32).max(0.0);
-        let x2 = ((cx + w / 2.0) * img_width as f32).min(img_width as f32);
-        let y2 = ((cy + h / 2.0) * img_height as f32).min(img_height as f32);
+        // Convert from 640x640 coordinates to original image coordinates
+        let x1 = (x1_raw * scale_x).max(0.0);
+        let y1 = (y1_raw * scale_y).max(0.0);
+        let x2 = (x2_raw * scale_x).min(img_width as f32);
+        let y2 = (y2_raw * scale_y).min(img_height as f32);
 
         // Get mask coefficients
         let mut mask_coeffs = Vec::with_capacity(MASK_DIM);
@@ -247,7 +251,7 @@ pub fn postprocess_segmentation(
 
         detections.push(Detection {
             class_name: COCO_CLASSES[class].to_string(),
-            score: score_sigmoid,
+            score: score,
             bbox: [x1, y1, x2, y2],
             mask_coeffs,
         });
