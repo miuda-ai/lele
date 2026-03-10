@@ -1,4 +1,6 @@
 use crate::kernels::activations::{sigmoid, tanh};
+#[cfg(target_arch = "wasm32")]
+use crate::kernels::wasm_matmul::{Accum, MatMut, MatRef, Par, matmul};
 use crate::tensor::TensorView;
 #[cfg(not(target_arch = "wasm32"))]
 use faer::linalg::matmul::matmul;
@@ -6,8 +8,6 @@ use faer::linalg::matmul::matmul;
 use faer::mat::{MatMut, MatRef};
 #[cfg(not(target_arch = "wasm32"))]
 use faer::{Accum, Par};
-#[cfg(target_arch = "wasm32")]
-use crate::kernels::wasm_matmul::{matmul, MatMut, MatRef, Accum, Par};
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
@@ -152,7 +152,7 @@ pub fn lstm<'b, 'a>(
             gates[g] = w_contribution[g] + r_contribution[g] + bias_w_slice[g] + bias_r_slice[g];
         }
 
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", nightly_build))]
         {
             use crate::kernels::neon::math::{simd_sigmoid, simd_tanh};
             use std::simd::f32x4;
@@ -203,7 +203,10 @@ pub fn lstm<'b, 'a>(
             }
         }
 
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        #[cfg(any(
+            all(target_arch = "aarch64", not(nightly_build)),
+            not(any(target_arch = "aarch64", target_arch = "x86_64"))
+        ))]
         for k in 0..hidden_size {
             let i_gate = sigmoid(gates[k]);
             let o_gate = sigmoid(gates[hidden_size + k]);

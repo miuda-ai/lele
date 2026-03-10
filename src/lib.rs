@@ -1,4 +1,4 @@
-#![feature(portable_simd)]
+#![cfg_attr(nightly_build, feature(portable_simd))]
 #[cfg(feature = "compiler")]
 pub mod compiler;
 pub mod features;

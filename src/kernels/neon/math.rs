@@ -1,7 +1,9 @@
 use crate::kernels::utils;
 use crate::tensor::TensorView;
 use std::borrow::Cow;
+#[cfg(nightly_build)]
 use std::simd::StdFloat;
+#[cfg(nightly_build)]
 use std::simd::prelude::*;
 
 /// Fast vectorized exp approximation using NEON intrinsics.
@@ -69,11 +71,13 @@ pub(crate) unsafe fn neon_exp_f32x4(
     }
 }
 
+#[cfg(nightly_build)]
 #[inline(always)]
 pub(crate) fn simd_exp(x: f32x4) -> f32x4 {
     x.exp()
 }
 
+#[cfg(nightly_build)]
 #[inline(always)]
 pub(crate) fn simd_tanh(x: f32x4) -> f32x4 {
     let one = f32x4::splat(1.0);
@@ -93,6 +97,7 @@ pub(crate) fn simd_tanh(x: f32x4) -> f32x4 {
     is_negative.select(zero - res_abs, res_abs)
 }
 
+#[cfg(nightly_build)]
 #[inline(always)]
 pub(crate) fn simd_sigmoid(x: f32x4) -> f32x4 {
     let one = f32x4::splat(1.0);
@@ -101,6 +106,7 @@ pub(crate) fn simd_sigmoid(x: f32x4) -> f32x4 {
     one / (one + e)
 }
 
+#[cfg(nightly_build)]
 pub fn relu<'a>(input: &TensorView<'_>, output_buf: &'a mut Vec<f32>) -> TensorView<'a> {
     let len = input.data.len();
     utils::ensure_capacity(output_buf, len);
@@ -128,6 +134,21 @@ pub fn relu<'a>(input: &TensorView<'_>, output_buf: &'a mut Vec<f32>) -> TensorV
     }
 }
 
+#[cfg(not(nightly_build))]
+pub fn relu<'a>(input: &TensorView<'_>, output_buf: &'a mut Vec<f32>) -> TensorView<'a> {
+    let len = input.data.len();
+    utils::ensure_capacity(output_buf, len);
+    let out_slice = output_buf.as_mut_slice();
+    for i in 0..len {
+        out_slice[i] = input.data[i].max(0.0);
+    }
+    TensorView {
+        data: Cow::Borrowed(output_buf),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
+}
+
+#[cfg(nightly_build)]
 pub fn tanh<'a>(input: &TensorView<'_>, output_buf: &'a mut Vec<f32>) -> TensorView<'a> {
     let len = input.data.len();
     utils::ensure_capacity(output_buf, len);
@@ -148,6 +169,23 @@ pub fn tanh<'a>(input: &TensorView<'_>, output_buf: &'a mut Vec<f32>) -> TensorV
     }
     let offset_suf = prefix.len() + middle.len() * 4;
     for i in offset_suf..len {
+        out_slice[i] = input.data[i].tanh();
+    }
+    TensorView {
+        data: Cow::Borrowed(output_buf),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
+}
+
+#[cfg(not(nightly_build))]
+pub fn tanh<'a>(input: &TensorView<'_>, output_buf: &'a mut Vec<f32>) -> TensorView<'a> {
+    let len = input.data.len();
+    utils::ensure_capacity(output_buf, len);
+    unsafe {
+        output_buf.set_len(len);
+    }
+    let out_slice = output_buf.as_mut_slice();
+    for i in 0..len {
         out_slice[i] = input.data[i].tanh();
     }
     TensorView {

@@ -1,6 +1,7 @@
 use crate::features::{Lfr, LfrConfig, RealFft, SparseMelBank, hann_window, log_compress};
 use crate::tensor::TensorView;
 use rustfft::num_complex::Complex;
+#[cfg(nightly_build)]
 use std::simd::prelude::*;
 
 #[derive(Debug, Clone)]
@@ -87,34 +88,52 @@ impl SenseVoiceFrontend {
 
             // 1. Scale and Copy
             let pcm_slice = &pcm[start..end];
-            let (prefix, middle, _suffix) = pcm_slice.as_simd::<8>();
-            let offset = prefix.len();
-            for j in 0..offset {
-                raw_frame[j] = pcm_slice[j] * scale;
+            #[cfg(nightly_build)]
+            {
+                let (prefix, middle, _suffix) = pcm_slice.as_simd::<8>();
+                let offset = prefix.len();
+                for j in 0..offset {
+                    raw_frame[j] = pcm_slice[j] * scale;
+                }
+                let scale_vec = f32x8::splat(scale);
+                for j in 0..middle.len() {
+                    let res = middle[j] * scale_vec;
+                    res.copy_to_slice(&mut raw_frame[offset + j * 8..]);
+                }
+                for j in (offset + middle.len() * 8)..frame_len {
+                    raw_frame[j] = pcm_slice[j] * scale;
+                }
             }
-            let scale_vec = f32x8::splat(scale);
-            for j in 0..middle.len() {
-                let res = middle[j] * scale_vec;
-                res.copy_to_slice(&mut raw_frame[offset + j * 8..]);
-            }
-            for j in (offset + middle.len() * 8)..frame_len {
-                raw_frame[j] = pcm_slice[j] * scale;
+            #[cfg(not(nightly_build))]
+            {
+                for j in 0..frame_len {
+                    raw_frame[j] = pcm_slice[j] * scale;
+                }
             }
 
             // 2. Mean Subtraction
             let sum: f32 = raw_frame.iter().sum();
             let mean = sum / frame_len as f32;
-            let mean_vec = f32x8::splat(mean);
+            #[cfg(nightly_build)]
+            {
+                let mean_vec = f32x8::splat(mean);
 
-            let (prefix, middle, suffix) = raw_frame.as_simd_mut::<8>();
-            for x in prefix {
-                *x -= mean;
+                let (prefix, middle, suffix) = raw_frame.as_simd_mut::<8>();
+                for x in prefix {
+                    *x -= mean;
+                }
+                for x_vec in middle {
+                    *x_vec -= mean_vec;
+                }
+                for x in suffix {
+                    *x -= mean;
+                }
             }
-            for x_vec in middle {
-                *x_vec -= mean_vec;
-            }
-            for x in suffix {
-                *x -= mean;
+            #[cfg(not(nightly_build))]
+            {
+                for x in &mut raw_frame {
+                    *x -= mean;
+                }
             }
 
             // 3. Pre-emphasis (inherently sequential)
@@ -123,19 +142,28 @@ impl SenseVoiceFrontend {
             }
 
             // 4. Windowing
-            let (prefix, middle, _suffix) = raw_frame.as_simd::<8>();
-            let offset = prefix.len();
-            for j in 0..offset {
-                frame_buf[j] = raw_frame[j] * self.window[j];
+            #[cfg(nightly_build)]
+            {
+                let (prefix, middle, _suffix) = raw_frame.as_simd::<8>();
+                let offset = prefix.len();
+                for j in 0..offset {
+                    frame_buf[j] = raw_frame[j] * self.window[j];
+                }
+                for j in 0..middle.len() {
+                    let idx = offset + j * 8;
+                    let w = f32x8::from_slice(&self.window[idx..idx + 8]);
+                    let res = middle[j] * w;
+                    res.copy_to_slice(&mut frame_buf[idx..idx + 8]);
+                }
+                for j in (offset + middle.len() * 8)..frame_len {
+                    frame_buf[j] = raw_frame[j] * self.window[j];
+                }
             }
-            for j in 0..middle.len() {
-                let idx = offset + j * 8;
-                let w = f32x8::from_slice(&self.window[idx..idx + 8]);
-                let res = middle[j] * w;
-                res.copy_to_slice(&mut frame_buf[idx..idx + 8]);
-            }
-            for j in (offset + middle.len() * 8)..frame_len {
-                frame_buf[j] = raw_frame[j] * self.window[j];
+            #[cfg(not(nightly_build))]
+            {
+                for j in 0..frame_len {
+                    frame_buf[j] = raw_frame[j] * self.window[j];
+                }
             }
 
             for j in frame_len..self.fft_len {
