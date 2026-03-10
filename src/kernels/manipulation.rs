@@ -110,7 +110,6 @@ pub fn concat<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     axis: i64,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
-    let _t = std::time::Instant::now();
     if inputs.is_empty() {
         return TensorView::empty();
     }
@@ -187,7 +186,6 @@ pub fn concat<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
             current_out_offset += copy_len;
         }
     }
-    crate::profiling::add_concat(_t.elapsed().as_nanos() as u64);
     TensorView::from_slice(out, out_shape)
 }
 pub fn slice<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
@@ -370,7 +368,6 @@ pub fn pad<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     mode: &str,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
-    let _t = std::time::Instant::now();
     // Safely convert i64 → usize, clamping negatives to 0
     let raw_p: Vec<usize> = pads
         .iter()
@@ -469,7 +466,6 @@ pub fn pad<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     if mode == "edge" {
         pad_edge_inplace(out, &input.shape, &new_shape, &p, rank);
     }
-    crate::profiling::add_pad(_t.elapsed().as_nanos() as u64);
     TensorView::from_slice(out, new_shape)
 }
 
@@ -583,9 +579,7 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
     perm: &[i64],
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
-    let _t = std::time::Instant::now();
     let result = transpose_inner(input, perm, out);
-    crate::profiling::add_transpose(_t.elapsed().as_nanos() as u64);
     result
 }
 fn transpose_inner<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
@@ -1066,7 +1060,6 @@ pub fn split_owned<T: Clone + Copy + std::fmt::Debug>(
     axis: i64,
     splits: &[i64],
 ) -> Vec<TensorView<'static, T>> {
-    let _t = std::time::Instant::now();
     let ndim = input.dim();
     let axis = if axis < 0 {
         (ndim as i64 + axis) as usize
@@ -1113,8 +1106,6 @@ pub fn split_owned<T: Clone + Copy + std::fmt::Debug>(
         results.push(TensorView::from_owned(buffer, out_shape));
         axis_offset += split_size;
     }
-
-    crate::profiling::add_split(_t.elapsed().as_nanos() as u64);
     results
 }
 pub fn where_op<'b, 'a, T, C>(
@@ -1127,9 +1118,7 @@ where
     T: Clone + Copy + std::fmt::Debug,
     C: Clone + Copy + std::fmt::Debug + crate::kernels::utils::AsI64,
 {
-    let _t = std::time::Instant::now();
     let result = where_op_inner(condition, x, y, out);
-    crate::profiling::add_where_op(_t.elapsed().as_nanos() as u64);
     result
 }
 fn where_op_inner<'b, 'a, T, C>(

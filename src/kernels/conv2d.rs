@@ -157,7 +157,6 @@ fn conv2d_activation<'b, 'a>(
     act: Activation,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let _t = std::time::Instant::now();
     let _relu = act == Activation::Relu;
     let in_shape = &input.shape;
     let w_shape = &weights.shape;
@@ -394,7 +393,6 @@ fn conv2d_activation<'b, 'a>(
                 }
             }
         }
-        crate::profiling::add_conv2d(_t.elapsed().as_nanos() as u64);
         return TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w]);
     }
 
@@ -592,7 +590,6 @@ fn conv2d_activation<'b, 'a>(
         }
     }); // COL_BUF.with
 
-    crate::profiling::add_conv2d(_t.elapsed().as_nanos() as u64);
     TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w])
 }
 

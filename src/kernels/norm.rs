@@ -205,7 +205,6 @@ pub fn layer_norm<'b, 'a>(
     epsilon: f32,
     out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let _t = std::time::Instant::now();
     let ndim = input.shape.len();
     let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
     let outer_size: usize = input.shape[..axis].iter().product();
@@ -280,7 +279,6 @@ pub fn layer_norm<'b, 'a>(
             }
         }
     }
-    crate::profiling::add_layernorm(_t.elapsed().as_nanos() as u64);
     TensorView {
         data: Cow::Borrowed(out_slice),
         shape: std::borrow::Cow::Owned(input.shape.to_vec()),

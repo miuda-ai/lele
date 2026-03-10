@@ -114,7 +114,6 @@ pub fn matmul<'a>(
     b: &TensorView<'_>,
     out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let _t = std::time::Instant::now();
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     accelerate::init();
 
@@ -216,7 +215,6 @@ pub fn matmul<'a>(
             faer_matmul(out_mat, Accum::Replace, a_mat, b_mat, 1.0, Par::Seq);
         }
     }
-    crate::profiling::add_f32_matmul(_t.elapsed().as_nanos() as u64);
     TensorView {
         data: Cow::Borrowed(out_slice),
         shape: Cow::Owned(out_shape),

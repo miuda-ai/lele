@@ -844,12 +844,9 @@ pub fn conv1d<'b, 'a>(
     strides: &[i64],
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let _t = std::time::Instant::now();
     let result = conv1d_fused(
         input, weights, bias, dilations, group, pads, strides, false, out,
     );
-    let elapsed_us = _t.elapsed().as_micros();
-    crate::profiling::add_conv1d(_t.elapsed().as_nanos() as u64);
     result
 }
 
