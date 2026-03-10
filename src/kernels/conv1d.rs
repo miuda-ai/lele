@@ -850,11 +850,6 @@ pub fn conv1d<'b, 'a>(
     );
     let elapsed_us = _t.elapsed().as_micros();
     crate::profiling::add_conv1d(_t.elapsed().as_nanos() as u64);
-    // Only log if conv1d takes more than 1ms
-    if elapsed_us > 1000 {
-        eprintln!("  conv1d: in={:?} w={:?} g={} -> {:.2}ms",
-            &*input.shape, &*weights.shape, group, elapsed_us as f64 / 1000.0);
-    }
     result
 }
 
@@ -1119,7 +1114,9 @@ pub fn conv1d_fused<'b, 'a>(
                             unsafe {
                                 let p = out_ptr.add(start + i);
                                 let mut v = *p + bv;
-                                if relu && v < 0.0 { v = 0.0; }
+                                if relu && v < 0.0 {
+                                    v = 0.0;
+                                }
                                 *p = v;
                             }
                         }
@@ -1141,7 +1138,9 @@ pub fn conv1d_fused<'b, 'a>(
             #[cfg(not(target_arch = "x86_64"))]
             {
                 for v in out.iter_mut() {
-                    if *v < 0.0 { *v = 0.0; }
+                    if *v < 0.0 {
+                        *v = 0.0;
+                    }
                 }
             }
         }
