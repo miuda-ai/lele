@@ -23,7 +23,7 @@ anyhow = "1.0"
 
 [package]
 name = "lele"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Bare-metal machine learning inference library in Rust"
 license = "MIT"
