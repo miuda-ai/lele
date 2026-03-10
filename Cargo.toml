@@ -23,7 +23,7 @@ anyhow = "1.0"
 
 [package]
 name = "lele"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "Bare-metal machine learning inference library in Rust"
 license = "MIT"
@@ -52,8 +52,6 @@ half = "2.7.1"
 faer = "0.24.0"
 gemm = { version = "0.19.0", features = ["experimental-apple-amx"] }
 
-[build-dependencies]
-prost-build = "0.14.3"
 
 [dev-dependencies]
 approx = "0.5"

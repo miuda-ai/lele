@@ -1,5 +1,5 @@
 pub mod onnx_proto {
-    include!(concat!(env!("OUT_DIR"), "/onnx.rs"));
+    include!("onnx_proto_gen.rs");
 }
 use self::onnx_proto::{GraphProto, ModelProto, TensorProto};
 use ::prost::DecodeError;
