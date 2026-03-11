@@ -131,12 +131,18 @@ impl<'a> SupertonicTts<'a> {
     ) -> Result<Vec<f32>> {
         let t_overhead = std::time::Instant::now();
         self.load_style(style_name)?;
-        eprintln!("[OVERHEAD] load_style: {:.2}ms", t_overhead.elapsed().as_secs_f64() * 1000.0);
+        eprintln!(
+            "[OVERHEAD] load_style: {:.2}ms",
+            t_overhead.elapsed().as_secs_f64() * 1000.0
+        );
         let style = self.style_cache.get(style_name).unwrap();
 
         let t_chunk = std::time::Instant::now();
         let chunks = chunk_text(text, None);
-        eprintln!("[OVERHEAD] chunk_text: {:.2}ms", t_chunk.elapsed().as_secs_f64() * 1000.0);
+        eprintln!(
+            "[OVERHEAD] chunk_text: {:.2}ms",
+            t_chunk.elapsed().as_secs_f64() * 1000.0
+        );
         let mut full_audio = Vec::new();
 
         for chunk in chunks {
@@ -147,7 +153,10 @@ impl<'a> SupertonicTts<'a> {
             let t_tok = std::time::Instant::now();
             let (text_ids_vec, mask_data, mask_shape) =
                 self.text_processor.call(&[chunk], &[lang.to_string()])?;
-            eprintln!("[OVERHEAD] tokenization: {:.2}ms", t_tok.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "[OVERHEAD] tokenization: {:.2}ms",
+                t_tok.elapsed().as_secs_f64() * 1000.0
+            );
             let bsz = 1;
             let max_len = text_ids_vec[0].len();
             let mut text_ids_i64 = vec![0i64; max_len];
@@ -172,7 +181,10 @@ impl<'a> SupertonicTts<'a> {
             for d in duration.iter_mut() {
                 *d /= speed;
             }
-            eprintln!("[STAGE] DurationPredictor: {:.2}ms", t_dp.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "[STAGE] DurationPredictor: {:.2}ms",
+                t_dp.elapsed().as_secs_f64() * 1000.0
+            );
 
             let total_duration_seconds: f32 = duration.iter().sum();
             let duration_batch = vec![total_duration_seconds];
@@ -182,7 +194,10 @@ impl<'a> SupertonicTts<'a> {
             let text_emb_tv =
                 self.text_encoder
                     .forward(text_ids_tv, style_ttl_tv.clone(), text_mask_tv.clone());
-            eprintln!("[STAGE] TextEncoder: {:.2}ms", t_te.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "[STAGE] TextEncoder: {:.2}ms",
+                t_te.elapsed().as_secs_f64() * 1000.0
+            );
 
             // 3. Vector Estimator (Loop)
             let (mut xt_data, xt_shape, latent_mask_data, latent_mask_shape) = sample_noisy_latent(
@@ -216,11 +231,18 @@ impl<'a> SupertonicTts<'a> {
                     current_step_tv,
                     total_step_tv.clone(),
                 );
-                eprintln!("[STAGE]   VE step {}: {:.2}ms", step, t_step.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "[STAGE]   VE step {}: {:.2}ms",
+                    step,
+                    t_step.elapsed().as_secs_f64() * 1000.0
+                );
 
                 xt_data = denoised_tv.data.to_vec();
             }
-            eprintln!("[STAGE] VectorEstimator total: {:.2}ms", t_ve.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "[STAGE] VectorEstimator total: {:.2}ms",
+                t_ve.elapsed().as_secs_f64() * 1000.0
+            );
 
             // Apply latent mask (zero out positions beyond sequence length)
             for d in 0..xt_shape[1] {
@@ -243,7 +265,10 @@ impl<'a> SupertonicTts<'a> {
             let t_voc = std::time::Instant::now();
             let xt_tv = TensorView::new(&xt_data, &xt_shape);
             let audio_tv = self.vocoder.forward(xt_tv);
-            eprintln!("[STAGE] Vocoder: {:.2}ms", t_voc.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "[STAGE] Vocoder: {:.2}ms",
+                t_voc.elapsed().as_secs_f64() * 1000.0
+            );
 
             let audio_data = audio_tv.data.to_vec();
             let expected_len =
@@ -280,10 +305,10 @@ fn main() -> Result<()> {
     {
         // Various sizes used in supertonic models
         let warmup_sizes = vec![
-            (256, 64, 63),   // DurationPredictor
-            (1024, 256, 62), // TextEncoder/VE
-            (512, 1024, 62), // VE
-            (1024, 512, 62), // VE
+            (256, 64, 63),    // DurationPredictor
+            (1024, 256, 62),  // TextEncoder/VE
+            (512, 1024, 62),  // VE
+            (1024, 512, 62),  // VE
             (2048, 512, 372), // Vocoder
             (512, 2048, 372), // Vocoder
         ];
@@ -328,8 +353,6 @@ fn main() -> Result<()> {
     println!("✓ Synthesized in {:.2}s", elapsed);
     println!("✓ Audio duration: {:.2}s", audio_duration);
     println!("✓ Real-time factor (RTF): {:.4}x", rtf);
-
-    lele::profiling::print_report();
 
     WavWriter::save(output_path, &audio, tts.config.ae.sample_rate as u32)?;
     println!("✓ Saved to {}", output_path);

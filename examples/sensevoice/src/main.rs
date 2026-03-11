@@ -201,7 +201,6 @@ fn main() {
 
     let mut times = Vec::new();
     for _ in 0..10 {
-        lele::profiling::reset();
         let bench_start = Instant::now();
         let _ = model
             .forward(
@@ -213,7 +212,6 @@ fn main() {
             .into_logits();
         times.push(bench_start.elapsed().as_secs_f64() * 1000.0);
     }
-    lele::profiling::print_report();
 
     let avg_time: f64 = times.iter().sum::<f64>() / times.len() as f64;
     let min_time = times.iter().cloned().fold(f64::INFINITY, f64::min);
