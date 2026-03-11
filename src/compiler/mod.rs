@@ -743,6 +743,7 @@ impl Compiler {
         let mut offset_map = Vec::new();
         let mut current_offset = 0usize;
         let mut int64_map = HashMap::new();
+        let mut content_hash_map = HashMap::new();
         // 1. Collect Weights
         collect_weights(
             graph,
@@ -750,6 +751,7 @@ impl Compiler {
             &mut offset_map,
             &mut current_offset,
             &mut int64_map,
+            &mut content_hash_map,
         )?;
         // Prepare weight lookup map for body generation
         let mut weight_lookup = HashMap::new();
@@ -1330,12 +1332,22 @@ pub fn sanitize_name(name: &str) -> String {
     }
 }
 
+fn compute_hash(bytes: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn collect_weights(
     graph: &GraphProto,
     bin_data: &mut Vec<u8>,
     offset_map: &mut Vec<(String, usize, usize, Vec<usize>, i32)>,
     current_offset: &mut usize,
     int64_map: &mut HashMap<String, (Vec<i64>, Vec<usize>)>,
+    content_hash_map: &mut HashMap<u64, (usize, usize)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initializers
     for init in &graph.initializer {
@@ -1350,23 +1362,39 @@ fn collect_weights(
 
         if let Ok((bytes, shape, data_type)) = crate::model::tensor_to_vec_u8(init) {
             if !bytes.is_empty() {
-                // Align to 16 bytes
-                let remainder = *current_offset % 16;
-                if remainder != 0 {
-                    let padding = 16 - remainder;
-                    bin_data.write_all(&vec![0u8; padding])?;
-                    *current_offset += padding;
-                }
+                // Compute content hash for deduplication
+                let hash = compute_hash(&bytes);
 
-                bin_data.write_all(&bytes)?;
-                offset_map.push((
-                    init.name.clone(),
-                    *current_offset,
-                    bytes.len(),
-                    shape,
-                    data_type,
-                ));
-                *current_offset += bytes.len();
+                // Check if we already have identical weight content
+                if let Some(&(existing_offset, existing_len)) = content_hash_map.get(&hash) {
+                    // Reuse existing offset, but keep current weight's shape and dtype
+                    offset_map.push((
+                        init.name.clone(),
+                        existing_offset,
+                        existing_len,
+                        shape,
+                        data_type,
+                    ));
+                } else {
+                    // New weight: align, write, and record
+                    let remainder = *current_offset % 16;
+                    if remainder != 0 {
+                        let padding = 16 - remainder;
+                        bin_data.write_all(&vec![0u8; padding])?;
+                        *current_offset += padding;
+                    }
+
+                    bin_data.write_all(&bytes)?;
+                    offset_map.push((
+                        init.name.clone(),
+                        *current_offset,
+                        bytes.len(),
+                        shape.clone(),
+                        data_type,
+                    ));
+                    content_hash_map.insert(hash, (*current_offset, bytes.len()));
+                    *current_offset += bytes.len();
+                }
             }
         }
     }
@@ -1389,24 +1417,42 @@ fn collect_weights(
 
             if let Ok((bytes, shape, data_type)) = crate::model::tensor_to_vec_u8(t) {
                 if !bytes.is_empty() {
-                    // Align to 16 bytes
-                    let remainder = *current_offset % 16;
-                    if remainder != 0 {
-                        let padding = 16 - remainder;
-                        bin_data.write_all(&vec![0u8; padding])?;
-                        *current_offset += padding;
-                    }
+                    // Compute content hash for deduplication
+                    let hash = compute_hash(&bytes);
 
-                    bin_data.write_all(&bytes)?;
-                    if let Some(out_name) = node.output.first() {
-                        offset_map.push((
-                            out_name.clone(),
-                            *current_offset,
-                            bytes.len(),
-                            shape,
-                            data_type,
-                        ));
-                        *current_offset += bytes.len();
+                    // Check if we already have identical weight content
+                    if let Some(&(existing_offset, existing_len)) = content_hash_map.get(&hash) {
+                        // Reuse existing offset, but keep current weight's shape and dtype
+                        if let Some(out_name) = node.output.first() {
+                            offset_map.push((
+                                out_name.clone(),
+                                existing_offset,
+                                existing_len,
+                                shape,
+                                data_type,
+                            ));
+                        }
+                    } else {
+                        // New weight: align, write, and record
+                        let remainder = *current_offset % 16;
+                        if remainder != 0 {
+                            let padding = 16 - remainder;
+                            bin_data.write_all(&vec![0u8; padding])?;
+                            *current_offset += padding;
+                        }
+
+                        bin_data.write_all(&bytes)?;
+                        if let Some(out_name) = node.output.first() {
+                            offset_map.push((
+                                out_name.clone(),
+                                *current_offset,
+                                bytes.len(),
+                                shape.clone(),
+                                data_type,
+                            ));
+                            content_hash_map.insert(hash, (*current_offset, bytes.len()));
+                            *current_offset += bytes.len();
+                        }
                     }
                 }
             }
@@ -1414,7 +1460,7 @@ fn collect_weights(
         // 3. Recurse
         for attr in &node.attribute {
             if let Some(g) = &attr.g {
-                collect_weights(g, bin_data, offset_map, current_offset, int64_map)?;
+                collect_weights(g, bin_data, offset_map, current_offset, int64_map, content_hash_map)?;
             }
         }
     }
