@@ -2543,17 +2543,15 @@ pub fn conv_transpose<'b, 'a>(
     let pad_bottom = pads.get(2).copied().unwrap_or(pad_top as i64) as usize;
     let pad_right = pads.get(3).copied().unwrap_or(pad_left as i64) as usize;
 
-    // Calculate output size
-    let out_h = (in_h - 1)
-        * stride_h
-            .saturating_sub(pad_top + pad_bottom)
-            .saturating_add(dilation_h * (kernel_h - 1))
-            .saturating_add(1);
-    let out_w = (in_w - 1)
-        * stride_w
-            .saturating_sub(pad_left + pad_right)
-            .saturating_add(dilation_w * (kernel_w - 1))
-            .saturating_add(1);
+    // Calculate output size: (in - 1) * stride - 2*pad + dilation * (kernel - 1) + output_padding + 1
+    let out_h = ((in_h - 1) * stride_h)
+        .saturating_sub(pad_top + pad_bottom)
+        .saturating_add(dilation_h * (kernel_h - 1))
+        .saturating_add(1);
+    let out_w = ((in_w - 1) * stride_w)
+        .saturating_sub(pad_left + pad_right)
+        .saturating_add(dilation_w * (kernel_w - 1))
+        .saturating_add(1);
     let out_size = batch_size * out_channels * out_h * out_w;
     if out.len() != out_size {
         out.resize(out_size, 0.0);
@@ -2630,4 +2628,89 @@ pub fn conv_transpose<'b, 'a>(
     }
 
     TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_conv_transpose_output_size_stride2_no_padding() {
+        // Input: [1, 64, 80, 80], kernel 2x2, stride 2, no padding
+        // Expected output: (80-1)*2 - 0 + 1*(2-1) + 1 = 160
+        let input_data = vec![0.0f32; 1 * 64 * 80 * 80];
+        let weight_data = vec![1.0f32; 64 * 64 * 2 * 2];
+        let bias_data = vec![0.0f32; 64];
+
+        let input = TensorView::from_slice(&input_data, vec![1, 64, 80, 80]);
+        let weights = TensorView::from_slice(&weight_data, vec![64, 64, 2, 2]);
+        let bias = TensorView::from_slice(&bias_data, vec![64]);
+
+        let mut out = Vec::new();
+        let result = conv_transpose(
+            &input, &weights, Some(&bias),
+            &[1, 1], 1, &[0, 0, 0, 0], &[2, 2], &mut out,
+        );
+
+        assert_eq!(result.shape.as_ref(), &[1, 64, 160, 160],
+            "conv_transpose with stride=2 should upsample 80x80 -> 160x160");
+    }
+
+    #[test]
+    fn test_conv_transpose_output_size_stride2_with_padding() {
+        // Input: [1, 32, 40, 40], kernel 3x3, stride 2, padding 1x1
+        // Expected: (40-1)*2 - 2 + 1*(3-1) + 1 = 78 - 2 + 2 + 1 = 79
+        let input_data = vec![0.0f32; 1 * 32 * 40 * 40];
+        let weight_data = vec![1.0f32; 32 * 32 * 3 * 3];
+        let bias_data = vec![0.0f32; 32];
+
+        let input = TensorView::from_slice(&input_data, vec![1, 32, 40, 40]);
+        let weights = TensorView::from_slice(&weight_data, vec![32, 32, 3, 3]);
+        let bias = TensorView::from_slice(&bias_data, vec![32]);
+
+        let mut out = Vec::new();
+        let result = conv_transpose(
+            &input, &weights, Some(&bias),
+            &[1, 1], 1, &[1, 1, 1, 1], &[2, 2], &mut out,
+        );
+
+        assert_eq!(result.shape.as_ref(), &[1, 32, 79, 79]);
+    }
+
+    #[test]
+    fn test_conv_transpose_stride1_no_padding() {
+        // Input: [1, 16, 10, 10], kernel 3x3, stride 1, no padding
+        // Expected: (10-1)*1 - 0 + 1*(3-1) + 1 = 9 + 2 + 1 = 12
+        let input_data = vec![0.0f32; 1 * 16 * 10 * 10];
+        let weight_data = vec![1.0f32; 16 * 16 * 3 * 3];
+        let bias_data = vec![0.0f32; 16];
+
+        let input = TensorView::from_slice(&input_data, vec![1, 16, 10, 10]);
+        let weights = TensorView::from_slice(&weight_data, vec![16, 16, 3, 3]);
+        let bias = TensorView::from_slice(&bias_data, vec![16]);
+
+        let mut out = Vec::new();
+        let result = conv_transpose(
+            &input, &weights, Some(&bias),
+            &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut out,
+        );
+
+        assert_eq!(result.shape.as_ref(), &[1, 16, 12, 12]);
+    }
+
+    #[test]
+    fn test_conv_transpose_values_simple() {
+        // Minimal: 1x1 input, 1x1 kernel, stride 1, no padding, no bias
+        let input = TensorView::from_slice(&[1.0f32], vec![1, 1, 1, 1]);
+        let weights = TensorView::from_slice(&[2.0f32], vec![1, 1, 1, 1]);
+
+        let mut out = Vec::new();
+        let result = conv_transpose(
+            &input, &weights, None,
+            &[1], 1, &[0, 0, 0, 0], &[1, 1], &mut out,
+        );
+
+        assert_eq!(result.shape.as_ref(), &[1, 1, 1, 1]);
+        assert!((result.data.as_ref()[0] - 2.0).abs() < 1e-6);
+    }
 }

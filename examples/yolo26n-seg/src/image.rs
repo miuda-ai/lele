@@ -1,88 +1,24 @@
 /// Image preprocessing and postprocessing for YOLO26 Segmentation.
 use std::path::Path;
 
-/// COCO class names (80 classes)
+/// Default COCO 80 class names.
 pub const COCO_CLASSES: &[&str] = &[
-    "person",
-    "bicycle",
-    "car",
-    "motorcycle",
-    "airplane",
-    "bus",
-    "train",
-    "truck",
-    "boat",
-    "traffic light",
-    "fire hydrant",
-    "stop sign",
-    "parking meter",
-    "bench",
-    "bird",
-    "cat",
-    "dog",
-    "horse",
-    "sheep",
-    "cow",
-    "elephant",
-    "bear",
-    "zebra",
-    "giraffe",
-    "backpack",
-    "umbrella",
-    "handbag",
-    "tie",
-    "suitcase",
-    "frisbee",
-    "skis",
-    "snowboard",
-    "sports ball",
-    "kite",
-    "baseball bat",
-    "baseball glove",
-    "skateboard",
-    "surfboard",
-    "tennis racket",
-    "bottle",
-    "wine glass",
-    "cup",
-    "fork",
-    "knife",
-    "spoon",
-    "bowl",
-    "banana",
-    "apple",
-    "sandwich",
-    "orange",
-    "broccoli",
-    "carrot",
-    "hot dog",
-    "pizza",
-    "donut",
-    "cake",
-    "chair",
-    "couch",
-    "potted plant",
-    "bed",
-    "dining table",
-    "toilet",
-    "tv",
-    "laptop",
-    "mouse",
-    "remote",
-    "keyboard",
-    "cell phone",
-    "microwave",
-    "oven",
-    "toaster",
-    "sink",
-    "refrigerator",
-    "book",
-    "clock",
-    "vase",
-    "scissors",
-    "teddy bear",
-    "hair drier",
-    "toothbrush",
+    "person", "bicycle", "car", "motorcycle", "airplane",
+    "bus", "train", "truck", "boat", "traffic light",
+    "fire hydrant", "stop sign", "parking meter", "bench", "bird",
+    "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack",
+    "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat",
+    "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
+    "wine glass", "cup", "fork", "knife", "spoon",
+    "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut",
+    "cake", "chair", "couch", "potted plant", "bed",
+    "dining table", "toilet", "tv", "laptop", "mouse",
+    "remote", "keyboard", "cell phone", "microwave", "oven",
+    "toaster", "sink", "refrigerator", "book", "clock",
+    "vase", "scissors", "teddy bear", "hair drier", "toothbrush",
 ];
 
 /// Detection result from YOLO26 Segmentation.
@@ -185,8 +121,8 @@ impl Image {
 }
 
 /// Post-process YOLO26 Segmentation outputs.
-/// logits: [1, 300, 38] - 4(bbox) + 1(score) + 32(mask_coeffs) + 1(class)
-/// mask_features: [1, 32, 160, 160] - 32 channels mask feature map
+/// logits: [1, 300, 38] - 4(bbox) + 1(score) + 1(class_id) + 32(mask_coeffs)
+/// mask_features: [1, 32, H, W] - 32 channels mask feature map (dynamic size)
 /// Returns detections with masks and the combined mask image.
 pub fn postprocess_segmentation(
     logits: &[f32],
@@ -194,19 +130,28 @@ pub fn postprocess_segmentation(
     img_width: usize,
     img_height: usize,
     threshold: f32,
+    class_names: Option<&[&str]>,
 ) -> (Vec<Detection>, Vec<u8>) {
     const NUM_QUERIES: usize = 300;
-    const NUM_CLASSES: usize = 80;
     const MASK_DIM: usize = 32;
-    const MASK_H: usize = 160;
-    const MASK_W: usize = 160;
+    let classes = class_names.unwrap_or(COCO_CLASSES);
+    let num_classes = classes.len();
+
+    // Infer mask dimensions from mask_features length
+    // mask_features: [1, 32, H, W] -> total = 32 * H * W
+    let mask_total = mask_features.len();
+    let mask_hw = mask_total / MASK_DIM;
+    let mask_h = (mask_hw as f32).sqrt() as usize;
+    let mask_w = mask_h;
 
     let mut detections = Vec::new();
 
-    // ONNX output format: [x1, y1, x2, y2, score, mask_coeffs(32)] = 38
+    // Output format: [x1, y1, x2, y2, score, class_id, mask_coeffs(32)] = 38
     // Note: coordinates are already in pixel space (relative to 640x640 input)
     const LOGIT_LEN: usize = 38;
-    const MASK_COEFF_START: usize = 5;
+    const SCORE_OFFSET: usize = 4;
+    const CLASS_OFFSET: usize = 5;
+    const MASK_COEFF_START: usize = 6;
 
     // Scale factors from 640x640 to original image size
     let scale_x = img_width as f32 / 640.0;
@@ -214,17 +159,17 @@ pub fn postprocess_segmentation(
 
     for i in 0..NUM_QUERIES {
         let bbox_offset = i * LOGIT_LEN;
-        let score_offset = bbox_offset + 4;
 
-        // Get score (already sigmoid applied based on ONNX output analysis)
-        let score = logits[score_offset];
+        // Get score (already sigmoid applied)
+        let score = logits[bbox_offset + SCORE_OFFSET];
 
         if score < threshold {
             continue;
         }
 
-        // Class is unknown due to Mod op not implemented, default to 0
-        let class = 0;
+        // Get class_id
+        let class_id = logits[bbox_offset + CLASS_OFFSET] as usize;
+        let class_id = class_id.min(num_classes - 1);
 
         // Get bbox - coordinates are [x1, y1, x2, y2] in pixel space (relative to 640x640)
         let x1_raw = logits[bbox_offset];
@@ -250,7 +195,7 @@ pub fn postprocess_segmentation(
         }
 
         detections.push(Detection {
-            class_name: COCO_CLASSES[class].to_string(),
+            class_name: classes[class_id].to_string(),
             score: score,
             bbox: [x1, y1, x2, y2],
             mask_coeffs,
@@ -263,27 +208,27 @@ pub fn postprocess_segmentation(
     }
 
     // Generate mask for each detection
-    // mask_features: [32, 160, 160]
+    // mask_features: [32, H, W]
     // For each detection: compute sigmoid of dot product of mask_coeffs and mask_features
     let mut mask_img = vec![0u8; img_width * img_height];
 
-    // Scale factors from 160x160 to img dimensions
-    let scale_x = MASK_W as f32 / img_width as f32;
-    let scale_y = MASK_H as f32 / img_height as f32;
+    // Scale factors from mask_size to img dimensions
+    let scale_x = mask_w as f32 / img_width as f32;
+    let scale_y = mask_h as f32 / img_height as f32;
 
     for det in &detections {
-        // Compute mask: for each pixel in 160x160, compute dot product
-        let mut det_mask = vec![0.0f32; MASK_H * MASK_W];
+        // Compute mask: for each pixel in mask, compute dot product
+        let mut det_mask = vec![0.0f32; mask_h * mask_w];
 
-        for y in 0..MASK_H {
-            for x in 0..MASK_W {
+        for y in 0..mask_h {
+            for x in 0..mask_w {
                 let mut sum = 0.0f32;
                 for c in 0..MASK_DIM {
-                    let idx = c * MASK_H * MASK_W + y * MASK_W + x;
+                    let idx = c * mask_h * mask_w + y * mask_w + x;
                     sum += det.mask_coeffs[c] * mask_features[idx];
                 }
                 // Sigmoid activation
-                det_mask[y * MASK_W + x] = 1.0 / (1.0 + (-sum).exp());
+                det_mask[y * mask_w + x] = 1.0 / (1.0 + (-sum).exp());
             }
         }
 
@@ -293,10 +238,10 @@ pub fn postprocess_segmentation(
                 // Map img coords to mask coords (nearest neighbor)
                 let mask_x = ((img_x as f32 + 0.5) * scale_x).floor() as usize;
                 let mask_y = ((img_y as f32 + 0.5) * scale_y).floor() as usize;
-                let mask_x = mask_x.min(MASK_W - 1);
-                let mask_y = mask_y.min(MASK_H - 1);
+                let mask_x = mask_x.min(mask_w - 1);
+                let mask_y = mask_y.min(mask_h - 1);
 
-                let mask_val = det_mask[mask_y * MASK_W + mask_x];
+                let mask_val = det_mask[mask_y * mask_w + mask_x];
 
                 // Check if this pixel is inside the bbox
                 let in_bbox = img_x as f32 >= det.bbox[0]

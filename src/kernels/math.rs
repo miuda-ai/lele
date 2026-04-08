@@ -1120,13 +1120,15 @@ pub fn mod_f32<'b, 'a>(
 ) -> TensorView<'a> {
     let len = a.data.len();
     utils::ensure_capacity(out, len);
+    let b_scalar = b.data.len() == 1;
     unsafe {
         let a_ptr = a.data.as_ptr();
         let b_ptr = b.data.as_ptr();
+        let b_val = *b_ptr;
         let o_ptr = out.as_mut_ptr();
         for i in 0..len {
             let ai = *a_ptr.add(i);
-            let bi = *b_ptr.add(i);
+            let bi = if b_scalar { b_val } else { *b_ptr.add(i) };
             // Handle division by zero
             if bi == 0.0 {
                 *o_ptr.add(i) = 0.0;
@@ -1993,5 +1995,43 @@ mod tests {
         let (min_val, max_val) = min_max(&t, &mut buf);
         assert_eq!(min_val, -5.0);
         assert_eq!(max_val, 10.0);
+    }
+
+    #[test]
+    fn test_mod_f32_same_shape() {
+        let a = TensorView::from_slice(&[9.0, 13.0, 7.0, 0.0, 25.0], vec![5]);
+        let b = TensorView::from_slice(&[5.0, 5.0, 3.0, 2.0, 10.0], vec![5]);
+        let mut out = Vec::new();
+        let res = mod_f32(&a, &b, &mut out);
+        assert_eq!(res.data.as_ref(), &[4.0, 3.0, 1.0, 0.0, 5.0]);
+    }
+
+    #[test]
+    fn test_mod_f32_scalar_broadcast() {
+        // b is a scalar (1 element), should broadcast to all elements of a
+        let a = TensorView::from_slice(&[3.0, 9.0, 13.0, 18.0, 23.0], vec![5]);
+        let b = TensorView::from_slice(&[5.0], vec![]);
+        let mut out = Vec::new();
+        let res = mod_f32(&a, &b, &mut out);
+        assert_eq!(res.data.as_ref(), &[3.0, 4.0, 3.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn test_mod_f32_scalar_broadcast_2d() {
+        let a = TensorView::from_slice(&[3.0, 9.0, 13.0, 18.0], vec![2, 2]);
+        let b = TensorView::from_slice(&[5.0], vec![]);
+        let mut out = Vec::new();
+        let res = mod_f32(&a, &b, &mut out);
+        assert_eq!(res.shape.as_ref(), &[2, 2]);
+        assert_eq!(res.data.as_ref(), &[3.0, 4.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn test_mod_f32_division_by_zero() {
+        let a = TensorView::from_slice(&[5.0, 10.0], vec![2]);
+        let b = TensorView::from_slice(&[0.0], vec![]);
+        let mut out = Vec::new();
+        let res = mod_f32(&a, &b, &mut out);
+        assert_eq!(res.data.as_ref(), &[0.0, 0.0]);
     }
 }
