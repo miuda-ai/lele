@@ -834,7 +834,9 @@ pub fn max_pool2d<'b, 'a>(
         (in_w + pad_left + pad_right - effective_kw) / sw + 1
     };
 
-    let total = batch * channels * out_h * out_w;
+    let total = batch as u64 * channels as u64 * out_h as u64 * out_w as u64;
+    assert!(total <= isize::MAX as u64, "pool/compute output size overflow");
+    let total = total as usize;
     utils::ensure_capacity(out, total);
     unsafe {
         out.set_len(total);
@@ -844,8 +846,10 @@ pub fn max_pool2d<'b, 'a>(
 
     for n in 0..batch {
         for c in 0..channels {
-            let in_offset = (n * channels + c) * in_h * in_w;
-            let out_offset = (n * channels + c) * out_h * out_w;
+            let in_offset = (n as u64 * channels as u64 + c as u64) * in_h as u64 * in_w as u64;
+            let out_offset = (n as u64 * channels as u64 + c as u64) * out_h as u64 * out_w as u64;
+            let in_offset = in_offset as usize;
+            let out_offset = out_offset as usize;
             for oh in 0..out_h {
                 for ow in 0..out_w {
                     let mut max_val = f32::NEG_INFINITY;
@@ -906,7 +910,9 @@ pub fn resize_nearest<'b, 'a>(
         panic!("Resize: either scales or sizes must be provided");
     };
 
-    let total = batch * channels * out_h * out_w;
+    let total = batch as u64 * channels as u64 * out_h as u64 * out_w as u64;
+    assert!(total <= isize::MAX as u64, "Resize: output size overflow");
+    let total = total as usize;
     utils::ensure_capacity(out, total);
     unsafe {
         out.set_len(total);
@@ -919,8 +925,10 @@ pub fn resize_nearest<'b, 'a>(
 
     for n in 0..batch {
         for c in 0..channels {
-            let in_offset = (n * channels + c) * in_h * in_w;
-            let out_offset = (n * channels + c) * out_h * out_w;
+            let in_offset = (n as u64 * channels as u64 + c as u64) * in_h as u64 * in_w as u64;
+            let out_offset = (n as u64 * channels as u64 + c as u64) * out_h as u64 * out_w as u64;
+            let in_offset = in_offset as usize;
+            let out_offset = out_offset as usize;
             for oh in 0..out_h {
                 let ih = if coordinate_transform_mode == "asymmetric" {
                     // asymmetric + floor: ih = floor(oh * in_h / out_h)
