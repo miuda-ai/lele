@@ -824,14 +824,14 @@ pub fn max_pool2d<'b, 'a>(
     let effective_kw = dw * (kw - 1) + 1;
 
     let out_h = if ceil_mode {
-        (in_h + pad_top + pad_bottom - effective_kh + sh - 1) / sh + 1
+        ((in_h as i64 + pad_top as i64 + pad_bottom as i64 - effective_kh as i64 + sh as i64 - 1) / sh as i64 + 1) as usize
     } else {
-        (in_h + pad_top + pad_bottom - effective_kh) / sh + 1
+        ((in_h as i64 + pad_top as i64 + pad_bottom as i64 - effective_kh as i64) / sh as i64 + 1) as usize
     };
     let out_w = if ceil_mode {
-        (in_w + pad_left + pad_right - effective_kw + sw - 1) / sw + 1
+        ((in_w as i64 + pad_left as i64 + pad_right as i64 - effective_kw as i64 + sw as i64 - 1) / sw as i64 + 1) as usize
     } else {
-        (in_w + pad_left + pad_right - effective_kw) / sw + 1
+        ((in_w as i64 + pad_left as i64 + pad_right as i64 - effective_kw as i64) / sw as i64 + 1) as usize
     };
 
     let total = batch as u64 * channels as u64 * out_h as u64 * out_w as u64;
@@ -900,19 +900,25 @@ pub fn resize_nearest<'b, 'a>(
 
     let (out_h, out_w) = if let Some(sizes) = sizes {
         // sizes is [N, C, H, W]
-        (sizes[2] as usize, sizes[3] as usize)
+        assert!(sizes.len() >= 4, "Resize: sizes must have at least 4 elements");
+        assert!(sizes[2] > 0 && sizes[3] > 0, "Resize: sizes H and W must be positive");
+        (sizes[2] as u64, sizes[3] as u64)
     } else if let Some(scales) = scales {
         // scales is [N, C, H, W]
         let sh = if scales.len() >= 3 { scales[2] } else { 1.0 };
         let sw = if scales.len() >= 4 { scales[3] } else { 1.0 };
-        ((in_h as f32 * sh) as usize, (in_w as f32 * sw) as usize)
+        assert!(sh > 0.0 && sw > 0.0, "Resize: scales must be positive");
+        ((in_h as f64 * sh as f64) as u64, (in_w as f64 * sw as f64) as u64)
     } else {
         panic!("Resize: either scales or sizes must be provided");
     };
 
-    let total = batch as u64 * channels as u64 * out_h as u64 * out_w as u64;
-    assert!(total <= isize::MAX as u64, "Resize: output size overflow");
+    assert!(out_h > 0 && out_w > 0, "Resize: output dimensions must be positive, got out_h={} out_w={}", out_h, out_w);
+    let total = batch as u64 * channels as u64 * out_h * out_w;
+    assert!(total <= isize::MAX as u64, "Resize: output size overflow ({}x{}x{}x{})", batch, channels, out_h, out_w);
     let total = total as usize;
+    let out_h = out_h as usize;
+    let out_w = out_w as usize;
     utils::ensure_capacity(out, total);
     unsafe {
         out.set_len(total);
@@ -2721,5 +2727,190 @@ mod tests {
 
         assert_eq!(result.shape.as_ref(), &[1, 1, 1, 1]);
         assert!((result.data.as_ref()[0] - 2.0).abs() < 1e-6);
+    }
+
+    // ==================== resize_nearest tests ====================
+
+    #[test]
+    fn test_resize_nearest_identity() {
+        // 1x1x2x2 input, scale 1.0 -> same output
+        let input = TensorView::from_slice(&[1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
+        let mut out = Vec::new();
+        let result = resize_nearest(&input, Some(&[1.0, 1.0, 1.0, 1.0]), None, "asymmetric", &mut out);
+        assert_eq!(result.shape.as_ref(), &[1, 1, 2, 2]);
+        let data = result.data.as_ref();
+        assert!((data[0] - 1.0).abs() < 1e-6);
+        assert!((data[1] - 2.0).abs() < 1e-6);
+        assert!((data[2] - 3.0).abs() < 1e-6);
+        assert!((data[3] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_resize_nearest_upscale_2x() {
+        // 1x1x2x2 input, scale 2.0 -> 1x1x4x4 output
+        let input = TensorView::from_slice(&[1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
+        let mut out = Vec::new();
+        let result = resize_nearest(&input, Some(&[1.0, 1.0, 2.0, 2.0]), None, "asymmetric", &mut out);
+        assert_eq!(result.shape.as_ref(), &[1, 1, 4, 4]);
+        let data = result.data.as_ref();
+        // With asymmetric mode: ih = floor(oh * 2/4) = floor(oh * 0.5)
+        // oh=0 -> ih=0, oh=1 -> ih=0, oh=2 -> ih=1, oh=3 -> ih=1
+        // Expected: [1,1,2,2, 1,1,2,2, 3,3,4,4, 3,3,4,4]
+        let expected = [1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 3.0, 3.0, 4.0, 4.0];
+        for (i, &e) in expected.iter().enumerate() {
+            assert!((data[i] - e).abs() < 1e-6, "mismatch at index {}: got {} expected {}", i, data[i], e);
+        }
+    }
+
+    #[test]
+    fn test_resize_nearest_with_sizes() {
+        // 1x1x2x2 input, target sizes [1,1,3,3]
+        let input = TensorView::from_slice(&[1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
+        let mut out = Vec::new();
+        let result = resize_nearest(&input, None, Some(&[1, 1, 3, 3]), "asymmetric", &mut out);
+        assert_eq!(result.shape.as_ref(), &[1, 1, 3, 3]);
+        let data = result.data.as_ref();
+        assert_eq!(data.len(), 9);
+    }
+
+    #[test]
+    fn test_resize_nearest_multichannel() {
+        // 1x2x2x2 input (2 channels), upscale to 1x2x4x4
+        let input_data: Vec<f32> = (0..8).map(|v| v as f32).collect();
+        let input = TensorView::from_slice(&input_data, vec![1, 2, 2, 2]);
+        let mut out = Vec::new();
+        let result = resize_nearest(&input, Some(&[1.0, 1.0, 2.0, 2.0]), None, "asymmetric", &mut out);
+        assert_eq!(result.shape.as_ref(), &[1, 2, 4, 4]);
+        assert_eq!(result.data.len(), 32);
+    }
+
+    #[test]
+    fn test_resize_nearest_half_pixel() {
+        // 1x1x2x2 input, upscale 2x with half_pixel mode
+        let input = TensorView::from_slice(&[1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
+        let mut out = Vec::new();
+        let result = resize_nearest(&input, Some(&[1.0, 1.0, 2.0, 2.0]), None, "half_pixel", &mut out);
+        assert_eq!(result.shape.as_ref(), &[1, 1, 4, 4]);
+        let data = result.data.as_ref();
+        assert_eq!(data.len(), 16);
+        // All values should be valid (from input)
+        for &v in data.iter() {
+            assert!(v >= 1.0 && v <= 4.0, "value {} out of range", v);
+        }
+    }
+
+    #[test]
+    fn test_resize_nearest_large_size_no_overflow() {
+        // Test that large sizes don't overflow - use sizes mode with moderately large dimensions
+        // 1x1x1x1 input -> 1x1x100x100
+        let input = TensorView::from_slice(&[42.0f32], vec![1, 1, 1, 1]);
+        let mut out = Vec::new();
+        let result = resize_nearest(&input, None, Some(&[1, 1, 100, 100]), "asymmetric", &mut out);
+        assert_eq!(result.shape.as_ref(), &[1, 1, 100, 100]);
+        // All values should be 42.0 (single pixel upscaled)
+        for &v in result.data.as_ref() {
+            assert!((v - 42.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "sizes H and W must be positive")]
+    fn test_resize_nearest_negative_sizes_panics() {
+        let input = TensorView::from_slice(&[1.0f32], vec![1, 1, 1, 1]);
+        let mut out = Vec::new();
+        let _ = resize_nearest(&input, None, Some(&[1, 1, -1, 10]), "asymmetric", &mut out);
+    }
+
+    // ==================== max_pool2d tests ====================
+
+    #[test]
+    fn test_max_pool2d_simple() {
+        // 1x1x4x4 input, 2x2 kernel, stride 2, no padding
+        let input_data: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let input = TensorView::from_slice(&input_data, vec![1, 1, 4, 4]);
+        let mut out = Vec::new();
+        let result = max_pool2d(
+            &input, &[2, 2], &[2, 2], &[0, 0, 0, 0], &[1, 1], false, &mut out,
+        );
+        assert_eq!(result.shape.as_ref(), &[1, 1, 2, 2]);
+        let data = result.data.as_ref();
+        // [[0,1,2,3],[4,5,6,7],[8,9,10,11],[12,13,14,15]]
+        // pool 2x2 stride 2: max(0,1,4,5)=5, max(2,3,6,7)=7, max(8,9,12,13)=13, max(10,11,14,15)=15
+        assert!((data[0] - 5.0).abs() < 1e-6, "got {}", data[0]);
+        assert!((data[1] - 7.0).abs() < 1e-6, "got {}", data[1]);
+        assert!((data[2] - 13.0).abs() < 1e-6, "got {}", data[2]);
+        assert!((data[3] - 15.0).abs() < 1e-6, "got {}", data[3]);
+    }
+
+    #[test]
+    fn test_max_pool2d_stride1() {
+        // 1x1x3x3 input, 2x2 kernel, stride 1
+        let input_data: Vec<f32> = (0..9).map(|v| v as f32).collect();
+        let input = TensorView::from_slice(&input_data, vec![1, 1, 3, 3]);
+        let mut out = Vec::new();
+        let result = max_pool2d(
+            &input, &[2, 2], &[1, 1], &[0, 0, 0, 0], &[1, 1], false, &mut out,
+        );
+        assert_eq!(result.shape.as_ref(), &[1, 1, 2, 2]);
+        let data = result.data.as_ref();
+        // [[0,1,2],[3,4,5],[6,7,8]]
+        // pool 2x2 stride 1: max(0,1,3,4)=4, max(1,2,4,5)=5, max(3,4,6,7)=7, max(4,5,7,8)=8
+        assert!((data[0] - 4.0).abs() < 1e-6);
+        assert!((data[1] - 5.0).abs() < 1e-6);
+        assert!((data[2] - 7.0).abs() < 1e-6);
+        assert!((data[3] - 8.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_max_pool2d_with_padding() {
+        // 1x1x2x2 input, 2x2 kernel, stride 1, padding 1
+        let input = TensorView::from_slice(&[1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
+        let mut out = Vec::new();
+        let result = max_pool2d(
+            &input, &[2, 2], &[1, 1], &[1, 1, 1, 1], &[1, 1], false, &mut out,
+        );
+        assert_eq!(result.shape.as_ref(), &[1, 1, 3, 3]);
+        let data = result.data.as_ref();
+        // With padding, the 2x2 input becomes 4x4 padded, then 2x2 pool stride 1 -> 3x3 output
+        // Position (0,0): max(pad, pad, pad, 1) = 1
+        assert!((data[0] - 1.0).abs() < 1e-6);
+        // Center position (1,1): max(1,2,3,4) = 4
+        assert!((data[4] - 4.0).abs() < 1e-6);
+        // Position (2,2): max(4, pad, pad, pad) = 4
+        assert!((data[8] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_max_pool2d_multichannel() {
+        // 1x2x4x4 input (2 channels)
+        let input_data: Vec<f32> = (0..32).map(|v| v as f32).collect();
+        let input = TensorView::from_slice(&input_data, vec![1, 2, 4, 4]);
+        let mut out = Vec::new();
+        let result = max_pool2d(
+            &input, &[2, 2], &[2, 2], &[0, 0, 0, 0], &[1, 1], false, &mut out,
+        );
+        assert_eq!(result.shape.as_ref(), &[1, 2, 2, 2]);
+        assert_eq!(result.data.len(), 8);
+    }
+
+    #[test]
+    fn test_max_pool2d_no_overflow_large_dims() {
+        // Test with moderately large dimensions to verify no overflow in intermediate calculations
+        let batch = 1usize;
+        let channels = 32usize;
+        let h = 80usize;
+        let w = 80usize;
+        let total = batch * channels * h * w;
+        let input_data = vec![1.0f32; total];
+        let input = TensorView::from_slice(&input_data, vec![batch, channels, h, w]);
+        let mut out = Vec::new();
+        let result = max_pool2d(
+            &input, &[2, 2], &[2, 2], &[0, 0, 0, 0], &[1, 1], false, &mut out,
+        );
+        assert_eq!(result.shape.as_ref(), &[1, 32, 40, 40]);
+        // All values should be 1.0
+        for &v in result.data.as_ref().iter().take(10) {
+            assert!((v - 1.0).abs() < 1e-6, "got {}", v);
+        }
     }
 }
