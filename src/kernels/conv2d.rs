@@ -2555,9 +2555,10 @@ pub fn conv_transpose<'b, 'a>(
     let out_size = batch_size * out_channels * out_h * out_w;
     if out.len() != out_size {
         out.resize(out_size, 0.0);
-    } else {
-        out.fill(0.0);
     }
+    // Always zero the entire output buffer before accumulation,
+    // since resize only fills NEW elements (old data may remain).
+    out[..out_size].fill(0.0);
 
     // Groups are not supported for simplicity in this implementation
     assert!(group == 1, "ConvTranspose: group > 1 not supported yet");

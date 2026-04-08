@@ -81,21 +81,6 @@ fn main() {
 
     println!("✓ Inference completed: {:.2}ms\n", best_time);
 
-    // Debug: check output tensor values
-    {
-        let logits_data = logits.data.as_ref();
-        let mask_data = mask_features.data.as_ref();
-        eprintln!(
-            "DEBUG logits shape: {:?}, len={}",
-            logits.shape.as_ref(),
-            logits_data.len()
-        );
-        eprintln!(
-            "DEBUG mask_features shape: {:?}, len={}",
-            mask_features.shape.as_ref(),
-            mask_data.len()
-        );
-    }
 
     // 5. Postprocess (segmentation)
     println!("--- Postprocessing ---");
