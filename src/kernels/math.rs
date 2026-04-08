@@ -384,14 +384,8 @@ pub fn add_f32<'b, 'a>(
             shape: std::borrow::Cow::Owned(a.shape.to_vec()),
         };
     }
-    // Fallback for broadcast
-    for i in 0..a.data.len() {
-        out[i] = a.data[i] + b.data[i];
-    }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: Cow::Owned(a.shape.to_vec()),
-    }
+    // Fallback for broadcast — delegate to generic broadcast impl
+    add_inner(a, b, out)
 }
 
 pub fn add<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Debug + 'static>(

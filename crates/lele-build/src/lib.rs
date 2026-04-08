@@ -232,6 +232,7 @@ impl<'a> {}<'a> {{
 
 /// Check if code generation should be skipped
 pub fn should_skip_codegen() -> bool {
+    println!("cargo:rerun-if-env-changed=LELE_SKIP_MODEL_GEN");
     std::env::var("LELE_SKIP_MODEL_GEN")
         .map(|v| v == "1" || v.to_lowercase() == "true")
         .unwrap_or(false)
@@ -239,6 +240,8 @@ pub fn should_skip_codegen() -> bool {
 
 /// Check if code should be forcefully regenerated
 pub fn should_force_regenerate() -> bool {
+    println!("cargo:rerun-if-env-changed=LELE_FORCE_REGENERATE");
+    println!("cargo:rerun-if-env-changed=LELE_FORCE_REGEN");
     std::env::var("LELE_FORCE_REGENERATE")
         .or_else(|_| std::env::var("LELE_FORCE_REGEN"))
         .map(|v| v == "1" || v.to_lowercase() == "true")
@@ -250,6 +253,16 @@ pub fn need_regenerate(
     class_name: &str,
     output_dir: impl AsRef<Path>,
     model_config_path: impl AsRef<Path>,
+) -> bool {
+    need_regenerate_with_model(class_name, output_dir, model_config_path, None)
+}
+
+/// Check if generated files already exist and are up to date, with optional model file path
+pub fn need_regenerate_with_model(
+    class_name: &str,
+    output_dir: impl AsRef<Path>,
+    model_config_path: impl AsRef<Path>,
+    model_file_path: Option<&Path>,
 ) -> bool {
     if should_force_regenerate() {
         return true;
@@ -284,13 +297,24 @@ pub fn need_regenerate(
         return true;
     }
 
-    if let (Ok(config_meta), Ok(rs_meta)) = (
-        fs::metadata(model_config_path.as_ref()),
-        fs::metadata(&rs_path),
-    ) {
-        if let (Ok(config_modified), Ok(rs_modified)) = (config_meta.modified(), rs_meta.modified())
-        {
-            return config_modified > rs_modified;
+    let rs_meta = match fs::metadata(&rs_path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return true,
+    };
+
+    // Emit cargo:rerun-if-changed and check modification time for all source files
+    let sources: Vec<&Path> = if let Some(mfp) = model_file_path {
+        vec![model_config_path.as_ref(), mfp]
+    } else {
+        vec![model_config_path.as_ref()]
+    };
+    for src in &sources {
+        println!("cargo:rerun-if-changed={}", src.display());
+        if let Ok(src_time) = fs::metadata(src).and_then(|m| m.modified()) {
+            if src_time > rs_meta {
+                println!("cargo:warning=Source file {:?} is newer than generated code, need regenerate", src);
+                return true;
+            }
         }
     }
 

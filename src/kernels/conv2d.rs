@@ -240,14 +240,22 @@ fn conv2d_activation<'b, 'a>(
         0
     };
 
-    let out_h = (in_h + pad_top + pad_bottom - dilation_h * (kernel_h - 1) - 1) / stride_h + 1;
-    let out_w = (in_w + pad_left + pad_right - dilation_w * (kernel_w - 1) - 1) / stride_w + 1;
+    let out_h = (in_h as u64 + pad_top as u64 + pad_bottom as u64
+        - dilation_h as u64 * (kernel_h as u64 - 1)
+        - 1) as usize / stride_h + 1;
+    let out_w = (in_w as u64 + pad_left as u64 + pad_right as u64
+        - dilation_w as u64 * (kernel_w as u64 - 1)
+        - 1) as usize / stride_w + 1;
+
+    assert!(out_h > 0 && out_w > 0, "conv2d: output dimensions must be positive, got out_h={} out_w={}", out_h, out_w);
+    let total_output = batch_size as u64 * out_channels as u64 * out_h as u64 * out_w as u64;
+    assert!(total_output <= isize::MAX as u64, "conv2d: output size overflow");
+    let total_output = total_output as usize;
 
     let groups = group as usize;
     let in_channels_per_group = in_channels / groups;
     let out_channels_per_group = out_channels / groups;
 
-    let total_output = batch_size * out_channels * out_h * out_w;
     utils::ensure_capacity(out, total_output);
     unsafe {
         out.set_len(total_output);
@@ -1171,14 +1179,22 @@ fn conv2d_with_zero_points<'b, 'a>(
         0
     };
 
-    let out_h = (in_h + pad_top + pad_bottom - dilation_h * (kernel_h - 1) - 1) / stride_h + 1;
-    let out_w = (in_w + pad_left + pad_right - dilation_w * (kernel_w - 1) - 1) / stride_w + 1;
+    let out_h = (in_h as u64 + pad_top as u64 + pad_bottom as u64
+        - dilation_h as u64 * (kernel_h as u64 - 1)
+        - 1) as usize / stride_h + 1;
+    let out_w = (in_w as u64 + pad_left as u64 + pad_right as u64
+        - dilation_w as u64 * (kernel_w as u64 - 1)
+        - 1) as usize / stride_w + 1;
+
+    assert!(out_h > 0 && out_w > 0, "conv2d_with_zero_points: output dimensions must be positive, got out_h={} out_w={}", out_h, out_w);
+    let total_output = batch_size as u64 * out_channels as u64 * out_h as u64 * out_w as u64;
+    assert!(total_output <= isize::MAX as u64, "conv2d_with_zero_points: output size overflow");
+    let total_output = total_output as usize;
 
     let groups = group as usize;
     let in_channels_per_group = in_channels / groups;
     let out_channels_per_group = out_channels / groups;
 
-    let total_output = batch_size * out_channels * out_h * out_w;
     utils::ensure_capacity(out, total_output);
     unsafe {
         out.set_len(total_output);
@@ -2558,14 +2574,17 @@ pub fn conv_transpose<'b, 'a>(
     let pad_right = pads.get(3).copied().unwrap_or(pad_left as i64) as usize;
 
     // Calculate output size: (in - 1) * stride - 2*pad + dilation * (kernel - 1) + output_padding + 1
-    let out_h = ((in_h - 1) * stride_h)
-        .saturating_sub(pad_top + pad_bottom)
-        .saturating_add(dilation_h * (kernel_h - 1))
-        .saturating_add(1);
-    let out_w = ((in_w - 1) * stride_w)
-        .saturating_sub(pad_left + pad_right)
-        .saturating_add(dilation_w * (kernel_w - 1))
-        .saturating_add(1);
+    let out_h = (in_h as i64 - 1) * stride_h as i64
+        - (pad_top as i64 + pad_bottom as i64)
+        + dilation_h as i64 * (kernel_h as i64 - 1)
+        + 1;
+    let out_w = (in_w as i64 - 1) * stride_w as i64
+        - (pad_left as i64 + pad_right as i64)
+        + dilation_w as i64 * (kernel_w as i64 - 1)
+        + 1;
+    assert!(out_h > 0 && out_w > 0, "conv_transpose: output dimensions must be positive, got out_h={} out_w={}", out_h, out_w);
+    let out_h = out_h as usize;
+    let out_w = out_w as usize;
     let out_size = batch_size * out_channels * out_h * out_w;
     if out.len() != out_size {
         out.resize(out_size, 0.0);
