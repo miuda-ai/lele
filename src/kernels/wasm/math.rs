@@ -486,6 +486,133 @@ pub unsafe fn div_f32(a: *const f32, b: *const f32, out: *mut f32, len: usize) {
     }
 }
 
+// ─── In-place activation helpers (mirrors avx/math.rs interface) ─────────────
+
+/// WASM SIMD128 bias-only add in-place: data[i] += bias
+#[inline]
+pub unsafe fn bias_add_inplace(data: *mut f32, len: usize, bias: f32) {
+    let vb = f32x4_splat(bias);
+    let mut i = 0;
+    while i + 16 <= len {
+        let v0 = v128_load(data.add(i) as *const v128);
+        let v1 = v128_load(data.add(i + 4) as *const v128);
+        let v2 = v128_load(data.add(i + 8) as *const v128);
+        let v3 = v128_load(data.add(i + 12) as *const v128);
+        v128_store(data.add(i) as *mut v128, f32x4_add(v0, vb));
+        v128_store(data.add(i + 4) as *mut v128, f32x4_add(v1, vb));
+        v128_store(data.add(i + 8) as *mut v128, f32x4_add(v2, vb));
+        v128_store(data.add(i + 12) as *mut v128, f32x4_add(v3, vb));
+        i += 16;
+    }
+    while i + 4 <= len {
+        let v = v128_load(data.add(i) as *const v128);
+        v128_store(data.add(i) as *mut v128, f32x4_add(v, vb));
+        i += 4;
+    }
+    while i < len {
+        *data.add(i) += bias;
+        i += 1;
+    }
+}
+
+/// WASM SIMD128 SiLU in-place: data[i] = data[i] / (1 + exp(-data[i]))
+#[inline]
+pub unsafe fn silu_inplace(data: *mut f32, len: usize) {
+    let one = f32x4_splat(1.0);
+    let mut i = 0;
+    while i + 4 <= len {
+        let x = v128_load(data.add(i) as *const v128);
+        let neg_x = f32x4_neg(x);
+        let exp_neg_x = exp_f32x4(neg_x);
+        let result = f32x4_div(x, f32x4_add(one, exp_neg_x));
+        v128_store(data.add(i) as *mut v128, result);
+        i += 4;
+    }
+    while i < len {
+        let x = *data.add(i);
+        *data.add(i) = x / (1.0 + (-x).exp());
+        i += 1;
+    }
+}
+
+/// WASM SIMD128 bias + SiLU in-place: data[i] = silu(data[i] + bias)
+#[inline]
+pub unsafe fn bias_silu_inplace(data: *mut f32, len: usize, bias: f32) {
+    let one = f32x4_splat(1.0);
+    let vb = f32x4_splat(bias);
+    let mut i = 0;
+    while i + 4 <= len {
+        let x = f32x4_add(v128_load(data.add(i) as *const v128), vb);
+        let neg_x = f32x4_neg(x);
+        let exp_neg_x = exp_f32x4(neg_x);
+        let result = f32x4_div(x, f32x4_add(one, exp_neg_x));
+        v128_store(data.add(i) as *mut v128, result);
+        i += 4;
+    }
+    while i < len {
+        let x = *data.add(i) + bias;
+        *data.add(i) = x / (1.0 + (-x).exp());
+        i += 1;
+    }
+}
+
+/// WASM SIMD128 ReLU in-place: data[i] = max(0, data[i])
+#[inline]
+pub unsafe fn relu_inplace(data: *mut f32, len: usize) {
+    let zero = f32x4_splat(0.0);
+    let mut i = 0;
+    while i + 16 <= len {
+        let v0 = v128_load(data.add(i) as *const v128);
+        let v1 = v128_load(data.add(i + 4) as *const v128);
+        let v2 = v128_load(data.add(i + 8) as *const v128);
+        let v3 = v128_load(data.add(i + 12) as *const v128);
+        v128_store(data.add(i) as *mut v128, f32x4_max(v0, zero));
+        v128_store(data.add(i + 4) as *mut v128, f32x4_max(v1, zero));
+        v128_store(data.add(i + 8) as *mut v128, f32x4_max(v2, zero));
+        v128_store(data.add(i + 12) as *mut v128, f32x4_max(v3, zero));
+        i += 16;
+    }
+    while i + 4 <= len {
+        let v = v128_load(data.add(i) as *const v128);
+        v128_store(data.add(i) as *mut v128, f32x4_max(v, zero));
+        i += 4;
+    }
+    while i < len {
+        let x = *data.add(i);
+        *data.add(i) = if x > 0.0 { x } else { 0.0 };
+        i += 1;
+    }
+}
+
+/// WASM SIMD128 bias + ReLU in-place: data[i] = max(0, data[i] + bias)
+#[inline]
+pub unsafe fn bias_relu_inplace(data: *mut f32, len: usize, bias: f32) {
+    let zero = f32x4_splat(0.0);
+    let vb = f32x4_splat(bias);
+    let mut i = 0;
+    while i + 16 <= len {
+        let v0 = f32x4_add(v128_load(data.add(i) as *const v128), vb);
+        let v1 = f32x4_add(v128_load(data.add(i + 4) as *const v128), vb);
+        let v2 = f32x4_add(v128_load(data.add(i + 8) as *const v128), vb);
+        let v3 = f32x4_add(v128_load(data.add(i + 12) as *const v128), vb);
+        v128_store(data.add(i) as *mut v128, f32x4_max(v0, zero));
+        v128_store(data.add(i + 4) as *mut v128, f32x4_max(v1, zero));
+        v128_store(data.add(i + 8) as *mut v128, f32x4_max(v2, zero));
+        v128_store(data.add(i + 12) as *mut v128, f32x4_max(v3, zero));
+        i += 16;
+    }
+    while i + 4 <= len {
+        let v = f32x4_add(v128_load(data.add(i) as *const v128), vb);
+        v128_store(data.add(i) as *mut v128, f32x4_max(v, zero));
+        i += 4;
+    }
+    while i < len {
+        let x = *data.add(i) + bias;
+        *data.add(i) = if x > 0.0 { x } else { 0.0 };
+        i += 1;
+    }
+}
+
 // ─── Public TensorView-level functions (mirror the neon/math.rs style) ──────
 
 pub fn relu_kernel<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {

@@ -1,18 +1,19 @@
-mod yolo26;
+mod yolo26seg;
 
 use lele::tensor::TensorView;
 use std::time::Instant;
 
 fn main() {
-    println!("=== YOLO26 Benchmark ===\n");
+    println!("=== YOLO26n-Seg Benchmark ===\n");
 
     // Load weights
-    let bin = std::fs::read("examples/yolo26/src/yolo26_weights.bin")
-        .or_else(|_| std::fs::read("yolo26_weights.bin"))
-        .or_else(|_| std::fs::read("src/yolo26_weights.bin"))
-        .expect("Failed to load yolo26_weights.bin");
+    let bin = std::fs::read("examples/yolo26n-seg/src/yolo26seg_weights.bin")
+        .or_else(|_| std::fs::read("src/yolo26seg_weights.bin"))
+        .or_else(|_| std::fs::read("examples/yolo26n-seg/yolo26seg_weights.bin"))
+        .or_else(|_| std::fs::read("yolo26seg_weights.bin"))
+        .expect("Failed to load yolo26seg_weights.bin. Run: cargo build -p yolo26n-seg-example");
 
-    let model = yolo26::Yolo26::new(&bin);
+    let model = yolo26seg::Yolo26Seg::new(&bin);
     println!(
         "✓ Model loaded ({:.1} MB)",
         bin.len() as f64 / 1024.0 / 1024.0
@@ -22,7 +23,7 @@ fn main() {
     let input_data = vec![0.5f32; 1 * 3 * 640 * 640];
     let input = TensorView::from_owned(input_data, vec![1, 3, 640, 640]);
 
-    let mut ws = yolo26::Yolo26Workspace::new();
+    let mut ws = yolo26seg::Yolo26SegWorkspace::new();
 
     // Warmup
     let n_warmup = 3;
@@ -35,6 +36,7 @@ fn main() {
 
     // Benchmark
     println!("Benchmarking ({} runs)...", n_runs);
+    lele::kernels::timing::reset();
     let mut times = Vec::with_capacity(n_runs);
     for _ in 0..n_runs {
         let start = Instant::now();
@@ -63,6 +65,9 @@ fn main() {
     for (i, t) in times.iter().enumerate() {
         println!("  run {}: {:.2}ms", i + 1, t);
     }
+
+    // Print per-operation timing breakdown
+    lele::kernels::timing::print();
 
     eprintln!("\n(profiling totals for {} runs)", n_runs);
 }

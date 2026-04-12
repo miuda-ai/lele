@@ -78,8 +78,9 @@ fn main() {
     }
     
     println!(
-        "✓ Inference completed: {:.2}ms\n",
-        best_time
+        "✓ Inference completed: {:.2}ms  RTF={:.4}\n",
+        best_time,
+        best_time / (1000.0 / 30.0)
     );
 
     // Debug: check output tensor values

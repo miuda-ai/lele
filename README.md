@@ -8,18 +8,20 @@ It rejects the "general-purpose runtime" approach (wrapping C++ libs like ORT or
 
 `lele` is designed to run deep learning models (specifically speech-related ones like SenseVoice, Silero VAD, and TTS, even `yolo26` ) with minimal overhead. 
 
-## Performance Benchmarks (2026-03-04)
+## Performance Benchmarks (2026-04-12)
 
-In-depth comparison between **lele** and **ONNX Runtime (CPU)** on macOS (Apple Silicon). All benchmarks run with single-thread affinity for fair comparison.
+Latest comparison between **lele** and **ONNX Runtime (CPU)** on macOS (Apple Silicon), single-threaded ORT (`intra_op_num_threads=1`, `inter_op_num_threads=1`).
+For fairness and stability, SenseVoice uses steady-state metrics (warmup + multi-run average).
 
-| Model | ORT RTF (CPU) | lele RTF | Speedup |
+| Model | ORT | lele | Speedup |
 | :--- | :--- | :--- | :--- |
-| **Silero VAD** | 0.0031 | **0.0016** | 1.93x |
-| **SenseVoice** | 0.032 | **0.0254** | 1.26x |
-| **Supertonic** | 0.130 | **0.0824** | 1.58x |
-| **Yolo26** | 925.59ms | **478.85** | 1.93x |
+| **Silero VAD** | RTF **0.002882** | RTF **0.0022** | **1.31x** |
+| **SenseVoice** | Steady Model RTF **0.0294** | Steady Model RTF **0.0256** (Cold RTF **0.0549**) | **1.15x** |
+| **Supertonic** | RTF **0.1667** | RTF **0.0648** | **2.57x** |
+| **Yolo26** | Avg **704.50ms** (RTF 21.1350) | Avg **534.97ms** (RTF 16.0490) | **1.32x** |
+| **Yolo26n-seg** | Avg **126.51ms** (RTF 3.7953) | Avg **64.82ms** (RTF 1.9445) | **1.95x** |
 
-*Note: RTF (Real-Time Factor) is defined as (Inference Time / Audio Duration). Lower is better.*
+*Note: For speech models we report steady-state RTF (warmup + average). For yolo models we report avg latency over 10 runs (and include RTF@30fps).*
 
 
 ## Key Features

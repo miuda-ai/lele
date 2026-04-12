@@ -6,6 +6,9 @@ import os
 import torchaudio
 import torch
 
+WARMUP_RUNS = 5
+MEASURE_RUNS = 20
+
 def load_tokens(path):
     tokens = {}
     with open(path, 'r', encoding='utf-8') as f:
@@ -109,12 +112,28 @@ def main():
     }
 
     print("Running model inference...")
-    # Warmup
-    _ = sess.run(None, inputs)
-    
-    start_inf = time.perf_counter()
+
+    # Cold-start inference (first run, includes one-time kernel/setup overhead)
+    cold_start = time.perf_counter()
     outputs = sess.run(None, inputs)
-    inf_time = (time.perf_counter() - start_inf) * 1000
+    cold_time = (time.perf_counter() - cold_start) * 1000
+
+    # Additional warmup runs before steady-state measurement
+    for _ in range(WARMUP_RUNS):
+        _ = sess.run(None, inputs)
+
+    # Steady-state measurement
+    times_ms = []
+    for _ in range(MEASURE_RUNS):
+        t0 = time.perf_counter()
+        outputs = sess.run(None, inputs)
+        times_ms.append((time.perf_counter() - t0) * 1000)
+
+    inf_time = float(np.mean(times_ms))
+    p50_time = float(np.percentile(times_ms, 50))
+    min_time = float(np.min(times_ms))
+    max_time = float(np.max(times_ms))
+    std_time = float(np.std(times_ms))
     
     # 4. Decoding
     tokens = load_tokens(tokens_path)
@@ -122,8 +141,13 @@ def main():
     
     print(f"\n=== SenseVoice ORT Results ===")
     print(f"Result: {text}")
-    print(f"Inference: {inf_time:.2f} ms")
-    print(f"Model RTF: {inf_time/1000 / duration:.4f}")
+    print(f"Cold inference: {cold_time:.2f} ms")
+    print(
+        f"Steady inference (avg/p50/min/max/std, {MEASURE_RUNS} runs): "
+        f"{inf_time:.2f} / {p50_time:.2f} / {min_time:.2f} / {max_time:.2f} / {std_time:.2f} ms"
+    )
+    print(f"Cold Model RTF: {cold_time/1000 / duration:.4f}")
+    print(f"Steady Model RTF (avg): {inf_time/1000 / duration:.4f}")
     
     total_time = feat_time + inf_time
     print(f"Total RTF: {(total_time/1000) / duration:.4f}")

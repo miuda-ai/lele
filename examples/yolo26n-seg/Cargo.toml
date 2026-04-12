@@ -8,6 +8,10 @@ publish = false
 name = "yolo26n-seg"
 path = "src/main.rs"
 
+[[bin]]
+name = "yolo26n-seg-bench"
+path = "src/benchmark.rs"
+
 [dependencies]
 lele = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }

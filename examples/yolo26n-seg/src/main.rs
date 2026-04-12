@@ -11,10 +11,11 @@ fn main() {
 
     // 1. Load Model Weights
     println!("Loading YOLO26n-Seg weights...");
-    let bin = std::fs::read("src/yolo26seg_weights.bin")
+    let bin = std::fs::read("examples/yolo26n-seg/src/yolo26seg_weights.bin")
+        .or_else(|_| std::fs::read("src/yolo26seg_weights.bin"))
+        .or_else(|_| std::fs::read("examples/yolo26n-seg/yolo26seg_weights.bin"))
         .or_else(|_| std::fs::read("yolo26seg_weights.bin"))
-        .or_else(|_| std::fs::read("../yolo26n-seg/src/yolo26seg_weights.bin"))
-        .expect("Failed to load yolo26seg_weights.bin");
+        .expect("Failed to load yolo26seg_weights.bin. Run: cargo build -p yolo26n-seg-example");
 
     let model = yolo26seg::Yolo26Seg::new(&bin);
     println!(
@@ -79,8 +80,11 @@ fn main() {
         eprintln!("  run {}: {:.2}ms", i + 1, t);
     }
 
-    println!("✓ Inference completed: {:.2}ms\n", best_time);
-
+    println!(
+        "✓ Inference completed: {:.2}ms  RTF={:.4}\n",
+        best_time,
+        best_time / (1000.0 / 30.0)
+    );
 
     // 5. Postprocess (segmentation)
     println!("--- Postprocessing ---");

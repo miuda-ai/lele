@@ -108,7 +108,9 @@ fn test_layer_norm_accuracy() {
     let mut out_buf = Vec::new();
     let result = layer_norm(&x, &scale, &bias, -1, 1e-5, &mut out_buf);
 
-    // After normalization, each row should have mean≈0 and std≈1
+    // After normalization, each row should have mean≈0.
+    // With epsilon in LayerNorm, std is slightly below 1:
+    // std = sqrt(var / (var + epsilon))
     let row1_mean: f32 = result.data[0..3].iter().sum::<f32>() / 3.0;
     let row1_std: f32 = (result.data[0..3]
         .iter()
@@ -117,9 +119,16 @@ fn test_layer_norm_accuracy() {
         / 3.0)
         .sqrt();
 
+    // Input row [1,2,3] has variance 2/3.
+    let input_var = 2.0f32 / 3.0;
+    let expected_std = (input_var / (input_var + 1e-5)).sqrt();
+
     println!("LayerNorm row1: mean={:.6}, std={:.6}", row1_mean, row1_std);
     assert!(row1_mean.abs() < 1e-5, "Mean should be ~0");
-    assert!((row1_std - 1.0).abs() < 1e-5, "Std should be ~1");
+    assert!(
+        (row1_std - expected_std).abs() < 1e-5,
+        "Std should match epsilon-adjusted expectation"
+    );
 }
 
 #[test]

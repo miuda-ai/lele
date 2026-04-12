@@ -197,7 +197,7 @@ fn main() {
 
     // Benchmark: Run multiple iterations to show steady-state performance
     println!("\n=== Performance Benchmark ===");
-    println!("Running 10 warm iterations...");
+    println!("Running 10 steady-state iterations...");
 
     let mut times = Vec::new();
     for _ in 0..10 {
@@ -216,6 +216,18 @@ fn main() {
     let avg_time: f64 = times.iter().sum::<f64>() / times.len() as f64;
     let min_time = times.iter().cloned().fold(f64::INFINITY, f64::min);
     let max_time = times.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let mut sorted = times.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p50_time = sorted[sorted.len() / 2];
+    let variance = times
+        .iter()
+        .map(|t| {
+            let d = *t - avg_time;
+            d * d
+        })
+        .sum::<f64>()
+        / times.len() as f64;
+    let std_time = variance.sqrt();
     let avg_rtf = avg_time / 1000.0 / audio_duration_sec;
     let min_rtf = min_time / 1000.0 / audio_duration_sec;
 
@@ -223,6 +235,7 @@ fn main() {
         "✓ Average inference: {:.2}ms (RTF: {:.4})",
         avg_time, avg_rtf
     );
+    println!("✓ P50 / Std: {:.2}ms / {:.2}ms", p50_time, std_time);
     println!(
         "✓ Min/Max: {:.2}ms / {:.2}ms (RTF: {:.4} / {:.4})",
         min_time,

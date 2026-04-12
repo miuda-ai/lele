@@ -47,6 +47,13 @@
                             <td class="stat-bin">—</td>
                             <td class="stat-rtf">—</td>
                         </tr>
+                        <tr id="stats-yolo26nseg">
+                            <td class="model-name">YOLO26n-Seg</td>
+                            <td class="model-task">Segmentation</td>
+                            <td class="stat-wasm">—</td>
+                            <td class="stat-bin">—</td>
+                            <td class="stat-rtf">—</td>
+                        </tr>
                     </tbody>
                     <tfoot>
                         <tr id="stats-total">
@@ -137,12 +144,22 @@
         <!-- Detection Tab -->
         <section id="detect" class="tab-content">
             <div class="card">
-                <h2>YOLO26 Object Detection</h2>
-                <p>Upload an image to detect objects.</p>
+                <h2>YOLO Detection / Segmentation</h2>
+                <p>Upload an image and run either YOLO26 detection or YOLO26n-seg segmentation.</p>
 
                 <div class="status-bar">
                     <span id="detect-status" class="status">⏳ Loading model...</span>
                     <span id="detect-model-size" class="badge"></span>
+                </div>
+
+                <div class="input-area">
+                    <label>
+                        Model:
+                        <select id="detect-model">
+                            <option value="yolo26">YOLO26 (Detection)</option>
+                            <option value="yolo26n-seg">YOLO26n-Seg (Segmentation)</option>
+                        </select>
+                    </label>
                 </div>
 
                 <div class="input-area">

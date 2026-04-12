@@ -2,3 +2,4 @@ onnx/*.json
 /web/models/
 /web/pkg/
 gen/
+node_modules/

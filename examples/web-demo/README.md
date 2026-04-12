@@ -9,6 +9,7 @@ WebAssembly demo proving that **lele** can compile to WASM and run ML inference 
 | 🎤 Speech Recognition | SenseVoice (INT8) | Upload WAV → ASR transcription |
 | 🔊 Text-to-Speech | Supertonic (4 models) | Text input → synthesized speech |
 | 📷 Object Detection | YOLO26 | Upload image → bounding boxes |
+| 🧩 Instance Segmentation | YOLO26n-Seg | Upload image → masks + boxes |
 
 ## Prerequisites
 

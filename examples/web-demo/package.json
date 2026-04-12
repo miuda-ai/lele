@@ -1,0 +1,19 @@
+{
+    "name": "lele-wasm-bench",
+    "version": "1.0.0",
+    "type": "module",
+    "description": "CDP-based WASM performance benchmark for lele web-demo",
+    "scripts": {
+        "bench": "node run_bench.mjs",
+        "bench:yolo": "node run_bench.mjs --model yolo26",
+        "bench:asr": "node run_bench.mjs --model sensevoice",
+        "bench:profile": "node run_bench.mjs --profile",
+        "bench:node": "node bench_node.mjs",
+        "bench:node:yolo": "node bench_node.mjs --model yolo26",
+        "bench:node:yolo26nseg": "node bench_node.mjs --model yolo26n-seg",
+        "bench:node:asr": "node bench_node.mjs --model sensevoice"
+    },
+    "dependencies": {
+        "playwright": "^1.42.0"
+    }
+}

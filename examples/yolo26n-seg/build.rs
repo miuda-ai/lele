@@ -31,7 +31,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or("yolo26n-seg.onnx");
 
     // Check if regeneration is needed
-    if !need_regenerate_with_model(class_name, output_dir, "model.toml", Some(std::path::Path::new(model_file))) && !should_force_regenerate() {
+    if !need_regenerate_with_model(
+        class_name,
+        output_dir,
+        "model.toml",
+        Some(std::path::Path::new(model_file)),
+    ) && !should_force_regenerate()
+    {
         println!("cargo:warning=Generated files are up to date, skipping regeneration");
         return Ok(());
     }

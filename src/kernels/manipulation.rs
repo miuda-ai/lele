@@ -110,6 +110,24 @@ pub fn concat<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     axis: i64,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
+    let _t0 = if crate::kernels::timing::TIMING_ENABLED {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let result = concat_impl(inputs, axis, out);
+    if crate::kernels::timing::TIMING_ENABLED {
+        let ns = _t0.unwrap().elapsed().as_nanos() as u64;
+        crate::kernels::timing::CONCAT_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+    result
+}
+
+fn concat_impl<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
+    inputs: &[&TensorView<'b, T>],
+    axis: i64,
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
     if inputs.is_empty() {
         return TensorView::empty();
     }
@@ -1060,6 +1078,11 @@ pub fn split_owned<T: Clone + Copy + std::fmt::Debug>(
     axis: i64,
     splits: &[i64],
 ) -> Vec<TensorView<'static, T>> {
+    let _t0 = if crate::kernels::timing::TIMING_ENABLED {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let ndim = input.dim();
     let axis = if axis < 0 {
         (ndim as i64 + axis) as usize
@@ -1105,6 +1128,10 @@ pub fn split_owned<T: Clone + Copy + std::fmt::Debug>(
         // Create owned TensorView
         results.push(TensorView::from_owned(buffer, out_shape));
         axis_offset += split_size;
+    }
+    if crate::kernels::timing::TIMING_ENABLED {
+        let ns = _t0.unwrap().elapsed().as_nanos() as u64;
+        crate::kernels::timing::SPLIT_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
     }
     results
 }

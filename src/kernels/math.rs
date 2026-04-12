@@ -388,12 +388,46 @@ pub fn add_f32<'b, 'a>(
     add_inner(a, b, out)
 }
 
+pub fn add_timed<
+    'b,
+    'a,
+    T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Debug + 'static,
+>(
+    a: &TensorView<'b, T>,
+    b: &TensorView<'b, T>,
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
+    let _t0 = if crate::kernels::timing::TIMING_ENABLED {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let r = add(a, b, out);
+    if crate::kernels::timing::TIMING_ENABLED {
+        crate::kernels::timing::OTHER_NS.fetch_add(
+            _t0.unwrap().elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    r
+}
 pub fn add<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Debug + 'static>(
     a: &TensorView<'b, T>,
     b: &TensorView<'b, T>,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
+    let _t0 = if crate::kernels::timing::TIMING_ENABLED {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let result = add_inner(a, b, out);
+    if crate::kernels::timing::TIMING_ENABLED {
+        crate::kernels::timing::ADD_NS.fetch_add(
+            _t0.unwrap().elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     result
 }
 fn add_inner<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Debug + 'static>(
@@ -579,8 +613,19 @@ pub fn mul<'b, 'a, T: Clone + Copy + std::ops::Mul<Output = T> + std::fmt::Debug
     b: &TensorView<'b, T>,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
-    let result = mul_inner(a, b, out);
-    result
+    let _t0 = if crate::kernels::timing::TIMING_ENABLED {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let r = mul_inner(a, b, out);
+    if crate::kernels::timing::TIMING_ENABLED {
+        crate::kernels::timing::MUL_NS.fetch_add(
+            _t0.unwrap().elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    r
 }
 fn mul_inner<'b, 'a, T: Clone + Copy + std::ops::Mul<Output = T> + std::fmt::Debug + 'static>(
     a: &TensorView<'b, T>,
@@ -879,7 +924,11 @@ pub fn gelu<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView
     {
         crate::kernels::wasm::math::gelu_kernel(input, out)
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "wasm32")))]
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "wasm32"
+    )))]
     {
         let numel = input.data.len();
         utils::ensure_capacity(out, numel);
@@ -923,7 +972,11 @@ pub fn fast_gelu<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> Tenso
     {
         crate::kernels::wasm::math::fast_gelu_kernel(input, out)
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "wasm32")))]
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "wasm32"
+    )))]
     {
         let numel = input.data.len();
         utils::ensure_capacity(out, numel);
@@ -1204,6 +1257,21 @@ pub fn equal_i64<'b, 'a, T: ElementOps>(
     }
 }
 pub fn sigmoid<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
+    let _t0 = if crate::kernels::timing::TIMING_ENABLED {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let _res = sigmoid_impl(input, out);
+    if crate::kernels::timing::TIMING_ENABLED {
+        crate::kernels::timing::SIGMOID_NS.fetch_add(
+            _t0.unwrap().elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    _res
+}
+fn sigmoid_impl<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     #[cfg(target_arch = "aarch64")]
     {
         crate::kernels::neon::math::sigmoid(input, out)
@@ -1260,6 +1328,22 @@ pub fn sigmoid<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorV
 
 /// SiLU activation: x * sigmoid(x), combined in a single pass
 pub fn silu<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
+    let _t0 = if crate::kernels::timing::TIMING_ENABLED {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let r = silu_inner(input, out);
+    if crate::kernels::timing::TIMING_ENABLED {
+        crate::kernels::timing::SILU_NS.fetch_add(
+            _t0.unwrap().elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    r
+}
+/// SiLU activation: x * sigmoid(x), combined in a single pass
+fn silu_inner<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     #[cfg(target_arch = "aarch64")]
     {
         crate::kernels::neon::math::swish(input, out)

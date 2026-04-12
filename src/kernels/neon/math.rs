@@ -604,3 +604,144 @@ pub unsafe fn mul_scalar_f32(data: *const f32, scalar: f32, out: *mut f32, len: 
         i += 1;
     }
 }
+
+// ─── Fused bias + activation (in-place) for conv2d post-GEMM step ─────────────
+
+/// Apply bias and SiLU in-place using NEON: out[i] = (x+b)*sigmoid(x+b)
+/// Uses the fast vectorized exp approximation (max relative error ~1e-6).
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[inline]
+pub unsafe fn bias_silu_inplace(data: *mut f32, len: usize, bias: f32) {
+    use core::arch::aarch64::*;
+    let v_bias = vdupq_n_f32(bias);
+    let v_one = vdupq_n_f32(1.0f32);
+    let mut i = 0;
+    while i + 4 <= len {
+        let xb = vaddq_f32(vld1q_f32(data.add(i)), v_bias);
+        // sigmoid(x) = 1 / (1 + exp(-x))
+        let neg_xb = vnegq_f32(xb);
+        let exp_neg = neon_exp_f32x4(neg_xb);
+        let sigmoid = vdivq_f32(v_one, vaddq_f32(v_one, exp_neg));
+        vst1q_f32(data.add(i), vmulq_f32(xb, sigmoid));
+        i += 4;
+    }
+    while i < len {
+        let x = *data.add(i) + bias;
+        *data.add(i) = x / (1.0f32 + (-x).exp());
+        i += 1;
+    }
+}
+
+/// Apply SiLU in-place (no bias) using NEON: out[i] = x*sigmoid(x)
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[inline]
+pub unsafe fn silu_inplace(data: *mut f32, len: usize) {
+    use core::arch::aarch64::*;
+    let v_one = vdupq_n_f32(1.0f32);
+    let mut i = 0;
+    while i + 4 <= len {
+        let x = vld1q_f32(data.add(i));
+        let exp_neg = neon_exp_f32x4(vnegq_f32(x));
+        let sigmoid = vdivq_f32(v_one, vaddq_f32(v_one, exp_neg));
+        vst1q_f32(data.add(i), vmulq_f32(x, sigmoid));
+        i += 4;
+    }
+    while i < len {
+        let x = *data.add(i);
+        *data.add(i) = x / (1.0f32 + (-x).exp());
+        i += 1;
+    }
+}
+
+/// Apply bias and ReLU in-place using NEON: out[i] = max(data[i]+bias, 0)
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[inline]
+pub unsafe fn bias_relu_inplace(data: *mut f32, len: usize, bias: f32) {
+    use core::arch::aarch64::*;
+    let v_bias = vdupq_n_f32(bias);
+    let v_zero = vdupq_n_f32(0.0f32);
+    let mut i = 0;
+    while i + 16 <= len {
+        let v0 = vmaxq_f32(vaddq_f32(vld1q_f32(data.add(i)), v_bias), v_zero);
+        let v1 = vmaxq_f32(vaddq_f32(vld1q_f32(data.add(i + 4)), v_bias), v_zero);
+        let v2 = vmaxq_f32(vaddq_f32(vld1q_f32(data.add(i + 8)), v_bias), v_zero);
+        let v3 = vmaxq_f32(vaddq_f32(vld1q_f32(data.add(i + 12)), v_bias), v_zero);
+        vst1q_f32(data.add(i), v0);
+        vst1q_f32(data.add(i + 4), v1);
+        vst1q_f32(data.add(i + 8), v2);
+        vst1q_f32(data.add(i + 12), v3);
+        i += 16;
+    }
+    while i + 4 <= len {
+        let v = vmaxq_f32(vaddq_f32(vld1q_f32(data.add(i)), v_bias), v_zero);
+        vst1q_f32(data.add(i), v);
+        i += 4;
+    }
+    while i < len {
+        *data.add(i) = (*data.add(i) + bias).max(0.0f32);
+        i += 1;
+    }
+}
+
+/// Apply ReLU in-place (no bias) using NEON: out[i] = max(data[i], 0)
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[inline]
+pub unsafe fn relu_inplace(data: *mut f32, len: usize) {
+    use core::arch::aarch64::*;
+    let v_zero = vdupq_n_f32(0.0f32);
+    let mut i = 0;
+    while i + 16 <= len {
+        let v0 = vmaxq_f32(vld1q_f32(data.add(i)), v_zero);
+        let v1 = vmaxq_f32(vld1q_f32(data.add(i + 4)), v_zero);
+        let v2 = vmaxq_f32(vld1q_f32(data.add(i + 8)), v_zero);
+        let v3 = vmaxq_f32(vld1q_f32(data.add(i + 12)), v_zero);
+        vst1q_f32(data.add(i), v0);
+        vst1q_f32(data.add(i + 4), v1);
+        vst1q_f32(data.add(i + 8), v2);
+        vst1q_f32(data.add(i + 12), v3);
+        i += 16;
+    }
+    while i + 4 <= len {
+        let v = vmaxq_f32(vld1q_f32(data.add(i)), v_zero);
+        vst1q_f32(data.add(i), v);
+        i += 4;
+    }
+    while i < len {
+        *data.add(i) = (*data.add(i)).max(0.0f32);
+        i += 1;
+    }
+}
+
+/// Add scalar bias in-place using NEON: out[i] = data[i] + bias
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[inline]
+pub unsafe fn bias_add_inplace(data: *mut f32, len: usize, bias: f32) {
+    use core::arch::aarch64::*;
+    let v_bias = vdupq_n_f32(bias);
+    let mut i = 0;
+    while i + 16 <= len {
+        let v0 = vaddq_f32(vld1q_f32(data.add(i)), v_bias);
+        let v1 = vaddq_f32(vld1q_f32(data.add(i + 4)), v_bias);
+        let v2 = vaddq_f32(vld1q_f32(data.add(i + 8)), v_bias);
+        let v3 = vaddq_f32(vld1q_f32(data.add(i + 12)), v_bias);
+        vst1q_f32(data.add(i), v0);
+        vst1q_f32(data.add(i + 4), v1);
+        vst1q_f32(data.add(i + 8), v2);
+        vst1q_f32(data.add(i + 12), v3);
+        i += 16;
+    }
+    while i + 4 <= len {
+        let v = vaddq_f32(vld1q_f32(data.add(i)), v_bias);
+        vst1q_f32(data.add(i), v);
+        i += 4;
+    }
+    while i < len {
+        *data.add(i) += bias;
+        i += 1;
+    }
+}

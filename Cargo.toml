@@ -10,6 +10,7 @@ members = [
     "examples/web-demo",
     "examples/web-demo/crates/sensevoice-wasm",
     "examples/web-demo/crates/yolo26-wasm",
+    "examples/web-demo/crates/yolo26n-seg-wasm",
     "examples/web-demo/crates/supertonic-wasm",
 ]
 resolver = "2"
@@ -22,7 +23,7 @@ anyhow = "1.0"
 
 [package]
 name = "lele"
-version = "0.1.10"
+version = "0.1.12"
 edition = "2024"
 description = "Bare-metal machine learning inference library in Rust"
 license = "MIT"
@@ -84,6 +85,3 @@ debug = true
 lto = "thin"
 codegen-units = 1
 opt-level = 3
-
-[target.'cfg(target_arch = "aarch64")'.rustflags]
-rustflags = ["-Ctarget-cpu=native"]

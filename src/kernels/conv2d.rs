@@ -1,3 +1,4 @@
+use crate::kernels::timing;
 use crate::kernels::utils;
 #[cfg(target_arch = "wasm32")]
 use crate::kernels::wasm_matmul::{Accum, MatMut, MatRef, Par, matmul as faer_matmul};
@@ -23,6 +24,7 @@ use faer::{Accum, Par};
 mod accelerate {
     pub const CBLAS_ROW_MAJOR: i32 = 101;
     pub const CBLAS_NO_TRANS: i32 = 111;
+    pub const CBLAS_TRANS: i32 = 112;
 
     unsafe extern "C" {
         pub fn cblas_sgemm(
@@ -70,6 +72,30 @@ unsafe fn accel_sgemm(m: usize, n: usize, k: usize, a: *const f32, b: *const f32
 }
 
 pub fn print_conv_stats() {}
+/// C = A^T * B (row-major, A transposed).
+/// A stored as [k, m] row-major, B as [k, n], C as [m, n].
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[inline(always)]
+unsafe fn accel_sgemm_ta(m: usize, n: usize, k: usize, a: *const f32, b: *const f32, c: *mut f32) {
+    unsafe {
+        accelerate::cblas_sgemm(
+            accelerate::CBLAS_ROW_MAJOR,
+            accelerate::CBLAS_TRANS,
+            accelerate::CBLAS_NO_TRANS,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0_f32,
+            a,
+            m as i32, // lda = number of cols in A as stored in memory (A stored as [k, m])
+            b,
+            n as i32,
+            0.0_f32,
+            c,
+            n as i32,
+        );
+    }
+}
 
 pub fn reset_conv_stats() {}
 
@@ -158,6 +184,11 @@ fn conv2d_activation<'b, 'a>(
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     let _relu = act == Activation::Relu;
+    let _t0 = if timing::TIMING_ENABLED {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let in_shape = &input.shape;
     let w_shape = &weights.shape;
 
@@ -242,14 +273,26 @@ fn conv2d_activation<'b, 'a>(
 
     let out_h = (in_h as u64 + pad_top as u64 + pad_bottom as u64
         - dilation_h as u64 * (kernel_h as u64 - 1)
-        - 1) as usize / stride_h + 1;
+        - 1) as usize
+        / stride_h
+        + 1;
     let out_w = (in_w as u64 + pad_left as u64 + pad_right as u64
         - dilation_w as u64 * (kernel_w as u64 - 1)
-        - 1) as usize / stride_w + 1;
+        - 1) as usize
+        / stride_w
+        + 1;
 
-    assert!(out_h > 0 && out_w > 0, "conv2d: output dimensions must be positive, got out_h={} out_w={}", out_h, out_w);
+    assert!(
+        out_h > 0 && out_w > 0,
+        "conv2d: output dimensions must be positive, got out_h={} out_w={}",
+        out_h,
+        out_w
+    );
     let total_output = batch_size as u64 * out_channels as u64 * out_h as u64 * out_w as u64;
-    assert!(total_output <= isize::MAX as u64, "conv2d: output size overflow");
+    assert!(
+        total_output <= isize::MAX as u64,
+        "conv2d: output size overflow"
+    );
     let total_output = total_output as usize;
 
     let groups = group as usize;
@@ -377,7 +420,85 @@ fn conv2d_activation<'b, 'a>(
                     }
                 }
             }
-            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(target_arch = "wasm32")]
+            {
+                for oc in 0..out_channels {
+                    let bias_val = if let Some(b) = bias { b.data[oc] } else { 0.0 };
+                    let row_start = o_offset + oc * spatial;
+                    let ptr = unsafe { out.as_mut_ptr().add(row_start) };
+                    unsafe {
+                        match act {
+                            Activation::SiLU => {
+                                if bias_val != 0.0 {
+                                    crate::kernels::wasm::math::bias_silu_inplace(
+                                        ptr, spatial, bias_val,
+                                    );
+                                } else {
+                                    crate::kernels::wasm::math::silu_inplace(ptr, spatial);
+                                }
+                            }
+                            Activation::Relu => {
+                                if bias_val != 0.0 {
+                                    crate::kernels::wasm::math::bias_relu_inplace(
+                                        ptr, spatial, bias_val,
+                                    );
+                                } else {
+                                    crate::kernels::wasm::math::relu_inplace(ptr, spatial);
+                                }
+                            }
+                            Activation::None => {
+                                if bias_val != 0.0 {
+                                    crate::kernels::wasm::math::bias_add_inplace(
+                                        ptr, spatial, bias_val,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                for oc in 0..out_channels {
+                    let bias_val = if let Some(b) = bias { b.data[oc] } else { 0.0 };
+                    let row_start = o_offset + oc * spatial;
+                    let ptr = unsafe { out.as_mut_ptr().add(row_start) };
+                    unsafe {
+                        match act {
+                            Activation::SiLU => {
+                                if bias_val != 0.0 {
+                                    crate::kernels::neon::math::bias_silu_inplace(
+                                        ptr, spatial, bias_val,
+                                    );
+                                } else {
+                                    crate::kernels::neon::math::silu_inplace(ptr, spatial);
+                                }
+                            }
+                            Activation::Relu => {
+                                if bias_val != 0.0 {
+                                    crate::kernels::neon::math::bias_relu_inplace(
+                                        ptr, spatial, bias_val,
+                                    );
+                                } else {
+                                    crate::kernels::neon::math::relu_inplace(ptr, spatial);
+                                }
+                            }
+                            Activation::None => {
+                                if bias_val != 0.0 {
+                                    crate::kernels::neon::math::bias_add_inplace(
+                                        ptr, spatial, bias_val,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(not(any(
+                target_arch = "x86_64",
+                target_arch = "wasm32",
+                target_arch = "aarch64"
+            )))]
             {
                 for oc in 0..out_channels {
                     let bias_val = if let Some(b) = bias { b.data[oc] } else { 0.0 };
@@ -401,7 +522,13 @@ fn conv2d_activation<'b, 'a>(
                 }
             }
         }
-        return TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w]);
+        return {
+            if timing::TIMING_ENABLED {
+                let ns = _t0.unwrap().elapsed().as_nanos() as u64;
+                timing::CONV1X1_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+            }
+            TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w])
+        };
     }
 
     let col_rows = in_channels_per_group * kernel_h * kernel_w;
@@ -567,7 +694,93 @@ fn conv2d_activation<'b, 'a>(
                         }
                     }
                 }
-                #[cfg(not(target_arch = "x86_64"))]
+                #[cfg(target_arch = "wasm32")]
+                {
+                    for oc in 0..out_channels_per_group {
+                        let bias_val = if let Some(b) = bias {
+                            b.data[out_ch_start + oc]
+                        } else {
+                            0.0
+                        };
+                        let row_start = o_offset + oc * col_cols;
+                        let ptr = unsafe { out.as_mut_ptr().add(row_start) };
+                        unsafe {
+                            match act {
+                                Activation::SiLU => {
+                                    if bias_val != 0.0 {
+                                        crate::kernels::wasm::math::bias_silu_inplace(
+                                            ptr, col_cols, bias_val,
+                                        );
+                                    } else {
+                                        crate::kernels::wasm::math::silu_inplace(ptr, col_cols);
+                                    }
+                                }
+                                Activation::Relu => {
+                                    if bias_val != 0.0 {
+                                        crate::kernels::wasm::math::bias_relu_inplace(
+                                            ptr, col_cols, bias_val,
+                                        );
+                                    } else {
+                                        crate::kernels::wasm::math::relu_inplace(ptr, col_cols);
+                                    }
+                                }
+                                Activation::None => {
+                                    if bias_val != 0.0 {
+                                        crate::kernels::wasm::math::bias_add_inplace(
+                                            ptr, col_cols, bias_val,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    for oc in 0..out_channels_per_group {
+                        let bias_val = if let Some(b) = bias {
+                            b.data[out_ch_start + oc]
+                        } else {
+                            0.0
+                        };
+                        let row_start = o_offset + oc * col_cols;
+                        let ptr = unsafe { out.as_mut_ptr().add(row_start) };
+                        unsafe {
+                            match act {
+                                Activation::SiLU => {
+                                    if bias_val != 0.0 {
+                                        crate::kernels::neon::math::bias_silu_inplace(
+                                            ptr, col_cols, bias_val,
+                                        );
+                                    } else {
+                                        crate::kernels::neon::math::silu_inplace(ptr, col_cols);
+                                    }
+                                }
+                                Activation::Relu => {
+                                    if bias_val != 0.0 {
+                                        crate::kernels::neon::math::bias_relu_inplace(
+                                            ptr, col_cols, bias_val,
+                                        );
+                                    } else {
+                                        crate::kernels::neon::math::relu_inplace(ptr, col_cols);
+                                    }
+                                }
+                                Activation::None => {
+                                    if bias_val != 0.0 {
+                                        crate::kernels::neon::math::bias_add_inplace(
+                                            ptr, col_cols, bias_val,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(any(
+                    target_arch = "x86_64",
+                    target_arch = "wasm32",
+                    target_arch = "aarch64"
+                )))]
                 {
                     for oc in 0..out_channels_per_group {
                         let bias_val = if let Some(b) = bias {
@@ -598,6 +811,16 @@ fn conv2d_activation<'b, 'a>(
         }
     }); // COL_BUF.with
 
+    if timing::TIMING_ENABLED {
+        let ns = _t0.unwrap().elapsed().as_nanos() as u64;
+        let kh = weights.shape[2];
+        let kw = weights.shape[3];
+        if kh == 3 && kw == 3 {
+            timing::CONV3X3_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            timing::CONV_OTHER_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w])
 }
 
@@ -662,15 +885,16 @@ fn im2col(
 
                     let oh_start = if kh < pad_top { pad_top - kh } else { 0 };
                     let oh_end = (in_h + pad_top).saturating_sub(kh).min(out_h);
+                    let ow_start = if kw < pad_left { pad_left - kw } else { 0 };
+                    let ow_end = (in_w + pad_left).saturating_sub(kw).min(out_w);
+                    let iw_start = (ow_start + kw) as isize - pad_left as isize;
+                    let count = ow_end.saturating_sub(ow_start);
 
                     // Zero the top padding rows
                     unsafe {
                         let col_ptr = col.as_mut_ptr().add(col_row_offset);
-                        for oh in 0..oh_start {
-                            let row_offset = oh * out_w;
-                            for ow in 0..out_w {
-                                *col_ptr.add(row_offset + ow) = 0.0;
-                            }
+                        if oh_start > 0 {
+                            std::ptr::write_bytes(col_ptr, 0, oh_start * out_w);
                         }
                     }
 
@@ -681,28 +905,25 @@ fn im2col(
                         let in_row_offset = ch_offset + ih * in_w;
                         let col_base = col_row_offset + oh * out_w;
 
-                        let ow_start = if kw < pad_left { pad_left - kw } else { 0 };
-                        let ow_end = (in_w + pad_left).saturating_sub(kw).min(out_w);
-
                         unsafe {
                             let col_ptr = col.as_mut_ptr().add(col_base);
                             let in_ptr = input.as_ptr().add(in_row_offset);
 
                             // Zero left padding
-                            for ow in 0..ow_start {
-                                *col_ptr.add(ow) = 0.0;
+                            if ow_start > 0 {
+                                std::ptr::write_bytes(col_ptr, 0, ow_start);
                             }
                             // Copy valid region
-                            let iw_start = (ow_start + kw) as isize - pad_left as isize;
-                            let count = ow_end - ow_start;
-                            std::ptr::copy_nonoverlapping(
-                                in_ptr.add(iw_start as usize),
-                                col_ptr.add(ow_start),
-                                count,
-                            );
+                            if count > 0 {
+                                std::ptr::copy_nonoverlapping(
+                                    in_ptr.add(iw_start as usize),
+                                    col_ptr.add(ow_start),
+                                    count,
+                                );
+                            }
                             // Zero right padding
-                            for ow in ow_end..out_w {
-                                *col_ptr.add(ow) = 0.0;
+                            if ow_end < out_w {
+                                std::ptr::write_bytes(col_ptr.add(ow_end), 0, out_w - ow_end);
                             }
                         }
                     }
@@ -710,11 +931,12 @@ fn im2col(
                     // Zero the bottom padding rows
                     unsafe {
                         let col_ptr = col.as_mut_ptr().add(col_row_offset);
-                        for oh in oh_end..out_h {
-                            let row_offset = oh * out_w;
-                            for ow in 0..out_w {
-                                *col_ptr.add(row_offset + ow) = 0.0;
-                            }
+                        if oh_end < out_h {
+                            std::ptr::write_bytes(
+                                col_ptr.add(oh_end * out_w),
+                                0,
+                                (out_h - oh_end) * out_w,
+                            );
                         }
                     }
                 }
@@ -751,9 +973,7 @@ fn im2col(
                         // Entire row is padding — zero it
                         unsafe {
                             let col_ptr = col.as_mut_ptr().add(col_oh_offset);
-                            for ow in 0..out_w {
-                                *col_ptr.add(ow) = 0.0;
-                            }
+                            std::ptr::write_bytes(col_ptr, 0, out_w);
                         }
                     }
                 }
@@ -832,18 +1052,27 @@ pub fn max_pool2d<'b, 'a>(
     let effective_kw = dw * (kw - 1) + 1;
 
     let out_h = if ceil_mode {
-        ((in_h as i64 + pad_top as i64 + pad_bottom as i64 - effective_kh as i64 + sh as i64 - 1) / sh as i64 + 1) as usize
+        ((in_h as i64 + pad_top as i64 + pad_bottom as i64 - effective_kh as i64 + sh as i64 - 1)
+            / sh as i64
+            + 1) as usize
     } else {
-        ((in_h as i64 + pad_top as i64 + pad_bottom as i64 - effective_kh as i64) / sh as i64 + 1) as usize
+        ((in_h as i64 + pad_top as i64 + pad_bottom as i64 - effective_kh as i64) / sh as i64 + 1)
+            as usize
     };
     let out_w = if ceil_mode {
-        ((in_w as i64 + pad_left as i64 + pad_right as i64 - effective_kw as i64 + sw as i64 - 1) / sw as i64 + 1) as usize
+        ((in_w as i64 + pad_left as i64 + pad_right as i64 - effective_kw as i64 + sw as i64 - 1)
+            / sw as i64
+            + 1) as usize
     } else {
-        ((in_w as i64 + pad_left as i64 + pad_right as i64 - effective_kw as i64) / sw as i64 + 1) as usize
+        ((in_w as i64 + pad_left as i64 + pad_right as i64 - effective_kw as i64) / sw as i64 + 1)
+            as usize
     };
 
     let total = batch as u64 * channels as u64 * out_h as u64 * out_w as u64;
-    assert!(total <= isize::MAX as u64, "pool/compute output size overflow");
+    assert!(
+        total <= isize::MAX as u64,
+        "pool/compute output size overflow"
+    );
     let total = total as usize;
     utils::ensure_capacity(out, total);
     unsafe {
@@ -898,6 +1127,27 @@ pub fn resize_nearest<'b, 'a>(
     coordinate_transform_mode: &str,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
+    let _t0 = if crate::kernels::timing::TIMING_ENABLED {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let r = resize_nearest_inner(input, scales, sizes, coordinate_transform_mode, out);
+    if crate::kernels::timing::TIMING_ENABLED {
+        crate::kernels::timing::RESIZE_NS.fetch_add(
+            _t0.unwrap().elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    r
+}
+fn resize_nearest_inner<'b, 'a>(
+    input: &TensorView<'b>,
+    scales: Option<&[f32]>,
+    sizes: Option<&[i64]>,
+    coordinate_transform_mode: &str,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
     let shape = &input.shape;
     assert!(shape.len() == 4, "Resize: expected rank-4 input");
 
@@ -908,22 +1158,43 @@ pub fn resize_nearest<'b, 'a>(
 
     let (out_h, out_w) = if let Some(sizes) = sizes {
         // sizes is [N, C, H, W]
-        assert!(sizes.len() >= 4, "Resize: sizes must have at least 4 elements");
-        assert!(sizes[2] > 0 && sizes[3] > 0, "Resize: sizes H and W must be positive");
+        assert!(
+            sizes.len() >= 4,
+            "Resize: sizes must have at least 4 elements"
+        );
+        assert!(
+            sizes[2] > 0 && sizes[3] > 0,
+            "Resize: sizes H and W must be positive"
+        );
         (sizes[2] as u64, sizes[3] as u64)
     } else if let Some(scales) = scales {
         // scales is [N, C, H, W]
         let sh = if scales.len() >= 3 { scales[2] } else { 1.0 };
         let sw = if scales.len() >= 4 { scales[3] } else { 1.0 };
         assert!(sh > 0.0 && sw > 0.0, "Resize: scales must be positive");
-        ((in_h as f64 * sh as f64) as u64, (in_w as f64 * sw as f64) as u64)
+        (
+            (in_h as f64 * sh as f64) as u64,
+            (in_w as f64 * sw as f64) as u64,
+        )
     } else {
         panic!("Resize: either scales or sizes must be provided");
     };
 
-    assert!(out_h > 0 && out_w > 0, "Resize: output dimensions must be positive, got out_h={} out_w={}", out_h, out_w);
+    assert!(
+        out_h > 0 && out_w > 0,
+        "Resize: output dimensions must be positive, got out_h={} out_w={}",
+        out_h,
+        out_w
+    );
     let total = batch as u64 * channels as u64 * out_h * out_w;
-    assert!(total <= isize::MAX as u64, "Resize: output size overflow ({}x{}x{}x{})", batch, channels, out_h, out_w);
+    assert!(
+        total <= isize::MAX as u64,
+        "Resize: output size overflow ({}x{}x{}x{})",
+        batch,
+        channels,
+        out_h,
+        out_w
+    );
     let total = total as usize;
     let out_h = out_h as usize;
     let out_w = out_w as usize;
@@ -1181,14 +1452,26 @@ fn conv2d_with_zero_points<'b, 'a>(
 
     let out_h = (in_h as u64 + pad_top as u64 + pad_bottom as u64
         - dilation_h as u64 * (kernel_h as u64 - 1)
-        - 1) as usize / stride_h + 1;
+        - 1) as usize
+        / stride_h
+        + 1;
     let out_w = (in_w as u64 + pad_left as u64 + pad_right as u64
         - dilation_w as u64 * (kernel_w as u64 - 1)
-        - 1) as usize / stride_w + 1;
+        - 1) as usize
+        / stride_w
+        + 1;
 
-    assert!(out_h > 0 && out_w > 0, "conv2d_with_zero_points: output dimensions must be positive, got out_h={} out_w={}", out_h, out_w);
+    assert!(
+        out_h > 0 && out_w > 0,
+        "conv2d_with_zero_points: output dimensions must be positive, got out_h={} out_w={}",
+        out_h,
+        out_w
+    );
     let total_output = batch_size as u64 * out_channels as u64 * out_h as u64 * out_w as u64;
-    assert!(total_output <= isize::MAX as u64, "conv2d_with_zero_points: output size overflow");
+    assert!(
+        total_output <= isize::MAX as u64,
+        "conv2d_with_zero_points: output size overflow"
+    );
     let total_output = total_output as usize;
 
     let groups = group as usize;
@@ -2524,14 +2807,35 @@ fn im2col_i16(
     }
 }
 
-/// 2D Transpose Convolution (ConvTranspose / Deconvolution).
-/// Input shape: [N, C_in, H, W]
-/// Weight shape: [C_in, C_out/groups, kH, kW] - note: transposed compared to Conv
 /// Output shape: [N, C_out, H_out, W_out]
 ///
 /// Output size formula:
 /// output_size = (input_size - 1) * strides - 2 * pads + dilations * (kernel_size - 1) + output_padding + 1
 pub fn conv_transpose<'b, 'a>(
+    input: &TensorView<'b>,
+    weights: &TensorView<'b>,
+    bias: Option<&TensorView<'b>>,
+    dilations: &[i64],
+    group: i64,
+    pads: &[i64],
+    strides: &[i64],
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let _t0 = if crate::kernels::timing::TIMING_ENABLED {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let r = conv_transpose_inner(input, weights, bias, dilations, group, pads, strides, out);
+    if crate::kernels::timing::TIMING_ENABLED {
+        crate::kernels::timing::CONV_TRANS_NS.fetch_add(
+            _t0.unwrap().elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    r
+}
+fn conv_transpose_inner<'b, 'a>(
     input: &TensorView<'b>,
     weights: &TensorView<'b>,
     bias: Option<&TensorView<'b>>,
@@ -2574,15 +2878,18 @@ pub fn conv_transpose<'b, 'a>(
     let pad_right = pads.get(3).copied().unwrap_or(pad_left as i64) as usize;
 
     // Calculate output size: (in - 1) * stride - 2*pad + dilation * (kernel - 1) + output_padding + 1
-    let out_h = (in_h as i64 - 1) * stride_h as i64
-        - (pad_top as i64 + pad_bottom as i64)
+    let out_h = (in_h as i64 - 1) * stride_h as i64 - (pad_top as i64 + pad_bottom as i64)
         + dilation_h as i64 * (kernel_h as i64 - 1)
         + 1;
-    let out_w = (in_w as i64 - 1) * stride_w as i64
-        - (pad_left as i64 + pad_right as i64)
+    let out_w = (in_w as i64 - 1) * stride_w as i64 - (pad_left as i64 + pad_right as i64)
         + dilation_w as i64 * (kernel_w as i64 - 1)
         + 1;
-    assert!(out_h > 0 && out_w > 0, "conv_transpose: output dimensions must be positive, got out_h={} out_w={}", out_h, out_w);
+    assert!(
+        out_h > 0 && out_w > 0,
+        "conv_transpose: output dimensions must be positive, got out_h={} out_w={}",
+        out_h,
+        out_w
+    );
     let out_h = out_h as usize;
     let out_w = out_w as usize;
     let out_size = batch_size * out_channels * out_h * out_w;
@@ -2596,50 +2903,70 @@ pub fn conv_transpose<'b, 'a>(
     // Groups are not supported for simplicity in this implementation
     assert!(group == 1, "ConvTranspose: group > 1 not supported yet");
 
-    let _in_channels_per_group = in_channels as usize / group as usize;
-    let _out_channels_per_group = out_channels as usize / group as usize;
+    // GEMM + col2im:
+    // col[oc*kh*kw, ih*iw] = W^T[oc*kh*kw, ic] * input[ic, ih*iw]
+    // then scatter col into output according to stride/dilation/padding.
+    let hw = in_h * in_w;
+    let col_rows = out_channels * kernel_h * kernel_w;
+    let mut col = vec![0.0f32; col_rows * hw];
 
     for n in 0..batch_size {
         let batch_offset = n * out_channels * out_h * out_w;
+        let input_ptr = unsafe { input.data.as_ptr().add(n * in_channels * hw) };
 
-        // ConvTranspose weight layout: [C_in, C_out, kH, kW] (ONNX convention)
-        for ic in 0..in_channels {
-            let in_ch_offset = n * in_channels * in_h * in_w + ic * in_h * in_w;
+        // GEMM: col[col_rows x hw] = W^T[col_rows x in_channels] * input[in_channels x hw]
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        unsafe {
+            accel_sgemm_ta(
+                col_rows,
+                hw,
+                in_channels,
+                weights.data.as_ptr(),
+                input_ptr,
+                col.as_mut_ptr(),
+            );
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+        {
+            for r in 0..col_rows {
+                let oc = r / (kernel_h * kernel_w);
+                let k_idx = r % (kernel_h * kernel_w);
+                let kh = k_idx / kernel_w;
+                let kw = k_idx % kernel_w;
+                for ih in 0..in_h {
+                    for iw in 0..in_w {
+                        let mut sum = 0.0f32;
+                        for ic in 0..in_channels {
+                            let w_val = weights.data
+                                [ic * col_rows + oc * kernel_h * kernel_w + kh * kernel_w + kw];
+                            let in_val =
+                                input.data[n * in_channels * hw + ic * hw + ih * in_w + iw];
+                            sum += w_val * in_val;
+                        }
+                        col[r * hw + ih * in_w + iw] = sum;
+                    }
+                }
+            }
+        }
 
-            for oc in 0..out_channels {
-                // Weight offset: [C_in, C_out, kH, kW] -> ic * out_channels * kH * kW + oc * kH * kW
-                let weight_offset =
-                    ic * out_channels * kernel_h * kernel_w + oc * kernel_h * kernel_w;
-
-                for kh in 0..kernel_h {
-                    for kw in 0..kernel_w {
-                        // Output position for this kernel element
-                        let oh_start = kh * dilation_h;
-                        let ow_start = kw * dilation_w;
-
-                        for ih in 0..in_h {
-                            let oh = ih * stride_h + oh_start;
-                            if oh >= pad_top && oh < out_h + pad_top {
-                                let oh_valid = oh - pad_top;
-                                for iw in 0..in_w {
-                                    let ow = iw * stride_w + ow_start;
-                                    if ow >= pad_left && ow < out_w + pad_left {
-                                        let ow_valid = ow - pad_left;
-
-                                        // Input value
-                                        let in_val = input.data[in_ch_offset + ih * in_w + iw];
-
-                                        // Weight value
-                                        let w_val =
-                                            weights.data[weight_offset + kh * kernel_w + kw];
-
-                                        // Accumulate to output
-                                        let out_idx = batch_offset
-                                            + oc * out_h * out_w
-                                            + oh_valid * out_w
-                                            + ow_valid;
-                                        out[out_idx] += in_val * w_val;
-                                    }
+        for oc in 0..out_channels {
+            let oc_out_base = batch_offset + oc * out_h * out_w;
+            for kh in 0..kernel_h {
+                let oh_shift = kh * dilation_h;
+                for kw in 0..kernel_w {
+                    let ow_shift = kw * dilation_w;
+                    let r = oc * kernel_h * kernel_w + kh * kernel_w + kw;
+                    let col_row_base = r * hw;
+                    for ih in 0..in_h {
+                        let oh = ih * stride_h + oh_shift;
+                        if oh >= pad_top && oh < out_h + pad_top {
+                            let oh_valid = oh - pad_top;
+                            for iw in 0..in_w {
+                                let ow = iw * stride_w + ow_shift;
+                                if ow >= pad_left && ow < out_w + pad_left {
+                                    let ow_valid = ow - pad_left;
+                                    out[oc_out_base + oh_valid * out_w + ow_valid] +=
+                                        col[col_row_base + ih * in_w + iw];
                                 }
                             }
                         }
@@ -2648,14 +2975,12 @@ pub fn conv_transpose<'b, 'a>(
             }
         }
 
-        // Add bias if present (after all convolutions)
         if let Some(b) = bias {
             for oc in 0..out_channels {
                 let ch_offset = batch_offset + oc * out_h * out_w;
-                for oh in 0..out_h {
-                    for ow in 0..out_w {
-                        out[ch_offset + oh * out_w + ow] += b.data[oc];
-                    }
+                let bv = b.data[oc];
+                for i in 0..out_h * out_w {
+                    out[ch_offset + i] += bv;
                 }
             }
         }
@@ -2682,12 +3007,21 @@ mod tests {
 
         let mut out = Vec::new();
         let result = conv_transpose(
-            &input, &weights, Some(&bias),
-            &[1, 1], 1, &[0, 0, 0, 0], &[2, 2], &mut out,
+            &input,
+            &weights,
+            Some(&bias),
+            &[1, 1],
+            1,
+            &[0, 0, 0, 0],
+            &[2, 2],
+            &mut out,
         );
 
-        assert_eq!(result.shape.as_ref(), &[1, 64, 160, 160],
-            "conv_transpose with stride=2 should upsample 80x80 -> 160x160");
+        assert_eq!(
+            result.shape.as_ref(),
+            &[1, 64, 160, 160],
+            "conv_transpose with stride=2 should upsample 80x80 -> 160x160"
+        );
     }
 
     #[test]
@@ -2704,8 +3038,14 @@ mod tests {
 
         let mut out = Vec::new();
         let result = conv_transpose(
-            &input, &weights, Some(&bias),
-            &[1, 1], 1, &[1, 1, 1, 1], &[2, 2], &mut out,
+            &input,
+            &weights,
+            Some(&bias),
+            &[1, 1],
+            1,
+            &[1, 1, 1, 1],
+            &[2, 2],
+            &mut out,
         );
 
         assert_eq!(result.shape.as_ref(), &[1, 32, 79, 79]);
@@ -2725,8 +3065,14 @@ mod tests {
 
         let mut out = Vec::new();
         let result = conv_transpose(
-            &input, &weights, Some(&bias),
-            &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut out,
+            &input,
+            &weights,
+            Some(&bias),
+            &[1, 1],
+            1,
+            &[0, 0, 0, 0],
+            &[1, 1],
+            &mut out,
         );
 
         assert_eq!(result.shape.as_ref(), &[1, 16, 12, 12]);
@@ -2740,8 +3086,14 @@ mod tests {
 
         let mut out = Vec::new();
         let result = conv_transpose(
-            &input, &weights, None,
-            &[1], 1, &[0, 0, 0, 0], &[1, 1], &mut out,
+            &input,
+            &weights,
+            None,
+            &[1],
+            1,
+            &[0, 0, 0, 0],
+            &[1, 1],
+            &mut out,
         );
 
         assert_eq!(result.shape.as_ref(), &[1, 1, 1, 1]);
@@ -2755,7 +3107,13 @@ mod tests {
         // 1x1x2x2 input, scale 1.0 -> same output
         let input = TensorView::from_slice(&[1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
         let mut out = Vec::new();
-        let result = resize_nearest(&input, Some(&[1.0, 1.0, 1.0, 1.0]), None, "asymmetric", &mut out);
+        let result = resize_nearest(
+            &input,
+            Some(&[1.0, 1.0, 1.0, 1.0]),
+            None,
+            "asymmetric",
+            &mut out,
+        );
         assert_eq!(result.shape.as_ref(), &[1, 1, 2, 2]);
         let data = result.data.as_ref();
         assert!((data[0] - 1.0).abs() < 1e-6);
@@ -2769,15 +3127,29 @@ mod tests {
         // 1x1x2x2 input, scale 2.0 -> 1x1x4x4 output
         let input = TensorView::from_slice(&[1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
         let mut out = Vec::new();
-        let result = resize_nearest(&input, Some(&[1.0, 1.0, 2.0, 2.0]), None, "asymmetric", &mut out);
+        let result = resize_nearest(
+            &input,
+            Some(&[1.0, 1.0, 2.0, 2.0]),
+            None,
+            "asymmetric",
+            &mut out,
+        );
         assert_eq!(result.shape.as_ref(), &[1, 1, 4, 4]);
         let data = result.data.as_ref();
         // With asymmetric mode: ih = floor(oh * 2/4) = floor(oh * 0.5)
         // oh=0 -> ih=0, oh=1 -> ih=0, oh=2 -> ih=1, oh=3 -> ih=1
         // Expected: [1,1,2,2, 1,1,2,2, 3,3,4,4, 3,3,4,4]
-        let expected = [1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 3.0, 3.0, 4.0, 4.0];
+        let expected = [
+            1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 3.0, 3.0, 4.0, 4.0,
+        ];
         for (i, &e) in expected.iter().enumerate() {
-            assert!((data[i] - e).abs() < 1e-6, "mismatch at index {}: got {} expected {}", i, data[i], e);
+            assert!(
+                (data[i] - e).abs() < 1e-6,
+                "mismatch at index {}: got {} expected {}",
+                i,
+                data[i],
+                e
+            );
         }
     }
 
@@ -2798,7 +3170,13 @@ mod tests {
         let input_data: Vec<f32> = (0..8).map(|v| v as f32).collect();
         let input = TensorView::from_slice(&input_data, vec![1, 2, 2, 2]);
         let mut out = Vec::new();
-        let result = resize_nearest(&input, Some(&[1.0, 1.0, 2.0, 2.0]), None, "asymmetric", &mut out);
+        let result = resize_nearest(
+            &input,
+            Some(&[1.0, 1.0, 2.0, 2.0]),
+            None,
+            "asymmetric",
+            &mut out,
+        );
         assert_eq!(result.shape.as_ref(), &[1, 2, 4, 4]);
         assert_eq!(result.data.len(), 32);
     }
@@ -2808,7 +3186,13 @@ mod tests {
         // 1x1x2x2 input, upscale 2x with half_pixel mode
         let input = TensorView::from_slice(&[1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
         let mut out = Vec::new();
-        let result = resize_nearest(&input, Some(&[1.0, 1.0, 2.0, 2.0]), None, "half_pixel", &mut out);
+        let result = resize_nearest(
+            &input,
+            Some(&[1.0, 1.0, 2.0, 2.0]),
+            None,
+            "half_pixel",
+            &mut out,
+        );
         assert_eq!(result.shape.as_ref(), &[1, 1, 4, 4]);
         let data = result.data.as_ref();
         assert_eq!(data.len(), 16);
@@ -2824,7 +3208,13 @@ mod tests {
         // 1x1x1x1 input -> 1x1x100x100
         let input = TensorView::from_slice(&[42.0f32], vec![1, 1, 1, 1]);
         let mut out = Vec::new();
-        let result = resize_nearest(&input, None, Some(&[1, 1, 100, 100]), "asymmetric", &mut out);
+        let result = resize_nearest(
+            &input,
+            None,
+            Some(&[1, 1, 100, 100]),
+            "asymmetric",
+            &mut out,
+        );
         assert_eq!(result.shape.as_ref(), &[1, 1, 100, 100]);
         // All values should be 42.0 (single pixel upscaled)
         for &v in result.data.as_ref() {
@@ -2849,7 +3239,13 @@ mod tests {
         let input = TensorView::from_slice(&input_data, vec![1, 1, 4, 4]);
         let mut out = Vec::new();
         let result = max_pool2d(
-            &input, &[2, 2], &[2, 2], &[0, 0, 0, 0], &[1, 1], false, &mut out,
+            &input,
+            &[2, 2],
+            &[2, 2],
+            &[0, 0, 0, 0],
+            &[1, 1],
+            false,
+            &mut out,
         );
         assert_eq!(result.shape.as_ref(), &[1, 1, 2, 2]);
         let data = result.data.as_ref();
@@ -2868,7 +3264,13 @@ mod tests {
         let input = TensorView::from_slice(&input_data, vec![1, 1, 3, 3]);
         let mut out = Vec::new();
         let result = max_pool2d(
-            &input, &[2, 2], &[1, 1], &[0, 0, 0, 0], &[1, 1], false, &mut out,
+            &input,
+            &[2, 2],
+            &[1, 1],
+            &[0, 0, 0, 0],
+            &[1, 1],
+            false,
+            &mut out,
         );
         assert_eq!(result.shape.as_ref(), &[1, 1, 2, 2]);
         let data = result.data.as_ref();
@@ -2886,7 +3288,13 @@ mod tests {
         let input = TensorView::from_slice(&[1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
         let mut out = Vec::new();
         let result = max_pool2d(
-            &input, &[2, 2], &[1, 1], &[1, 1, 1, 1], &[1, 1], false, &mut out,
+            &input,
+            &[2, 2],
+            &[1, 1],
+            &[1, 1, 1, 1],
+            &[1, 1],
+            false,
+            &mut out,
         );
         assert_eq!(result.shape.as_ref(), &[1, 1, 3, 3]);
         let data = result.data.as_ref();
@@ -2906,7 +3314,13 @@ mod tests {
         let input = TensorView::from_slice(&input_data, vec![1, 2, 4, 4]);
         let mut out = Vec::new();
         let result = max_pool2d(
-            &input, &[2, 2], &[2, 2], &[0, 0, 0, 0], &[1, 1], false, &mut out,
+            &input,
+            &[2, 2],
+            &[2, 2],
+            &[0, 0, 0, 0],
+            &[1, 1],
+            false,
+            &mut out,
         );
         assert_eq!(result.shape.as_ref(), &[1, 2, 2, 2]);
         assert_eq!(result.data.len(), 8);
@@ -2924,7 +3338,13 @@ mod tests {
         let input = TensorView::from_slice(&input_data, vec![batch, channels, h, w]);
         let mut out = Vec::new();
         let result = max_pool2d(
-            &input, &[2, 2], &[2, 2], &[0, 0, 0, 0], &[1, 1], false, &mut out,
+            &input,
+            &[2, 2],
+            &[2, 2],
+            &[0, 0, 0, 0],
+            &[1, 1],
+            false,
+            &mut out,
         );
         assert_eq!(result.shape.as_ref(), &[1, 32, 40, 40]);
         // All values should be 1.0

@@ -47,7 +47,8 @@ pub fn softmax<'b, 'a>(
                     }
 
                     // Merge max vectors
-                    let mut max_vec = vmaxq_f32(vmaxq_f32(max_vec0, max_vec1), vmaxq_f32(max_vec2, max_vec3));
+                    let mut max_vec =
+                        vmaxq_f32(vmaxq_f32(max_vec0, max_vec1), vmaxq_f32(max_vec2, max_vec3));
 
                     let simd_end = (axis_size / 4) * 4;
                     while j < simd_end {
@@ -76,10 +77,22 @@ pub fn softmax<'b, 'a>(
                         let v2 = vld1q_f32(src.as_ptr().add(j + 8));
                         let v3 = vld1q_f32(src.as_ptr().add(j + 12));
 
-                        let e0 = crate::kernels::neon::math::neon_exp_f32x4(vsubq_f32(v0, max_broadcast));
-                        let e1 = crate::kernels::neon::math::neon_exp_f32x4(vsubq_f32(v1, max_broadcast));
-                        let e2 = crate::kernels::neon::math::neon_exp_f32x4(vsubq_f32(v2, max_broadcast));
-                        let e3 = crate::kernels::neon::math::neon_exp_f32x4(vsubq_f32(v3, max_broadcast));
+                        let e0 = crate::kernels::neon::math::neon_exp_f32x4(vsubq_f32(
+                            v0,
+                            max_broadcast,
+                        ));
+                        let e1 = crate::kernels::neon::math::neon_exp_f32x4(vsubq_f32(
+                            v1,
+                            max_broadcast,
+                        ));
+                        let e2 = crate::kernels::neon::math::neon_exp_f32x4(vsubq_f32(
+                            v2,
+                            max_broadcast,
+                        ));
+                        let e3 = crate::kernels::neon::math::neon_exp_f32x4(vsubq_f32(
+                            v3,
+                            max_broadcast,
+                        ));
 
                         vst1q_f32(dst.as_mut_ptr().add(j), e0);
                         vst1q_f32(dst.as_mut_ptr().add(j + 4), e1);
@@ -94,7 +107,8 @@ pub fn softmax<'b, 'a>(
                     }
 
                     // Merge sum vectors
-                    let mut sum_vec = vaddq_f32(vaddq_f32(sum_vec0, sum_vec1), vaddq_f32(sum_vec2, sum_vec3));
+                    let mut sum_vec =
+                        vaddq_f32(vaddq_f32(sum_vec0, sum_vec1), vaddq_f32(sum_vec2, sum_vec3));
 
                     while j < simd_end {
                         let v = vld1q_f32(src.as_ptr().add(j));
@@ -120,10 +134,22 @@ pub fn softmax<'b, 'a>(
 
                     j = 0;
                     while j < simd_end_4x {
-                        vst1q_f32(dst.as_mut_ptr().add(j), vmulq_f32(vld1q_f32(dst.as_ptr().add(j)), inv_sum_vec));
-                        vst1q_f32(dst.as_mut_ptr().add(j + 4), vmulq_f32(vld1q_f32(dst.as_ptr().add(j + 4)), inv_sum_vec));
-                        vst1q_f32(dst.as_mut_ptr().add(j + 8), vmulq_f32(vld1q_f32(dst.as_ptr().add(j + 8)), inv_sum_vec));
-                        vst1q_f32(dst.as_mut_ptr().add(j + 12), vmulq_f32(vld1q_f32(dst.as_ptr().add(j + 12)), inv_sum_vec));
+                        vst1q_f32(
+                            dst.as_mut_ptr().add(j),
+                            vmulq_f32(vld1q_f32(dst.as_ptr().add(j)), inv_sum_vec),
+                        );
+                        vst1q_f32(
+                            dst.as_mut_ptr().add(j + 4),
+                            vmulq_f32(vld1q_f32(dst.as_ptr().add(j + 4)), inv_sum_vec),
+                        );
+                        vst1q_f32(
+                            dst.as_mut_ptr().add(j + 8),
+                            vmulq_f32(vld1q_f32(dst.as_ptr().add(j + 8)), inv_sum_vec),
+                        );
+                        vst1q_f32(
+                            dst.as_mut_ptr().add(j + 12),
+                            vmulq_f32(vld1q_f32(dst.as_ptr().add(j + 12)), inv_sum_vec),
+                        );
                         j += 16;
                     }
 
@@ -323,7 +349,17 @@ pub fn batch_norm<'b, 'a>(
                         spatial_size,
                     );
                 }
-                #[cfg(not(target_arch = "x86_64"))]
+                #[cfg(target_arch = "wasm32")]
+                unsafe {
+                    crate::kernels::wasm::norm::scale_bias_spatial(
+                        src.as_ptr().add(offset),
+                        out_slice.as_mut_ptr().add(offset),
+                        scale_val,
+                        bias_val,
+                        spatial_size,
+                    );
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "wasm32")))]
                 for i in 0..spatial_size {
                     out_slice[offset + i] = src[offset + i] * scale_val + bias_val;
                 }
@@ -357,7 +393,17 @@ pub fn batch_norm<'b, 'a>(
                         inner_size,
                     );
                 }
-                #[cfg(not(target_arch = "x86_64"))]
+                #[cfg(target_arch = "wasm32")]
+                unsafe {
+                    crate::kernels::wasm::norm::scale_bias_spatial(
+                        src.as_ptr().add(offset),
+                        out_slice.as_mut_ptr().add(offset),
+                        scale_val,
+                        bias_val,
+                        inner_size,
+                    );
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "wasm32")))]
                 for k in 0..inner_size {
                     let idx = offset + k;
                     out_slice[idx] = src[idx] * scale_val + bias_val;
@@ -410,7 +456,23 @@ pub fn rms_norm<'b, 'a>(
         );
     }
 
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        crate::kernels::wasm::norm::rms_norm(
+            input.data.as_ptr(),
+            weight.data.as_ptr(),
+            out_slice.as_mut_ptr(),
+            norm_size,
+            outer_size,
+            epsilon,
+        );
+    }
+
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "wasm32"
+    )))]
     {
         let src = &input.data;
         let w = &weight.data;

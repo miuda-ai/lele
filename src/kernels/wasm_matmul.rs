@@ -252,12 +252,16 @@ unsafe fn matmul_simd_tiled(
     let mut acc_raw: *mut f32 = std::ptr::null_mut();
     B_PACK_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
-        if buf.len() < b_pack_size { buf.resize(b_pack_size, 0.0); }
+        if buf.len() < b_pack_size {
+            buf.resize(b_pack_size, 0.0);
+        }
         b_pack_raw = buf.as_mut_ptr();
     });
     ACC_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
-        if buf.len() < acc_buf_size { buf.resize(acc_buf_size, 0.0); }
+        if buf.len() < acc_buf_size {
+            buf.resize(acc_buf_size, 0.0);
+        }
         acc_raw = buf.as_mut_ptr();
     });
     let b_pack_ptr: *mut f32 = b_pack_raw;
@@ -276,7 +280,7 @@ unsafe fn matmul_simd_tiled(
         while kk < k {
             let kb = KC.min(k - kk);
             let is_first_kk = kk_panel == 0;
-            let is_last_kk  = kk_panel == num_kk - 1;
+            let is_last_kk = kk_panel == num_kk - 1;
 
             // Pack B sub-panel: B[kk:kk+kb, jj:jj+nb] → b_pack[0..kb*NC]
             for p in 0..kb {
@@ -306,22 +310,22 @@ unsafe fn matmul_simd_tiled(
                             let zero = f32x4_splat(0.0);
                             let mut ji = 0;
                             while ji + 16 <= nb {
-                                v128_store(acc_row.add(ji     ) as *mut v128, zero);
-                                v128_store(acc_row.add(ji +  4) as *mut v128, zero);
-                                v128_store(acc_row.add(ji +  8) as *mut v128, zero);
+                                v128_store(acc_row.add(ji) as *mut v128, zero);
+                                v128_store(acc_row.add(ji + 4) as *mut v128, zero);
+                                v128_store(acc_row.add(ji + 8) as *mut v128, zero);
                                 v128_store(acc_row.add(ji + 12) as *mut v128, zero);
-                                v128_store(acc_row.add(ji      + NC) as *mut v128, zero);
-                                v128_store(acc_row.add(ji +  4 + NC) as *mut v128, zero);
-                                v128_store(acc_row.add(ji +  8 + NC) as *mut v128, zero);
+                                v128_store(acc_row.add(ji + NC) as *mut v128, zero);
+                                v128_store(acc_row.add(ji + 4 + NC) as *mut v128, zero);
+                                v128_store(acc_row.add(ji + 8 + NC) as *mut v128, zero);
                                 v128_store(acc_row.add(ji + 12 + NC) as *mut v128, zero);
-                                v128_store(acc_row.add(ji      + 2*NC) as *mut v128, zero);
-                                v128_store(acc_row.add(ji +  4 + 2*NC) as *mut v128, zero);
-                                v128_store(acc_row.add(ji +  8 + 2*NC) as *mut v128, zero);
-                                v128_store(acc_row.add(ji + 12 + 2*NC) as *mut v128, zero);
-                                v128_store(acc_row.add(ji      + 3*NC) as *mut v128, zero);
-                                v128_store(acc_row.add(ji +  4 + 3*NC) as *mut v128, zero);
-                                v128_store(acc_row.add(ji +  8 + 3*NC) as *mut v128, zero);
-                                v128_store(acc_row.add(ji + 12 + 3*NC) as *mut v128, zero);
+                                v128_store(acc_row.add(ji + 2 * NC) as *mut v128, zero);
+                                v128_store(acc_row.add(ji + 4 + 2 * NC) as *mut v128, zero);
+                                v128_store(acc_row.add(ji + 8 + 2 * NC) as *mut v128, zero);
+                                v128_store(acc_row.add(ji + 12 + 2 * NC) as *mut v128, zero);
+                                v128_store(acc_row.add(ji + 3 * NC) as *mut v128, zero);
+                                v128_store(acc_row.add(ji + 4 + 3 * NC) as *mut v128, zero);
+                                v128_store(acc_row.add(ji + 8 + 3 * NC) as *mut v128, zero);
+                                v128_store(acc_row.add(ji + 12 + 3 * NC) as *mut v128, zero);
                                 ji += 16;
                             }
                             while ji + 4 <= nb {
@@ -331,18 +335,24 @@ unsafe fn matmul_simd_tiled(
                                 ji += 4;
                             }
                             while ji < nb {
-                                for r in 0..MR { *acc_row.add(ji + r * NC) = 0.0; }
+                                for r in 0..MR {
+                                    *acc_row.add(ji + r * NC) = 0.0;
+                                }
                                 ji += 1;
                             }
                         }
 
                         // Accumulate into acc (loaded from acc, add A*B, store to acc)
                         micro_kernel_4r_packed(
-                            nb, kb,
+                            nb,
+                            kb,
                             a_row_base.add(ir * a_rs), // A[ir, kk]
                             b_packed,
-                            acc_row,   // acc row stride = NC
-                            a_rs, NC, NC, alpha,
+                            acc_row, // acc row stride = NC
+                            a_rs,
+                            NC,
+                            NC,
+                            alpha,
                         );
 
                         if is_last_kk {
@@ -387,7 +397,10 @@ unsafe fn matmul_simd_tiled(
                                     v128_store(row.add(ji) as *mut v128, f32x4_splat(0.0));
                                     ji += 4;
                                 }
-                                while ji < nb { *row.add(ji) = 0.0; ji += 1; }
+                                while ji < nb {
+                                    *row.add(ji) = 0.0;
+                                    ji += 1;
+                                }
                             }
                         }
                         for r in 0..rows_left {
@@ -395,15 +408,19 @@ unsafe fn matmul_simd_tiled(
                             let a_row_r = a_row_base.add((ir + r) * a_rs);
                             for p in 0..kb {
                                 let av = *a_row_r.add(p) * alpha;
-                                if av == 0.0 { continue; }
+                                if av == 0.0 {
+                                    continue;
+                                }
                                 let b_row = b_packed.add(p * NC);
                                 let av_v = f32x4_splat(av);
                                 let mut ji = 0;
                                 while ji + 4 <= nb {
                                     let cv = v128_load(c_r.add(ji) as *const v128);
                                     let bv = v128_load(b_row.add(ji) as *const v128);
-                                    v128_store(c_r.add(ji) as *mut v128,
-                                        f32x4_add(cv, f32x4_mul(av_v, bv)));
+                                    v128_store(
+                                        c_r.add(ji) as *mut v128,
+                                        f32x4_add(cv, f32x4_mul(av_v, bv)),
+                                    );
                                     ji += 4;
                                 }
                                 while ji < nb {
@@ -436,12 +453,12 @@ unsafe fn matmul_simd_tiled(
 unsafe fn micro_kernel_4r_packed(
     nb: usize,
     kb: usize,
-    a: *const f32,  // A rows (direct, stride = a_rs)
-    b: *const f32,  // packed B: kb rows × NC cols (b_rs_packed = NC)
-    c: *mut f32,    // output C: 4 rows × nb, stride = c_rs
-    a_rs: usize,    // A row stride (== k, weight matrix width)
-    b_rs: usize,    // = NC (packed)
-    c_rs: usize,    // output stride
+    a: *const f32, // A rows (direct, stride = a_rs)
+    b: *const f32, // packed B: kb rows × NC cols (b_rs_packed = NC)
+    c: *mut f32,   // output C: 4 rows × nb, stride = c_rs
+    a_rs: usize,   // A row stride (== k, weight matrix width)
+    b_rs: usize,   // = NC (packed)
+    c_rs: usize,   // output stride
     alpha: f32,
 ) {
     let a0 = a;
@@ -459,24 +476,24 @@ unsafe fn micro_kernel_4r_packed(
     // ── 16-col unrolled loop (4 SIMD f32x4 per row) ──────────────────────────
     while j + NR <= nb {
         // Load 4×4 accumulator (current C values)
-        let mut r00 = v128_load(c0.add(j     ) as *const v128);
-        let mut r01 = v128_load(c0.add(j +  4) as *const v128);
-        let mut r02 = v128_load(c0.add(j +  8) as *const v128);
+        let mut r00 = v128_load(c0.add(j) as *const v128);
+        let mut r01 = v128_load(c0.add(j + 4) as *const v128);
+        let mut r02 = v128_load(c0.add(j + 8) as *const v128);
         let mut r03 = v128_load(c0.add(j + 12) as *const v128);
 
-        let mut r10 = v128_load(c1.add(j     ) as *const v128);
-        let mut r11 = v128_load(c1.add(j +  4) as *const v128);
-        let mut r12 = v128_load(c1.add(j +  8) as *const v128);
+        let mut r10 = v128_load(c1.add(j) as *const v128);
+        let mut r11 = v128_load(c1.add(j + 4) as *const v128);
+        let mut r12 = v128_load(c1.add(j + 8) as *const v128);
         let mut r13 = v128_load(c1.add(j + 12) as *const v128);
 
-        let mut r20 = v128_load(c2.add(j     ) as *const v128);
-        let mut r21 = v128_load(c2.add(j +  4) as *const v128);
-        let mut r22 = v128_load(c2.add(j +  8) as *const v128);
+        let mut r20 = v128_load(c2.add(j) as *const v128);
+        let mut r21 = v128_load(c2.add(j + 4) as *const v128);
+        let mut r22 = v128_load(c2.add(j + 8) as *const v128);
         let mut r23 = v128_load(c2.add(j + 12) as *const v128);
 
-        let mut r30 = v128_load(c3.add(j     ) as *const v128);
-        let mut r31 = v128_load(c3.add(j +  4) as *const v128);
-        let mut r32 = v128_load(c3.add(j +  8) as *const v128);
+        let mut r30 = v128_load(c3.add(j) as *const v128);
+        let mut r31 = v128_load(c3.add(j + 4) as *const v128);
+        let mut r32 = v128_load(c3.add(j + 8) as *const v128);
         let mut r33 = v128_load(c3.add(j + 12) as *const v128);
 
         // K accumulation – B is contiguous (packed), b.add(p*NC+j) is sequential
@@ -485,9 +502,9 @@ unsafe fn micro_kernel_4r_packed(
         if alpha == 1.0 {
             while p < kb {
                 let b_row = b.add(p * b_rs + j);
-                let bv0 = v128_load(b_row        as *const v128);
-                let bv1 = v128_load(b_row.add( 4) as *const v128);
-                let bv2 = v128_load(b_row.add( 8) as *const v128);
+                let bv0 = v128_load(b_row as *const v128);
+                let bv1 = v128_load(b_row.add(4) as *const v128);
+                let bv2 = v128_load(b_row.add(8) as *const v128);
                 let bv3 = v128_load(b_row.add(12) as *const v128);
 
                 let s0 = f32x4_splat(*a0.add(p));
@@ -495,34 +512,34 @@ unsafe fn micro_kernel_4r_packed(
                 let s2 = f32x4_splat(*a2.add(p));
                 let s3 = f32x4_splat(*a3.add(p));
 
-                r00 = f32x4_add(r00, f32x4_mul(s0, bv0));
-                r01 = f32x4_add(r01, f32x4_mul(s0, bv1));
-                r02 = f32x4_add(r02, f32x4_mul(s0, bv2));
-                r03 = f32x4_add(r03, f32x4_mul(s0, bv3));
+                r00 = fmadd(s0, bv0, r00);
+                r01 = fmadd(s0, bv1, r01);
+                r02 = fmadd(s0, bv2, r02);
+                r03 = fmadd(s0, bv3, r03);
 
-                r10 = f32x4_add(r10, f32x4_mul(s1, bv0));
-                r11 = f32x4_add(r11, f32x4_mul(s1, bv1));
-                r12 = f32x4_add(r12, f32x4_mul(s1, bv2));
-                r13 = f32x4_add(r13, f32x4_mul(s1, bv3));
+                r10 = fmadd(s1, bv0, r10);
+                r11 = fmadd(s1, bv1, r11);
+                r12 = fmadd(s1, bv2, r12);
+                r13 = fmadd(s1, bv3, r13);
 
-                r20 = f32x4_add(r20, f32x4_mul(s2, bv0));
-                r21 = f32x4_add(r21, f32x4_mul(s2, bv1));
-                r22 = f32x4_add(r22, f32x4_mul(s2, bv2));
-                r23 = f32x4_add(r23, f32x4_mul(s2, bv3));
+                r20 = fmadd(s2, bv0, r20);
+                r21 = fmadd(s2, bv1, r21);
+                r22 = fmadd(s2, bv2, r22);
+                r23 = fmadd(s2, bv3, r23);
 
-                r30 = f32x4_add(r30, f32x4_mul(s3, bv0));
-                r31 = f32x4_add(r31, f32x4_mul(s3, bv1));
-                r32 = f32x4_add(r32, f32x4_mul(s3, bv2));
-                r33 = f32x4_add(r33, f32x4_mul(s3, bv3));
+                r30 = fmadd(s3, bv0, r30);
+                r31 = fmadd(s3, bv1, r31);
+                r32 = fmadd(s3, bv2, r32);
+                r33 = fmadd(s3, bv3, r33);
 
                 p += 1;
             }
         } else {
             while p < kb {
                 let b_row = b.add(p * b_rs + j);
-                let bv0 = v128_load(b_row        as *const v128);
-                let bv1 = v128_load(b_row.add( 4) as *const v128);
-                let bv2 = v128_load(b_row.add( 8) as *const v128);
+                let bv0 = v128_load(b_row as *const v128);
+                let bv1 = v128_load(b_row.add(4) as *const v128);
+                let bv2 = v128_load(b_row.add(8) as *const v128);
                 let bv3 = v128_load(b_row.add(12) as *const v128);
 
                 let s0 = f32x4_splat(*a0.add(p) * alpha);
@@ -530,48 +547,48 @@ unsafe fn micro_kernel_4r_packed(
                 let s2 = f32x4_splat(*a2.add(p) * alpha);
                 let s3 = f32x4_splat(*a3.add(p) * alpha);
 
-                r00 = f32x4_add(r00, f32x4_mul(s0, bv0));
-                r01 = f32x4_add(r01, f32x4_mul(s0, bv1));
-                r02 = f32x4_add(r02, f32x4_mul(s0, bv2));
-                r03 = f32x4_add(r03, f32x4_mul(s0, bv3));
+                r00 = fmadd(s0, bv0, r00);
+                r01 = fmadd(s0, bv1, r01);
+                r02 = fmadd(s0, bv2, r02);
+                r03 = fmadd(s0, bv3, r03);
 
-                r10 = f32x4_add(r10, f32x4_mul(s1, bv0));
-                r11 = f32x4_add(r11, f32x4_mul(s1, bv1));
-                r12 = f32x4_add(r12, f32x4_mul(s1, bv2));
-                r13 = f32x4_add(r13, f32x4_mul(s1, bv3));
+                r10 = fmadd(s1, bv0, r10);
+                r11 = fmadd(s1, bv1, r11);
+                r12 = fmadd(s1, bv2, r12);
+                r13 = fmadd(s1, bv3, r13);
 
-                r20 = f32x4_add(r20, f32x4_mul(s2, bv0));
-                r21 = f32x4_add(r21, f32x4_mul(s2, bv1));
-                r22 = f32x4_add(r22, f32x4_mul(s2, bv2));
-                r23 = f32x4_add(r23, f32x4_mul(s2, bv3));
+                r20 = fmadd(s2, bv0, r20);
+                r21 = fmadd(s2, bv1, r21);
+                r22 = fmadd(s2, bv2, r22);
+                r23 = fmadd(s2, bv3, r23);
 
-                r30 = f32x4_add(r30, f32x4_mul(s3, bv0));
-                r31 = f32x4_add(r31, f32x4_mul(s3, bv1));
-                r32 = f32x4_add(r32, f32x4_mul(s3, bv2));
-                r33 = f32x4_add(r33, f32x4_mul(s3, bv3));
+                r30 = fmadd(s3, bv0, r30);
+                r31 = fmadd(s3, bv1, r31);
+                r32 = fmadd(s3, bv2, r32);
+                r33 = fmadd(s3, bv3, r33);
 
                 p += 1;
             }
         } // end if alpha == 1.0
 
-        v128_store(c0.add(j     ) as *mut v128, r00);
-        v128_store(c0.add(j +  4) as *mut v128, r01);
-        v128_store(c0.add(j +  8) as *mut v128, r02);
+        v128_store(c0.add(j) as *mut v128, r00);
+        v128_store(c0.add(j + 4) as *mut v128, r01);
+        v128_store(c0.add(j + 8) as *mut v128, r02);
         v128_store(c0.add(j + 12) as *mut v128, r03);
 
-        v128_store(c1.add(j     ) as *mut v128, r10);
-        v128_store(c1.add(j +  4) as *mut v128, r11);
-        v128_store(c1.add(j +  8) as *mut v128, r12);
+        v128_store(c1.add(j) as *mut v128, r10);
+        v128_store(c1.add(j + 4) as *mut v128, r11);
+        v128_store(c1.add(j + 8) as *mut v128, r12);
         v128_store(c1.add(j + 12) as *mut v128, r13);
 
-        v128_store(c2.add(j     ) as *mut v128, r20);
-        v128_store(c2.add(j +  4) as *mut v128, r21);
-        v128_store(c2.add(j +  8) as *mut v128, r22);
+        v128_store(c2.add(j) as *mut v128, r20);
+        v128_store(c2.add(j + 4) as *mut v128, r21);
+        v128_store(c2.add(j + 8) as *mut v128, r22);
         v128_store(c2.add(j + 12) as *mut v128, r23);
 
-        v128_store(c3.add(j     ) as *mut v128, r30);
-        v128_store(c3.add(j +  4) as *mut v128, r31);
-        v128_store(c3.add(j +  8) as *mut v128, r32);
+        v128_store(c3.add(j) as *mut v128, r30);
+        v128_store(c3.add(j + 4) as *mut v128, r31);
+        v128_store(c3.add(j + 8) as *mut v128, r32);
         v128_store(c3.add(j + 12) as *mut v128, r33);
 
         j += NR;
@@ -584,12 +601,22 @@ unsafe fn micro_kernel_4r_packed(
         let mut r2 = v128_load(c2.add(j) as *const v128);
         let mut r3 = v128_load(c3.add(j) as *const v128);
 
-        for p in 0..kb {
-            let bv = v128_load(b.add(p * b_rs + j) as *const v128);
-            r0 = f32x4_add(r0, f32x4_mul(f32x4_splat(*a0.add(p) * alpha), bv));
-            r1 = f32x4_add(r1, f32x4_mul(f32x4_splat(*a1.add(p) * alpha), bv));
-            r2 = f32x4_add(r2, f32x4_mul(f32x4_splat(*a2.add(p) * alpha), bv));
-            r3 = f32x4_add(r3, f32x4_mul(f32x4_splat(*a3.add(p) * alpha), bv));
+        if alpha == 1.0 {
+            for p in 0..kb {
+                let bv = v128_load(b.add(p * b_rs + j) as *const v128);
+                r0 = fmadd(f32x4_splat(*a0.add(p)), bv, r0);
+                r1 = fmadd(f32x4_splat(*a1.add(p)), bv, r1);
+                r2 = fmadd(f32x4_splat(*a2.add(p)), bv, r2);
+                r3 = fmadd(f32x4_splat(*a3.add(p)), bv, r3);
+            }
+        } else {
+            for p in 0..kb {
+                let bv = v128_load(b.add(p * b_rs + j) as *const v128);
+                r0 = fmadd(f32x4_splat(*a0.add(p) * alpha), bv, r0);
+                r1 = fmadd(f32x4_splat(*a1.add(p) * alpha), bv, r1);
+                r2 = fmadd(f32x4_splat(*a2.add(p) * alpha), bv, r2);
+                r3 = fmadd(f32x4_splat(*a3.add(p) * alpha), bv, r3);
+            }
         }
 
         v128_store(c0.add(j) as *mut v128, r0);
@@ -602,18 +629,48 @@ unsafe fn micro_kernel_4r_packed(
 
     // ── scalar tail ──────────────────────────────────────────────────────────
     while j < nb {
-        for p in 0..kb {
-            let av0 = *a0.add(p) * alpha;
-            let av1 = *a1.add(p) * alpha;
-            let av2 = *a2.add(p) * alpha;
-            let av3 = *a3.add(p) * alpha;
-            let bv = *b.add(p * b_rs + j);
-            *c0.add(j) += av0 * bv;
-            *c1.add(j) += av1 * bv;
-            *c2.add(j) += av2 * bv;
-            *c3.add(j) += av3 * bv;
+        if alpha == 1.0 {
+            for p in 0..kb {
+                let av0 = *a0.add(p);
+                let av1 = *a1.add(p);
+                let av2 = *a2.add(p);
+                let av3 = *a3.add(p);
+                let bv = *b.add(p * b_rs + j);
+                *c0.add(j) += av0 * bv;
+                *c1.add(j) += av1 * bv;
+                *c2.add(j) += av2 * bv;
+                *c3.add(j) += av3 * bv;
+            }
+        } else {
+            for p in 0..kb {
+                let av0 = *a0.add(p) * alpha;
+                let av1 = *a1.add(p) * alpha;
+                let av2 = *a2.add(p) * alpha;
+                let av3 = *a3.add(p) * alpha;
+                let bv = *b.add(p * b_rs + j);
+                *c0.add(j) += av0 * bv;
+                *c1.add(j) += av1 * bv;
+                *c2.add(j) += av2 * bv;
+                *c3.add(j) += av3 * bv;
+            }
         }
         j += 1;
+    }
+}
+
+/// FMA helper: computes a*b + acc using relaxed FMA when available.
+/// Falls back to separate mul+add on platforms without relaxed-simd.
+/// Maps to ARM FMLA on Apple Silicon = 1 cycle vs 2 for mul+add.
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+unsafe fn fmadd(a: v128, b: v128, acc: v128) -> v128 {
+    #[cfg(target_feature = "relaxed-simd")]
+    {
+        f32x4_relaxed_madd(a, b, acc)
+    }
+    #[cfg(not(target_feature = "relaxed-simd"))]
+    {
+        f32x4_add(acc, f32x4_mul(a, b))
     }
 }
 

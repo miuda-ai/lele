@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Lele WASM Benchmark</title>
+    <style>
+        body {
+            font-family: monospace;
+            background: #1a1a1a;
+            color: #e0e0e0;
+            padding: 20px;
+        }
+
+        #log {
+            white-space: pre;
+            line-height: 1.5;
+        }
+
+        .ok {
+            color: #4ade80;
+        }
+
+        .err {
+            color: #f87171;
+        }
+
+        .dim {
+            color: #6b7280;
+        }
+
+        .bold {
+            font-weight: bold;
+            color: #facc15;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="log"><span class="dim">Initializing benchmarks...</span>
+    </div>
+    <script type="module" src="./bench.js"></script>
+</body>
+
+</html>

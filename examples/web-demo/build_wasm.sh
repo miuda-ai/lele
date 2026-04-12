@@ -6,7 +6,8 @@ set -euo pipefail
 # Builds 3 separate WASM modules:
 #   1. sensevoice-wasm  (ASR)
 #   2. yolo26-wasm      (Object Detection)
-#   3. supertonic-wasm  (TTS)
+#   3. yolo26n-seg-wasm (Instance Segmentation)
+#   4. supertonic-wasm  (TTS)
 # ─────────────────────────────────────────────
 # Prerequisites:
 #   cargo install wasm-pack
@@ -54,6 +55,7 @@ build_module() {
 
 build_module "sensevoice-wasm"
 build_module "yolo26-wasm"
+build_module "yolo26n-seg-wasm"
 build_module "supertonic-wasm"
 
 # ── Copy model weights ──
@@ -85,6 +87,11 @@ copy_if_exists "$PROJECT_ROOT/examples/yolo26/src/yolo26_weights.bin" "$MODELS_D
 copy_if_exists "$CRATES_DIR/yolo26-wasm/src/gen/yolo26_weights.bin" "$MODELS_DIR/" "yolo26_weights.bin (from gen)" || \
 echo "⚠ yolo26_weights.bin not found"
 
+# YOLO26n-Seg
+copy_if_exists "$PROJECT_ROOT/examples/yolo26n-seg/src/yolo26seg_weights.bin" "$MODELS_DIR/" "yolo26seg_weights.bin" || \
+copy_if_exists "$CRATES_DIR/yolo26n-seg-wasm/src/gen/yolo26seg_weights.bin" "$MODELS_DIR/" "yolo26seg_weights.bin (from gen)" || \
+echo "⚠ yolo26seg_weights.bin not found"
+
 # Supertonic weights
 for model in textencoder durationpredictor vectorestimator vocoder; do
     copy_if_exists "$PROJECT_ROOT/examples/supertonic/src/${model}_weights.bin" "$MODELS_DIR/" "${model}_weights.bin" || \
@@ -108,7 +115,7 @@ echo "⚠ M1.json not found"
 # ── Summary ──
 echo ""
 echo "=== WASM Module Sizes ==="
-for name in sensevoice-wasm yolo26-wasm supertonic-wasm; do
+for name in sensevoice-wasm yolo26-wasm yolo26n-seg-wasm supertonic-wasm; do
     wasm_file="$WEB_DIR/pkg/$name/${name//-/_}_bg.wasm"
     if [ -f "$wasm_file" ]; then
         size=$(ls -lh "$wasm_file" | awk '{print $5}')

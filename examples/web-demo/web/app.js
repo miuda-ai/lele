@@ -13,6 +13,10 @@ import initYolo26, {
     Yolo26Engine,
 } from './pkg/yolo26-wasm/yolo26_wasm.js';
 
+import initYolo26NSeg, {
+    Yolo26NSegEngine,
+} from './pkg/yolo26n-seg-wasm/yolo26n_seg_wasm.js';
+
 import initSupertonic, {
     SupertonicEngine,
     encode_wav,
@@ -21,12 +25,14 @@ import initSupertonic, {
 // ── State ──
 let asrEngine = null;
 let yoloEngine = null;
+let yoloSegEngine = null;
 let ttsEngine = null;
 let asrAudioData = null;
 let asrSampleRate = null;
 let detectImageData = null;
 let detectImageWidth = null;
 let detectImageHeight = null;
+let detectModelKey = 'yolo26';
 
 // ── Base URL for model files (can be overridden) ──
 const MODEL_BASE = './models/';
@@ -59,6 +65,7 @@ const modelStats = {
     sensevoice: { wasm: null, bin: null, rtf: null, rtfLabel: '' },
     supertonic: { wasm: null, bin: null, rtf: null, rtfLabel: '' },
     yolo26: { wasm: null, bin: null, rtf: null, rtfLabel: '' },
+    yolo26nseg: { wasm: null, bin: null, rtf: null, rtfLabel: '' },
 };
 
 function updateStatsTable() {
@@ -306,17 +313,7 @@ document.getElementById('tts-run').addEventListener('click', () => {
 // ─────────────────────────────────────────────
 async function initDetection() {
     try {
-        setStatus('detect-status', '⏳ Downloading model weights...');
-        const weights = await fetchModel('yolo26_weights.bin');
-
-        modelStats.yolo26.bin = weights.length;
-        updateStatsTable();
-        document.getElementById('detect-model-size').textContent = formatBytes(weights.length);
-        setStatus('detect-status', '⏳ Initializing model...');
-
-        yoloEngine = new Yolo26Engine(weights);
-
-        setStatus('detect-status', '✅ Model ready', 'ready');
+        await ensureDetectionEngine(detectModelKey);
         document.getElementById('detect-file').disabled = false;
         document.getElementById('detect-upload-label').style.opacity = '1';
     } catch (e) {
@@ -324,6 +321,44 @@ async function initDetection() {
         console.error('Detection init error:', e);
     }
 }
+
+async function ensureDetectionEngine(modelKey) {
+    if (modelKey === 'yolo26') {
+        if (!yoloEngine) {
+            setStatus('detect-status', '⏳ Loading YOLO26 WASM module...');
+            await initYolo26();
+            setStatus('detect-status', '⏳ Downloading YOLO26 weights...');
+            const weights = await fetchModel('yolo26_weights.bin');
+            yoloEngine = new Yolo26Engine(weights);
+            modelStats.yolo26.bin = weights.length;
+            updateStatsTable();
+        }
+        document.getElementById('detect-model-size').textContent = formatBytes(modelStats.yolo26.bin || 0);
+        setStatus('detect-status', '✅ YOLO26 ready', 'ready');
+        return;
+    }
+
+    if (!yoloSegEngine) {
+        setStatus('detect-status', '⏳ Loading YOLO26n-Seg WASM module...');
+        await initYolo26NSeg();
+        setStatus('detect-status', '⏳ Downloading YOLO26n-Seg weights...');
+        const weights = await fetchModel('yolo26seg_weights.bin');
+        yoloSegEngine = new Yolo26NSegEngine(weights);
+        modelStats.yolo26nseg.bin = weights.length;
+        updateStatsTable();
+    }
+    document.getElementById('detect-model-size').textContent = formatBytes(modelStats.yolo26nseg.bin || 0);
+    setStatus('detect-status', '✅ YOLO26n-Seg ready', 'ready');
+}
+
+document.getElementById('detect-model').addEventListener('change', async (e) => {
+    detectModelKey = e.target.value;
+    try {
+        await ensureDetectionEngine(detectModelKey);
+    } catch (err) {
+        setStatus('detect-status', '❌ Failed to switch model: ' + err.message, 'error');
+    }
+});
 
 document.getElementById('detect-file').addEventListener('change', async (e) => {
     const file = e.target.files[0];
@@ -354,24 +389,31 @@ document.getElementById('detect-file').addEventListener('change', async (e) => {
 });
 
 document.getElementById('detect-run').addEventListener('click', () => {
-    if (!yoloEngine || !detectImageData) return;
+    if (!detectImageData) return;
 
     const btn = document.getElementById('detect-run');
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span>Detecting...';
 
-    setTimeout(() => {
+    setTimeout(async () => {
         try {
+            await ensureDetectionEngine(detectModelKey);
+
             const start = performance.now();
-            const resultJson = yoloEngine.detect(
-                detectImageData,
-                detectImageWidth,
-                detectImageHeight,
-                0.3
-            );
+            const resultJson = detectModelKey === 'yolo26'
+                ? yoloEngine.detect(detectImageData, detectImageWidth, detectImageHeight, 0.3)
+                : yoloSegEngine.segment(detectImageData, detectImageWidth, detectImageHeight, 0.3);
             const elapsed = performance.now() - start;
 
-            const detections = JSON.parse(resultJson);
+            const result = JSON.parse(resultJson);
+            const detections = Array.isArray(result) ? result : (result.detections || []);
+            const segMask = Array.isArray(result)
+                ? null
+                : {
+                    data: result.mask || [],
+                    width: result.mask_width || detectImageWidth,
+                    height: result.mask_height || detectImageHeight,
+                };
 
             // Draw detections on canvas
             const canvas = document.getElementById('detect-canvas');
@@ -382,6 +424,9 @@ document.getElementById('detect-run').addEventListener('click', () => {
             const img = new Image();
             img.onload = () => {
                 ctx.drawImage(img, 0, 0);
+                if (segMask) {
+                    drawSegmentationMask(ctx, segMask, detectImageWidth, detectImageHeight);
+                }
                 drawDetections(ctx, detections);
             };
             img.src = URL.createObjectURL(file);
@@ -401,8 +446,13 @@ document.getElementById('detect-run').addEventListener('click', () => {
             }
 
             const fps = 1000 / elapsed;
-            modelStats.yolo26.rtf = elapsed;
-            modelStats.yolo26.rtfLabel = `${elapsed.toFixed(0)}ms (${fps.toFixed(1)} fps)`;
+            if (detectModelKey === 'yolo26') {
+                modelStats.yolo26.rtf = elapsed;
+                modelStats.yolo26.rtfLabel = `${elapsed.toFixed(0)}ms (${fps.toFixed(1)} fps)`;
+            } else {
+                modelStats.yolo26nseg.rtf = elapsed;
+                modelStats.yolo26nseg.rtfLabel = `${elapsed.toFixed(0)}ms (${fps.toFixed(1)} fps)`;
+            }
             updateStatsTable();
 
             document.getElementById('detect-timing').textContent =
@@ -417,6 +467,30 @@ document.getElementById('detect-run').addEventListener('click', () => {
     }, 50);
 });
 
+function drawSegmentationMask(ctx, mask, imageWidth, imageHeight) {
+    if (!mask || !Array.isArray(mask.data) || mask.data.length === 0) return;
+
+    const srcW = mask.width;
+    const srcH = mask.height;
+    const overlay = ctx.createImageData(imageWidth, imageHeight);
+
+    for (let y = 0; y < imageHeight; y++) {
+        for (let x = 0; x < imageWidth; x++) {
+            const sx = Math.min(Math.floor((x + 0.5) * srcW / imageWidth), srcW - 1);
+            const sy = Math.min(Math.floor((y + 0.5) * srcH / imageHeight), srcH - 1);
+            const on = mask.data[sy * srcW + sx] > 0;
+            if (!on) continue;
+            const idx = (y * imageWidth + x) * 4;
+            overlay.data[idx] = 0;
+            overlay.data[idx + 1] = 200;
+            overlay.data[idx + 2] = 255;
+            overlay.data[idx + 3] = 70;
+        }
+    }
+
+    ctx.putImageData(overlay, 0, 0);
+}
+
 function drawDetections(ctx, detections) {
     const colors = [
         '#ef4444', '#f97316', '#f59e0b', '#22c55e', '#06b6d4',
@@ -424,7 +498,8 @@ function drawDetections(ctx, detections) {
     ];
 
     detections.forEach((det, i) => {
-        const color = colors[det.class_id % colors.length];
+        const classIdx = Number.isInteger(det.class_id) ? det.class_id : i;
+        const color = colors[classIdx % colors.length];
         const [x1, y1, x2, y2] = det.bbox;
 
         // Draw box
@@ -475,13 +550,11 @@ async function initAndLoadTTS() {
 
 async function initAndLoadDetection() {
     try {
-        setStatus('detect-status', '⏳ Loading WASM module...');
-        await initYolo26();
-        console.log('YOLO26 WASM loaded');
+        setStatus('detect-status', '⏳ Initializing detection models...');
         await initDetection();
     } catch (e) {
         setStatus('detect-status', '❌ Failed to load WASM: ' + e.message, 'error');
-        console.error('YOLO26 WASM error:', e);
+        console.error('Detection WASM error:', e);
     }
 }
 
@@ -504,10 +577,12 @@ async function main() {
         getWasmSize('./pkg/sensevoice-wasm/sensevoice_wasm_bg.wasm'),
         getWasmSize('./pkg/supertonic-wasm/supertonic_wasm_bg.wasm'),
         getWasmSize('./pkg/yolo26-wasm/yolo26_wasm_bg.wasm'),
-    ]).then(([svSize, stSize, yoloSize]) => {
+        getWasmSize('./pkg/yolo26n-seg-wasm/yolo26n_seg_wasm_bg.wasm'),
+    ]).then(([svSize, stSize, yoloSize, yoloSegSize]) => {
         if (svSize) modelStats.sensevoice.wasm = svSize;
         if (stSize) modelStats.supertonic.wasm = stSize;
         if (yoloSize) modelStats.yolo26.wasm = yoloSize;
+        if (yoloSegSize) modelStats.yolo26nseg.wasm = yoloSegSize;
         updateStatsTable();
     });
 
