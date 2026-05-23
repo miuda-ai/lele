@@ -1,0 +1,72 @@
+[model]
+source = "hf-hub"
+repo = "Supertone/supertonic-3"
+revision = "main"
+
+[[model.files]]
+file = "onnx/text_encoder.onnx"
+dest = "text_encoder.onnx"
+
+[[model.files]]
+file = "onnx/duration_predictor.onnx"
+dest = "duration_predictor.onnx"
+
+[[model.files]]
+file = "onnx/vector_estimator.onnx"
+dest = "vector_estimator.onnx"
+
+[[model.files]]
+file = "onnx/vocoder.onnx"
+dest = "vocoder.onnx"
+
+[[model.files]]
+file = "onnx/tts.json"
+dest = "onnx/tts.json"
+
+[[model.files]]
+file = "onnx/unicode_indexer.json"
+dest = "onnx/unicode_indexer.json"
+
+[[model.files]]
+file = "voice_styles/M1.json"
+dest = "voice_styles/M1.json"
+
+[[model.files]]
+file = "voice_styles/M2.json"
+dest = "voice_styles/M2.json"
+
+[[model.files]]
+file = "voice_styles/M3.json"
+dest = "voice_styles/M3.json"
+
+[[model.files]]
+file = "voice_styles/M4.json"
+dest = "voice_styles/M4.json"
+
+[[model.files]]
+file = "voice_styles/M5.json"
+dest = "voice_styles/M5.json"
+
+[[model.files]]
+file = "voice_styles/F1.json"
+dest = "voice_styles/F1.json"
+
+[[model.files]]
+file = "voice_styles/F2.json"
+dest = "voice_styles/F2.json"
+
+[[model.files]]
+file = "voice_styles/F3.json"
+dest = "voice_styles/F3.json"
+
+[[model.files]]
+file = "voice_styles/F4.json"
+dest = "voice_styles/F4.json"
+
+[[model.files]]
+file = "voice_styles/F5.json"
+dest = "voice_styles/F5.json"
+
+[codegen]
+class_name = "Supertonic"
+custom_methods = []

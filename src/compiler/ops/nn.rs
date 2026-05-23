@@ -160,6 +160,73 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 outputs[0]
             )?;
         }
+        "GRU" => {
+            let bias = if inputs.len() > 3 && !ctx.node.input[3].is_empty() {
+                format!("Some(&{})", inputs[3])
+            } else {
+                "None".to_string()
+            };
+            let initial_h = if inputs.len() > 5 && !ctx.node.input[5].is_empty() {
+                format!("Some(&{})", inputs[5])
+            } else {
+                "None".to_string()
+            };
+            let linear_before_reset = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "linear_before_reset")
+                .map(|a| a.i)
+                .unwrap_or(0)
+                != 0;
+            writeln!(
+                w,
+                "{}let mut buf_{}_h = Vec::<f32>::new();",
+                tab, outputs[0]
+            )?;
+            if outputs.len() >= 2 {
+                writeln!(
+                    w,
+                    "{}let mut buf_{} = Vec::<f32>::new();",
+                    tab, outputs[0]
+                )?;
+                writeln!(
+                    w,
+                    "{}let ({}, {}) = lele::kernels::gru(&{}, &{}, &{}, {}, {}, {}, &mut buf_{}, &mut buf_{}_h);",
+                    tab,
+                    outputs[0],
+                    outputs[1],
+                    inputs[0],
+                    inputs[1],
+                    inputs[2],
+                    bias,
+                    initial_h,
+                    linear_before_reset,
+                    outputs[0],
+                    outputs[0]
+                )?;
+            } else {
+                writeln!(
+                    w,
+                    "{}let mut buf_{} = Vec::<f32>::new();",
+                    tab, outputs[0]
+                )?;
+                writeln!(
+                    w,
+                    "{}let ({}, _) = lele::kernels::gru(&{}, &{}, &{}, {}, {}, {}, &mut buf_{}, &mut buf_{}_h);",
+                    tab,
+                    outputs[0],
+                    inputs[0],
+                    inputs[1],
+                    inputs[2],
+                    bias,
+                    initial_h,
+                    linear_before_reset,
+                    outputs[0],
+                    outputs[0]
+                )?;
+            }
+        }
         "LayerNormalization" => {
             let epsilon = ctx
                 .node

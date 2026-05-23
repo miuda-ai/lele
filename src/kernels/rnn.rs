@@ -227,3 +227,136 @@ pub fn lstm<'b, 'a>(
     let output_c = TensorView::from_slice(out_c, output_c_shape);
     (output_y, output_h, output_c)
 }
+
+/// GRU (Gated Recurrent Unit) forward pass.
+///
+/// Inputs:
+///   input:  [seq_len, batch_size, input_size]
+///   w:      [1, 3*hidden_size, input_size]  (Weights for update/reset/candidate gates)
+///   r:      [1, 3*hidden_size, hidden_size] (Recurrent weights)
+///   bias:   optional [1, 6*hidden_size]     (bias_w + bias_r concatenated)
+///   initial_h: optional [1, 1, hidden_size]
+///
+/// linear_before_reset: if true, apply bias_r before reset gate multiplication
+///
+/// Outputs: (Y, H_n)
+///   Y:     [seq_len, 1, 1, hidden_size]
+///   H_n:   [1, 1, hidden_size]
+pub fn gru<'b, 'a>(
+    input: &TensorView<'b>,
+    w: &TensorView<'b>,
+    r: &TensorView<'b>,
+    bias: Option<&TensorView<'b>>,
+    initial_h: Option<&TensorView<'b>>,
+    linear_before_reset: bool,
+    out_y: &'a mut Vec<f32>,
+    out_h: &'a mut Vec<f32>,
+) -> (TensorView<'a>, TensorView<'a>) {
+    let seq_len = input.shape[0];
+    let batch_size = input.shape[1];
+    let input_size = input.shape[2];
+
+    let num_directions = w.shape[0];
+    let hidden_size = w.shape[1] / 3;
+    if num_directions != 1 {
+        panic!("GRU: Only num_directions=1 supported");
+    }
+    if batch_size != 1 {
+        panic!("GRU: Only batch_size=1 supported");
+    }
+    let w_data = &w.data;
+    let r_data = &r.data;
+    let default_bias = vec![0.0; 6 * hidden_size];
+    let bias_data: &[f32] = if let Some(b) = bias {
+        b.data.as_ref()
+    } else {
+        default_bias.as_slice()
+    };
+    let (bias_w_slice, bias_r_slice) = bias_data.split_at(3 * hidden_size);
+
+    out_h.resize(hidden_size, 0.0);
+    if let Some(h) = initial_h {
+        out_h.copy_from_slice(&h.data);
+    } else {
+        out_h.fill(0.0);
+    }
+    out_y.resize(seq_len * hidden_size, 0.0);
+
+    let mut gates = vec![0.0; 3 * hidden_size];
+    let mut w_contribution = vec![0.0; 3 * hidden_size];
+    let mut r_contribution = vec![0.0; 3 * hidden_size];
+
+    for t in 0..seq_len {
+        let input_offset = t * input_size;
+        let x_t = &input.data[input_offset..input_offset + input_size];
+
+        unsafe {
+            // W * x_t: [3*H, I] x [I, 1] -> [3*H]
+            let m = 3 * hidden_size;
+            let k = input_size;
+            let a = MatRef::<f32>::from_raw_parts(w_data.as_ptr(), m, k, k as isize, 1);
+            let b = MatRef::<f32>::from_raw_parts(x_t.as_ptr(), k, 1, 1, 1);
+            let c = MatMut::<f32>::from_raw_parts_mut(w_contribution.as_mut_ptr(), m, 1, 1, 1);
+            matmul(c, Accum::Replace, a, b, 1.0, Par::Seq);
+
+            // R * h_{t-1}: [3*H, H] x [H, 1] -> [3*H]
+            let a = MatRef::<f32>::from_raw_parts(
+                r_data.as_ptr(),
+                m,
+                hidden_size,
+                hidden_size as isize,
+                1,
+            );
+            let b = MatRef::<f32>::from_raw_parts(out_h.as_ptr(), hidden_size, 1, 1, 1);
+            let c = MatMut::<f32>::from_raw_parts_mut(r_contribution.as_mut_ptr(), m, 1, 1, 1);
+            matmul(c, Accum::Replace, a, b, 1.0, Par::Seq);
+        }
+
+        // gates = Wx + Rh + bias
+        for g in 0..(3 * hidden_size) {
+            gates[g] = w_contribution[g] + r_contribution[g] + bias_w_slice[g] + bias_r_slice[g];
+        }
+
+        // Split into z (update), r (reset), h (candidate)
+        let (z_wx, r_wx_hx) = gates.split_at(hidden_size);
+        let (r_wx, h_wx) = r_wx_hx.split_at(hidden_size);
+
+        // z = sigmoid(Wz*x + Rz*h + b_z)
+        // r = sigmoid(Wr*x + Rr*h + b_r)
+        // h_candidate = tanh(Wh*x + linear_before_reset ? r*(Rh*h + b_rh) : (r*(Rh*h)) + b_h)
+
+        if linear_before_reset {
+            // h_candidate = tanh(Wh*x + r * (Rh*h + bias_r_h))
+            let mut r_bias_r = vec![0.0; hidden_size];
+            for k in 0..hidden_size {
+                r_bias_r[k] = r_contribution[hidden_size + k] + bias_r_slice[hidden_size + k];
+            }
+            for k in 0..hidden_size {
+                let z_gate = sigmoid(z_wx[k]);
+                let r_gate = sigmoid(r_wx[k]);
+                let h_pre = h_wx[k] + r_gate * r_bias_r[k];
+                let h_gate = tanh(h_pre);
+                let ht = (1.0 - z_gate) * h_gate + z_gate * out_h[k];
+                out_h[k] = ht;
+                out_y[t * hidden_size + k] = ht;
+            }
+        } else {
+            // Standard: h_candidate = tanh(Wh*x + r*(Rh*h) + bias_h)
+            for k in 0..hidden_size {
+                let z_gate = sigmoid(z_wx[k]);
+                let r_gate = sigmoid(r_wx[k]);
+                let h_pre = h_wx[k] + r_gate * r_contribution[2 * hidden_size + k];
+                let h_gate = tanh(h_pre);
+                let ht = (1.0 - z_gate) * h_gate + z_gate * out_h[k];
+                out_h[k] = ht;
+                out_y[t * hidden_size + k] = ht;
+            }
+        }
+    }
+
+    let output_y_shape = vec![seq_len, 1, 1, hidden_size];
+    let output_y = TensorView::from_slice(out_y, output_y_shape);
+    let output_h_shape = vec![1, 1, hidden_size];
+    let output_h = TensorView::from_slice(out_h, output_h_shape);
+    (output_y, output_h)
+}

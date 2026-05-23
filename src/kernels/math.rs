@@ -1747,6 +1747,148 @@ where
     }
 }
 
+pub fn reduce_l2<'b, 'a>(
+    input: &TensorView<'b>,
+    axes: &[i64],
+    keepdims: bool,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let dims = input.dim();
+    let mut resolved_axes: Vec<usize> = axes
+        .iter()
+        .map(|&x| {
+            if x < 0 {
+                (dims as i64 + x) as usize
+            } else {
+                x as usize
+            }
+        })
+        .collect();
+    resolved_axes.sort();
+    resolved_axes.dedup();
+    let mut out_shape = Vec::new();
+    let mut reduce_mask = vec![false; dims];
+    for &ax in &resolved_axes {
+        reduce_mask[ax] = true;
+    }
+    for i in 0..dims {
+        if !reduce_mask[i] {
+            out_shape.push(input.shape[i]);
+        } else if keepdims {
+            out_shape.push(1);
+        }
+    }
+    let out_numel = out_shape.iter().product::<usize>();
+    if out.len() != out_numel {
+        out.resize(out_numel, 0.0);
+    }
+    out.fill(0.0);
+    let real_out_strides = utils::compute_strides(&out_shape);
+    let mut input_to_out_strides = vec![0; dims];
+    let mut out_dim_idx = 0;
+    for i in 0..dims {
+        if reduce_mask[i] {
+            input_to_out_strides[i] = 0;
+            if keepdims {
+                out_dim_idx += 1;
+            }
+        } else {
+            input_to_out_strides[i] = real_out_strides[out_dim_idx];
+            out_dim_idx += 1;
+        }
+    }
+    let mut coords = vec![0; dims];
+    let total_elems = input.data.len();
+    let i_slice = &input.data;
+    let o_slice = out.as_mut_slice();
+    for i in 0..total_elems {
+        let val = unsafe { *i_slice.get_unchecked(i) };
+        let mut out_off = 0;
+        for d in 0..dims {
+            out_off += coords[d] * input_to_out_strides[d];
+        }
+        unsafe {
+            *o_slice.get_unchecked_mut(out_off) += val * val;
+        }
+        for d in (0..dims).rev() {
+            coords[d] += 1;
+            if coords[d] < input.shape[d] {
+                break;
+            }
+            coords[d] = 0;
+        }
+    }
+    for v in o_slice.iter_mut() {
+        *v = v.sqrt();
+    }
+    TensorView {
+        data: Cow::Borrowed(out),
+        shape: Cow::Owned(out_shape),
+    }
+}
+
+pub fn max<'b, 'a>(
+    a: &TensorView<'b>,
+    b: &TensorView<'b>,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let len = a.data.len().max(b.data.len());
+    utils::ensure_capacity(out, len);
+    unsafe {
+        out.set_len(len);
+    }
+    let out_slice = out.as_mut_slice();
+    if a.shape == b.shape {
+        for i in 0..len {
+            out_slice[i] = a.data[i].max(b.data[i]);
+        }
+        TensorView::from_slice(out, a.shape.to_vec())
+    } else {
+        // Broadcast
+        let a_strides = utils::compute_strides(&a.shape);
+        let b_strides = utils::compute_strides(&b.shape);
+        let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap_or_else(|| {
+            panic!("max: cannot broadcast shapes {:?} and {:?}", a.shape, b.shape)
+        });
+        let out_strides = utils::compute_strides(&out_shape);
+        let ndim = out_shape.len();
+        let mut coords = vec![0usize; ndim];
+        for i in 0..len {
+            let mut a_idx = 0;
+            let mut b_idx = 0;
+            for d in 0..ndim {
+                let ca = if d + a.shape.len() >= ndim {
+                    coords[d + ndim - a.shape.len()]
+                } else {
+                    0
+                };
+                let cb = if d + b.shape.len() >= ndim {
+                    coords[d + ndim - b.shape.len()]
+                } else {
+                    0
+                };
+                if d + a.shape.len() >= ndim && a.shape[d + ndim - a.shape.len()] > 1 {
+                    a_idx += ca * a_strides[d + ndim - a.shape.len()];
+                }
+                if d + b.shape.len() >= ndim && b.shape[d + ndim - b.shape.len()] > 1 {
+                    b_idx += cb * b_strides[d + ndim - b.shape.len()];
+                }
+            }
+            let a_val = if a_idx < a.data.len() { a.data[a_idx] } else { f32::NEG_INFINITY };
+            let b_val = if b_idx < b.data.len() { b.data[b_idx] } else { f32::NEG_INFINITY };
+            out_slice[i] = a_val.max(b_val);
+            for d in (0..ndim).rev() {
+                coords[d] += 1;
+                if coords[d] < out_shape[d] {
+                    break;
+                }
+                coords[d] = 0;
+            }
+        }
+        TensorView::from_slice(out, out_shape)
+    }
+}
+
 pub fn clip<'b, 'a, T: ElementOps, U: ElementOps, V: ElementOps>(
     input: &TensorView<'b, T>,
     min: Option<&TensorView<U>>,
@@ -1893,6 +2035,18 @@ pub fn exp<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
         TensorView::from_slice(out, input.shape.to_vec())
     }
 }
+pub fn log<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
+    let numel = input.data.len();
+    utils::ensure_capacity(out, numel);
+    unsafe {
+        out.set_len(numel);
+    }
+    let out_slice = out.as_mut_slice();
+    for i in 0..numel {
+        out_slice[i] = input.data[i].ln();
+    }
+    TensorView::from_slice(out, input.shape.to_vec())
+}
 pub fn neg<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
@@ -1939,7 +2093,13 @@ pub fn expand<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         };
         let offset_target = ndim_out - ndim_target;
         let dim_target = if i >= offset_target {
-            target_shape_vec[i - offset_target]
+            let raw = target_shape_vec[i - offset_target];
+            // ONNX convention: 0 means "use the input dimension size"
+            if raw == 0 {
+                dim_in
+            } else {
+                raw
+            }
         } else {
             1
         };
@@ -2040,6 +2200,71 @@ pub fn tile<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     }
     TensorView::from_slice(out, out_shape)
 }
+
+/// Short-Time Fourier Transform.
+///
+/// Input: 1D signal of shape [signal_length]
+/// n_fft: FFT size
+/// hop_length: hop size between frames
+/// win_length: window length (must be <= n_fft)
+/// Returns: complex STFT output as f32 pairs [real, imag] with shape
+///   [num_frames, n_fft/2+1, 2] (freq_bins x 2 for real/imag)
+pub fn stft<'b, 'a>(
+    input: &TensorView<'b>,
+    n_fft: usize,
+    hop_length: usize,
+    win_length: usize,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    use rustfft::{FftPlanner, num_complex::Complex};
+
+    let signal_len = input.data.len();
+    if signal_len == 0 {
+        out.clear();
+        return TensorView::from_slice(out, vec![0, n_fft / 2 + 1, 2]);
+    }
+
+    let num_frames = if signal_len < win_length {
+        1
+    } else {
+        (signal_len - win_length) / hop_length + 1
+    };
+    let n_freqs = n_fft / 2 + 1;
+
+    // Hann window
+    let mut window = vec![0.0f32; win_length];
+    for i in 0..win_length {
+        window[i] = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / win_length as f32).cos());
+    }
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(n_fft);
+
+    let mut buffer: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); n_fft];
+    out.resize(num_frames * n_freqs * 2, 0.0);
+
+    for frame in 0..num_frames {
+        let start = frame * hop_length;
+        // Zero-pad and apply window
+        for i in 0..n_fft {
+            if i < win_length && start + i < signal_len {
+                buffer[i] = Complex::new(input.data[start + i] * window[i], 0.0);
+            } else {
+                buffer[i] = Complex::new(0.0, 0.0);
+            }
+        }
+        fft.process(&mut buffer);
+        // Copy real/imag pairs to output
+        for freq in 0..n_freqs {
+            let out_idx = (frame * n_freqs + freq) * 2;
+            out[out_idx] = buffer[freq].re;
+            out[out_idx + 1] = buffer[freq].im;
+        }
+    }
+
+    TensorView::from_slice(out, vec![num_frames, n_freqs, 2])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

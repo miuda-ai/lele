@@ -840,20 +840,31 @@ pub(crate) fn generate_nodes(
         if op == "Constant" && !outputs.is_empty() && known_weights.contains_key(&outputs[0]) {
             continue;
         }
+        // Check if Div/Mod output is i64 (e.g. integer division for shape computation)
+        let div_mod_output_is_i64 = if matches!(op, "Div" | "Mod") {
+            outputs
+                .get(0)
+                .and_then(|out| var_types.get(out))
+                .map(|t| t == "i64")
+                .unwrap_or(false)
+        } else {
+            false
+        };
         let inputs: Vec<String> = node
             .input
             .iter()
             .map(|s| {
                 let name = sanitize_name(s);
                 if let Some((offset, len, shape, data_type)) = known_weights.get(&name) {
-                    // For Div and Mod operations, force f32 type
-                    let force_f32 = matches!(op, "Div" | "Mod");
+                    // For Div/Mod: only force f32 when output is NOT i64.
+                    // When output is i64 (integer division), keep i64 types.
+                    let force_f32 = matches!(op, "Div" | "Mod") && !div_mod_output_is_i64;
                     let target_type = if force_f32 {
                         "f32"
                     } else {
                         var_types.get(&name).map(|s| s.as_str()).unwrap_or("f32")
                     };
-                    if target_type == "i64" && !force_f32 {
+                    if target_type == "i64" {
                         match data_type {
                             7 => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape),
                             6 => format!("self.weight_i32_i64({}, {}, &{:?})", offset, len, shape),
@@ -898,8 +909,9 @@ pub(crate) fn generate_nodes(
             // writeln!(w, "{}// Op {} {} skipped (unused)", tab, op, outputs.join(","))?;
             continue;
         }
-        // For Div and Mod operations, force f32 type since these ops only support f32
-        let force_f32 = matches!(op, "Div" | "Mod");
+        // For Div and Mod operations, force f32 type for output ONLY when output is not i64.
+        // When output is i64 (integer division for shape computation), keep i64.
+        let force_f32 = matches!(op, "Div" | "Mod") && !div_mod_output_is_i64;
         let is_i64 = if force_f32 {
             false
         } else {

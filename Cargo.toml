@@ -5,6 +5,7 @@ members = [
     "examples/sensevoice",
     "examples/silero",
     "examples/supertonic",
+    "examples/supertonic3",
     "examples/yolo26",
     "examples/yolo26n-seg",
     "examples/web-demo",
@@ -23,7 +24,7 @@ anyhow = "1.0"
 
 [package]
 name = "lele"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2024"
 description = "Bare-metal machine learning inference library in Rust"
 license = "MIT"
@@ -37,7 +38,16 @@ keywords = [
     "text-to-speech",
 ]
 categories = ["algorithms", "compilers"]
-
+exclude = [
+    "build.rs",
+    "benches/*",
+    "examples/*",
+    "tests/*",
+    "fixtures/*",
+    "scripts/*",
+    "src/bin/*",
+    "docs/*",
+]
 [features]
 default = ["compiler"]
 compiler = ["dep:prost", "dep:prost-types"]

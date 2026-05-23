@@ -1,6 +1,6 @@
 [package]
 name = "lele-build"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 publish = false
 
@@ -9,4 +9,3 @@ lele = { path = "../.." }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9.8"
 ureq = "3.1"
-

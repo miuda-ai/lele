@@ -127,6 +127,11 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             "{}let {} = lele::kernels::exp(&{}, {});",
             tab, outputs[0], inputs[0], buf_expr
         )?,
+        "Log" => writeln!(
+            w,
+            "{}let {} = lele::kernels::log(&{}, {});",
+            tab, outputs[0], inputs[0], buf_expr
+        )?,
         "Sin" => writeln!(
             w,
             "{}let {} = lele::kernels::sin(&{}, {});",
@@ -284,6 +289,58 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 tab, outputs[0], inputs[0], axes, keepdims, buf_expr
             )?;
         }
+        "ReduceL2" => {
+            let axes = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "axes")
+                .map(|a| a.ints.clone())
+                .unwrap_or(vec![]);
+            let keepdims = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "keepdims")
+                .map(|a| a.i)
+                .unwrap_or(1)
+                != 0;
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::reduce_l2(&{}, &{:?}, {}, {});",
+                tab, outputs[0], inputs[0], axes, keepdims, buf_expr
+            )?;
+        }
+        "Max" => {
+            // ONNX Max: element-wise maximum of two or more inputs
+            if inputs.len() == 2 {
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::max(&{}, &{}, {});",
+                    tab, outputs[0], inputs[0], inputs[1], buf_expr
+                )?;
+            } else {
+                // Chain: max(a, max(b, max(c, d)))
+                let mut result = inputs[0].clone();
+                for (i, input) in inputs.iter().enumerate().skip(1) {
+                    if i < inputs.len() - 1 {
+                        let tmp = format!("max_tmp_{}_{}", outputs[0], i);
+                        writeln!(
+                            w,
+                            "{}let {} = lele::kernels::max(&{}, &{}, {});",
+                            tab, tmp, result, input, buf_expr
+                        )?;
+                        result = tmp;
+                    } else {
+                        writeln!(
+                            w,
+                            "{}let {} = lele::kernels::max(&{}, &{}, {});",
+                            tab, outputs[0], result, input, buf_expr
+                        )?;
+                    }
+                }
+            }
+        }
         "Range" => {
             let is_i64 = ctx
                 .var_types
@@ -356,6 +413,38 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                     tab, outputs[0], inputs[1], inputs[0], buf_expr
                 )?;
             }
+        }
+        "STFT" => {
+            // ONNX STFT: inputs[0]=signal, inputs[1]=frame_step, optional inputs[2]=frame_length, inputs[3]=window
+            let frame_step = if ctx.node.input.len() > 1 {
+                // frame_step is typically a constant
+                if let Some((ints, _)) = ctx.int64_map.get(&ctx.node.input[1]) {
+                    ints[0] as usize
+                } else {
+                    160
+                }
+            } else {
+                160
+            };
+            let n_fft = if ctx.node.input.len() > 2 && !ctx.node.input[2].is_empty() {
+                if let Some((ints, _)) = ctx.int64_map.get(&ctx.node.input[2]) {
+                    ints[0] as usize
+                } else {
+                    512
+                }
+            } else {
+                512
+            };
+            let _window = if ctx.node.input.len() > 3 && !ctx.node.input[3].is_empty() {
+                format!("Some(&{})", inputs[3])
+            } else {
+                "None".to_string()
+            };
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::stft(&{}, {}, {}, {}, {});",
+                tab, outputs[0], inputs[0], n_fft, frame_step, n_fft, buf_expr
+            )?;
         }
         _ => return Ok(false),
     }
