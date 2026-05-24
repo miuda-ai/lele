@@ -22,6 +22,57 @@ pub static CONV_TRANS_NS: AtomicU64 = AtomicU64::new(0);
 pub static OTHER_NS: AtomicU64 = AtomicU64::new(0);
 pub static TOTAL_CONV_CALLS: AtomicU64 = AtomicU64::new(0);
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+
+thread_local! {
+    static SCOPE_TIMINGS: RefCell<BTreeMap<String, u64>> = RefCell::new(BTreeMap::new());
+}
+
+pub struct ScopeTimer {
+    label: &'static str,
+    start: std::time::Instant,
+}
+
+impl ScopeTimer {
+    pub fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for ScopeTimer {
+    fn drop(&mut self) {
+        let ns = self.start.elapsed().as_nanos() as u64;
+        SCOPE_TIMINGS.with(|m| {
+            *m.borrow_mut().entry(self.label.to_string()).or_insert(0) += ns;
+        });
+    }
+}
+
+pub fn reset_scope() {
+    SCOPE_TIMINGS.with(|m| m.borrow_mut().clear());
+}
+
+pub fn print_scope() {
+    SCOPE_TIMINGS.with(|m| {
+        let map = m.borrow();
+        if map.is_empty() { return; }
+        let total_ns: u64 = map.values().sum();
+        let mut entries: Vec<_> = map.iter().collect();
+        entries.sort_by(|a, b| b.1.cmp(a.1));
+        eprintln!("\n--- Scope Timing Breakdown ---");
+        for (label, ns) in &entries {
+            let ms = **ns as f64 / 1e6;
+            let pct = 100.0 * **ns as f64 / total_ns.max(1) as f64;
+            eprintln!("  {:<30} {:>7.2} ms ({:5.1}%)", label, ms, pct);
+        }
+        eprintln!("  {:<30} {:>7.2} ms", "TOTAL", total_ns as f64 / 1e6);
+    });
+}
+
 pub fn reset() {
     CONV1X1_NS.store(0, Ordering::Relaxed);
     CONV3X3_NS.store(0, Ordering::Relaxed);

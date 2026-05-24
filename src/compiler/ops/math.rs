@@ -1,4 +1,5 @@
 use super::super::generate::OpContext;
+use super::super::sanitize_name;
 use std::io::Write;
 
 pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<bool> {
@@ -143,7 +144,6 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             tab, outputs[0], inputs[0], buf_expr
         )?,
         "Equal" => {
-            // Equal can work with both f32 and i64
             let is_i64 = ctx
                 .var_types
                 .get(&ctx.outputs[0])
@@ -155,11 +155,30 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                     .map(|t| t == "i64")
                     .unwrap_or(false);
             if is_i64 {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::equal_i64(&{}, &{}, {});",
-                    tab, outputs[0], inputs[0], inputs[1], buf_expr
-                )?;
+                let a_is_weight_f32 = inputs[0].contains("weight_f32");
+                let b_is_weight_f32 = inputs.len() > 1 && inputs[1].contains("weight_f32");
+                let raw_a = sanitize_name(&ctx.node.input[0]);
+                let type_a = ctx.var_types.get(&raw_a).map(|s| s.as_str()).unwrap_or("f32");
+                if b_is_weight_f32 {
+                    let func = if type_a == "i64" { "equal_i64_f32_r_i64" } else { "equal_i64_f32_r" };
+                    writeln!(
+                        w,
+                        "{}let {} = lele::kernels::{}(&{}, &{}, {});",
+                        tab, outputs[0], func, inputs[0], inputs[1], buf_expr
+                    )?;
+                } else if a_is_weight_f32 {
+                    writeln!(
+                        w,
+                        "{}let {} = lele::kernels::equal_i64_f32_lhs(&{}, &{}, {});",
+                        tab, outputs[0], inputs[0], inputs[1], buf_expr
+                    )?;
+                } else {
+                    writeln!(
+                        w,
+                        "{}let {} = lele::kernels::equal_i64(&{}, &{}, {});",
+                        tab, outputs[0], inputs[0], inputs[1], buf_expr
+                    )?;
+                }
             } else {
                 writeln!(
                     w,
@@ -268,13 +287,19 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             )?;
         }
         "ReduceMean" => {
-            let axes = ctx
+            let mut axes = ctx
                 .node
                 .attribute
                 .iter()
                 .find(|a| a.name == "axes")
                 .map(|a| a.ints.clone())
                 .unwrap_or(vec![]);
+            // If axes attribute is empty, check second input
+            if axes.is_empty() && inputs.len() > 1 && !ctx.node.input[1].is_empty() {
+                if let Some((data, _shape)) = ctx.int64_map.get(&ctx.node.input[1]) {
+                    axes = data.clone();
+                }
+            }
             let keepdims = ctx
                 .node
                 .attribute
@@ -290,13 +315,19 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             )?;
         }
         "ReduceL2" => {
-            let axes = ctx
+            let mut axes = ctx
                 .node
                 .attribute
                 .iter()
                 .find(|a| a.name == "axes")
                 .map(|a| a.ints.clone())
                 .unwrap_or(vec![]);
+            // If axes attribute is empty, check second input
+            if axes.is_empty() && inputs.len() > 1 && !ctx.node.input[1].is_empty() {
+                if let Some((data, _shape)) = ctx.int64_map.get(&ctx.node.input[1]) {
+                    axes = data.clone();
+                }
+            }
             let keepdims = ctx
                 .node
                 .attribute
@@ -415,9 +446,8 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             }
         }
         "STFT" => {
-            // ONNX STFT: inputs[0]=signal, inputs[1]=frame_step, optional inputs[2]=frame_length, inputs[3]=window
+            // ONNX STFT: inputs[0]=signal, inputs[1]=frame_step, inputs[2]=window, inputs[3]=frame_length
             let frame_step = if ctx.node.input.len() > 1 {
-                // frame_step is typically a constant
                 if let Some((ints, _)) = ctx.int64_map.get(&ctx.node.input[1]) {
                     ints[0] as usize
                 } else {
@@ -426,8 +456,8 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             } else {
                 160
             };
-            let n_fft = if ctx.node.input.len() > 2 && !ctx.node.input[2].is_empty() {
-                if let Some((ints, _)) = ctx.int64_map.get(&ctx.node.input[2]) {
+            let n_fft = if ctx.node.input.len() > 3 && !ctx.node.input[3].is_empty() {
+                if let Some((ints, _)) = ctx.int64_map.get(&ctx.node.input[3]) {
                     ints[0] as usize
                 } else {
                     512
@@ -435,15 +465,20 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             } else {
                 512
             };
-            let _window = if ctx.node.input.len() > 3 && !ctx.node.input[3].is_empty() {
-                format!("Some(&{})", inputs[3])
+            let window = if ctx.node.input.len() > 2 && !ctx.node.input[2].is_empty() {
+                let wname = sanitize_name(&ctx.node.input[2]);
+                if let Some((o, l, s, _dt)) = ctx.known_weights.get(&wname) {
+                    format!("Some(&self.weight_f32({}, {}, &{:?}))", o, l, s)
+                } else {
+                    format!("Some(&{})", inputs[2])
+                }
             } else {
                 "None".to_string()
             };
             writeln!(
                 w,
-                "{}let {} = lele::kernels::stft(&{}, {}, {}, {}, {});",
-                tab, outputs[0], inputs[0], n_fft, frame_step, n_fft, buf_expr
+                "{}let {} = lele::kernels::stft(&{}, {}, {}, {}, {}, {});",
+                tab, outputs[0], inputs[0], n_fft, frame_step, n_fft, window, buf_expr
             )?;
         }
         _ => return Ok(false),

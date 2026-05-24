@@ -557,7 +557,7 @@ pub fn get_default_patterns() -> Vec<Pattern> {
             }),
         },
         Pattern {
-            name: "Conv1d + Relu".to_string(),
+            name: "Conv + Relu".to_string(),
             matcher: Box::new(|nodes: &[&NodeProto]| -> Option<usize> {
                 if nodes.len() < 2 {
                     return None;
@@ -568,17 +568,6 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     && n1.op_type == "Relu"
                     && n0.output.first() == n1.input.first()
                 {
-                    // Check kernel_shape attribute to distinguish conv1d vs conv2d
-                    let kernel_shape = n0
-                        .attribute
-                        .iter()
-                        .find(|a| a.name == "kernel_shape")
-                        .map(|a| a.ints.len())
-                        .unwrap_or(1);
-                    // Only fuse for 1D convolutions; 2D conv+relu handled separately
-                    if kernel_shape >= 2 {
-                        return None;
-                    }
                     return Some(2);
                 }
                 None
@@ -614,10 +603,11 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         10 => "weight_f16",
                         _ => "weight_f32",
                     };
-                    format!("self.{}({}, {}, &{:?})", loader, o, l, s)
+                    (format!("self.{}({}, {}, &{:?})", loader, o, l, s), s.len())
                 } else {
-                    weight_s
+                    (weight_s, 3)
                 };
+                let (weight_expr, weight_rank) = weight_expr;
                 let bias = if conv.input.len() > 2 {
                     let b = &conv.input[2];
                     let b_s = sanitize_name(b);
@@ -675,20 +665,37 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, output_name)?;
                     format!("&mut buf_{}", output_name)
                 };
-                writeln!(
-                    w,
-                    "{}let {} = self.conv1d_relu({}, {}, {}, {}, {}, {}, {}, {});",
-                    tab,
-                    output_name,
-                    input_expr,
-                    weight_expr,
-                    bias,
-                    stride,
-                    dilation,
-                    groups,
-                    padding,
-                    buf_expr
-                )?;
+                if weight_rank >= 4 {
+                    writeln!(
+                        w,
+                        "{}let {} = lele::kernels::conv2d_fused(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, true, {});",
+                        tab,
+                        output_name,
+                        input_expr,
+                        weight_expr,
+                        bias,
+                        [dilation as i64; 2],
+                        groups,
+                        [padding as i64; 4],
+                        [stride as i64; 2],
+                        buf_expr
+                    )?;
+                } else {
+                    writeln!(
+                        w,
+                        "{}let {} = self.conv1d_relu({}, {}, {}, {}, {}, {}, {}, {});",
+                        tab,
+                        output_name,
+                        input_expr,
+                        weight_expr,
+                        bias,
+                        stride,
+                        dilation,
+                        groups,
+                        padding,
+                        buf_expr
+                    )?;
+                }
                 Ok(())
             }),
         },

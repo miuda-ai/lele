@@ -483,6 +483,8 @@ pub fn pad<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     // For edge mode, replicate edge values into padding regions
     if mode == "edge" {
         pad_edge_inplace(out, &input.shape, &new_shape, &p, rank);
+    } else if mode == "reflect" {
+        pad_reflect_inplace(out, &input.shape, &new_shape, &p, rank);
     }
     TensorView::from_slice(out, new_shape)
 }
@@ -537,6 +539,53 @@ fn pad_edge_inplace<T: Clone + Copy>(
         }
     }
 }
+
+fn pad_reflect_inplace<T: Clone + Copy>(
+    out: &mut [T],
+    input_shape: &[usize],
+    new_shape: &[usize],
+    p: &[usize],
+    rank: usize,
+) {
+    let total: usize = new_shape.iter().product();
+    let strides = utils::compute_strides(new_shape);
+    let mut coords = vec![0usize; rank];
+    for idx in 0..total {
+        let mut in_center = true;
+        for d in 0..rank {
+            if coords[d] < p[d] || coords[d] >= p[d] + input_shape[d] {
+                in_center = false;
+                break;
+            }
+        }
+        if !in_center {
+            let mut src_idx = 0;
+            for d in 0..rank {
+                let c = coords[d];
+                let pad_begin = p[d];
+                let pad_end = p[d] + input_shape[d];
+                let reflected = if c < pad_begin {
+                    pad_begin + (pad_begin - c)
+                } else if c >= pad_end {
+                    let past = c - pad_end;
+                    pad_end - 1 - past
+                } else {
+                    c
+                };
+                src_idx += reflected * strides[d];
+            }
+            out[idx] = out[src_idx];
+        }
+        for d in (0..rank).rev() {
+            coords[d] += 1;
+            if coords[d] < new_shape[d] {
+                break;
+            }
+            coords[d] = 0;
+        }
+    }
+}
+
 pub fn gather<'b, 'a, T, I>(
     data: &TensorView<'b, T>,
     indices: &TensorView<'b, I>,
@@ -606,17 +655,36 @@ fn transpose_inner<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
     let ndim = input.dim();
-    let perm: Vec<usize> = if perm.is_empty() {
+    let mut perm_vec: Vec<usize> = if perm.is_empty() {
         (0..ndim).rev().collect()
     } else {
-        perm.iter().map(|&x| x as usize).collect()
+        let mut p: Vec<usize> = perm.iter().map(|&x| x as usize).collect();
+        while p.len() < ndim {
+            let next = p.len();
+            p.push(next);
+        }
+        p
     };
+    perm_vec.truncate(ndim);
 
     let input_shape = input.shape.to_vec();
     let input_data: &[T] = input.data.as_ref();
 
     let mut out_shape = vec![0; ndim];
-    for (i, &p) in perm.iter().enumerate() {
+    for (i, &p) in perm_vec.iter().enumerate() {
+        if p >= input_shape.len() {
+            eprintln!(
+                "DEBUG transpose: perm={:?} input_shape={:?} ndim={}",
+                perm_vec, input_shape, ndim
+            );
+            panic!(
+                "transpose: perm[{}]={} but input has {} dims (shape={:?})",
+                i,
+                p,
+                input_shape.len(),
+                input_shape
+            );
+        }
         out_shape[i] = input_shape[p];
     }
     let out_numel = input.data.len();
@@ -627,7 +695,7 @@ fn transpose_inner<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
 
     // Fast path: perm [0,2,1,3] for 4D tensors — copy contiguous blocks
     // [B, A, C, D] -> [B, C, A, D] — inner dim D is contiguous
-    if ndim == 4 && perm == [0, 2, 1, 3] {
+    if ndim == 4 && perm_vec == [0, 2, 1, 3] {
         let (b, a, c, d) = (
             input_shape[0],
             input_shape[1],
@@ -655,7 +723,7 @@ fn transpose_inner<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
 
     // Fast path: perm [0,2,3,1] for 4D tensors
     // [B, A, C, D] -> [B, C, D, A]
-    if ndim == 4 && perm == [0, 2, 3, 1] {
+    if ndim == 4 && perm_vec == [0, 2, 3, 1] {
         let (b, a, c, d) = (
             input_shape[0],
             input_shape[1],
@@ -770,7 +838,7 @@ fn transpose_inner<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
 
     // Fast path: perm [0,2,1] for 3D tensors — 2D transpose within each batch
     // [B, R, C] -> [B, C, R]
-    if ndim == 3 && perm == [0, 2, 1] {
+    if ndim == 3 && perm_vec == [0, 2, 1] {
         let (b, r, c) = (input_shape[0], input_shape[1], input_shape[2]);
 
         // Fast NEON path for f32: 4×4 block transpose within each batch
@@ -876,7 +944,7 @@ fn transpose_inner<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
     }
 
     // Fast path: perm [1, 0] for 2D tensors — simple matrix transpose
-    if ndim == 2 && perm == [1, 0] {
+    if ndim == 2 && perm_vec == [1, 0] {
         let (r, c) = (input_shape[0], input_shape[1]);
         let out_slice = out.as_mut_slice();
 
@@ -980,7 +1048,16 @@ fn transpose_inner<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
     let in_strides = utils::compute_strides(&input_shape);
     let mut virtual_strides = vec![0; ndim];
     for i in 0..ndim {
-        virtual_strides[i] = in_strides[perm[i]];
+        if perm_vec[i] >= in_strides.len() {
+            panic!(
+                "transpose: perm[{}]={} but input has {} dims (shape={:?})",
+                i,
+                perm_vec[i],
+                in_strides.len(),
+                input_shape
+            );
+        }
+        virtual_strides[i] = in_strides[perm_vec[i]];
     }
     let mut coords = vec![0; ndim];
     let out_slice = out.as_mut_slice();

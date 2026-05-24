@@ -3,6 +3,7 @@ pub mod activations;
 pub mod avx;
 pub mod conv1d;
 pub mod conv2d;
+pub mod fft;
 pub mod gemm;
 pub mod manipulation;
 pub mod math;

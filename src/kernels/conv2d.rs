@@ -1,3 +1,4 @@
+#![allow(unsafe_op_in_unsafe_fn)]
 use crate::kernels::timing;
 use crate::kernels::utils;
 #[cfg(target_arch = "wasm32")]
@@ -529,6 +530,68 @@ fn conv2d_activation<'b, 'a>(
             }
             TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w])
         };
+    }
+
+    // Fast path: depthwise convolution (groups == channels, in_channels_per_group == 1)
+    // Skips im2col overhead and does direct computation with SIMD.
+    if groups == in_channels && in_channels_per_group == 1 && out_channels_per_group == 1
+        && dilation_h == 1 && dilation_w == 1
+    {
+        let input_data = &input.data;
+        let weight_data = &weights.data;
+        let out_slice = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr(), total_output) };
+
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            if kernel_h == 3 && kernel_w == 3 && stride_h == 1 && stride_w == 1
+                && pad_top == 1 && pad_left == 1
+            {
+                let bias_slice: Option<&[f32]> = bias.map(|b| b.data.as_ref());
+                unsafe {
+                    depthwise_conv2d_3x3_s1_avx2(
+                        input_data, weight_data, bias_slice, out_slice,
+                        batch_size, in_channels, in_h, in_w, out_h, out_w, act,
+                    );
+                }
+                return TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w]);
+            }
+            unsafe { depthwise_conv2d_avx2(
+                input_data, weight_data, out_slice,
+                batch_size, in_channels, in_h, in_w,
+                kernel_h, kernel_w, stride_h, stride_w,
+                pad_top, pad_left, out_h, out_w, act,
+            ); }
+            return TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w]);
+        }
+
+        // Scalar depthwise fallback
+        for n in 0..batch_size {
+            for c in 0..in_channels {
+                let in_base = n * in_channels * in_h * in_w + c * in_h * in_w;
+                let w_base = c * kernel_h * kernel_w;
+                let out_base = n * out_channels * out_h * out_w + c * out_h * out_w;
+                for oh in 0..out_h {
+                    for ow in 0..out_w {
+                        let mut sum = 0.0f32;
+                        for kh in 0..kernel_h {
+                            let ih = (oh * stride_h + kh) as isize - pad_top as isize;
+                            if ih < 0 || ih >= in_h as isize { continue; }
+                            for kw in 0..kernel_w {
+                                let iw = (ow * stride_w + kw) as isize - pad_left as isize;
+                                if iw < 0 || iw >= in_w as isize { continue; }
+                                sum += input_data[in_base + ih as usize * in_w + iw as usize]
+                                    * weight_data[w_base + kh * kernel_w + kw];
+                            }
+                        }
+                        out_slice[out_base + oh * out_w + ow] = match act {
+                            Activation::Relu => if sum < 0.0 { 0.0 } else { sum },
+                            _ => sum,
+                        };
+                    }
+                }
+            }
+        }
+        return TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w]);
     }
 
     let col_rows = in_channels_per_group * kernel_h * kernel_w;
@@ -1080,6 +1143,81 @@ pub fn max_pool2d<'b, 'a>(
     }
 
     let data = &input.data;
+
+    if kh == 2
+        && kw == 2
+        && sh == 2
+        && sw == 2
+        && pad_top == 0
+        && pad_left == 0
+        && pad_bottom == 0
+        && pad_right == 0
+        && dh == 1
+        && dw == 1
+        && out_w >= 8
+    {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                unsafe {
+                    use std::arch::x86_64::*;
+                    let idx = _mm256_set_epi32(0, 0, 0, 0, 6, 4, 2, 0);
+                    for n in 0..batch {
+                        for c in 0..channels {
+                            let in_base =
+                                (n * channels + c) * in_h * in_w;
+                            let out_base =
+                                (n * channels + c) * out_h * out_w;
+                            for oh in 0..out_h {
+                                let r0 = data
+                                    .as_ptr()
+                                    .add(in_base + oh * 2 * in_w);
+                                let r1 = data
+                                    .as_ptr()
+                                    .add(in_base + (oh * 2 + 1) * in_w);
+                                let dst = out.as_mut_ptr().add(
+                                    out_base + oh * out_w,
+                                );
+                                let mut ow: usize = 0;
+                                while ow + 8 <= out_w {
+                                    let col = ow * 2;
+                                    let r0_lo = _mm256_loadu_ps(r0.add(col));
+                                    let r0_hi = _mm256_loadu_ps(r0.add(col + 8));
+                                    let r1_lo = _mm256_loadu_ps(r1.add(col));
+                                    let r1_hi = _mm256_loadu_ps(r1.add(col + 8));
+                                    let m_lo = _mm256_max_ps(r0_lo, r1_lo);
+                                    let m_hi = _mm256_max_ps(r0_hi, r1_hi);
+                                    let s_lo = _mm256_shuffle_ps(m_lo, m_lo, 0xB1);
+                                    let s_hi = _mm256_shuffle_ps(m_hi, m_hi, 0xB1);
+                                    let p_lo = _mm256_max_ps(m_lo, s_lo);
+                                    let p_hi = _mm256_max_ps(m_hi, s_hi);
+                                    let r_lo = _mm256_permutevar8x32_ps(p_lo, idx);
+                                    let r_hi = _mm256_permutevar8x32_ps(p_hi, idx);
+                                    let res = _mm256_permute2f128_ps(r_lo, r_hi, 0x20);
+                                    _mm256_storeu_ps(dst.add(ow), res);
+                                    ow += 8;
+                                }
+                                while ow < out_w {
+                                    let col = ow * 2;
+                                    let v00 = *r0.add(col);
+                                    let v01 = *r0.add(col + 1);
+                                    let v10 = *r1.add(col);
+                                    let v11 = *r1.add(col + 1);
+                                    *dst.add(ow) =
+                                        v00.max(v01).max(v10).max(v11);
+                                    ow += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                return TensorView::from_slice(
+                    out,
+                    vec![batch, channels, out_h, out_w],
+                );
+            }
+        }
+    }
 
     for n in 0..batch {
         for c in 0..channels {
@@ -2912,7 +3050,7 @@ fn conv_transpose_inner<'b, 'a>(
 
     for n in 0..batch_size {
         let batch_offset = n * out_channels * out_h * out_w;
-        let input_ptr = unsafe { input.data.as_ptr().add(n * in_channels * hw) };
+        let _input_ptr = unsafe { input.data.as_ptr().add(n * in_channels * hw) };
 
         // GEMM: col[col_rows x hw] = W^T[col_rows x in_channels] * input[in_channels x hw]
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -2987,6 +3125,262 @@ fn conv_transpose_inner<'b, 'a>(
     }
 
     TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w])
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn depthwise_conv2d_avx2(
+    input: &[f32],
+    weight: &[f32],
+    out: &mut [f32],
+    batch: usize,
+    channels: usize,
+    in_h: usize,
+    in_w: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    pad_top: usize,
+    pad_left: usize,
+    out_h: usize,
+    out_w: usize,
+    act: Activation,
+) {
+    use std::arch::x86_64::*;
+
+    let zero_vec = _mm256_setzero_ps();
+
+    // For the vectorized sw==1 path, we need to ensure all 8 loads are in bounds.
+    // Input pixel for output ow with kernel offset kj: ow + kj - pad_left
+    // Max read index: ow + (kw-1) - pad_left + 7
+    // Must be < in_w, so: ow + kw - 1 - pad_left + 7 < in_w
+    // => ow < in_w + pad_left - kw - 6
+    // We also need: ow + 0 - pad_left >= 0 => ow >= pad_left
+    let vec_ow_end = if sw == 1 {
+        in_w + pad_left.saturating_sub(kw - 1 + 7)
+    } else {
+        0
+    };
+    // Round down to multiple of 8
+    let vec_ow_end = (vec_ow_end / 8) * 8;
+    let vec_ow_start = if sw == 1 { pad_left } else { out_w };
+
+    for n in 0..batch {
+        for c in 0..channels {
+            let in_base = n * channels * in_h * in_w + c * in_h * in_w;
+            let w_base = c * kh * kw;
+            let out_base = n * channels * out_h * out_w + c * out_h * out_w;
+
+            for oh in 0..out_h {
+                let mut ow = 0usize;
+
+                // Scalar prefix (before vectorized region)
+                while ow < vec_ow_start.min(out_w) {
+                    depthwise_scalar_px(
+                        input, weight, out, in_base, w_base, out_base,
+                        oh, ow, in_h, in_w, kh, kw, sh, sw, pad_top, pad_left, out_w, act,
+                    );
+                    ow += 1;
+                }
+
+                // Vectorized middle (sw==1 only)
+                while sw == 1 && ow + 8 <= vec_ow_end && ow + 8 <= out_w {
+                    let mut acc = _mm256_setzero_ps();
+                    for ki in 0..kh {
+                        let ih = oh * sh + ki;
+                        if ih < pad_top || ih >= in_h + pad_top { continue; }
+                        let ih_valid = ih - pad_top;
+                        let row_ptr = input.as_ptr().add(in_base + ih_valid * in_w);
+                        for kj in 0..kw {
+                            let iw_valid = ow + kj - pad_left;
+                            let w_val = _mm256_set1_ps(*weight.get_unchecked(w_base + ki * kw + kj));
+                            let v = _mm256_loadu_ps(row_ptr.add(iw_valid));
+                            acc = _mm256_fmadd_ps(w_val, v, acc);
+                        }
+                    }
+                    if act == Activation::Relu {
+                        acc = _mm256_max_ps(acc, zero_vec);
+                    }
+                    _mm256_storeu_ps(out.as_mut_ptr().add(out_base + oh * out_w + ow), acc);
+                    ow += 8;
+                }
+
+                // Scalar tail
+                while ow < out_w {
+                    depthwise_scalar_px(
+                        input, weight, out, in_base, w_base, out_base,
+                        oh, ow, in_h, in_w, kh, kw, sh, sw, pad_top, pad_left, out_w, act,
+                    );
+                    ow += 1;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn depthwise_conv2d_3x3_s1_avx2(
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+    batch: usize,
+    channels: usize,
+    in_h: usize,
+    in_w: usize,
+    out_h: usize,
+    out_w: usize,
+    act: Activation,
+) {
+    use std::arch::x86_64::*;
+    let zero_v = _mm256_setzero_ps();
+    let pad = 1usize;
+    let first_valid_oh = pad;
+    let last_valid_oh = in_h.saturating_sub(pad);
+
+    for n in 0..batch {
+        for c in 0..channels {
+            let in_base = n * channels * in_h * in_w + c * in_h * in_w;
+            let w_base = c * 9;
+            let out_base = n * channels * out_h * out_w + c * out_h * out_w;
+
+            let w0 = _mm256_set1_ps(*weight.get_unchecked(w_base));
+            let w1 = _mm256_set1_ps(*weight.get_unchecked(w_base + 1));
+            let w2 = _mm256_set1_ps(*weight.get_unchecked(w_base + 2));
+            let w3 = _mm256_set1_ps(*weight.get_unchecked(w_base + 3));
+            let w4 = _mm256_set1_ps(*weight.get_unchecked(w_base + 4));
+            let w5 = _mm256_set1_ps(*weight.get_unchecked(w_base + 5));
+            let w6 = _mm256_set1_ps(*weight.get_unchecked(w_base + 6));
+            let w7 = _mm256_set1_ps(*weight.get_unchecked(w_base + 7));
+            let w8 = _mm256_set1_ps(*weight.get_unchecked(w_base + 8));
+
+            let bias_v = bias.map(|b| _mm256_set1_ps(*b.get_unchecked(c)));
+
+            let vec_end = (in_w / 8) * 8;
+
+            for oh in 0..out_h {
+                let out_row = out_base + oh * out_w;
+                let mut ow = 0usize;
+
+                if oh >= first_valid_oh && oh < last_valid_oh {
+                    // Fully valid rows: all 3 input rows are in bounds
+                    let r0 = input.as_ptr().add(in_base + (oh - 1) * in_w);
+                    let r1 = input.as_ptr().add(in_base + oh * in_w);
+                    let r2 = input.as_ptr().add(in_base + (oh + 1) * in_w);
+
+                    // Scalar: ow=0 (left pad)
+                    {
+                        let mut s = bias.map(|b| *b.get_unchecked(c)).unwrap_or(0.0f32);
+                        for ki in 0..3usize {
+                            let rp = [r0, r1, r2][ki];
+                            for kj in 0..3usize {
+                                let iw = ow + kj;
+                                if iw > 0 && iw - 1 < in_w {
+                                    s += *rp.add(iw - 1) * *weight.get_unchecked(w_base + ki * 3 + kj);
+                                }
+                            }
+                        }
+                        let v = if act == Activation::Relu && s < 0.0 { 0.0 } else { s };
+                        *out.get_unchecked_mut(out_row + ow) = v;
+                        ow += 1;
+                    }
+
+                    // AVX2 middle: ow=1..vec_end
+                    while ow + 8 <= vec_end && ow + 8 <= out_w {
+                        let mut acc = bias_v.unwrap_or(zero_v);
+                        let off = ow - 1;
+                        acc = _mm256_fmadd_ps(w0, _mm256_loadu_ps(r0.add(off)),     acc);
+                        acc = _mm256_fmadd_ps(w1, _mm256_loadu_ps(r0.add(off + 1)), acc);
+                        acc = _mm256_fmadd_ps(w2, _mm256_loadu_ps(r0.add(off + 2)), acc);
+                        acc = _mm256_fmadd_ps(w3, _mm256_loadu_ps(r1.add(off)),     acc);
+                        acc = _mm256_fmadd_ps(w4, _mm256_loadu_ps(r1.add(off + 1)), acc);
+                        acc = _mm256_fmadd_ps(w5, _mm256_loadu_ps(r1.add(off + 2)), acc);
+                        acc = _mm256_fmadd_ps(w6, _mm256_loadu_ps(r2.add(off)),     acc);
+                        acc = _mm256_fmadd_ps(w7, _mm256_loadu_ps(r2.add(off + 1)), acc);
+                        acc = _mm256_fmadd_ps(w8, _mm256_loadu_ps(r2.add(off + 2)), acc);
+                        if act == Activation::Relu {
+                            acc = _mm256_max_ps(acc, zero_v);
+                        }
+                        _mm256_storeu_ps(out.as_mut_ptr().add(out_row + ow), acc);
+                        ow += 8;
+                    }
+
+                    // Scalar tail
+                    while ow < out_w {
+                        let off = ow - 1;
+                        let mut s = bias.map(|b| *b.get_unchecked(c)).unwrap_or(0.0f32);
+                        s += *r0.add(off)     * *weight.get_unchecked(w_base);
+                        s += *r0.add(off + 1) * *weight.get_unchecked(w_base + 1);
+                        s += *r0.add(off + 2) * *weight.get_unchecked(w_base + 2);
+                        s += *r1.add(off)     * *weight.get_unchecked(w_base + 3);
+                        s += *r1.add(off + 1) * *weight.get_unchecked(w_base + 4);
+                        s += *r1.add(off + 2) * *weight.get_unchecked(w_base + 5);
+                        s += *r2.add(off)     * *weight.get_unchecked(w_base + 6);
+                        s += *r2.add(off + 1) * *weight.get_unchecked(w_base + 7);
+                        s += *r2.add(off + 2) * *weight.get_unchecked(w_base + 8);
+                        let v = if act == Activation::Relu && s < 0.0 { 0.0 } else { s };
+                        *out.get_unchecked_mut(out_row + ow) = v;
+                        ow += 1;
+                    }
+                } else {
+                    // Edge rows: use generic scalar
+                    while ow < out_w {
+                        let mut s = bias.map(|b| *b.get_unchecked(c)).unwrap_or(0.0f32);
+                        for ki in 0..3usize {
+                            let ih = oh + ki;
+                            if ih < pad || ih >= in_h + pad { continue; }
+                            let rp = input.as_ptr().add(in_base + (ih - pad) * in_w);
+                            for kj in 0..3usize {
+                                let iw = ow + kj;
+                                if iw < pad || iw >= in_w + pad { continue; }
+                                s += *rp.add(iw - pad) * *weight.get_unchecked(w_base + ki * 3 + kj);
+                            }
+                        }
+                        let v = if act == Activation::Relu && s < 0.0 { 0.0 } else { s };
+                        *out.get_unchecked_mut(out_row + ow) = v;
+                        ow += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn depthwise_scalar_px(
+    input: &[f32],
+    weight: &[f32],
+    out: &mut [f32],
+    in_base: usize,
+    w_base: usize,
+    out_base: usize,
+    oh: usize,
+    ow: usize,
+    in_h: usize,
+    in_w: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    pad_top: usize,
+    pad_left: usize,
+    out_w: usize,
+    act: Activation,
+) {
+    let mut sum = 0.0f32;
+    for ki in 0..kh {
+        let ih = (oh * sh + ki) as isize - pad_top as isize;
+        if ih < 0 || ih >= in_h as isize { continue; }
+        for kj in 0..kw {
+            let iw = (ow * sw + kj) as isize - pad_left as isize;
+            if iw < 0 || iw >= in_w as isize { continue; }
+            sum += *input.get_unchecked(in_base + ih as usize * in_w + iw as usize)
+                * *weight.get_unchecked(w_base + ki * kw + kj);
+        }
+    }
+    out[out_base + oh * out_w + ow] = if act == Activation::Relu && sum < 0.0 { 0.0 } else { sum };
 }
 
 #[cfg(test)]

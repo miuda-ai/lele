@@ -1203,11 +1203,48 @@ pub fn equal_i64<'b, 'a, T: ElementOps>(
     b: &TensorView<'b, T>,
     out: &'a mut Vec<i64>,
 ) -> TensorView<'a, i64> {
-    // Need to convert comparison to i64 result (0 or 1)
-    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap_or_else(|| {
+    equal_i64_impl(&a.data, &a.shape, &b.data, &b.shape, out)
+}
+
+pub fn equal_i64_f32_r<'a, 'b>(
+    a: &TensorView<'b, f32>,
+    b: &TensorView<'b, f32>,
+    out: &'a mut Vec<i64>,
+) -> TensorView<'a, i64> {
+    let a_as_i64: Vec<i64> = a.data.iter().map(|&v| v as i64).collect();
+    let b_as_i64: Vec<i64> = b.data.iter().map(|&v| v as i64).collect();
+    equal_i64_impl(&a_as_i64, &a.shape, &b_as_i64, &b.shape, out)
+}
+
+pub fn equal_i64_f32_r_i64<'a, 'b>(
+    a: &TensorView<'b, i64>,
+    b: &TensorView<'b, f32>,
+    out: &'a mut Vec<i64>,
+) -> TensorView<'a, i64> {
+    let b_as_i64: Vec<i64> = b.data.iter().map(|&v| v as i64).collect();
+    equal_i64_impl(&a.data, &a.shape, &b_as_i64, &b.shape, out)
+}
+
+pub fn equal_i64_f32_lhs<'a, 'b>(
+    a: &TensorView<'b, f32>,
+    b: &TensorView<'b, i64>,
+    out: &'a mut Vec<i64>,
+) -> TensorView<'a, i64> {
+    let a_as_i64: Vec<i64> = a.data.iter().map(|&v| v as i64).collect();
+    equal_i64_impl(&a_as_i64, &a.shape, &b.data, &b.shape, out)
+}
+
+fn equal_i64_impl<'a, T: PartialEq + Copy>(
+    a_data: &[T],
+    a_shape: &[usize],
+    b_data: &[T],
+    b_shape: &[usize],
+    out: &'a mut Vec<i64>,
+) -> TensorView<'a, i64> {
+    let out_shape = utils::broadcast_shapes(a_shape, b_shape).unwrap_or_else(|| {
         panic!(
             "Shapes not broadcastable: a={:?} b={:?}",
-            &*a.shape, &*b.shape
+            a_shape, b_shape
         )
     });
     let numel = out_shape.iter().product::<usize>();
@@ -1215,47 +1252,31 @@ pub fn equal_i64<'b, 'a, T: ElementOps>(
     unsafe {
         out.set_len(numel);
     }
-
-    // Simplification: assume broadcast handled by loop if not scalars
-    // Optimized scalar paths can check lengths
-    if a.data.len() == 1 && b.data.len() == 1 {
-        out[0] = if a.data[0] == b.data[0] { 1 } else { 0 };
-    } else if a.data.len() == 1 {
-        let val_a = a.data[0];
+    if a_data.len() == 1 && b_data.len() == 1 {
+        out[0] = if a_data[0] == b_data[0] { 1 } else { 0 };
+    } else if a_data.len() == 1 {
+        let val_a = a_data[0];
         for i in 0..numel {
-            out[i] = if val_a == b.data[i] { 1 } else { 0 };
+            out[i] = if val_a == b_data[i] { 1 } else { 0 };
         }
-    } else if b.data.len() == 1 {
-        let val_b = b.data[0];
+    } else if b_data.len() == 1 {
+        let val_b = b_data[0];
         for i in 0..numel {
-            out[i] = if a.data[i] == val_b { 1 } else { 0 };
+            out[i] = if a_data[i] == val_b { 1 } else { 0 };
+        }
+    } else if a_data.len() == b_data.len() {
+        for i in 0..numel {
+            out[i] = if a_data[i] == b_data[i] { 1 } else { 0 };
         }
     } else {
-        // Full broadcast or same shape
-        // Code should handle full broadcast loop properly using indices, but here we assume flattened iteration works?
-        // Wait, original code iterated 0..numel using `a.data[i]`, `b.data[i]`. This only works if same shape or broadcasting involves copying.
-        // But `utils::broadcast_shapes` returns shape. It doesn't broadcast data.
-        // If shapes are different, a.data[i] might be invalid or wrong mapping!
-        // The original implementation was BUGGY for general broadcasting unless inputs were already broadcasted in memory?
-        // But `broadcast_binary_op` (used elsewhere) handles broadcasting logic via strides.
-        // `equal_i64` manual implementation seems to assume same length if not scalar?
-        // Or maybe strict check:
-        if a.data.len() == b.data.len() {
-            for i in 0..numel {
-                out[i] = if a.data[i] == b.data[i] { 1 } else { 0 };
-            }
-        } else {
-            // Resort to broadcast_binary_op but we want i64 output? `broadcast_binary_op` assumes T->T.
-            // We need T->i64.
-            // I'll assume same shape mostly. If not, panic for now (or implement proper loop).
-            panic!("equal_i64: complex broadcast not implemented inline");
-        }
+        panic!("equal_i64: complex broadcast not implemented");
     }
     TensorView {
         data: Cow::Borrowed(out),
         shape: Cow::Owned(out_shape),
     }
 }
+
 pub fn sigmoid<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let _t0 = if crate::kernels::timing::TIMING_ENABLED {
         Some(std::time::Instant::now())
@@ -1766,6 +1787,77 @@ pub fn reduce_l2<'b, 'a>(
         .collect();
     resolved_axes.sort();
     resolved_axes.dedup();
+
+    if resolved_axes.len() == 1
+        && resolved_axes[0] == dims - 1
+        && input.shape[dims - 1] == 2
+    {
+        let n = input.data.len() / 2;
+        utils::ensure_capacity(out, n);
+        unsafe {
+            out.set_len(n);
+        }
+        let mut out_shape = Vec::new();
+        for i in 0..dims {
+            if i != dims - 1 {
+                out_shape.push(input.shape[i]);
+            } else if keepdims {
+                out_shape.push(1);
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && n >= 8 {
+                unsafe {
+                    use std::arch::x86_64::*;
+                    let src = input.data.as_ptr();
+                    let dst = out.as_mut_ptr();
+                    let mut i: usize = 0;
+                    while i + 8 <= n {
+                        let base = i * 2;
+                        // Process 4+4 complex pairs using 128-bit ops to avoid 256-bit lane issues
+                        let v0 = _mm_loadu_ps(src.add(base));
+                        let v1 = _mm_loadu_ps(src.add(base + 4));
+                        let re0 = _mm_shuffle_ps(v0, v1, 0x88);
+                        let im0 = _mm_shuffle_ps(v0, v1, 0xDD);
+                        let res0 = _mm_sqrt_ps(_mm_add_ps(_mm_mul_ps(re0, re0), _mm_mul_ps(im0, im0)));
+
+                        let v2 = _mm_loadu_ps(src.add(base + 8));
+                        let v3 = _mm_loadu_ps(src.add(base + 12));
+                        let re1 = _mm_shuffle_ps(v2, v3, 0x88);
+                        let im1 = _mm_shuffle_ps(v2, v3, 0xDD);
+                        let res1 = _mm_sqrt_ps(_mm_add_ps(_mm_mul_ps(re1, re1), _mm_mul_ps(im1, im1)));
+
+                        _mm_storeu_ps(dst.add(i), res0);
+                        _mm_storeu_ps(dst.add(i + 4), res1);
+                        i += 8;
+                    }
+                    while i < n {
+                        let base = i * 2;
+                        let re = *src.add(base);
+                        let im = *src.add(base + 1);
+                        *dst.add(i) = re.hypot(im);
+                        i += 1;
+                    }
+                }
+                return TensorView {
+                    data: Cow::Borrowed(out),
+                    shape: Cow::Owned(out_shape),
+                };
+            }
+        }
+        let src = &input.data;
+        for i in 0..n {
+            let re = src[i * 2];
+            let im = src[i * 2 + 1];
+            out[i] = re.hypot(im);
+        }
+        return TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(out_shape),
+        };
+    }
+
     let mut out_shape = Vec::new();
     let mut reduce_mask = vec![false; dims];
     for &ax in &resolved_axes {
@@ -1850,28 +1942,28 @@ pub fn max<'b, 'a>(
         let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap_or_else(|| {
             panic!("max: cannot broadcast shapes {:?} and {:?}", a.shape, b.shape)
         });
-        let out_strides = utils::compute_strides(&out_shape);
+        let _out_strides = utils::compute_strides(&out_shape);
         let ndim = out_shape.len();
         let mut coords = vec![0usize; ndim];
         for i in 0..len {
             let mut a_idx = 0;
             let mut b_idx = 0;
             for d in 0..ndim {
-                let ca = if d + a.shape.len() >= ndim {
-                    coords[d + ndim - a.shape.len()]
+                let a_dim = if d + a.shape.len() >= ndim {
+                    d + a.shape.len() - ndim
                 } else {
-                    0
+                    usize::MAX
                 };
-                let cb = if d + b.shape.len() >= ndim {
-                    coords[d + ndim - b.shape.len()]
+                let b_dim = if d + b.shape.len() >= ndim {
+                    d + b.shape.len() - ndim
                 } else {
-                    0
+                    usize::MAX
                 };
-                if d + a.shape.len() >= ndim && a.shape[d + ndim - a.shape.len()] > 1 {
-                    a_idx += ca * a_strides[d + ndim - a.shape.len()];
+                if a_dim != usize::MAX && a.shape[a_dim] > 1 {
+                    a_idx += coords[d] * a_strides[a_dim];
                 }
-                if d + b.shape.len() >= ndim && b.shape[d + ndim - b.shape.len()] > 1 {
-                    b_idx += cb * b_strides[d + ndim - b.shape.len()];
+                if b_dim != usize::MAX && b.shape[b_dim] > 1 {
+                    b_idx += coords[d] * b_strides[b_dim];
                 }
             }
             let a_val = if a_idx < a.data.len() { a.data[a_idx] } else { f32::NEG_INFINITY };
@@ -2214,14 +2306,13 @@ pub fn stft<'b, 'a>(
     n_fft: usize,
     hop_length: usize,
     win_length: usize,
+    window: Option<&TensorView<'b>>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    use rustfft::{FftPlanner, num_complex::Complex};
-
     let signal_len = input.data.len();
     if signal_len == 0 {
         out.clear();
-        return TensorView::from_slice(out, vec![0, n_fft / 2 + 1, 2]);
+        return TensorView::from_slice(out, vec![0, 0, n_fft / 2 + 1, 2]);
     }
 
     let num_frames = if signal_len < win_length {
@@ -2231,38 +2322,120 @@ pub fn stft<'b, 'a>(
     };
     let n_freqs = n_fft / 2 + 1;
 
-    // Hann window
-    let mut window = vec![0.0f32; win_length];
-    for i in 0..win_length {
-        window[i] = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / win_length as f32).cos());
-    }
+    let window_data: Vec<f32> = if let Some(w) = window {
+        w.data.iter().copied().collect()
+    } else {
+        let mut w = vec![0.0f32; win_length];
+        for i in 0..win_length {
+            w[i] = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / win_length as f32).cos());
+        }
+        w
+    };
 
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(n_fft);
-
-    let mut buffer: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); n_fft];
+    let (tw_re, tw_im, bit_rev) = crate::kernels::fft::precompute_twiddles(n_fft);
+    let mut re_buf = vec![0.0f32; n_fft];
+    let mut im_buf = vec![0.0f32; n_fft];
+    let mut frame_data = vec![0.0f32; n_fft];
+    let mut freq_re = vec![0.0f32; n_freqs];
+    let mut freq_im = vec![0.0f32; n_freqs];
     out.resize(num_frames * n_freqs * 2, 0.0);
 
     for frame in 0..num_frames {
         let start = frame * hop_length;
-        // Zero-pad and apply window
         for i in 0..n_fft {
             if i < win_length && start + i < signal_len {
-                buffer[i] = Complex::new(input.data[start + i] * window[i], 0.0);
+                frame_data[i] = input.data[start + i] * window_data[i];
             } else {
-                buffer[i] = Complex::new(0.0, 0.0);
+                frame_data[i] = 0.0;
             }
         }
-        fft.process(&mut buffer);
-        // Copy real/imag pairs to output
+        crate::kernels::fft::rfft_forward_f32_precomputed(
+            &frame_data, &tw_re, &tw_im, &bit_rev,
+            &mut re_buf, &mut im_buf,
+            &mut freq_re, &mut freq_im,
+        );
         for freq in 0..n_freqs {
             let out_idx = (frame * n_freqs + freq) * 2;
-            out[out_idx] = buffer[freq].re;
-            out[out_idx + 1] = buffer[freq].im;
+            out[out_idx] = freq_re[freq];
+            out[out_idx + 1] = freq_im[freq];
         }
     }
 
-    TensorView::from_slice(out, vec![num_frames, n_freqs, 2])
+    let batch: usize = input.shape[..input.shape.len().saturating_sub(1)].iter().product();
+    let mut stft_shape = vec![batch, num_frames, n_freqs, 2];
+    if input.dim() <= 1 {
+        stft_shape = vec![num_frames, n_freqs, 2];
+    }
+    TensorView::from_slice(out, stft_shape)
+}
+
+pub fn stft_power_spectrum<'b, 'a>(
+    input: &TensorView<'b>,
+    n_fft: usize,
+    hop_length: usize,
+    win_length: usize,
+    window: Option<&TensorView<'b>>,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let signal_len = input.data.len();
+    if signal_len == 0 {
+        out.clear();
+        return TensorView::from_slice(out, vec![0, 0, n_fft / 2 + 1]);
+    }
+
+    let num_frames = if signal_len < win_length {
+        1
+    } else {
+        (signal_len - win_length) / hop_length + 1
+    };
+    let n_freqs = n_fft / 2 + 1;
+
+    let window_data: Vec<f32> = if let Some(w) = window {
+        w.data.iter().copied().collect()
+    } else {
+        let mut w = vec![0.0f32; win_length];
+        for i in 0..win_length {
+            w[i] = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / win_length as f32).cos());
+        }
+        w
+    };
+
+    let (tw_re, tw_im, bit_rev) = crate::kernels::fft::precompute_twiddles(n_fft);
+    let mut re_buf = vec![0.0f32; n_fft];
+    let mut im_buf = vec![0.0f32; n_fft];
+    let mut frame_data = vec![0.0f32; n_fft];
+    let mut freq_re = vec![0.0f32; n_freqs];
+    let mut freq_im = vec![0.0f32; n_freqs];
+    out.resize(num_frames * n_freqs, 0.0);
+
+    for frame in 0..num_frames {
+        let start = frame * hop_length;
+        for i in 0..n_fft {
+            if i < win_length && start + i < signal_len {
+                frame_data[i] = input.data[start + i] * window_data[i];
+            } else {
+                frame_data[i] = 0.0;
+            }
+        }
+        crate::kernels::fft::rfft_forward_f32_precomputed(
+            &frame_data, &tw_re, &tw_im, &bit_rev,
+            &mut re_buf, &mut im_buf,
+            &mut freq_re, &mut freq_im,
+        );
+        let base = frame * n_freqs;
+        for freq in 0..n_freqs {
+            let re = freq_re[freq];
+            let im = freq_im[freq];
+            out[base + freq] = re * re + im * im;
+        }
+    }
+
+    let batch: usize = input.shape[..input.shape.len().saturating_sub(1)].iter().product();
+    let mut stft_shape = vec![batch, num_frames, n_freqs];
+    if input.dim() <= 1 {
+        stft_shape = vec![num_frames, n_freqs];
+    }
+    TensorView::from_slice(out, stft_shape)
 }
 
 #[cfg(test)]

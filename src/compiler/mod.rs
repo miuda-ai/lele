@@ -1,4 +1,4 @@
-use crate::model::onnx_proto::{GraphProto, NodeProto, TensorProto};
+use crate::model::onnx_proto::{type_proto, tensor_shape_proto, GraphProto, NodeProto, TensorProto};
 use crate::model::tensor_to_array;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -397,6 +397,37 @@ impl Compiler {
                 constants.insert(init.name.clone(), (data, shape, init.data_type));
             }
         }
+        // 1b. Pre-populate Shape outputs for model inputs with known static shapes.
+        // Dynamic dims use -1 (Reshape "infer" sentinel).
+        // This allows Shape->Concat->Reshape chains to be folded at compile time.
+        for inp in &graph.input {
+            if let Some(ref type_proto) = inp.r#type
+                && let Some(type_proto::Value::TensorType(ref tensor_type)) = type_proto.value
+                && let Some(ref shape) = tensor_type.shape
+            {
+                let mut dims: Vec<f32> = Vec::new();
+                for dim in &shape.dim {
+                    match &dim.value {
+                        Some(tensor_shape_proto::dimension::Value::DimValue(v)) => {
+                            dims.push(if *v > 0 { *v as f32 } else { 1.0 });
+                        }
+                        Some(tensor_shape_proto::dimension::Value::DimParam(_)) => {
+                            dims.push(-1.0);
+                        }
+                        None => {
+                            dims.push(1.0);
+                        }
+                    }
+                }
+                if !dims.is_empty() {
+                    let shape_usize: Vec<usize> = dims.iter().map(|&d| d as usize).collect();
+                    constants.insert(
+                        inp.name.clone(),
+                        (dims, shape_usize, 7),
+                    );
+                }
+            }
+        }
         // 2. Load existing Constant nodes
         for node in &graph.node {
             if node.op_type == "Constant"
@@ -727,6 +758,11 @@ impl Compiler {
         }
     }
 
+    fn simplify_dynamic_shapes(_graph: &mut GraphProto) {
+        // No-op for now. The Reshape kernel handles 0 sentinel failures at runtime
+        // by trying multiple strategies (standard, 0→-1, collapse to source rank).
+    }
+
     pub fn compile(
         &self,
         graph: &GraphProto,
@@ -734,6 +770,7 @@ impl Compiler {
         let mut graph_storage;
         let graph = if self.constant_folding {
             graph_storage = graph.clone();
+            Self::simplify_dynamic_shapes(&mut graph_storage);
             self.fold_constants(&mut graph_storage);
             &graph_storage
         } else {

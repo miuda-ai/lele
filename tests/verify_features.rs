@@ -1,6 +1,6 @@
 use approx::assert_abs_diff_eq;
+use lele::features::fft::Complex;
 use lele::features::{RealFft, hann_window};
-use rustfft::num_complex::Complex;
 
 #[test]
 fn test_hann_window_correctness() {

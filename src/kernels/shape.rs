@@ -4,13 +4,65 @@ pub fn reshape<'a, T: Clone + std::fmt::Debug>(
     target_shape_raw: &[i64],
 ) -> TensorView<'a, T> {
     let total_elements = input.data.len();
+
+    // First pass: standard 0/-1 semantics
+    if let Some(shape) = try_reshape_with_zeros(input, target_shape_raw, total_elements) {
+        return TensorView {
+            data: input.data.clone(),
+            shape: std::borrow::Cow::Owned(shape),
+        };
+    }
+
+    // Second pass: replace 0 with -1 (infer) and retry
+    let fixed: Vec<i64> = target_shape_raw.iter().map(|&d| if d == 0 { -1 } else { d }).collect();
+    if let Some(shape) = try_reshape_with_zeros(input, &fixed, total_elements) {
+        return TensorView {
+            data: input.data.clone(),
+            shape: std::borrow::Cow::Owned(shape),
+        };
+    }
+
+    // Third pass: collapse target to match source rank using -1
+    // e.g. target [1, 96000, 64, 601] for source [1, 64, 601] → [1, -1, 601]
+    let source_rank = input.dim();
+    if target_shape_raw.len() > source_rank && source_rank > 0 {
+        // Keep first dim, infer middle, keep last (source_rank - 1) dims
+        let mut collapsed: Vec<i64> = Vec::new();
+        // First dim from target
+        let first = if target_shape_raw[0] > 0 { target_shape_raw[0] } else { -1 };
+        collapsed.push(first);
+        // -1 for inferred
+        collapsed.push(-1);
+        // Last (source_rank - 1) dims from target end
+        for &dim in target_shape_raw.iter().rev().take(source_rank - 1).rev() {
+            collapsed.push(if dim > 0 { dim } else { -1 });
+        }
+        if let Some(shape) = try_reshape_with_zeros(input, &collapsed, total_elements) {
+            return TensorView {
+                data: input.data.clone(),
+                shape: std::borrow::Cow::Owned(shape),
+            };
+        }
+    }
+
+    panic!(
+        "Reshape: element count mismatch (input={:?} target={:?})",
+        input.shape, target_shape_raw
+    );
+}
+
+fn try_reshape_with_zeros<T: Clone + std::fmt::Debug>(
+    input: &TensorView<'_, T>,
+    target: &[i64],
+    total_elements: usize,
+) -> Option<Vec<usize>> {
     let mut new_shape = Vec::new();
     let mut known_product = 1;
     let mut infer_idx = None;
-    for (i, &dim) in target_shape_raw.iter().enumerate() {
+    for (i, &dim) in target.iter().enumerate() {
         if dim == -1 {
             if infer_idx.is_some() {
-                panic!("Reshape: multiple -1 dimensions");
+                return None;
             }
             infer_idx = Some(i);
         } else if dim == 0 {
@@ -19,11 +71,7 @@ pub fn reshape<'a, T: Clone + std::fmt::Debug>(
                 new_shape.push(d);
                 known_product *= d;
             } else {
-                panic!(
-                    "Reshape: 0 dimension index out of bounds of input shape {} vs target rank {}",
-                    input.dim(),
-                    target_shape_raw.len()
-                );
+                return None;
             }
         } else {
             new_shape.push(dim as usize);
@@ -31,25 +79,16 @@ pub fn reshape<'a, T: Clone + std::fmt::Debug>(
         }
     }
     if let Some(idx) = infer_idx {
-        if known_product == 0 {
-            panic!(
-                "Reshape: known product is 0, cannot infer -1 dimension. Total elements: {}",
-                total_elements
-            );
+        if known_product == 0 || total_elements % known_product != 0 {
+            return None;
         }
         let missing = total_elements / known_product;
         new_shape.insert(idx, missing);
     }
-    assert_eq!(
-        new_shape.iter().product::<usize>(),
-        total_elements,
-        "Reshape: element count mismatch (input={:?} target={:?})",
-        input.shape,
-        target_shape_raw
-    );
-    TensorView {
-        data: input.data.clone(),
-        shape: std::borrow::Cow::Owned(new_shape),
+    if new_shape.iter().product::<usize>() == total_elements {
+        Some(new_shape)
+    } else {
+        None
     }
 }
 

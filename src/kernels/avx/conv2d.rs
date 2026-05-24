@@ -1,3 +1,4 @@
+#![allow(unsafe_op_in_unsafe_fn)]
 /// AVX2-accelerated direct 2D convolution for common cases.
 ///
 /// This module bypasses the im2col→GEMM pipeline for convolutions that benefit

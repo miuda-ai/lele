@@ -1,6 +1,6 @@
+use crate::features::fft::Complex;
 use crate::features::{Lfr, LfrConfig, RealFft, SparseMelBank, hann_window, log_compress};
 use crate::tensor::TensorView;
-use rustfft::num_complex::Complex;
 #[cfg(nightly_build)]
 use std::simd::prelude::*;
 

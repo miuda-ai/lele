@@ -30,3 +30,5 @@ examples/*/target/
 # Model cache
 /target/lele_cache/
 examples/web-demo/crates/sensevoice-wasm/src/gen/sensevoice.rs
+*.npy
+examples/web-demo/crates/sensevoice-wasm/src/gen/sensevoice.rs

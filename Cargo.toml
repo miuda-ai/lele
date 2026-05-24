@@ -24,7 +24,7 @@ anyhow = "1.0"
 
 [package]
 name = "lele"
-version = "0.1.13"
+version = "0.1.10"
 edition = "2024"
 description = "Bare-metal machine learning inference library in Rust"
 license = "MIT"
@@ -55,10 +55,8 @@ compiler = ["dep:prost", "dep:prost-types"]
 [dependencies]
 prost = { version = "0.14.3", optional = true }
 prost-types = { version = "0.14.3", optional = true }
-bytes = "1.11.1"
 thiserror = "2"
 byteorder = "1.5"
-rustfft = "6.2"
 libm = "0.2"
 half = "2.7.1"
 
@@ -69,15 +67,8 @@ gemm = { version = "0.19.0", features = ["experimental-apple-amx"] }
 
 [dev-dependencies]
 approx = "0.5"
-anyhow = "1.0"
 test-log = "0.2"
-env_logger = "0.11"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-regex = "1.12.3"
 unicode-normalization = "0.1"
-rand = "0.10.0"
-rand_distr = "0.6.0"
 faer = "0.24.0"
 criterion = "0.8.2"
 

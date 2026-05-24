@@ -33,6 +33,19 @@ For fairness and stability, SenseVoice uses steady-state metrics (warmup + multi
 - **Speech Optimized**: Built-in feature extraction for audio (FFT, Mel-spectrogram, LFR, CMVN).
 - **WebAssembly Ready**: Full browser compatibility with WASM SIMD128 optimizations.
 
+## Supported ONNX Operators
+
+`lele` supports a comprehensive set of ONNX operators:
+
+- **Math**: Add, Sub, Mul, Div, Pow, Sqrt, Neg, Abs, Exp, Log, Sin, Cos, Erf, Softplus, Clip, Mod
+- **Neural Network**: Conv, ConvTranspose, Gemm, MatMul, MatMulInteger, LSTM, GRU, BatchNormalization, LayerNormalization
+- **Activation**: Relu, Sigmoid, Tanh, Softmax, Gelu, PRelu, Silu
+- **Tensor**: Reshape, Transpose, Concat, Split, Slice, Gather, GatherElements, Pad, Expand, Tile, Where, TopK, Flatten, Squeeze, Unsqueeze
+- **Reduction**: ReduceSum, ReduceMean, ReduceMax, ReduceL2
+- **Comparison**: Equal, Less, Greater, LessOrEqual, GreaterOrEqual
+- **Signal**: STFT (Short-Time Fourier Transform)
+- **Other**: Shape, Size, Cast, ConstantOfShape, DynamicQuantizeLinear, Identity, Range
+
 ## WebAssembly Support
 
 **lele** compiles to WebAssembly and runs ML inference directly in the browser with **no server required**.
@@ -68,7 +81,8 @@ See [examples/web-demo/README.md](examples/web-demo/README.md) for details.
 
 - **SenseVoiceSmall**: High-accuracy multi-lingual ASR.
 - **Silero VAD**: Reliable Voice Activity Detection.
-- **Supertonic**: Fast and high-quality Text-to-Speech.
+- **Supertonic 2**: Fast and high-quality Text-to-Speech (5 languages).
+- **Supertonic 3**: Improved TTS with 31 languages, better reading stability, and expression tags (`<laugh>`, `<breath>`, `<sigh>`).
 - **Yolo26**: Real-time object detection.
 
 ## Getting Started
@@ -92,8 +106,11 @@ cargo run --release --bin lele_gen -- <model.onnx> <output_path.rs>
 # SenseVoice ASR
 ./run_sensevoice.sh
 
-# Supertonic TTS
+# Supertonic 2 TTS (5 languages)
 ./run_supertonic.sh
+
+# Supertonic 3 TTS (31 languages, expression tags)
+./run_supertonic3.sh
 
 # Silero VAD
 ./run_silero.sh

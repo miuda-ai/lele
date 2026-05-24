@@ -1,3 +1,4 @@
+#![allow(unsafe_op_in_unsafe_fn)]
 use crate::kernels::activations::{sigmoid, tanh};
 #[cfg(target_arch = "wasm32")]
 use crate::kernels::wasm_matmul::{Accum, MatMut, MatRef, Par, matmul};
@@ -282,70 +283,64 @@ pub fn gru<'b, 'a>(
     }
     out_y.resize(seq_len * hidden_size, 0.0);
 
-    let mut gates = vec![0.0; 3 * hidden_size];
-    let mut w_contribution = vec![0.0; 3 * hidden_size];
-    let mut r_contribution = vec![0.0; 3 * hidden_size];
+    let mut gates = vec![0.0f32; 3 * hidden_size];
+    let mut w_contribution = vec![0.0f32; 3 * hidden_size];
+    let mut r_contribution = vec![0.0f32; 3 * hidden_size];
+
+    let m = 3 * hidden_size;
 
     for t in 0..seq_len {
         let input_offset = t * input_size;
         let x_t = &input.data[input_offset..input_offset + input_size];
 
         unsafe {
-            // W * x_t: [3*H, I] x [I, 1] -> [3*H]
-            let m = 3 * hidden_size;
-            let k = input_size;
-            let a = MatRef::<f32>::from_raw_parts(w_data.as_ptr(), m, k, k as isize, 1);
-            let b = MatRef::<f32>::from_raw_parts(x_t.as_ptr(), k, 1, 1, 1);
+            let a = MatRef::<f32>::from_raw_parts(w_data.as_ptr(), m, input_size, input_size as isize, 1);
+            let b = MatRef::<f32>::from_raw_parts(x_t.as_ptr(), input_size, 1, 1, 1);
             let c = MatMut::<f32>::from_raw_parts_mut(w_contribution.as_mut_ptr(), m, 1, 1, 1);
             matmul(c, Accum::Replace, a, b, 1.0, Par::Seq);
 
-            // R * h_{t-1}: [3*H, H] x [H, 1] -> [3*H]
-            let a = MatRef::<f32>::from_raw_parts(
-                r_data.as_ptr(),
-                m,
-                hidden_size,
-                hidden_size as isize,
-                1,
-            );
+            let a = MatRef::<f32>::from_raw_parts(r_data.as_ptr(), m, hidden_size, hidden_size as isize, 1);
             let b = MatRef::<f32>::from_raw_parts(out_h.as_ptr(), hidden_size, 1, 1, 1);
             let c = MatMut::<f32>::from_raw_parts_mut(r_contribution.as_mut_ptr(), m, 1, 1, 1);
             matmul(c, Accum::Replace, a, b, 1.0, Par::Seq);
         }
 
-        // gates = Wx + Rh + bias
-        for g in 0..(3 * hidden_size) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                unsafe { gru_gate_fusion_avx2(
+                    &w_contribution, &r_contribution, bias_w_slice, bias_r_slice,
+                    out_h, &mut out_y[t * hidden_size..], hidden_size, linear_before_reset,
+                ); }
+                continue;
+            }
+        }
+
+        for g in 0..m {
             gates[g] = w_contribution[g] + r_contribution[g] + bias_w_slice[g] + bias_r_slice[g];
         }
 
-        // Split into z (update), r (reset), h (candidate)
         let (z_wx, r_wx_hx) = gates.split_at(hidden_size);
         let (r_wx, h_wx) = r_wx_hx.split_at(hidden_size);
 
-        // z = sigmoid(Wz*x + Rz*h + b_z)
-        // r = sigmoid(Wr*x + Rr*h + b_r)
-        // h_candidate = tanh(Wh*x + linear_before_reset ? r*(Rh*h + b_rh) : (r*(Rh*h)) + b_h)
-
         if linear_before_reset {
-            // h_candidate = tanh(Wh*x + r * (Rh*h + bias_r_h))
-            let mut r_bias_r = vec![0.0; hidden_size];
-            for k in 0..hidden_size {
-                r_bias_r[k] = r_contribution[hidden_size + k] + bias_r_slice[hidden_size + k];
-            }
             for k in 0..hidden_size {
                 let z_gate = sigmoid(z_wx[k]);
                 let r_gate = sigmoid(r_wx[k]);
-                let h_pre = h_wx[k] + r_gate * r_bias_r[k];
+                let r_bias_r = r_contribution[hidden_size + k] + bias_r_slice[hidden_size + k];
+                let h_pre = h_wx[k] + r_gate * r_bias_r;
                 let h_gate = tanh(h_pre);
                 let ht = (1.0 - z_gate) * h_gate + z_gate * out_h[k];
                 out_h[k] = ht;
                 out_y[t * hidden_size + k] = ht;
             }
         } else {
-            // Standard: h_candidate = tanh(Wh*x + r*(Rh*h) + bias_h)
             for k in 0..hidden_size {
                 let z_gate = sigmoid(z_wx[k]);
                 let r_gate = sigmoid(r_wx[k]);
-                let h_pre = h_wx[k] + r_gate * r_contribution[2 * hidden_size + k];
+                let wh_x_bh = w_contribution[2 * hidden_size + k] + bias_w_slice[2 * hidden_size + k];
+                let r_rh = r_gate * (r_contribution[2 * hidden_size + k] + bias_r_slice[2 * hidden_size + k]);
+                let h_pre = wh_x_bh + r_rh;
                 let h_gate = tanh(h_pre);
                 let ht = (1.0 - z_gate) * h_gate + z_gate * out_h[k];
                 out_h[k] = ht;
@@ -359,4 +354,79 @@ pub fn gru<'b, 'a>(
     let output_h_shape = vec![1, 1, hidden_size];
     let output_h = TensorView::from_slice(out_h, output_h_shape);
     (output_y, output_h)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn gru_gate_fusion_avx2(
+    w_cont: &[f32],
+    r_cont: &[f32],
+    bias_w: &[f32],
+    bias_r: &[f32],
+    h: &mut [f32],
+    y_out: &mut [f32],
+    hidden_size: usize,
+    _linear_before_reset: bool,
+) {
+    use std::arch::x86_64::*;
+
+    let one = _mm256_set1_ps(1.0);
+
+    let mut k = 0usize;
+    while k + 8 <= hidden_size {
+        // z gate: sigmoid(w_cont[k] + r_cont[k] + bias_w[k] + bias_r[k])
+        let wz = _mm256_loadu_ps(w_cont.as_ptr().add(k));
+        let wr = _mm256_loadu_ps(r_cont.as_ptr().add(k));
+        let bwz = _mm256_loadu_ps(bias_w.as_ptr().add(k));
+        let bwr = _mm256_loadu_ps(bias_r.as_ptr().add(k));
+        let z_pre = _mm256_add_ps(_mm256_add_ps(wz, wr), _mm256_add_ps(bwz, bwr));
+        let z_gate = crate::kernels::avx::math::avx2_sigmoid_ps(z_pre);
+
+        // r gate
+        let k2 = k + hidden_size;
+        let wr2 = _mm256_loadu_ps(w_cont.as_ptr().add(k2));
+        let rr2 = _mm256_loadu_ps(r_cont.as_ptr().add(k2));
+        let bwr2 = _mm256_loadu_ps(bias_w.as_ptr().add(k2));
+        let brr2 = _mm256_loadu_ps(bias_r.as_ptr().add(k2));
+        let r_pre = _mm256_add_ps(_mm256_add_ps(wr2, rr2), _mm256_add_ps(bwr2, brr2));
+        let r_gate = crate::kernels::avx::math::avx2_sigmoid_ps(r_pre);
+
+        // h gate
+        let k3 = k + 2 * hidden_size;
+        let wh_x = _mm256_add_ps(
+            _mm256_loadu_ps(w_cont.as_ptr().add(k3)),
+            _mm256_loadu_ps(bias_w.as_ptr().add(k3)),
+        );
+        let r_rh = _mm256_mul_ps(
+            r_gate,
+            _mm256_add_ps(
+                _mm256_loadu_ps(r_cont.as_ptr().add(k3)),
+                _mm256_loadu_ps(bias_r.as_ptr().add(k3)),
+            ),
+        );
+        let h_pre = _mm256_add_ps(wh_x, r_rh);
+        let h_gate = crate::kernels::avx::math::avx2_tanh_ps(h_pre);
+
+        // ht = (1-z)*h_gate + z*h_prev
+        let h_prev = _mm256_loadu_ps(h.as_ptr().add(k));
+        let ht = _mm256_fmadd_ps(_mm256_sub_ps(one, z_gate), h_gate, _mm256_mul_ps(z_gate, h_prev));
+        _mm256_storeu_ps(h.as_mut_ptr().add(k), ht);
+        _mm256_storeu_ps(y_out.as_mut_ptr().add(k), ht);
+
+        k += 8;
+    }
+    while k < hidden_size {
+        let z_pre = w_cont[k] + r_cont[k] + bias_w[k] + bias_r[k];
+        let z_gate = sigmoid(z_pre);
+        let r_pre = w_cont[k + hidden_size] + r_cont[k + hidden_size]
+            + bias_w[k + hidden_size] + bias_r[k + hidden_size];
+        let r_gate = sigmoid(r_pre);
+        let wh_x_bh = w_cont[k + 2 * hidden_size] + bias_w[k + 2 * hidden_size];
+        let r_rh = r_gate * (r_cont[k + 2 * hidden_size] + bias_r[k + 2 * hidden_size]);
+        let h_pre = wh_x_bh + r_rh;
+        let h_gate = tanh(h_pre);
+        let ht = (1.0 - z_gate) * h_gate + z_gate * h[k];
+        h[k] = ht;
+        y_out[k] = ht;
+        k += 1;
+    }
 }
