@@ -3050,7 +3050,7 @@ fn conv_transpose_inner<'b, 'a>(
 
     for n in 0..batch_size {
         let batch_offset = n * out_channels * out_h * out_w;
-        let _input_ptr = unsafe { input.data.as_ptr().add(n * in_channels * hw) };
+        let input_ptr = unsafe { input.data.as_ptr().add(n * in_channels * hw) };
 
         // GEMM: col[col_rows x hw] = W^T[col_rows x in_channels] * input[in_channels x hw]
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
