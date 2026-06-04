@@ -24,12 +24,58 @@ pub struct OnnxModel {
 }
 impl OnnxModel {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, ModelError> {
+        let path = path.as_ref();
         let mut file = File::open(path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
-        let proto = ModelProto::decode(&buffer[..])?;
+        let mut proto = ModelProto::decode(&buffer[..])?;
+        let model_dir = path.parent().unwrap_or(Path::new("."));
+        if let Some(graph) = proto.graph.as_mut() {
+            Self::load_external_data(graph, model_dir)?;
+        }
         Ok(Self { proto })
     }
+
+    fn load_external_data(graph: &mut GraphProto, model_dir: &Path) -> Result<(), ModelError> {
+        let mut data_cache: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+        for init in &mut graph.initializer {
+            if init.data_location == 1 && init.raw_data.is_empty() {
+                let location = init.external_data.iter()
+                    .find(|e| e.key == "location")
+                    .map(|e| e.value.as_str())
+                    .unwrap_or("");
+                let offset: usize = init.external_data.iter()
+                    .find(|e| e.key == "offset")
+                    .and_then(|e| e.value.parse().ok())
+                    .unwrap_or(0);
+                let length: usize = init.external_data.iter()
+                    .find(|e| e.key == "length")
+                    .and_then(|e| e.value.parse().ok())
+                    .unwrap_or(0);
+                if location.is_empty() || length == 0 {
+                    continue;
+                }
+                let data_file_path = model_dir.join(location);
+                let data_file_key = data_file_path.to_string_lossy().to_string();
+                let data = data_cache.entry(data_file_key.clone()).or_insert_with(|| {
+                    let mut f = File::open(&data_file_path).ok();
+                    match &mut f {
+                        Some(f) => {
+                            let mut buf = Vec::new();
+                            f.read_to_end(&mut buf).ok();
+                            buf
+                        }
+                        None => Vec::new(),
+                    }
+                });
+                if offset + length <= data.len() {
+                    init.raw_data = data[offset..offset + length].to_vec();
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn graph(&self) -> Option<&GraphProto> {
         self.proto.graph.as_ref()
     }

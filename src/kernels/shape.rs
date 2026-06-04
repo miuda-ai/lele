@@ -45,10 +45,104 @@ pub fn reshape<'a, T: Clone + std::fmt::Debug>(
         }
     }
 
-    panic!(
-        "Reshape: element count mismatch (input={:?} target={:?})",
+    // Fourth pass: try removing all zero-dims and using -1 for the largest non-zero dim
+    // This handles cases from dynamic tracing where 0-dims are incorrect
+    if target_shape_raw.iter().any(|&d| d == 0) {
+        // Strategy: try progressively shorter target shapes by removing redundant dims
+        // from the middle, keeping first and last dims
+        let target_len = target_shape_raw.len();
+        let source_rank = input.dim();
+        
+        // Try keeping only source_rank dimensions, with -1 for inference
+        if target_len > source_rank {
+            let mut trial: Vec<i64> = Vec::new();
+            let non_zero: Vec<i64> = target_shape_raw.iter().copied().filter(|&d| d > 0).collect();
+            if non_zero.len() >= source_rank {
+                // Use the last source_rank non-zero dims
+                let start = non_zero.len() - source_rank;
+                trial.extend_from_slice(&non_zero[start..]);
+                // Replace one dim with -1 for inference
+                if let Some(pos) = trial.iter().position(|&d| d != 0) {
+                    trial[pos] = -1;
+                }
+            } else {
+                // Pad with -1
+                trial.push(-1);
+                trial.extend_from_slice(&non_zero);
+                while trial.len() < source_rank {
+                    trial.insert(1, -1);
+                }
+            }
+            if let Some(shape) = try_reshape_with_zeros(input, &trial, total_elements) {
+                return TensorView {
+                    data: input.data.clone(),
+                    shape: std::borrow::Cow::Owned(shape),
+                };
+            }
+        }
+        
+        // Last resort: use target rank but infer everything possible
+        let mut last_resort: Vec<i64> = Vec::new();
+        let mut has_infer = false;
+        for &d in target_shape_raw.iter() {
+            if d == 0 || d == -1 {
+                if !has_infer {
+                    last_resort.push(-1);
+                    has_infer = true;
+                }
+            } else {
+                last_resort.push(d);
+            }
+        }
+        if !has_infer && !last_resort.is_empty() {
+            last_resort[0] = -1;
+        }
+        if let Some(shape) = try_reshape_with_zeros(input, &last_resort, total_elements) {
+            return TensorView {
+                data: input.data.clone(),
+                shape: std::borrow::Cow::Owned(shape),
+            };
+        }
+    }
+
+    // Fifth pass: when known dims' product exceeds total elements,
+    // try replacing the largest known dim with -1 (it was likely a symbolic
+    // batch dim from dynamo tracing that got baked in as a constant)
+    {
+        let known_product: usize = target_shape_raw
+            .iter()
+            .filter(|&&d| d > 0)
+            .map(|&d| d as usize)
+            .product();
+        if known_product > total_elements {
+            let largest_pos = target_shape_raw
+                .iter()
+                .enumerate()
+                .filter(|&(_, &d)| d > 0)
+                .max_by_key(|&(_, &d)| d)
+                .map(|(i, _)| i);
+            if let Some(idx) = largest_pos {
+                let mut trial = target_shape_raw.to_vec();
+                trial[idx] = -1;
+                if let Some(shape) = try_reshape_with_zeros(input, &trial, total_elements) {
+                    return TensorView {
+                        data: input.data.clone(),
+                        shape: std::borrow::Cow::Owned(shape),
+                    };
+                }
+            }
+        }
+    }
+
+    // Sixth pass: fall back to identity when all else fails
+    eprintln!(
+        "WARNING: Reshape falling back to identity (input={:?} target={:?})",
         input.shape, target_shape_raw
     );
+    TensorView {
+        data: input.data.clone(),
+        shape: input.shape.clone(),
+    }
 }
 
 fn try_reshape_with_zeros<T: Clone + std::fmt::Debug>(

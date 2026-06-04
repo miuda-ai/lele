@@ -294,6 +294,22 @@ pub mod patterns;
 
 pub(crate) use generate::*;
 
+fn to_pascal_case(s: &str) -> String {
+    let mut result = String::new();
+    let mut capitalize_next = true;
+    for c in s.chars() {
+        if c == '_' {
+            capitalize_next = true;
+        } else if capitalize_next {
+            result.push(c.to_ascii_uppercase());
+            capitalize_next = false;
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 pub struct Compiler {
     pub(crate) overrides: HashMap<String, OpHandler>,
     pub(crate) model_name: String,
@@ -363,7 +379,7 @@ impl Compiler {
     }
 
     pub fn with_name(mut self, name: &str) -> Self {
-        self.model_name = name.to_string();
+        self.model_name = to_pascal_case(name);
         self
     }
 
@@ -1397,42 +1413,45 @@ fn collect_weights(
             }
         }
 
-        if let Ok((bytes, shape, data_type)) = crate::model::tensor_to_vec_u8(init) {
-            if !bytes.is_empty() {
-                // Compute content hash for deduplication
-                let hash = compute_hash(&bytes);
+        match crate::model::tensor_to_vec_u8(init) {
+            Ok((bytes, shape, data_type)) => {
+                if !bytes.is_empty() {
+                    // Compute content hash for deduplication
+                    let hash = compute_hash(&bytes);
 
-                // Check if we already have identical weight content
-                if let Some(&(existing_offset, existing_len)) = content_hash_map.get(&hash) {
-                    // Reuse existing offset, but keep current weight's shape and dtype
-                    offset_map.push((
-                        init.name.clone(),
-                        existing_offset,
-                        existing_len,
-                        shape,
-                        data_type,
-                    ));
-                } else {
-                    // New weight: align, write, and record
-                    let remainder = *current_offset % 16;
-                    if remainder != 0 {
-                        let padding = 16 - remainder;
-                        bin_data.write_all(&vec![0u8; padding])?;
-                        *current_offset += padding;
+                    // Check if we already have identical weight content
+                    if let Some(&(existing_offset, existing_len)) = content_hash_map.get(&hash) {
+                        // Reuse existing offset, but keep current weight's shape and dtype
+                        offset_map.push((
+                            init.name.clone(),
+                            existing_offset,
+                            existing_len,
+                            shape,
+                            data_type,
+                        ));
+                    } else {
+                        // New weight: align, write, and record
+                        let remainder = *current_offset % 16;
+                        if remainder != 0 {
+                            let padding = 16 - remainder;
+                            bin_data.write_all(&vec![0u8; padding])?;
+                            *current_offset += padding;
+                        }
+
+                        bin_data.write_all(&bytes)?;
+                        offset_map.push((
+                            init.name.clone(),
+                            *current_offset,
+                            bytes.len(),
+                            shape.clone(),
+                            data_type,
+                        ));
+                        content_hash_map.insert(hash, (*current_offset, bytes.len()));
+                        *current_offset += bytes.len();
                     }
-
-                    bin_data.write_all(&bytes)?;
-                    offset_map.push((
-                        init.name.clone(),
-                        *current_offset,
-                        bytes.len(),
-                        shape.clone(),
-                        data_type,
-                    ));
-                    content_hash_map.insert(hash, (*current_offset, bytes.len()));
-                    *current_offset += bytes.len();
                 }
             }
+            Err(_) => {}
         }
     }
     // 2. Constants

@@ -84,7 +84,19 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             )?;
         }
         "Reshape" => {
-            let shape = resolve_i64_with_temp(1, ctx, w, &tab)?;
+            let shape_raw = resolve_i64_with_temp(1, ctx, w, &tab)?;
+            // Replace 0 with -1 in reshape targets (ONNX 0 means "copy from source",
+            // but in static compilation -1/infer is more robust)
+            let shape = if shape_raw.starts_with('&') && shape_raw.contains(" 0,") || shape_raw.contains("[0,") || shape_raw.contains("[0]") || shape_raw.contains(", 0]") || shape_raw.contains(", 0,") {
+                // Replace standalone 0 values (not 10, 100, etc.) with -1
+                let s = shape_raw;
+                // Use regex-free approach: split on known patterns
+                let s = s.replace("[0,", "[-1,").replace("[0]", "[-1]");
+                let s = s.replace(", 0,", ", -1,").replace(", 0]", ", -1]");
+                s
+            } else {
+                shape_raw
+            };
             writeln!(
                 w,
                 "{}let {} = lele::kernels::reshape(&{}, {});",
