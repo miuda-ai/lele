@@ -1478,6 +1478,54 @@ pub fn sqrt<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView
     }
 }
 
+pub fn round<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
+    let len = input.data.len();
+    utils::ensure_capacity(out, len);
+    let in_slice = &input.data;
+    let out_slice = out.as_mut_slice();
+    for i in 0..len {
+        unsafe {
+            *out_slice.get_unchecked_mut(i) = in_slice.get_unchecked(i).round();
+        }
+    }
+    TensorView {
+        data: Cow::Borrowed(out),
+        shape: std::borrow::Cow::Owned(input.shape.to_vec()),
+    }
+}
+
+pub fn floor<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
+    let len = input.data.len();
+    utils::ensure_capacity(out, len);
+    let in_slice = &input.data;
+    let out_slice = out.as_mut_slice();
+    for i in 0..len {
+        unsafe {
+            *out_slice.get_unchecked_mut(i) = in_slice.get_unchecked(i).floor();
+        }
+    }
+    TensorView {
+        data: Cow::Borrowed(out),
+        shape: std::borrow::Cow::Owned(input.shape.to_vec()),
+    }
+}
+
+pub fn ceil<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
+    let len = input.data.len();
+    utils::ensure_capacity(out, len);
+    let in_slice = &input.data;
+    let out_slice = out.as_mut_slice();
+    for i in 0..len {
+        unsafe {
+            *out_slice.get_unchecked_mut(i) = in_slice.get_unchecked(i).ceil();
+        }
+    }
+    TensorView {
+        data: Cow::Borrowed(out),
+        shape: std::borrow::Cow::Owned(input.shape.to_vec()),
+    }
+}
+
 pub fn pow<'b, 'a, T: ElementOps>(
     a: &TensorView<'b, T>,
     b: &TensorView<'b, T>,
@@ -2164,6 +2212,20 @@ pub fn less_i64<'b, 'a, T: ElementOps>(
     out: &'a mut Vec<i64>,
 ) -> TensorView<'a, i64> {
     broadcast_binary_op_to(a, b, out, |x, y| if x < y { 1 } else { 0 })
+}
+pub fn less_or_equal<'b, 'a>(
+    a: &TensorView<'b>,
+    b: &TensorView<'b>,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    broadcast_binary_op(a, b, out, |x, y| if x <= y { 1.0 } else { 0.0 })
+}
+pub fn less_or_equal_i64<'b, 'a, T: ElementOps>(
+    a: &TensorView<'b, T>,
+    b: &TensorView<'b, T>,
+    out: &'a mut Vec<i64>,
+) -> TensorView<'a, i64> {
+    broadcast_binary_op_to(a, b, out, |x, y| if x <= y { 1 } else { 0 })
 }
 pub fn expand<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     input: &TensorView<'b, T>,

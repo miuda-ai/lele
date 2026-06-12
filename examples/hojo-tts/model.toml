@@ -1,0 +1,32 @@
+# Hojo-TTS-Light: Token-LM TTS (0.08B), bilingual ZH/EN voice cloning.
+# ONNX models are on Hugging Face (via hf-mirror); tokenizer + assets are on GitHub.
+[model]
+source = "url"
+
+[[model.files]]
+url = "https://hf-mirror.com/HojoAI/Hojo-TTS-Light/resolve/main/onnx/Hojo-TTS-Light-encoder.onnx"
+dest = "onnx/Hojo-TTS-Light-encoder.onnx"
+
+[[model.files]]
+url = "https://hf-mirror.com/HojoAI/Hojo-TTS-Light/resolve/main/onnx/Hojo-TTS-Light-llm.onnx"
+dest = "onnx/Hojo-TTS-Light-llm.onnx"
+
+[[model.files]]
+url = "https://hf-mirror.com/HojoAI/Hojo-TTS-Light/resolve/main/onnx/Hojo-TTS-Light-decoder.onnx"
+dest = "onnx/Hojo-TTS-Light-decoder.onnx"
+
+[[model.files]]
+url = "https://raw.githubusercontent.com/HojoAI/Hojo-TTS-Light/main/tokenizer/tokenizer.json"
+dest = "tokenizer/tokenizer.json"
+
+[[model.files]]
+url = "https://raw.githubusercontent.com/HojoAI/Hojo-TTS-Light/main/tokenizer/tokenizer_config.json"
+dest = "tokenizer/tokenizer_config.json"
+
+[[model.files]]
+url = "https://raw.githubusercontent.com/HojoAI/Hojo-TTS-Light/main/assets/zh1.wav"
+dest = "assets/zh1.wav"
+
+[codegen]
+class_name = "Hojo"
+custom_methods = []

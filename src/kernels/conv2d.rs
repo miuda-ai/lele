@@ -2964,7 +2964,11 @@ pub fn conv_transpose<'b, 'a>(
     } else {
         None
     };
-    let r = conv_transpose_inner(input, weights, bias, dilations, group, pads, strides, out);
+    let r = if input.shape.len() == 3 {
+        conv_transpose_1d(input, weights, bias, dilations, group, pads, strides, out)
+    } else {
+        conv_transpose_inner(input, weights, bias, dilations, group, pads, strides, out)
+    };
     if crate::kernels::timing::TIMING_ENABLED {
         crate::kernels::timing::CONV_TRANS_NS.fetch_add(
             _t0.unwrap().elapsed().as_nanos() as u64,
@@ -2973,6 +2977,95 @@ pub fn conv_transpose<'b, 'a>(
     }
     r
 }
+fn conv_transpose_1d<'b, 'a>(
+    input: &TensorView<'b>,
+    weights: &TensorView<'b>,
+    bias: Option<&TensorView<'b>>,
+    dilations: &[i64],
+    group: i64,
+    pads: &[i64],
+    strides: &[i64],
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let in_shape = &input.shape;
+    let w_shape = &weights.shape;
+
+    // Input: [N, C_in, L_in]
+    // Weights: [C_in, C_out/group, K]
+    let batch_size = in_shape[0];
+    let in_channels = in_shape[1];
+    let l_in = in_shape[2];
+
+    let out_channels_per_group = w_shape[1] as usize;
+    let kernel = w_shape[2] as usize;
+    let group = group as usize;
+    let out_channels = out_channels_per_group * group;
+    let in_channels_per_group = in_channels / group;
+
+    let stride = strides.get(0).copied().unwrap_or(1) as usize;
+    let dilation = dilations.get(0).copied().unwrap_or(1) as usize;
+    let pad_begin = pads.get(0).copied().unwrap_or(0) as usize;
+    let pad_end = pads.get(1).copied().unwrap_or(0) as usize;
+
+    let l_out = (l_in as i64 - 1) * stride as i64
+        - (pad_begin as i64 + pad_end as i64)
+        + dilation as i64 * (kernel as i64 - 1)
+        + 1;
+    assert!(
+        l_out > 0,
+        "conv_transpose_1d: output length must be positive, got {}",
+        l_out
+    );
+    let l_out = l_out as usize;
+
+    let out_size = batch_size * out_channels * l_out;
+    if out.len() != out_size {
+        out.resize(out_size, 0.0);
+    }
+    out[..out_size].fill(0.0);
+
+    // Weight layout: [C_in, C_out_per_group, K] (C-order)
+    let w_stride_oc = kernel;
+
+    for n in 0..batch_size {
+        for g in 0..group {
+            for ic_local in 0..in_channels_per_group {
+                let ic_global = g * in_channels_per_group + ic_local;
+                let in_base = n * in_channels * l_in + ic_global * l_in;
+
+                for oc_local in 0..out_channels_per_group {
+                    let oc_global = g * out_channels_per_group + oc_local;
+                    let out_base = n * out_channels * l_out + oc_global * l_out;
+                    let w_base = ic_global * out_channels_per_group * kernel + oc_local * w_stride_oc;
+
+                    for l in 0..l_in {
+                        let in_val = input.data[in_base + l];
+                        for k in 0..kernel {
+                            let v = l * stride + k * dilation;
+                            if v >= pad_begin && v < l_out + pad_begin {
+                                let v_valid = v - pad_begin;
+                                out[out_base + v_valid] += weights.data[w_base + k] * in_val;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(b) = bias {
+            for oc in 0..out_channels {
+                let bv = b.data[oc];
+                let ch_off = n * out_channels * l_out + oc * l_out;
+                for i in 0..l_out {
+                    out[ch_off + i] += bv;
+                }
+            }
+        }
+    }
+
+    TensorView::from_slice(out, vec![batch_size, out_channels, l_out])
+}
+
 fn conv_transpose_inner<'b, 'a>(
     input: &TensorView<'b>,
     weights: &TensorView<'b>,

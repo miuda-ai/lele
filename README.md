@@ -8,7 +8,7 @@ It rejects the "general-purpose runtime" approach (wrapping C++ libs like ORT or
 
 `lele` is designed to run deep learning models (specifically speech-related ones like SenseVoice, Silero VAD, and TTS, even `yolo26` ) with minimal overhead. 
 
-## Performance Benchmarks (2026-04-12)
+## Performance Benchmarks (2026-06-12)
 
 Latest comparison between **lele** and **ONNX Runtime (CPU)** on macOS (Apple Silicon), single-threaded ORT (`intra_op_num_threads=1`, `inter_op_num_threads=1`).
 For fairness and stability, SenseVoice uses steady-state metrics (warmup + multi-run average).
@@ -17,11 +17,14 @@ For fairness and stability, SenseVoice uses steady-state metrics (warmup + multi
 | :--- | :--- | :--- | :--- |
 | **Silero VAD** | RTF **0.002882** | RTF **0.0022** | **1.31x** |
 | **SenseVoice** | Steady Model RTF **0.0294** | Steady Model RTF **0.0256** (Cold RTF **0.0549**) | **1.15x** |
-| **Supertonic** | RTF **0.1667** | RTF **0.0648** | **2.57x** |
+| **Supertonic 2** | RTF **0.1667** | RTF **0.0550** | **3.03x** |
+| **Supertonic 3** | — | RTF **0.1585** | — |
 | **Yolo26** | Avg **704.50ms** (RTF 21.1350) | Avg **534.97ms** (RTF 16.0490) | **1.32x** |
 | **Yolo26n-seg** | Avg **126.51ms** (RTF 3.7953) | Avg **64.82ms** (RTF 1.9445) | **1.95x** |
+| **Hojo-TTS-Light** | RTF **8.75** | RTF **6.69** | **1.31x** |
 
 *Note: For speech models we report steady-state RTF (warmup + average). For yolo models we report avg latency over 10 runs (and include RTF@30fps).*
+*Hojo-TTS-Light is a 3-stage pipeline (encoder → AR-LLM → decoder); lele uses a custom KV-cache for the AR loop.*
 
 
 ## Key Features
@@ -37,7 +40,7 @@ For fairness and stability, SenseVoice uses steady-state metrics (warmup + multi
 
 `lele` supports a comprehensive set of ONNX operators:
 
-- **Math**: Add, Sub, Mul, Div, Pow, Sqrt, Neg, Abs, Exp, Log, Sin, Cos, Erf, Softplus, Clip, Mod
+- **Math**: Add, Sub, Mul, Div, Pow, Sqrt, Neg, Abs, Exp, Log, Sin, Cos, Erf, Softplus, Clip, Mod, Round, Floor, Ceil
 - **Neural Network**: Conv, ConvTranspose, Gemm, MatMul, MatMulInteger, LSTM, GRU, BatchNormalization, LayerNormalization
 - **Activation**: Relu, Sigmoid, Tanh, Softmax, Gelu, PRelu, Silu
 - **Tensor**: Reshape, Transpose, Concat, Split, Slice, Gather, GatherElements, Pad, Expand, Tile, Where, TopK, Flatten, Squeeze, Unsqueeze
@@ -83,6 +86,7 @@ See [examples/web-demo/README.md](examples/web-demo/README.md) for details.
 - **Silero VAD**: Reliable Voice Activity Detection.
 - **Supertonic 2**: Fast and high-quality Text-to-Speech (5 languages).
 - **Supertonic 3**: Improved TTS with 31 languages, better reading stability, and expression tags (`<laugh>`, `<breath>`, `<sigh>`).
+- **Hojo-TTS-Light**: Ultra-lightweight 0.08B bilingual (ZH/EN) Token-LM TTS with voice cloning (encoder → autoregressive LM → decoder).
 - **Yolo26**: Real-time object detection.
 
 ## Getting Started
@@ -117,6 +121,9 @@ cargo run --release --bin lele_gen -- <model.onnx> <output_path.rs>
 
 # Yolo26 Object Detection
 ./run_yolo26.sh
+
+# Hojo-TTS-Light (bilingual ZH/EN voice-cloning TTS)
+./run_hojo_tts.sh "今天天气怎么样。"
 ```
 
 

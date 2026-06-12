@@ -1,0 +1,13 @@
+models/
+onnx/
+tokenizer/
+assets/
+encoder.rs
+llm.rs
+decoder.rs
+encoder_weights.bin
+llm_weights.bin
+decoder_weights.bin
+output_hojo.wav
+output_onnx.wav
+infer_onnx.py

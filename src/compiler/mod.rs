@@ -413,29 +413,32 @@ impl Compiler {
                 constants.insert(init.name.clone(), (data, shape, init.data_type));
             }
         }
-        // 1b. Pre-populate Shape outputs for model inputs with known static shapes.
-        // Dynamic dims use -1 (Reshape "infer" sentinel).
-        // This allows Shape->Concat->Reshape chains to be folded at compile time.
+        // 1b. Pre-populate Shape outputs for model inputs with fully static shapes.
+        // Inputs with ANY dynamic dimension (DimParam) are NOT pre-populated,
+        // so Shape ops on them stay in the graph and are evaluated at runtime.
+        // This allows Shape->Concat->Reshape chains to be folded at compile time
+        // only when all dims are known statically.
         for inp in &graph.input {
             if let Some(ref type_proto) = inp.r#type
                 && let Some(type_proto::Value::TensorType(ref tensor_type)) = type_proto.value
                 && let Some(ref shape) = tensor_type.shape
             {
                 let mut dims: Vec<f32> = Vec::new();
+                let mut has_dynamic = false;
                 for dim in &shape.dim {
                     match &dim.value {
                         Some(tensor_shape_proto::dimension::Value::DimValue(v)) => {
                             dims.push(if *v > 0 { *v as f32 } else { 1.0 });
                         }
                         Some(tensor_shape_proto::dimension::Value::DimParam(_)) => {
-                            dims.push(-1.0);
+                            has_dynamic = true;
                         }
                         None => {
                             dims.push(1.0);
                         }
                     }
                 }
-                if !dims.is_empty() {
+                if !dims.is_empty() && !has_dynamic {
                     let shape_usize: Vec<usize> = dims.iter().map(|&d| d as usize).collect();
                     constants.insert(
                         inp.name.clone(),
@@ -457,6 +460,11 @@ impl Compiler {
         }
         let mut folded_indices = std::collections::HashSet::new();
         let mut new_initializers = Vec::new();
+        let graph_input_names: std::collections::HashSet<&str> = graph
+            .input
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect();
         // 3. Simple single-pass folding (can be iterative but single-pass handles most ONNX patterns which are DAG)
         for (i, node) in graph.node.iter().enumerate() {
             let mut all_inputs_const = true;
@@ -464,6 +472,10 @@ impl Compiler {
                 all_inputs_const = false;
             }
             for input in &node.input {
+                if graph_input_names.contains(input.as_str()) && node.op_type != "Shape" {
+                    all_inputs_const = false;
+                    break;
+                }
                 if !constants.contains_key(input) {
                     all_inputs_const = false;
                     break;

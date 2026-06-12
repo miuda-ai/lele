@@ -143,6 +143,21 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             "{}let {} = lele::kernels::cos(&{}, {});",
             tab, outputs[0], inputs[0], buf_expr
         )?,
+        "Round" => writeln!(
+            w,
+            "{}let {} = lele::kernels::round(&{}, {});",
+            tab, outputs[0], inputs[0], buf_expr
+        )?,
+        "Floor" => writeln!(
+            w,
+            "{}let {} = lele::kernels::floor(&{}, {});",
+            tab, outputs[0], inputs[0], buf_expr
+        )?,
+        "Ceil" => writeln!(
+            w,
+            "{}let {} = lele::kernels::ceil(&{}, {});",
+            tab, outputs[0], inputs[0], buf_expr
+        )?,
         "Equal" => {
             let is_i64 = ctx
                 .var_types
@@ -208,6 +223,31 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 writeln!(
                     w,
                     "{}let {} = lele::kernels::less(&{}, &{}, {});",
+                    tab, outputs[0], inputs[0], inputs[1], buf_expr
+                )?;
+            }
+        }
+        "LessOrEqual" => {
+            let is_i64 = ctx
+                .var_types
+                .get(&inputs[0])
+                .map(|t| t == "i64")
+                .unwrap_or(false)
+                || ctx
+                    .var_types
+                    .get(&inputs[1])
+                    .map(|t| t == "i64")
+                    .unwrap_or(false);
+            if is_i64 {
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::less_or_equal_i64(&{}, &{}, {});",
+                    tab, outputs[0], inputs[0], inputs[1], buf_expr
+                )?;
+            } else {
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::less_or_equal(&{}, &{}, {});",
                     tab, outputs[0], inputs[0], inputs[1], buf_expr
                 )?;
             }

@@ -1100,7 +1100,7 @@ pub fn split<'a, T: Clone + Copy + std::fmt::Debug>(
     } else {
         axis as usize
     };
-    assert!(axis < ndim, "Split: axis out of bounds");
+    assert!(axis < ndim, "Split: axis out of bounds (axis={}, ndim={}, shape={:?})", axis, ndim, &*input.shape);
     let num_splits = splits.len();
     assert_eq!(
         outputs.len(),
@@ -1166,7 +1166,7 @@ pub fn split_owned<T: Clone + Copy + std::fmt::Debug>(
     } else {
         axis as usize
     };
-    assert!(axis < ndim, "Split: axis out of bounds");
+    assert!(axis < ndim, "Split: axis out of bounds (axis={}, ndim={}, shape={:?})", axis, ndim, &*input.shape);
 
     let num_splits = splits.len();
     let total: i64 = splits.iter().sum();
