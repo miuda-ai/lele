@@ -8,7 +8,7 @@ It rejects the "general-purpose runtime" approach (wrapping C++ libs like ORT or
 
 `lele` is designed to run deep learning models (specifically speech-related ones like SenseVoice, Silero VAD, and TTS, even `yolo26` ) with minimal overhead. 
 
-## Performance Benchmarks (2026-06-12)
+## Performance Benchmarks (2026-06-13)
 
 Latest comparison between **lele** and **ONNX Runtime (CPU)** on macOS (Apple Silicon), single-threaded ORT (`intra_op_num_threads=1`, `inter_op_num_threads=1`).
 For fairness and stability, SenseVoice uses steady-state metrics (warmup + multi-run average).
@@ -22,9 +22,11 @@ For fairness and stability, SenseVoice uses steady-state metrics (warmup + multi
 | **Yolo26** | Avg **704.50ms** (RTF 21.1350) | Avg **534.97ms** (RTF 16.0490) | **1.32x** |
 | **Yolo26n-seg** | Avg **126.51ms** (RTF 3.7953) | Avg **64.82ms** (RTF 1.9445) | **1.95x** |
 | **Hojo-TTS-Light** | RTF **8.75** | RTF **6.69** | **1.31x** |
+| **MOSS-TTS-Nano** | RTF **0.376** | RTF **0.293** | **1.28x** |
 
 *Note: For speech models we report steady-state RTF (warmup + average). For yolo models we report avg latency over 10 runs (and include RTF@30fps).*
 *Hojo-TTS-Light is a 3-stage pipeline (encoder → AR-LLM → decoder); lele uses a custom KV-cache for the AR loop.*
+*MOSS-TTS-Nano uses SDOT int8 GEMV (137 GFLOPS on Apple M2 Pro NEON) with sequential tiled weight layout for cache-efficient generation.*
 
 
 ## Key Features
@@ -87,6 +89,7 @@ See [examples/web-demo/README.md](examples/web-demo/README.md) for details.
 - **Supertonic 2**: Fast and high-quality Text-to-Speech (5 languages).
 - **Supertonic 3**: Improved TTS with 31 languages, better reading stability, and expression tags (`<laugh>`, `<breath>`, `<sigh>`).
 - **Hojo-TTS-Light**: Ultra-lightweight 0.08B bilingual (ZH/EN) Token-LM TTS with voice cloning (encoder → autoregressive LM → decoder).
+- **MOSS-TTS-Nano**: Lightweight end-to-end neural TTS with transformer-based frame generation and codec decoding.
 - **Yolo26**: Real-time object detection.
 
 ## Getting Started
@@ -124,6 +127,9 @@ cargo run --release --bin lele_gen -- <model.onnx> <output_path.rs>
 
 # Hojo-TTS-Light (bilingual ZH/EN voice-cloning TTS)
 ./run_hojo_tts.sh "今天天气怎么样。"
+
+# MOSS-TTS-Nano (end-to-end TTS with SDOT int8 GEMV)
+cd examples/moss-tts-nano && cargo run --release -- "你好，这是一个测试"
 ```
 
 

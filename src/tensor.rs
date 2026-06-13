@@ -83,6 +83,25 @@ where
             }
         }
     }
+
+    /// Efficiently convert to any lifetime without copying borrowed data.
+    /// If data is `Cow::Borrowed` (from workspace/weights), zero-copy via raw pointer.
+    /// If data is `Cow::Owned`, copies the data. Shape is always copied (tiny).
+    /// 
+    /// # Safety
+    /// When data is borrowed, the caller must ensure the underlying storage outlives `'b`.
+    pub unsafe fn detach_or_own<'b>(&self) -> TensorView<'b, T> {
+        match &self.data {
+            Cow::Borrowed(slice) => {
+                let data_slice = std::slice::from_raw_parts(slice.as_ptr(), slice.len());
+                TensorView {
+                    data: Cow::Borrowed(data_slice),
+                    shape: Cow::Owned(self.shape.to_vec()),
+                }
+            }
+            Cow::Owned(vec) => TensorView::from_owned(vec.clone(), self.shape.to_vec()),
+        }
+    }
 }
 
 impl<'a> TensorView<'a, f32> {
@@ -223,14 +242,19 @@ impl<'a> TensorView<'a, f32> {
 impl<'a> TensorView<'a, i64> {
     /// Create a TensorView<i64> from byte slice
     pub fn from_bytes_i64(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, i64> {
-        let mut i64_vec = Vec::with_capacity(bytes.len() / 8);
-        for chunk in bytes.chunks_exact(8) {
-            let bytes_arr: [u8; 8] = [
-                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-            ];
-            i64_vec.push(i64::from_le_bytes(bytes_arr));
+        if bytes.len() >= 8 && bytes.len() % 8 == 0 {
+            let mut i64_vec = Vec::with_capacity(bytes.len() / 8);
+            for chunk in bytes.chunks_exact(8) {
+                let bytes_arr: [u8; 8] = [
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ];
+                i64_vec.push(i64::from_le_bytes(bytes_arr));
+            }
+            TensorView::from_owned(i64_vec, shape)
+        } else {
+            let i64_vec: Vec<i64> = bytes.iter().map(|&b| b as i64).collect();
+            TensorView::from_owned(i64_vec, shape)
         }
-        TensorView::from_owned(i64_vec, shape)
     }
 
     /// Create a TensorView<i64> from i32 byte slice (cast to i64)

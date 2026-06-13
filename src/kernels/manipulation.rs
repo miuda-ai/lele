@@ -1270,6 +1270,41 @@ where
     }
     let o = out.as_mut_slice();
 
+    // Fast path: both x and y are scalars — just fill based on condition
+    // This is the attention mask pattern: where(mask, 0.0, -inf)
+    if x.data.len() == 1 && y.data.len() == 1 {
+        let x_val = x.data[0];
+        let y_val = y.data[0];
+        let cond_numel = cond_data.len();
+        if cond_numel == out_numel {
+            for i in 0..out_numel {
+                unsafe {
+                    *o.get_unchecked_mut(i) = if cond_data.get_unchecked(i).as_i64() != 0 {
+                        x_val
+                    } else {
+                        y_val
+                    };
+                }
+            }
+        } else if cond_numel > 0 && out_numel % cond_numel == 0 {
+            let repeat = out_numel / cond_numel;
+            for r in 0..repeat {
+                let base = r * cond_numel;
+                for i in 0..cond_numel {
+                    unsafe {
+                        *o.get_unchecked_mut(base + i) =
+                            if cond_data.get_unchecked(i).as_i64() != 0 {
+                                x_val
+                            } else {
+                                y_val
+                            };
+                    }
+                }
+            }
+        }
+        return TensorView::from_slice(out, out_shape);
+    }
+
     // Fast path: scalar x, condition broadcasts, y is full-sized
     // This is the attention mask pattern: where(mask, -inf, attention_scores)
     if x.data.len() == 1 && y.data.len() == out_numel {

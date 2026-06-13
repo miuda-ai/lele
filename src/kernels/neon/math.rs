@@ -11,7 +11,7 @@ use std::simd::prelude::*;
 /// Accuracy: max relative error ~1e-6 over [-88, 88].
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub(crate) unsafe fn neon_exp_f32x4(
+pub unsafe fn neon_exp_f32x4(
     x: core::arch::aarch64::float32x4_t,
 ) -> core::arch::aarch64::float32x4_t {
     use core::arch::aarch64::*;

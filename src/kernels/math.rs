@@ -220,6 +220,60 @@ where
         }
     }
 
+    // Fast path: 2D outer-product broadcast [1,N] op [M,1] or [M,1] op [1,N] → [*,M,N]
+    // Common in attention mask computation (e.g. range subtraction)
+    if dims >= 2 {
+        let rows = out_shape[dims - 2];
+        let cols = out_shape[dims - 1];
+        let leading = numel / (rows * cols);
+        let a_last = a.shape[a.shape.len() - 1];
+        let a_prev = if a.shape.len() >= 2 { a.shape[a.shape.len() - 2] } else { 1 };
+        let b_last = b.shape[b.shape.len() - 1];
+        let b_prev = if b.shape.len() >= 2 { b.shape[b.shape.len() - 2] } else { 1 };
+        // a is [1,N] (a_prev==1, a_last==cols), b is [M,1] (b_prev==rows, b_last==1)
+        if a_prev == 1 && a_last == cols && b_prev == rows && b_last == 1 && cols > 1 && rows > 1 {
+            let a_slice = &a.data;
+            let b_slice = &b.data;
+            for l in 0..leading {
+                let lbase = l * rows * cols;
+                for r in 0..rows {
+                    let bv = b_slice[r];
+                    let base = lbase + r * cols;
+                    for c in 0..cols {
+                        unsafe {
+                            *o_slice.get_unchecked_mut(base + c) = op(*a_slice.get_unchecked(c), bv);
+                        }
+                    }
+                }
+            }
+            return TensorView {
+                data: Cow::Borrowed(output_buf),
+                shape: Cow::Owned(out_shape),
+            };
+        }
+        // a is [M,1] (a_prev==rows, a_last==1), b is [1,N] (b_prev==1, b_last==cols)
+        if a_prev == rows && a_last == 1 && b_prev == 1 && b_last == cols && cols > 1 && rows > 1 {
+            let a_slice = &a.data;
+            let b_slice = &b.data;
+            for l in 0..leading {
+                let lbase = l * rows * cols;
+                for r in 0..rows {
+                    let av = a_slice[r];
+                    let base = lbase + r * cols;
+                    for c in 0..cols {
+                        unsafe {
+                            *o_slice.get_unchecked_mut(base + c) = op(av, *b_slice.get_unchecked(c));
+                        }
+                    }
+                }
+            }
+            return TensorView {
+                data: Cow::Borrowed(output_buf),
+                shape: Cow::Owned(out_shape),
+            };
+        }
+    }
+
     // General broadcast: coordinate-based indexing
     let mk_strides = |shape: &[usize], target_dims: usize| -> Vec<usize> {
         let mut strides = vec![0; target_dims];
@@ -601,6 +655,50 @@ fn add_inner<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Deb
                         data: Cow::Borrowed(out),
                         shape: Cow::Owned(out_shape),
                     };
+                }
+            }
+        }
+    }
+    // Tile-broadcast fast path for f32 on aarch64: one operand is a contiguous tile
+    // that repeats to fill the output (e.g. [1,8,H,W] + [1,1,H,W] attention mask).
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+            let out_shape = utils::broadcast_shapes(&a.shape, &b.shape);
+            if let Some(ref os) = out_shape {
+                let numel: usize = os.iter().product();
+                let a_len = a.data.len();
+                let b_len = b.data.len();
+                let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
+                if a_len == numel && b_len < numel && b_len > 1 && numel % b_len == 0 {
+                    utils::ensure_capacity(out_f32, numel);
+                    unsafe { out_f32.set_len(numel); }
+                    let n_tiles = numel / b_len;
+                    let a_ptr = a.data.as_ptr() as *const f32;
+                    let b_ptr = b.data.as_ptr() as *const f32;
+                    let o_ptr = out_f32.as_mut_ptr();
+                    unsafe {
+                        for t in 0..n_tiles {
+                            let off = t * b_len;
+                            crate::kernels::neon::math::add_f32(a_ptr.add(off), b_ptr, o_ptr.add(off), b_len);
+                        }
+                    }
+                    return TensorView { data: Cow::Borrowed(out), shape: Cow::Owned(os.clone()) };
+                }
+                if b_len == numel && a_len < numel && a_len > 1 && numel % a_len == 0 {
+                    utils::ensure_capacity(out_f32, numel);
+                    unsafe { out_f32.set_len(numel); }
+                    let n_tiles = numel / a_len;
+                    let a_ptr = a.data.as_ptr() as *const f32;
+                    let b_ptr = b.data.as_ptr() as *const f32;
+                    let o_ptr = out_f32.as_mut_ptr();
+                    unsafe {
+                        for t in 0..n_tiles {
+                            let off = t * a_len;
+                            crate::kernels::neon::math::add_f32(a_ptr, b_ptr.add(off), o_ptr.add(off), a_len);
+                        }
+                    }
+                    return TensorView { data: Cow::Borrowed(out), shape: Cow::Owned(os.clone()) };
                 }
             }
         }
@@ -1160,29 +1258,26 @@ pub fn div<'b, 'a, T: Clone + Copy + std::ops::Div<Output = T> + std::fmt::Debug
 }
 
 /// Modulo operation: a % b (floating point)
-pub fn mod_f32<'b, 'a>(
-    a: &TensorView<'b>,
+pub fn mod_f32<'b, 'a, T: ElementOps>(
+    a: &TensorView<'b, T>,
     b: &TensorView<'b>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     let len = a.data.len();
     utils::ensure_capacity(out, len);
-    let b_scalar = b.data.len() == 1;
     unsafe {
-        let a_ptr = a.data.as_ptr();
-        let b_ptr = b.data.as_ptr();
-        let b_val = *b_ptr;
-        let o_ptr = out.as_mut_ptr();
-        for i in 0..len {
-            let ai = *a_ptr.add(i);
-            let bi = if b_scalar { b_val } else { *b_ptr.add(i) };
-            // Handle division by zero
-            if bi == 0.0 {
-                *o_ptr.add(i) = 0.0;
-            } else {
-                // f32 modulo using remainder
-                *o_ptr.add(i) = ai - bi * (ai / bi).floor();
-            }
+        out.set_len(len);
+    }
+    let b_scalar = b.data.len() == 1;
+    let o_slice = out.as_mut_slice();
+    let b_slice = &b.data;
+    for i in 0..len {
+        let ai = a.data[i].as_f32();
+        let bi = if b_scalar { b_slice[0] } else { b_slice[i] };
+        if bi == 0.0 {
+            o_slice[i] = 0.0;
+        } else {
+            o_slice[i] = ai - bi * (ai / bi).floor();
         }
     }
     TensorView {
@@ -1531,6 +1626,41 @@ pub fn pow<'b, 'a, T: ElementOps>(
     b: &TensorView<'b, T>,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
+    if b.data.len() == 1 {
+        let exp_val = b.data.first().unwrap().as_f32();
+        let len = a.data.len();
+        utils::ensure_capacity(out, len);
+        unsafe { out.set_len(len); }
+        let a_slice = &a.data;
+        let o_slice = out.as_mut_slice();
+        if exp_val == 3.0 {
+            for i in 0..len {
+                unsafe {
+                    let x = a_slice.get_unchecked(i).as_f32();
+                    *o_slice.get_unchecked_mut(i) = T::from_f32(x * x * x);
+                }
+            }
+        } else if exp_val == 2.0 {
+            for i in 0..len {
+                unsafe {
+                    let x = a_slice.get_unchecked(i).as_f32();
+                    *o_slice.get_unchecked_mut(i) = T::from_f32(x * x);
+                }
+            }
+        } else {
+            let exp_t = *b.data.first().unwrap();
+            for i in 0..len {
+                unsafe {
+                    *o_slice.get_unchecked_mut(i) =
+                        a_slice.get_unchecked(i).pow(exp_t);
+                }
+            }
+        }
+        return TensorView {
+            data: Cow::Borrowed(out),
+            shape: std::borrow::Cow::Owned(a.shape.to_vec()),
+        };
+    }
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
         utils::ensure_capacity(out, len);
@@ -1656,12 +1786,12 @@ pub fn reduce_mean<'b, 'a>(
         shape: Cow::Owned(out_shape),
     }
 }
-pub fn reduce_sum<'b, 'a>(
-    input: &TensorView<'b>,
+pub fn reduce_sum<'b, 'a, T: ElementOps + std::ops::AddAssign>(
+    input: &TensorView<'b, T>,
     axes: &[i64],
     keepdims: bool,
-    out: &'a mut Vec<f32>,
-) -> TensorView<'a> {
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
     let dims = input.dim();
     let mut resolved_axes: Vec<usize> = axes
         .iter()
@@ -1689,9 +1819,12 @@ pub fn reduce_sum<'b, 'a>(
     }
     let out_numel = out_shape.iter().product::<usize>();
     if out.len() != out_numel {
-        out.resize(out_numel, 0.0);
+        out.resize(out_numel, T::from_f32(0.0));
     }
-    out.fill(0.0);
+    let zero = T::from_f32(0.0);
+    for v in out.iter_mut() {
+        *v = zero;
+    }
     let real_out_strides = utils::compute_strides(&out_shape);
     let mut input_to_out_strides = vec![0; dims];
     let mut out_dim_idx = 0;
@@ -2187,7 +2320,7 @@ pub fn log<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
     }
     TensorView::from_slice(out, input.shape.to_vec())
 }
-pub fn neg<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
+pub fn neg<'b, 'a, T: ElementOps>(input: &TensorView<'b, T>, out: &'a mut Vec<T>) -> TensorView<'a, T> {
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
     unsafe {
@@ -2195,16 +2328,16 @@ pub fn neg<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
     }
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
-        out_slice[i] = -input.data[i];
+        out_slice[i] = T::from_f32(-input.data[i].as_f32());
     }
     TensorView::from_slice(out, input.shape.to_vec())
 }
-pub fn less<'b, 'a>(
-    a: &TensorView<'b>,
-    b: &TensorView<'b>,
-    out: &'a mut Vec<f32>,
-) -> TensorView<'a> {
-    broadcast_binary_op(a, b, out, |x, y| if x < y { 1.0 } else { 0.0 })
+pub fn less<'b, 'a, T: ElementOps>(
+    a: &TensorView<'b, T>,
+    b: &TensorView<'b, T>,
+    out: &'a mut Vec<i64>,
+) -> TensorView<'a, i64> {
+    broadcast_binary_op_to(a, b, out, |x, y| if x < y { 1 } else { 0 })
 }
 pub fn less_i64<'b, 'a, T: ElementOps>(
     a: &TensorView<'b, T>,
@@ -2213,12 +2346,12 @@ pub fn less_i64<'b, 'a, T: ElementOps>(
 ) -> TensorView<'a, i64> {
     broadcast_binary_op_to(a, b, out, |x, y| if x < y { 1 } else { 0 })
 }
-pub fn less_or_equal<'b, 'a>(
-    a: &TensorView<'b>,
-    b: &TensorView<'b>,
-    out: &'a mut Vec<f32>,
-) -> TensorView<'a> {
-    broadcast_binary_op(a, b, out, |x, y| if x <= y { 1.0 } else { 0.0 })
+pub fn less_or_equal<'b, 'a, T: ElementOps>(
+    a: &TensorView<'b, T>,
+    b: &TensorView<'b, T>,
+    out: &'a mut Vec<i64>,
+) -> TensorView<'a, i64> {
+    broadcast_binary_op_to(a, b, out, |x, y| if x <= y { 1 } else { 0 })
 }
 pub fn less_or_equal_i64<'b, 'a, T: ElementOps>(
     a: &TensorView<'b, T>,
@@ -2226,6 +2359,144 @@ pub fn less_or_equal_i64<'b, 'a, T: ElementOps>(
     out: &'a mut Vec<i64>,
 ) -> TensorView<'a, i64> {
     broadcast_binary_op_to(a, b, out, |x, y| if x <= y { 1 } else { 0 })
+}
+pub fn greater_or_equal<'b, 'a, T: ElementOps>(
+    a: &TensorView<'b, T>,
+    b: &TensorView<'b, T>,
+    out: &'a mut Vec<i64>,
+) -> TensorView<'a, i64> {
+    broadcast_binary_op_to(a, b, out, |x, y| if x >= y { 1 } else { 0 })
+}
+pub fn greater_or_equal_i64<'b, 'a, T: ElementOps>(
+    a: &TensorView<'b, T>,
+    b: &TensorView<'b, T>,
+    out: &'a mut Vec<i64>,
+) -> TensorView<'a, i64> {
+    broadcast_binary_op_to(a, b, out, |x, y| if x >= y { 1 } else { 0 })
+}
+pub fn logical_and<'b, 'a, T: ElementOps>(
+    a: &TensorView<'b, T>,
+    b: &TensorView<'b, T>,
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
+    let zero = T::from_f32(0.0);
+    let one = T::from_f32(1.0);
+    broadcast_binary_op(a, b, out, move |x, y| if x != zero && y != zero { one } else { zero })
+}
+pub fn logical_or<'b, 'a, T: ElementOps>(
+    a: &TensorView<'b, T>,
+    b: &TensorView<'b, T>,
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
+    let zero = T::from_f32(0.0);
+    let one = T::from_f32(1.0);
+    broadcast_binary_op(a, b, out, move |x, y| if x != zero || y != zero { one } else { zero })
+}
+pub fn logical_xor<'b, 'a, T: ElementOps>(
+    a: &TensorView<'b, T>,
+    b: &TensorView<'b, T>,
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
+    let zero = T::from_f32(0.0);
+    let one = T::from_f32(1.0);
+    broadcast_binary_op(a, b, out, move |x, y| {
+        if (x != zero) != (y != zero) { one } else { zero }
+    })
+}
+pub fn cumsum<'b, 'a, T>(
+    input: &TensorView<'b, T>,
+    axis: i64,
+    exclusive: bool,
+    reverse: bool,
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T>
+where
+    T: ElementOps + std::ops::AddAssign,
+{
+    let dims = input.shape.len();
+    let ax = if axis < 0 {
+        (dims as i64 + axis) as usize
+    } else {
+        axis as usize
+    };
+    let numel = input.data.len();
+    utils::ensure_capacity(out, numel);
+    unsafe {
+        out.set_len(numel);
+    }
+    let o_slice = out.as_mut_slice();
+    let i_slice = &input.data;
+    let ax_dim = input.shape[ax];
+
+    // Compute strides (row-major)
+    let mut strides = vec![1usize; dims];
+    for d in (0..dims - 1).rev() {
+        strides[d] = strides[d + 1] * input.shape[d + 1];
+    }
+    let ax_stride = strides[ax];
+
+    // Number of "lines" to scan along axis
+    let outer: usize = input.shape[..ax].iter().product();
+    let inner: usize = input.shape[ax + 1..].iter().product();
+
+    for o in 0..outer {
+        for i in 0..inner {
+            let base = o * (ax_dim * ax_stride) + i;
+            if reverse {
+                let mut acc = T::from_f32(0.0);
+                for j in (0..ax_dim).rev() {
+                    let idx = base + j * ax_stride;
+                    if exclusive {
+                        o_slice[idx] = acc;
+                        acc += i_slice[idx];
+                    } else {
+                        acc += i_slice[idx];
+                        o_slice[idx] = acc;
+                    }
+                }
+            } else {
+                let mut acc = T::from_f32(0.0);
+                for j in 0..ax_dim {
+                    let idx = base + j * ax_stride;
+                    if exclusive {
+                        o_slice[idx] = acc;
+                        acc += i_slice[idx];
+                    } else {
+                        acc += i_slice[idx];
+                        o_slice[idx] = acc;
+                    }
+                }
+            }
+        }
+    }
+    TensorView::from_slice(out, input.shape.to_vec())
+}
+/// Einsum with equation "bs,d->bsd": outer product producing [b,s,d] from [b,s] and [d].
+pub fn einsum_bs_d_bsd<'b, 'a>(
+    a: &TensorView<'b>,
+    b: &TensorView<'b>,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    // a: [bs_shape...] flattened, b: [d]
+    let d_len = b.data.len();
+    let bs_len = a.data.len();
+    let numel = bs_len * d_len;
+    utils::ensure_capacity(out, numel);
+    unsafe {
+        out.set_len(numel);
+    }
+    let o_slice = out.as_mut_slice();
+    let mut idx = 0;
+    for i in 0..bs_len {
+        let av = a.data[i];
+        for j in 0..d_len {
+            o_slice[idx] = av * b.data[j];
+            idx += 1;
+        }
+    }
+    let mut out_shape = a.shape.to_vec();
+    out_shape.push(d_len);
+    TensorView::from_slice(out, out_shape)
 }
 pub fn expand<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     input: &TensorView<'b, T>,

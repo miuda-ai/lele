@@ -1417,8 +1417,8 @@ fn collect_weights(
     // 1. Initializers
     for init in &graph.initializer {
         // Populate int64_map for INT64 types
-        if init.data_type == 7 {
-            // INT64
+        if init.data_type == 7 || init.data_type == 6 {
+            // INT64 or INT32
             if let Ok((data, dims)) = tensor_to_array(init) {
                 let ints: Vec<i64> = data.iter().map(|&x| x as i64).collect();
                 int64_map.insert(init.name.clone(), (ints, dims));
@@ -1473,8 +1473,8 @@ fn collect_weights(
             && let Some(t) = &attr.t
         {
             // Populate int64_map for INT64 types
-            if t.data_type == 7 {
-                // INT64
+            if t.data_type == 7 || t.data_type == 6 {
+                // INT64 or INT32
                 if let Ok((data, dims)) = tensor_to_array(t) {
                     let ints: Vec<i64> = data.iter().map(|&x| x as i64).collect();
                     if let Some(out_name) = node.output.first() {

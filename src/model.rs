@@ -119,6 +119,7 @@ pub fn tensor_to_array(tensor: &TensorProto) -> Result<(Vec<f32>, Vec<usize>), M
                     i64::from_le_bytes(bytes) as f32
                 })
                 .collect(),
+            9 => tensor.raw_data.iter().map(|&x| if x != 0 { 1.0 } else { 0.0 }).collect(),
             _ => Vec::new(),
         }
     } else {

@@ -14,6 +14,7 @@ Cargo.lock
 *_profile.json
 profile.json.gz
 .DS_Store
+__pycache__/
 
 # Generated model code in examples
 examples/*/src/*_weights.bin

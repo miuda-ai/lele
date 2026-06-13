@@ -27,11 +27,11 @@ pub use conv2d::{
     conv2d_fused, conv2d_silu, fused_scale_bias, fused_scale_bias_silu, gather_elements,
     max_pool2d, print_conv_stats, reset_conv_stats, resize_nearest, topk,
 };
-pub use gemm::{gemm, matmul, matmul_fused_add};
+pub use gemm::{gemm, matmul, matmul_fused_add, Int8Weight, quantize_f32_to_i8};
 pub use manipulation::*;
 pub use manipulation::{split, where_op};
 pub use math::*;
-pub use math::{cos, exp, expand, less, min_max, neg, range, sin, tile};
+pub use math::{cos, cumsum, einsum_bs_d_bsd, exp, expand, greater_or_equal, less, logical_and, logical_or, logical_xor, min_max, neg, range, sin, tile};
 pub use norm::*;
 pub use pooling::*;
 pub use quantization::*;

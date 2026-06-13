@@ -1435,12 +1435,12 @@ pub fn topk<'a>(
 }
 
 /// GatherElements: gather elements along an axis using index tensor.
-pub fn gather_elements<'a>(
-    input: &TensorView<'_>,
-    indices: &TensorView<'_>,
+pub fn gather_elements<'a, 'b, T: Clone + Copy + std::fmt::Debug, U: crate::kernels::ElementOps>(
+    input: &TensorView<'b, T>,
+    indices: &TensorView<'b, U>,
     axis: i64,
-    out: &'a mut Vec<f32>,
-) -> TensorView<'a> {
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
     let shape = &input.shape;
     let idx_shape = &indices.shape;
     let rank = shape.len();
@@ -1481,7 +1481,7 @@ pub fn gather_elements<'a>(
         }
 
         // Replace axis coordinate with the index value
-        let index_val = idx_data[flat_idx] as i64;
+        let index_val = idx_data[flat_idx].as_f32() as i64;
         let index_val = if index_val < 0 {
             (shape[axis] as i64 + index_val) as usize
         } else {

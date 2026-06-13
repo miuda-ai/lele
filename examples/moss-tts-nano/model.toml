@@ -1,0 +1,57 @@
+[model.tts]
+source = "hf-hub"
+repo = "OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX"
+revision = "main"
+
+[[model.tts.files]]
+file = "moss_tts_prefill.onnx"
+dest = "tts/moss_tts_prefill.onnx"
+
+[[model.tts.files]]
+file = "moss_tts_global_shared.data"
+dest = "tts/moss_tts_global_shared.data"
+
+[[model.tts.files]]
+file = "moss_tts_decode_step.onnx"
+dest = "tts/moss_tts_decode_step.onnx"
+
+[[model.tts.files]]
+file = "moss_tts_local_fixed_sampled_frame.onnx"
+dest = "tts/moss_tts_local_fixed_sampled_frame.onnx"
+
+[[model.tts.files]]
+file = "moss_tts_local_shared.data"
+dest = "tts/moss_tts_local_shared.data"
+
+[[model.tts.files]]
+file = "tokenizer.model"
+dest = "tts/tokenizer.model"
+
+[[model.tts.files]]
+file = "tts_browser_onnx_meta.json"
+dest = "tts/tts_browser_onnx_meta.json"
+
+[[model.tts.files]]
+file = "browser_poc_manifest.json"
+dest = "tts/browser_poc_manifest.json"
+
+[model.codec]
+source = "hf-hub"
+repo = "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX"
+revision = "main"
+
+[[model.codec.files]]
+file = "moss_audio_tokenizer_decode_full.onnx"
+dest = "codec/moss_audio_tokenizer_decode_full.onnx"
+
+[[model.codec.files]]
+file = "moss_audio_tokenizer_decode_shared.data"
+dest = "codec/moss_audio_tokenizer_decode_shared.data"
+
+[[model.codec.files]]
+file = "codec_browser_onnx_meta.json"
+dest = "codec/codec_browser_onnx_meta.json"
+
+[codegen]
+class_name = "MossTtsNano"
+custom_methods = []

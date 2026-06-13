@@ -9,6 +9,7 @@ members = [
     "examples/yolo26",
     "examples/yolo26n-seg",
     "examples/hojo-tts",
+    "examples/moss-tts-nano",
     "examples/web-demo",
     "examples/web-demo/crates/sensevoice-wasm",
     "examples/web-demo/crates/yolo26-wasm",
@@ -25,7 +26,7 @@ anyhow = "1.0"
 
 [package]
 name = "lele"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2024"
 description = "Bare-metal machine learning inference library in Rust"
 license = "MIT"
@@ -87,3 +88,4 @@ debug = true
 lto = "thin"
 codegen-units = 1
 opt-level = 3
+

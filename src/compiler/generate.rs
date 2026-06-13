@@ -205,7 +205,7 @@ pub(crate) fn infer_variable_types(
                         }
                     }
                 }
-                "Greater" | "Less" | "Equal" | "And" | "Or" | "Not" | "GreaterOrEqual"
+                "Greater" | "Less" | "Equal" | "And" | "Or" | "Xor" | "Not" | "GreaterOrEqual"
                 | "LessOrEqual" => {
                     for out in &node.output {
                         if !out.is_empty() {
@@ -271,7 +271,7 @@ pub(crate) fn infer_variable_types(
                 "Reshape" | "Unsqueeze" | "Squeeze" | "Slice" | "Flatten" | "Transpose"
                 | "Identity" | "Add" | "Sub" | "Mul" | "Div" | "Tile" | "Split" | "Expand"
                 | "Pow" | "Clip" | "PRelu" | "LeakyRelu" | "Range" | "ReduceSum" | "ReduceMean"
-                | "ReduceMax" | "Pad" | "MaxPool" | "Resize" => {
+                | "ReduceMax" | "Pad" | "MaxPool" | "Resize" | "Neg" | "GatherElements" => {
                     // All data-carrying inputs and outputs share the same type
                     let relevant_inputs: Vec<String> = if op == "Pad" {
                         node.input
@@ -306,6 +306,9 @@ pub(crate) fn infer_variable_types(
                         }
                         // For Pad, only input 0 is data
                         if op == "Pad" && i >= 1 {
+                            continue;
+                        }
+                        if op == "GatherElements" && i >= 1 {
                             continue;
                         }
 
@@ -362,6 +365,9 @@ pub(crate) fn infer_variable_types(
                                 continue;
                             }
                             if op == "Pad" && i >= 1 {
+                                continue;
+                            }
+                            if op == "GatherElements" && i >= 1 {
                                 continue;
                             }
 
@@ -744,10 +750,18 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
             compiler,
             &var_types,
         )?;
-        // Return
+        // Return — use detach_or_own for f32 (zero-copy from workspace/weights),
+        // to_owned for i64 (local buffers need copying)
         let ret_vals: Vec<String> = chunk_outputs
             .iter()
-            .map(|s| format!("{}.to_owned()", s))
+            .map(|s| {
+                let ty = var_types.get(s).map(|t| t.as_str()).unwrap_or("f32");
+                if ty == "f32" {
+                    format!("unsafe {{ {}.detach_or_own() }}", s)
+                } else {
+                    format!("{}.to_owned()", s)
+                }
+            })
             .collect();
         if ret_vals.is_empty() {
             writeln!(&mut f, "        // No outputs")?;

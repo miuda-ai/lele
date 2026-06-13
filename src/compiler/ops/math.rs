@@ -187,6 +187,12 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                         "{}let {} = lele::kernels::equal_i64_f32_lhs(&{}, &{}, {});",
                         tab, outputs[0], inputs[0], inputs[1], buf_expr
                     )?;
+                } else if type_a == "f32" && (inputs[1].contains("weight_i64") || ctx.var_types.get(&sanitize_name(&ctx.node.input[1])).map(|t| t == "i64").unwrap_or(false)) {
+                    writeln!(
+                        w,
+                        "{}let {} = lele::kernels::equal_i64_f32_lhs(&{}, &{}, {});",
+                        tab, outputs[0], inputs[0], inputs[1], buf_expr
+                    )?;
                 } else {
                     writeln!(
                         w,
@@ -520,6 +526,109 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 "{}let {} = lele::kernels::stft(&{}, {}, {}, {}, {}, {});",
                 tab, outputs[0], inputs[0], n_fft, frame_step, n_fft, window, buf_expr
             )?;
+        }
+        "And" => writeln!(
+            w,
+            "{}let {} = lele::kernels::logical_and(&{}, &{}, {});",
+            tab, outputs[0], inputs[0], inputs[1], buf_expr
+        )?,
+        "Or" => writeln!(
+            w,
+            "{}let {} = lele::kernels::logical_or(&{}, &{}, {});",
+            tab, outputs[0], inputs[0], inputs[1], buf_expr
+        )?,
+        "Xor" => writeln!(
+            w,
+            "{}let {} = lele::kernels::logical_xor(&{}, &{}, {});",
+            tab, outputs[0], inputs[0], inputs[1], buf_expr
+        )?,
+        "GreaterOrEqual" => {
+            let is_i64 = ctx
+                .var_types
+                .get(&inputs[0])
+                .map(|t| t == "i64")
+                .unwrap_or(false)
+                || ctx
+                    .var_types
+                    .get(&inputs[1])
+                    .map(|t| t == "i64")
+                    .unwrap_or(false);
+            if is_i64 {
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::greater_or_equal_i64(&{}, &{}, {});",
+                    tab, outputs[0], inputs[0], inputs[1], buf_expr
+                )?;
+            } else {
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::greater_or_equal(&{}, &{}, {});",
+                    tab, outputs[0], inputs[0], inputs[1], buf_expr
+                )?;
+            }
+        }
+        "CumSum" => {
+            let axis = if !ctx.node.input.is_empty() && ctx.node.input.len() > 1 {
+                let name = &ctx.node.input[1];
+                if let Some((ints, _)) = ctx.int64_map.get(name) {
+                    ints[0]
+                } else {
+                    0
+                }
+            } else {
+                ctx.node
+                    .attribute
+                    .iter()
+                    .find(|a| a.name == "axis")
+                    .map(|a| a.i)
+                    .unwrap_or(0)
+            };
+            let exclusive = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "exclusive")
+                .map(|a| a.i != 0)
+                .unwrap_or(false);
+            let reverse = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "reverse")
+                .map(|a| a.i != 0)
+                .unwrap_or(false);
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::cumsum(&{}, {}, {}, {}, {});",
+                tab, outputs[0], inputs[0], axis, exclusive, reverse, buf_expr
+            )?;
+        }
+        "Einsum" => {
+            let equation = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "equation")
+                .map(|a| String::from_utf8_lossy(&a.s).to_string())
+                .unwrap_or_default();
+            let normalized = equation.replace(' ', "");
+            match normalized.as_str() {
+                "bs,d->bsd" => {
+                    writeln!(
+                        w,
+                        "{}let {} = lele::kernels::einsum_bs_d_bsd(&{}, &{}, {});",
+                        tab, outputs[0], inputs[0], inputs[1], buf_expr
+                    )?;
+                }
+                other => {
+                    writeln!(w, "{}// Unsupported Einsum: {}", tab, other)?;
+                    writeln!(
+                        w,
+                        "{}let {} = lele::kernels::einsum_bs_d_bsd(&{}, &{}, {});",
+                        tab, outputs[0], inputs[0], inputs[1], buf_expr
+                    )?;
+                }
+            }
         }
         _ => return Ok(false),
     }
