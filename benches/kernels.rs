@@ -301,6 +301,35 @@ fn bench_activations(c: &mut Criterion) {
 }
 
 // ============================================================================
+// LeakyReLU Benchmark (all architectures)
+// ============================================================================
+
+fn bench_leaky_relu(c: &mut Criterion) {
+    let mut group = c.benchmark_group("leaky_relu");
+
+    let sizes = [512, 1024, 2048, 4096, 8192];
+
+    for &size in &sizes {
+        let input_data: Vec<f32> = (0..size).map(|i| ((i % 20) as f32 - 10.0) * 0.1).collect();
+        let mut out_buf = vec![0.0f32; size];
+
+        let shape = vec![size];
+        let input = TensorView { data: Cow::Borrowed(&input_data), shape: Cow::Borrowed(&shape) };
+
+        group.throughput(Throughput::Elements(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("leaky_relu", size), &size, |bencher, _| {
+            bencher.iter(|| {
+                out_buf.fill(0.0);
+                let _ = lele::kernels::math::leaky_relu(black_box(&input), 0.01, &mut out_buf);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+// ============================================================================
 // GEMM with Bias (matmul_fused_add)
 // ============================================================================
 
@@ -354,6 +383,7 @@ criterion_group!(
     bench_layer_norm,
     bench_transpose,
     bench_elementwise,
+    bench_leaky_relu,
     bench_matmul_fused_add,
 );
 

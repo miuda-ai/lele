@@ -42,9 +42,9 @@ For fairness and stability, SenseVoice uses steady-state metrics (warmup + multi
 
 `lele` supports a comprehensive set of ONNX operators:
 
-- **Math**: Add, Sub, Mul, Div, Pow, Sqrt, Neg, Abs, Exp, Log, Sin, Cos, Erf, Softplus, Clip, Mod, Round, Floor, Ceil
+- **Math**: Add, Sub, Mul, Div, Pow, Sqrt, Neg, Abs, Exp, Log, Sin, Cos, Erf, Softplus, Clip, Mod, Round, Floor, Ceil, CumSum
 - **Neural Network**: Conv, ConvTranspose, Gemm, MatMul, MatMulInteger, LSTM, GRU, BatchNormalization, LayerNormalization
-- **Activation**: Relu, Sigmoid, Tanh, Softmax, Gelu, PRelu, Silu
+- **Activation**: Relu, LeakyRelu, Sigmoid, Tanh, Softmax, Gelu, PRelu, Silu
 - **Tensor**: Reshape, Transpose, Concat, Split, Slice, Gather, GatherElements, Pad, Expand, Tile, Where, TopK, Flatten, Squeeze, Unsqueeze
 - **Reduction**: ReduceSum, ReduceMean, ReduceMax, ReduceL2
 - **Comparison**: Equal, Less, Greater, LessOrEqual, GreaterOrEqual

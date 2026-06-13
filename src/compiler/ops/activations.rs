@@ -17,6 +17,20 @@ pub(crate) fn handle_activation_ops(
             "{}let {} = lele::kernels::relu(&{}, {});",
             tab, outputs[0], inputs[0], buf_expr
         )?,
+        "LeakyRelu" => {
+            let alpha = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "alpha")
+                .map(|a| a.f)
+                .unwrap_or(0.01);
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::leaky_relu(&{}, {}, {});",
+                tab, outputs[0], inputs[0], alpha, buf_expr
+            )?;
+        }
         "Sigmoid" => writeln!(
             w,
             "{}let {} = lele::kernels::sigmoid(&{}, {});",

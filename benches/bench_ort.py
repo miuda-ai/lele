@@ -246,6 +246,47 @@ def bench_relu():
 
     return results
 
+def bench_leaky_relu():
+    """LeakyReLU benchmark"""
+    results = {}
+    sizes = [512, 1024, 2048, 4096, 8192]
+
+    for size in sizes:
+        x_info = helper.make_tensor_value_info("x", TensorProto.FLOAT, [size])
+        y_info = helper.make_tensor_value_info("y", TensorProto.FLOAT, [size])
+        node = helper.make_node("LeakyRelu", ["x"], ["y"], alpha=0.01)
+        graph = helper.make_graph([node], "leaky_relu", [x_info], [y_info])
+        model = helper.make_model(graph)
+        model.ir_version = 8
+        model.opset_import[0].version = 12
+
+        sess = ort.InferenceSession(model.SerializeToString(), providers=['CPUExecutionProvider'])
+
+        x = np.random.randn(size).astype(np.float32)
+
+        # Warmup
+        for _ in range(WARMUP):
+            sess.run(None, {"x": x})
+
+        # Benchmark
+        times = []
+        for _ in range(ITERATIONS):
+            start = time.perf_counter()
+            sess.run(None, {"x": x})
+            times.append(time.perf_counter() - start)
+
+        times = np.array(times)
+        key = f"leaky_relu_{size}"
+        results[key] = {
+            "mean_us": float(np.mean(times) * 1e6),
+            "min_us": float(np.min(times) * 1e6),
+            "median_us": float(np.median(times) * 1e6),
+        }
+        print(f"leaky_relu {size}: {results[key]['median_us']:.2f} us")
+
+    return results
+
+
 def main():
     print("=" * 60)
     print("ORT Baseline Benchmark")
@@ -267,6 +308,9 @@ def main():
 
     print("\n--- ReLU ---")
     all_results["relu"] = bench_relu()
+
+    print("\n--- LeakyReLU ---")
+    all_results["leaky_relu"] = bench_leaky_relu()
 
     # Save results
     with open("ort_benchmark_results.json", "w") as f:

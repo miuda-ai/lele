@@ -1552,6 +1552,51 @@ pub fn relu<'a, 'b>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView
     }
 }
 
+pub fn leaky_relu<'a, 'b>(
+    input: &TensorView<'b>,
+    alpha: f32,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let len = input.data.len();
+    utils::ensure_capacity(out, len);
+    let i_slice = &input.data;
+    let o_slice = out.as_mut_slice();
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::*;
+        let valpha = unsafe { vdupq_n_f32(alpha) };
+        let vzero = unsafe { vdupq_n_f32(0.0) };
+        let mut i = 0;
+        unsafe {
+            while i + 4 <= len {
+                let xv = vld1q_f32(i_slice.as_ptr().add(i));
+                let mask = vcgeq_f32(xv, vzero);
+                let neg = vmulq_f32(xv, valpha);
+                let result = vbslq_f32(mask, xv, neg);
+                vst1q_f32(o_slice.as_mut_ptr().add(i), result);
+                i += 4;
+            }
+        }
+        for j in i..len {
+            let x = i_slice[j];
+            o_slice[j] = if x >= 0.0 { x } else { alpha * x };
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for i in 0..len {
+            let x = i_slice[i];
+            unsafe {
+                *o_slice.get_unchecked_mut(i) = if x >= 0.0 { x } else { alpha * x };
+            }
+        }
+    }
+    TensorView {
+        data: Cow::Borrowed(out),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
+}
+
 pub fn sqrt<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let len = input.data.len();
     utils::ensure_capacity(out, len);
@@ -2842,5 +2887,60 @@ mod tests {
         let mut out = Vec::new();
         let res = mod_f32(&a, &b, &mut out);
         assert_eq!(res.data.as_ref(), &[0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_leaky_relu_default_alpha() {
+        // ONNX LeakyReLU: f(x) = x if x >= 0, else alpha * x. Default alpha = 0.01
+        let data = vec![-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0];
+        let input = TensorView::from_slice(&data, vec![data.len()]);
+        let mut out = Vec::new();
+        let res = leaky_relu(&input, 0.01, &mut out);
+        let expected: Vec<f32> = data.iter().map(|&x| if x >= 0.0 { x } else { 0.01 * x }).collect();
+        assert_eq!(res.shape, vec![data.len()]);
+        for (a, b) in res.data.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-6, "got {} expected {}", a, b);
+        }
+    }
+
+    #[test]
+    fn test_leaky_relu_custom_alpha() {
+        let data = vec![-4.0, -2.0, 0.0, 2.0, 4.0];
+        let input = TensorView::from_slice(&data, vec![5]);
+        let mut out = Vec::new();
+        let res = leaky_relu(&input, 0.2, &mut out);
+        let expected = vec![-0.8, -0.4, 0.0, 2.0, 4.0];
+        for (a, b) in res.data.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-6, "got {} expected {}", a, b);
+        }
+    }
+
+    #[test]
+    fn test_leaky_relu_2d() {
+        let data = vec![-3.0, 1.0, 2.0, -5.0, 0.0, -1.0, 4.0, -2.0];
+        let input = TensorView::from_slice(&data, vec![2, 4]);
+        let mut out = Vec::new();
+        let res = leaky_relu(&input, 0.1, &mut out);
+        let expected: Vec<f32> = data.iter().map(|&x| if x >= 0.0 { x } else { 0.1 * x }).collect();
+        assert_eq!(res.shape, vec![2, 4]);
+        for (a, b) in res.data.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-6, "got {} expected {}", a, b);
+        }
+    }
+
+    #[test]
+    fn test_leaky_relu_large_aligned() {
+        // Size multiple of 4 to exercise the NEON SIMD loop fully
+        let data: Vec<f32> = (0..1024)
+            .map(|i| ((i as f32 % 20.0) - 10.0) * 0.3)
+            .collect();
+        let input = TensorView::from_slice(&data, vec![data.len()]);
+        let mut out = Vec::new();
+        let alpha = 0.01f32;
+        let res = leaky_relu(&input, alpha, &mut out);
+        let expected: Vec<f32> = data.iter().map(|&x| if x >= 0.0 { x } else { alpha * x }).collect();
+        for (a, b) in res.data.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-6, "mismatch: got {} expected {}", a, b);
+        }
     }
 }

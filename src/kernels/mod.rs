@@ -31,7 +31,7 @@ pub use gemm::{gemm, matmul, matmul_fused_add, Int8Weight, quantize_f32_to_i8};
 pub use manipulation::*;
 pub use manipulation::{split, where_op};
 pub use math::*;
-pub use math::{cos, cumsum, einsum_bs_d_bsd, exp, expand, greater_or_equal, less, logical_and, logical_or, logical_xor, min_max, neg, range, sin, tile};
+pub use math::{cos, cumsum, einsum_bs_d_bsd, exp, expand, greater_or_equal, less, leaky_relu, logical_and, logical_or, logical_xor, min_max, neg, range, sin, tile};
 pub use norm::*;
 pub use pooling::*;
 pub use quantization::*;
