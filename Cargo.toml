@@ -10,6 +10,7 @@ members = [
     "examples/yolo26n-seg",
     "examples/hojo-tts",
     "examples/moss-tts-nano",
+    "examples/ppocr",
     "examples/web-demo",
     "examples/web-demo/crates/sensevoice-wasm",
     "examples/web-demo/crates/yolo26-wasm",
@@ -38,8 +39,10 @@ keywords = [
     "onnx",
     "speech-synthesis",
     "text-to-speech",
+    "computer-vision",
+    "wasm",
 ]
-categories = ["algorithms", "compilers"]
+categories = ["algorithms", "compilers", "science", "wasm"]
 exclude = [
     "build.rs",
     "benches/*",

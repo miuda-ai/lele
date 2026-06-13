@@ -4,7 +4,7 @@
 pub const TIMING_ENABLED: bool = false;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub const TIMING_ENABLED: bool = true;
+pub const TIMING_ENABLED: bool = false;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -19,6 +19,7 @@ pub static MUL_NS: AtomicU64 = AtomicU64::new(0);
 pub static SILU_NS: AtomicU64 = AtomicU64::new(0);
 pub static RESIZE_NS: AtomicU64 = AtomicU64::new(0);
 pub static CONV_TRANS_NS: AtomicU64 = AtomicU64::new(0);
+pub static CONV_DW_NS: AtomicU64 = AtomicU64::new(0);
 pub static OTHER_NS: AtomicU64 = AtomicU64::new(0);
 pub static TOTAL_CONV_CALLS: AtomicU64 = AtomicU64::new(0);
 
@@ -85,6 +86,7 @@ pub fn reset() {
     SILU_NS.store(0, Ordering::Relaxed);
     RESIZE_NS.store(0, Ordering::Relaxed);
     CONV_TRANS_NS.store(0, Ordering::Relaxed);
+    CONV_DW_NS.store(0, Ordering::Relaxed);
     OTHER_NS.store(0, Ordering::Relaxed);
     TOTAL_CONV_CALLS.store(0, Ordering::Relaxed);
 }
@@ -101,8 +103,9 @@ pub fn print() {
     let si = SILU_NS.load(Ordering::Relaxed);
     let re = RESIZE_NS.load(Ordering::Relaxed);
     let ct = CONV_TRANS_NS.load(Ordering::Relaxed);
+    let dw = CONV_DW_NS.load(Ordering::Relaxed);
     let ot = OTHER_NS.load(Ordering::Relaxed);
-    let total = c1 + c3 + co + sp + ca + ad + sig + mu + si + re + ct + ot;
+    let total = c1 + c3 + co + sp + ca + ad + sig + mu + si + re + ct + dw + ot;
     println!("\n[Timing breakdown]");
     println!(
         "  conv2d 1×1:    {:>8.2}ms  ({:.1}%)",
@@ -158,6 +161,11 @@ pub fn print() {
         "  conv_transpose:{:>8.2}ms  ({:.1}%)",
         ct as f64 / 1e6,
         100.0 * ct as f64 / total.max(1) as f64
+    );
+    println!(
+        "  conv_depthwise:{:>8.2}ms  ({:.1}%)",
+        dw as f64 / 1e6,
+        100.0 * dw as f64 / total.max(1) as f64
     );
     println!(
         "  other:         {:>8.2}ms  ({:.1}%)",

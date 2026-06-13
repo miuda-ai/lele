@@ -3126,34 +3126,34 @@ fn embedding_concat_i64<'c, 'd>(
         self.prepared_weights_cache.borrow_mut().insert(key, pw.clone());
         pw
     }
-    fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {
+    pub fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {
         TensorView::from_bytes_f32(&self.data[offset..offset+len], shape)
     }
-    fn weight_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
+    pub fn weight_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
         TensorView::from_bytes_i64(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_i32_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
+    pub fn weight_i32_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
         TensorView::from_bytes_i32_as_i64(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_i32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i32> {
+    pub fn weight_i32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i32> {
         TensorView::from_bytes_i32(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_i64_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
+    pub fn weight_i64_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
         TensorView::from_bytes_i64_as_f32(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_i32_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
+    pub fn weight_i32_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
         TensorView::from_bytes_i32_as_f32(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_u8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
+    pub fn weight_u8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
         TensorView::from_bytes_u8(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_i8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
+    pub fn weight_i8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
         TensorView::from_bytes_i8(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_f16(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
+    pub fn weight_f16(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
         TensorView::from_bytes_f16(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_u8_raw(&self, offset: usize, len: usize) -> &'a [u8] {
+    pub fn weight_u8_raw(&self, offset: usize, len: usize) -> &'a [u8] {
         &self.data[offset..offset+len]
     }
 

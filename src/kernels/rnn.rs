@@ -327,8 +327,9 @@ pub fn gru<'b, 'a>(
             for k in 0..hidden_size {
                 let z_gate = sigmoid(z_wx[k]);
                 let r_gate = sigmoid(r_wx[k]);
-                let r_bias_r = r_contribution[hidden_size + k] + bias_r_slice[hidden_size + k];
-                let h_pre = h_wx[k] + r_gate * r_bias_r;
+                let wh_x_bwh = w_contribution[2 * hidden_size + k] + bias_w_slice[2 * hidden_size + k];
+                let rh_brh = r_contribution[2 * hidden_size + k] + bias_r_slice[2 * hidden_size + k];
+                let h_pre = wh_x_bwh + r_gate * rh_brh;
                 let h_gate = tanh(h_pre);
                 let ht = (1.0 - z_gate) * h_gate + z_gate * out_h[k];
                 out_h[k] = ht;

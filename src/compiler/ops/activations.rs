@@ -76,6 +76,27 @@ pub(crate) fn handle_activation_ops(
             "{}let {} = lele::kernels::tanh_kernel(&{}, {});",
             tab, outputs[0], inputs[0], buf_expr
         )?,
+        "HardSigmoid" => {
+            let alpha = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "alpha")
+                .map(|a| a.f)
+                .unwrap_or(0.2);
+            let beta = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "beta")
+                .map(|a| a.f)
+                .unwrap_or(0.5);
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::hard_sigmoid(&{}, {:?}, {:?}, {});",
+                tab, outputs[0], inputs[0], alpha, beta, buf_expr
+            )?;
+        }
         _ => return Ok(false),
     }
     Ok(true)

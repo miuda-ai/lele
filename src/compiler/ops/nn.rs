@@ -1,6 +1,60 @@
 use super::super::generate::OpContext;
 use std::io::Write;
 
+/// Compute explicit pads from auto_pad attribute for SAME_UPPER/SAME_LOWER.
+/// Returns Some([pad_top, pad_left, pad_bottom, pad_right]) or None.
+fn compute_same_pads(
+    kernel_shape: &[i64],
+    strides: &[i64],
+    dilations: &[i64],
+    auto_pad: &str,
+) -> Option<Vec<i64>> {
+    if auto_pad == "NOTSET" || auto_pad.is_empty() {
+        return None;
+    }
+    let kh = kernel_shape.get(0).copied().unwrap_or(1);
+    let kw = kernel_shape.get(1).copied().unwrap_or(kh);
+    let sh = strides.get(0).copied().unwrap_or(1);
+    let sw = strides.get(1).copied().unwrap_or(sh);
+    let dh = dilations.get(0).copied().unwrap_or(1);
+    let dw = dilations.get(1).copied().unwrap_or(dh);
+
+    let eff_kh = (kh - 1) * dh + 1;
+    let eff_kw = (kw - 1) * dw + 1;
+
+    // For SAME padding with stride 1, pad_total = effective_kernel - 1
+    // For stride > 1, we can't know exact padding without input size,
+    // but SAME_UPPER typically uses pad_total = effective_kernel - 1 for stride 1
+    // For general stride, ONNX spec: output = ceil(input / stride)
+    // pad_total = max((output-1)*stride + eff_kernel - input, 0)
+    // Since input is dynamic, we use the stride-1 formula as approximation
+    // which works for the common case
+    let pad_total_h = eff_kh - 1;
+    let pad_total_w = eff_kw - 1;
+
+    let (pad_top, pad_bottom) = if auto_pad == "SAME_LOWER" {
+        (pad_total_h - pad_total_h / 2, pad_total_h / 2)
+    } else {
+        (pad_total_h / 2, pad_total_h - pad_total_h / 2)
+    };
+    let (pad_left, pad_right) = if auto_pad == "SAME_LOWER" {
+        (pad_total_w - pad_total_w / 2, pad_total_w / 2)
+    } else {
+        (pad_total_w / 2, pad_total_w - pad_total_w / 2)
+    };
+
+    // For stride > 1, we need to account for the extra padding needed
+    // For SAME, pad_total = (output-1)*stride + eff_kernel - input
+    // where output = ceil(input/stride). For dynamic input, we use:
+    // pad_total_h and pad_total_w are for stride 1.
+    // For stride > 1, the pad depends on input size which we don't have at compile time.
+    // However, the kernel functions handle this by using the explicit pads we provide.
+    // For stride=1, this is exact. For stride>1, the user should use explicit pads.
+    let _ = (sh, sw);
+
+    Some(vec![pad_top, pad_left, pad_bottom, pad_right])
+}
+
 pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<bool> {
     let op = ctx.node.op_type.as_str();
     let tab = ctx.tab();
@@ -24,13 +78,40 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 .find(|a| a.name == "group")
                 .map(|a| a.i)
                 .unwrap_or(1);
-            let pads = ctx
+            let auto_pad = ctx
                 .node
                 .attribute
                 .iter()
-                .find(|a| a.name == "pads")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
+                .find(|a| a.name == "auto_pad")
+                .and_then(|a| std::str::from_utf8(&a.s).ok())
+                .unwrap_or("NOTSET");
+            let kernel_shape: Vec<i64> = {
+                let weight_name = &ctx.node.input[1];
+                let weight_name_s = super::super::sanitize_name(weight_name);
+                ctx.known_weights
+                    .get(&weight_name_s)
+                    .and_then(|(_, _, shape, _)| {
+                        if shape.len() >= 4 {
+                            Some(vec![shape[2] as i64, shape[3] as i64])
+                        } else if shape.len() == 3 {
+                            Some(vec![shape[2] as i64])
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default()
+            };
+            let pads = if auto_pad != "NOTSET" && !auto_pad.is_empty() {
+                compute_same_pads(&kernel_shape, &[1, 1], &dilations, auto_pad)
+                    .unwrap_or_default()
+            } else {
+                ctx.node
+                    .attribute
+                    .iter()
+                    .find(|a| a.name == "pads")
+                    .map(|a| a.ints.clone())
+                    .unwrap_or(vec![])
+            };
             let strides = ctx
                 .node
                 .attribute
@@ -376,13 +457,13 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 .find(|a| a.name == "strides")
                 .map(|a| a.ints.clone())
                 .unwrap_or(vec![]);
-            let pads = ctx
+            let auto_pad = ctx
                 .node
                 .attribute
                 .iter()
-                .find(|a| a.name == "pads")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
+                .find(|a| a.name == "auto_pad")
+                .and_then(|a| std::str::from_utf8(&a.s).ok())
+                .unwrap_or("NOTSET");
             let dilations = ctx
                 .node
                 .attribute
@@ -390,6 +471,17 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 .find(|a| a.name == "dilations")
                 .map(|a| a.ints.clone())
                 .unwrap_or(vec![]);
+            let pads = if auto_pad != "NOTSET" && !auto_pad.is_empty() {
+                compute_same_pads(&kernel_shape, &strides, &dilations, auto_pad)
+                    .unwrap_or_default()
+            } else {
+                ctx.node
+                    .attribute
+                    .iter()
+                    .find(|a| a.name == "pads")
+                    .map(|a| a.ints.clone())
+                    .unwrap_or(vec![])
+            };
             let ceil_mode = ctx
                 .node
                 .attribute
@@ -443,6 +535,55 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
             } else {
                 panic!("Resize: neither scales nor sizes provided");
             }
+        }
+        "GlobalAveragePool" => {
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::global_average_pool(&{}, {});",
+                tab, outputs[0], inputs[0], buf_expr
+            )?;
+        }
+        "AveragePool" => {
+            let kernel_shape = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "kernel_shape")
+                .map(|a| a.ints.clone())
+                .unwrap_or(vec![]);
+            let strides = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "strides")
+                .map(|a| a.ints.clone())
+                .unwrap_or(vec![]);
+            let pads = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "pads")
+                .map(|a| a.ints.clone())
+                .unwrap_or(vec![]);
+            let count_include_pad = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "count_include_pad")
+                .map(|a| a.i != 0)
+                .unwrap_or(false);
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::average_pool2d(&{}, &{:?}, &{:?}, &{:?}, {}, {});",
+                tab,
+                outputs[0],
+                inputs[0],
+                kernel_shape,
+                strides,
+                pads,
+                count_include_pad,
+                buf_expr
+            )?;
         }
         "ConvTranspose" => {
             let dilations = ctx

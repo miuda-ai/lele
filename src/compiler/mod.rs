@@ -1163,7 +1163,7 @@ impl Compiler {
         // Helpers for weights
         writeln!(
             &mut code,
-            "    fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {{"
+            "    pub fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {{"
         )?;
         writeln!(
             &mut code,
@@ -1173,7 +1173,7 @@ impl Compiler {
 
         writeln!(
             &mut code,
-            "    fn weight_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {{"
+            "    pub fn weight_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {{"
         )?;
         writeln!(
             &mut code,
@@ -1183,7 +1183,7 @@ impl Compiler {
 
         writeln!(
             &mut code,
-            "    fn weight_i32_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {{"
+            "    pub fn weight_i32_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {{"
         )?;
         writeln!(
             &mut code,
@@ -1193,7 +1193,7 @@ impl Compiler {
 
         writeln!(
             &mut code,
-            "    fn weight_i32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i32> {{"
+            "    pub fn weight_i32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i32> {{"
         )?;
         writeln!(
             &mut code,
@@ -1203,7 +1203,7 @@ impl Compiler {
 
         writeln!(
             &mut code,
-            "    fn weight_i64_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
+            "    pub fn weight_i64_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
         )?;
         writeln!(
             &mut code,
@@ -1213,7 +1213,7 @@ impl Compiler {
 
         writeln!(
             &mut code,
-            "    fn weight_i32_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
+            "    pub fn weight_i32_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
         )?;
         writeln!(
             &mut code,
@@ -1223,7 +1223,7 @@ impl Compiler {
 
         writeln!(
             &mut code,
-            "    fn weight_u8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
+            "    pub fn weight_u8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
         )?;
         writeln!(
             &mut code,
@@ -1233,7 +1233,7 @@ impl Compiler {
 
         writeln!(
             &mut code,
-            "    fn weight_i8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
+            "    pub fn weight_i8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
         )?;
         writeln!(
             &mut code,
@@ -1243,7 +1243,7 @@ impl Compiler {
 
         writeln!(
             &mut code,
-            "    fn weight_f16(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
+            "    pub fn weight_f16(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
         )?;
         writeln!(
             &mut code,
@@ -1254,7 +1254,7 @@ impl Compiler {
         // Raw byte accessors for prepared weights (no f32 conversion)
         writeln!(
             &mut code,
-            "    fn weight_u8_raw(&self, offset: usize, len: usize) -> &'a [u8] {{"
+            "    pub fn weight_u8_raw(&self, offset: usize, len: usize) -> &'a [u8] {{"
         )?;
         writeln!(&mut code, "        &self.data[offset..offset+len]")?;
         writeln!(&mut code, "    }}")?;

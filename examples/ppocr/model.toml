@@ -1,0 +1,33 @@
+# PP-OCRv6 tiny detection model
+[model.det]
+source = "hf-hub"
+repo = "PaddlePaddle/PP-OCRv6_tiny_det_onnx"
+revision = "main"
+
+[[model.det.files]]
+file = "inference.onnx"
+dest = "det.onnx"
+
+# PP-OCRv6 tiny recognition model
+[model.rec]
+source = "hf-hub"
+repo = "PaddlePaddle/PP-OCRv6_tiny_rec_onnx"
+revision = "main"
+
+[[model.rec.files]]
+file = "inference.onnx"
+dest = "rec.onnx"
+
+[[model.rec.files]]
+file = "inference.yml"
+dest = "rec_inference.yml"
+
+[codegen.det]
+class_name = "PpocrDet"
+model_file = "det.onnx"
+custom_methods = []
+
+[codegen.rec]
+class_name = "PpocrRec"
+model_file = "rec.onnx"
+custom_methods = []

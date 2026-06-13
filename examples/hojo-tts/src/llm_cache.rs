@@ -1,6 +1,4 @@
 use crate::llm::Llm;
-use lele::kernels::*;
-use lele::tensor::TensorView;
 
 const D_MODEL: usize = 512;
 const N_HEADS: usize = 4;
@@ -88,25 +86,30 @@ impl<'a> Llm<'a> {
         let seq = input_ids.len();
         cache.seq_len = seq;
 
-        // Use the original generated forward for correct logits + K/V extraction
-        let mut ws = crate::llm::LlmWorkspace::new();
-        let in_shape = [1usize, seq];
-        let in_tv = TensorView::new(input_ids, &in_shape);
-        let result = self.forward_with_workspace(&mut ws, in_tv);
-
-        // Extract logits first (need to drop borrow on ws)
-        let vocab = result.shape.last().copied().unwrap_or(0);
-        let rows = result.shape.iter().product::<usize>() / vocab.max(1);
-        let last_row_start = (rows.saturating_sub(1)) * vocab;
-        let logits: Vec<f32> = result.data[last_row_start..last_row_start + vocab].to_vec();
-
-        // Extract K/V from workspace into cache
-        for layer in 0..N_LAYERS.min(ws.kv_cache.len()) {
-            let (k_data, v_data) = &ws.kv_cache[layer];
-            cache.k_cache[layer] = k_data.clone();
-            cache.v_cache[layer] = v_data.clone();
+        let embed_w = self.weight_f16(EMBED_OFFSET, 17667 * 512 * 2, &[VOCAB, D_MODEL]);
+        let mut hidden = vec![0.0f32; seq * D_MODEL];
+        for t in 0..seq {
+            let row = &embed_w.data[input_ids[t] as usize * D_MODEL..(input_ids[t] as usize + 1) * D_MODEL];
+            hidden[t * D_MODEL..(t + 1) * D_MODEL].copy_from_slice(row);
         }
 
+        let norm_w = self.weight_f16(NORM_WEIGHT_OFFSET, 1024, &[D_MODEL]);
+        let norm_w = &norm_w.data[..D_MODEL];
+        let qk_norm_w = self.weight_f16(QK_NORM_OFFSET, 256, &[D_HEAD]);
+        let qk_norm_w = &qk_norm_w.data[..D_HEAD];
+
+        for layer in 0..N_LAYERS {
+            hidden = self.forward_layer_full(
+                &hidden, seq, layer, norm_w, qk_norm_w,
+                &mut cache.k_cache[layer], &mut cache.v_cache[layer],
+                &cache.inv_freq, cache.attn_scale,
+            );
+        }
+
+        self.rms_norm_inplace(&mut hidden[seq * D_MODEL - D_MODEL..seq * D_MODEL], norm_w, LN_EPS);
+        let last_row = &hidden[(seq - 1) * D_MODEL..seq * D_MODEL];
+        let lm_head = self.weight_f16(LM_HEAD_OFFSET, VOCAB * D_MODEL * 2, &[D_MODEL, VOCAB]);
+        let logits = self.matvec(last_row, &lm_head.data, VOCAB, D_MODEL);
         logits
     }
 

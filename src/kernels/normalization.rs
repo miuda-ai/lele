@@ -473,6 +473,30 @@ pub fn batch_norm<'b, 'a>(
         let b = &bias.data;
         let m = &mean.data;
         let v = &var.data;
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            use core::arch::aarch64::*;
+            for ni in 0..n {
+                for ci in 0..c {
+                    let offset = (ni * c + ci) * spatial_size;
+                    let scale_val = s[ci] / (v[ci] + epsilon).sqrt();
+                    let bias_val = b[ci] - m[ci] * scale_val;
+                    let sv = vdupq_n_f32(scale_val);
+                    let bv = vdupq_n_f32(bias_val);
+                    let mut i = 0;
+                    while i + 4 <= spatial_size {
+                        let x = vld1q_f32(src.as_ptr().add(offset + i));
+                        vst1q_f32(out_slice.as_mut_ptr().add(offset + i), vfmaq_f32(bv, sv, x));
+                        i += 4;
+                    }
+                    while i < spatial_size {
+                        out_slice[offset + i] = src[offset + i] * scale_val + bias_val;
+                        i += 1;
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         for ni in 0..n {
             for ci in 0..c {
                 let offset = (ni * c + ci) * spatial_size;

@@ -557,6 +557,198 @@ pub fn get_default_patterns() -> Vec<Pattern> {
             }),
         },
         Pattern {
+            name: "Conv + Add(bias)".to_string(),
+            matcher: Box::new(|nodes: &[&NodeProto]| -> Option<usize> {
+                if nodes.len() < 2 {
+                    return None;
+                }
+                let n0 = nodes[0];
+                let n1 = nodes[1];
+                if n0.op_type != "Conv" || n1.op_type != "Add" {
+                    return None;
+                }
+                if n0.input.len() > 2 && !n0.input[2].is_empty() {
+                    return None;
+                }
+                let conv_out = match n0.output.first() {
+                    Some(o) => o,
+                    None => return None,
+                };
+                let in0_match = n1.input.get(0).map(|s| s == conv_out).unwrap_or(false);
+                let in1_match = n1.input.get(1).map(|s| s == conv_out).unwrap_or(false);
+                if !in0_match && !in1_match {
+                    return None;
+                }
+                Some(2)
+            }),
+            generator: Box::new(|nodes, weights, allocator, w, indent| {
+                let conv = nodes[0];
+                let add = nodes[1];
+                let tab = "    ".repeat(indent);
+                let input = &conv.input[0];
+                let weight = &conv.input[1];
+                let input_s = sanitize_name(input);
+                let weight_s = sanitize_name(weight);
+                let input_expr = if let Some((o, l, s, dt)) = weights.get(&input_s) {
+                    let loader = match *dt {
+                        1 => "weight_f32",
+                        2 => "weight_u8",
+                        3 => "weight_i8",
+                        6 => "weight_i32",
+                        7 => "weight_i64",
+                        10 => "weight_f16",
+                        _ => "weight_f32",
+                    };
+                    format!("self.{}({}, {}, &{:?})", loader, o, l, s)
+                } else {
+                    input_s
+                };
+                let (weight_expr, weight_rank, weight_shape) = if let Some((o, l, s, dt)) = weights.get(&weight_s) {
+                    let loader = match *dt {
+                        1 => "weight_f32",
+                        2 => "weight_u8",
+                        3 => "weight_i8",
+                        6 => "weight_i32",
+                        7 => "weight_i64",
+                        10 => "weight_f16",
+                        _ => "weight_f32",
+                    };
+                    (format!("self.{}({}, {}, &{:?})", loader, o, l, s), s.len(), s.to_vec())
+                } else {
+                    (weight_s, 3, vec![3usize, 3, 3, 3])
+                };
+                let conv_out = &conv.output[0];
+                let bias_name_raw = if &add.input[0] == conv_out {
+                    &add.input[1]
+                } else {
+                    &add.input[0]
+                };
+                let bias_s = sanitize_name(bias_name_raw);
+                let mut stride = 1;
+                let mut dilation = 1;
+                let mut groups = 1;
+                let mut pads_vec: Vec<i64> = vec![];
+                let mut auto_pad = String::new();
+                for attr in &conv.attribute {
+                    match attr.name.as_str() {
+                        "strides" => {
+                            if !attr.ints.is_empty() {
+                                stride = attr.ints[0] as usize;
+                            }
+                        }
+                        "dilations" => {
+                            if !attr.ints.is_empty() {
+                                dilation = attr.ints[0] as usize;
+                            }
+                        }
+                        "group" => groups = attr.i as usize,
+                        "pads" => {
+                            pads_vec = attr.ints.clone();
+                        }
+                        "auto_pad" => {
+                            auto_pad = String::from_utf8_lossy(&attr.s).to_string();
+                        }
+                        _ => {}
+                    }
+                }
+                if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") && pads_vec.is_empty() {
+                    let kh = weight_shape.get(2).copied().unwrap_or(1) as i64;
+                    let kw = weight_shape.get(3).copied().unwrap_or(weight_shape.get(2).copied().unwrap_or(1) as usize) as i64;
+                    let pad_total_h = (kh - 1) * dilation as i64;
+                    let pad_total_w = (kw - 1) * dilation as i64;
+                    let (pt, pb) = if auto_pad == "SAME_LOWER" {
+                        (pad_total_h - pad_total_h / 2, pad_total_h / 2)
+                    } else {
+                        (pad_total_h / 2, pad_total_h - pad_total_h / 2)
+                    };
+                    let (pl, pr) = if auto_pad == "SAME_LOWER" {
+                        (pad_total_w - pad_total_w / 2, pad_total_w / 2)
+                    } else {
+                        (pad_total_w / 2, pad_total_w - pad_total_w / 2)
+                    };
+                    pads_vec = vec![pt, pl, pb, pr];
+                }
+                let padding_arr: Vec<i64> = if !pads_vec.is_empty() {
+                    pads_vec
+                } else {
+                    vec![0, 0, 0, 0]
+                };
+                let output_name = sanitize_name(&add.output[0]);
+                let buf_expr = if let Some(alloc) = allocator {
+                    if let Some(&idx) = alloc.tensor_to_buffer.get(&add.output[0]) {
+                        format!("&mut ws.buf_{}", idx)
+                    } else {
+                        writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, output_name)?;
+                        format!("&mut buf_{}", output_name)
+                    }
+                } else {
+                    writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, output_name)?;
+                    format!("&mut buf_{}", output_name)
+                };
+                if let Some((o, l, s, dt)) = weights.get(&bias_s) {
+                    let loader = match *dt {
+                        1 => "weight_f32",
+                        2 => "weight_u8",
+                        3 => "weight_i8",
+                        6 => "weight_i32",
+                        7 => "weight_i64",
+                        10 => "weight_f16",
+                        _ => "weight_f32",
+                    };
+                    let bias_expr = format!("Some(&self.{}({}, {}, &{:?}))", loader, o, l, s);
+                    if weight_rank >= 4 {
+                        writeln!(
+                            w,
+                            "{}let {} = lele::kernels::conv2d(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
+                            tab, output_name, input_expr, weight_expr, bias_expr,
+                            [dilation as i64; 2], groups, padding_arr.as_slice(), [stride as i64; 2], buf_expr
+                        )?;
+                    } else {
+                        writeln!(
+                            w,
+                            "{}let {} = lele::kernels::conv1d(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
+                            tab, output_name, input_expr, weight_expr, bias_expr,
+                            [dilation as i64], groups, &padding_arr[..2], [stride as i64], buf_expr
+                        )?;
+                    }
+                } else {
+                    let conv_out_name = sanitize_name(conv_out);
+                    let conv_buf = if let Some(alloc) = allocator {
+                        if let Some(&idx) = alloc.tensor_to_buffer.get(conv_out as &str) {
+                            format!("&mut ws.buf_{}", idx)
+                        } else {
+                            writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, conv_out_name)?;
+                            format!("&mut buf_{}", conv_out_name)
+                        }
+                    } else {
+                        writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, conv_out_name)?;
+                        format!("&mut buf_{}", conv_out_name)
+                    };
+                    if weight_rank >= 4 {
+                        writeln!(
+                            w,
+                            "{}let {} = lele::kernels::conv2d(&{}, &{}, None, &{:?}, {}, &{:?}, &{:?}, {});",
+                            tab, conv_out_name, input_expr, weight_expr,
+                            [dilation as i64; 2], groups, padding_arr.as_slice(), [stride as i64; 2], conv_buf
+                        )?;
+                    } else {
+                        writeln!(
+                            w,
+                            "{}let {} = lele::kernels::conv1d(&{}, &{}, None, &{:?}, {}, &{:?}, &{:?}, {});",
+                            tab, conv_out_name, input_expr, weight_expr,
+                            [dilation as i64], groups, &padding_arr[..2], [stride as i64], conv_buf
+                        )?;
+                    }
+                    writeln!(
+                        w,
+                        "{}let {} = lele::kernels::add(&{}, &{}, {});",
+                        tab, output_name, conv_out_name, bias_s, buf_expr
+                    )?;
+                }
+                Ok(())
+            }),
+        },
+        Pattern {
             name: "Conv + Relu".to_string(),
             matcher: Box::new(|nodes: &[&NodeProto]| -> Option<usize> {
                 if nodes.len() < 2 {
@@ -603,11 +795,11 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         10 => "weight_f16",
                         _ => "weight_f32",
                     };
-                    (format!("self.{}({}, {}, &{:?})", loader, o, l, s), s.len())
+                    (format!("self.{}({}, {}, &{:?})", loader, o, l, s), s.len(), s.to_vec())
                 } else {
-                    (weight_s, 3)
+                    (weight_s, 3, vec![3usize, 3, 3, 3])
                 };
-                let (weight_expr, weight_rank) = weight_expr;
+                let (weight_expr, weight_rank, weight_shape) = weight_expr;
                 let bias = if conv.input.len() > 2 {
                     let b = &conv.input[2];
                     let b_s = sanitize_name(b);
@@ -631,7 +823,8 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 let mut stride = 1;
                 let mut dilation = 1;
                 let mut groups = 1;
-                let mut padding = 0;
+                let mut pads_vec: Vec<i64> = vec![];
+                let mut auto_pad = String::new();
                 for attr in &conv.attribute {
                     match attr.name.as_str() {
                         "strides" => {
@@ -646,13 +839,37 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         }
                         "group" => groups = attr.i as usize,
                         "pads" => {
-                            if !attr.ints.is_empty() {
-                                padding = attr.ints[0] as usize;
-                            }
+                            pads_vec = attr.ints.clone();
+                        }
+                        "auto_pad" => {
+                            auto_pad = String::from_utf8_lossy(&attr.s).to_string();
                         }
                         _ => {}
                     }
                 }
+                // Compute SAME padding if auto_pad is set
+                if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") && pads_vec.is_empty() {
+                    let kh = weight_shape.get(2).copied().unwrap_or(1) as i64;
+                    let kw = weight_shape.get(3).copied().unwrap_or(weight_shape.get(2).copied().unwrap_or(1) as usize) as i64;
+                    let pad_total_h = (kh - 1) * dilation as i64;
+                    let pad_total_w = (kw - 1) * dilation as i64;
+                    let (pt, pb) = if auto_pad == "SAME_LOWER" {
+                        (pad_total_h - pad_total_h / 2, pad_total_h / 2)
+                    } else {
+                        (pad_total_h / 2, pad_total_h - pad_total_h / 2)
+                    };
+                    let (pl, pr) = if auto_pad == "SAME_LOWER" {
+                        (pad_total_w - pad_total_w / 2, pad_total_w / 2)
+                    } else {
+                        (pad_total_w / 2, pad_total_w - pad_total_w / 2)
+                    };
+                    pads_vec = vec![pt, pl, pb, pr];
+                }
+                let padding_arr: Vec<i64> = if !pads_vec.is_empty() {
+                    pads_vec
+                } else {
+                    vec![0, 0, 0, 0]
+                };
                 let output_name = sanitize_name(&nodes[1].output[0]);
                 let buf_expr = if let Some(alloc) = allocator {
                     if let Some(&idx) = alloc.tensor_to_buffer.get(&nodes[1].output[0]) {
@@ -676,7 +893,7 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         bias,
                         [dilation as i64; 2],
                         groups,
-                        [padding as i64; 4],
+                        padding_arr.as_slice(),
                         [stride as i64; 2],
                         buf_expr
                     )?;
@@ -692,7 +909,7 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         stride,
                         dilation,
                         groups,
-                        padding,
+                        padding_arr[0] as usize,
                         buf_expr
                     )?;
                 }
@@ -1116,6 +1333,54 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     w,
                     "{}let {} = self.linear(&{}, &{}, &{}, {});",
                     tab, output_name, input, weight, bias, buf_expr
+                )?;
+                Ok(())
+            }),
+        },
+        Pattern {
+            name: "GELU (Erf)".to_string(),
+            matcher: Box::new(|nodes: &[&NodeProto]| -> Option<usize> {
+                if nodes.len() < 5 {
+                    return None;
+                }
+                if nodes[0].op_type != "Div" { return None; }
+                if nodes[1].op_type != "Erf" { return None; }
+                if nodes[2].op_type != "Add" { return None; }
+                if nodes[3].op_type != "Mul" { return None; }
+                if nodes[4].op_type != "Mul" { return None; }
+                let gelu_input = &nodes[0].input[0];
+                let div_out = &nodes[0].output[0];
+                if nodes[1].input[0] != *div_out { return None; }
+                let erf_out = &nodes[1].output[0];
+                let add_out = &nodes[2].output[0];
+                let uses_erf = nodes[2].input[0] == *erf_out || nodes[2].input[1] == *erf_out;
+                if !uses_erf { return None; }
+                let mul1_out = &nodes[3].output[0];
+                let uses_add = nodes[3].input[0] == *add_out || nodes[3].input[1] == *add_out;
+                let uses_input = nodes[3].input[0] == *gelu_input || nodes[3].input[1] == *gelu_input;
+                if !uses_add || !uses_input { return None; }
+                if nodes[4].input[0] != *mul1_out { return None; }
+                Some(5)
+            }),
+            generator: Box::new(|nodes, _weights, allocator, w, indent| {
+                let input = sanitize_name(&nodes[0].input[0]);
+                let output_name = sanitize_name(&nodes[4].output[0]);
+                let tab = "    ".repeat(indent);
+                let buf_expr = if let Some(alloc) = allocator {
+                    if let Some(&idx) = alloc.tensor_to_buffer.get(&nodes[4].output[0]) {
+                        format!("&mut ws.buf_{}", idx)
+                    } else {
+                        writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, output_name)?;
+                        format!("&mut buf_{}", output_name)
+                    }
+                } else {
+                    writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, output_name)?;
+                    format!("&mut buf_{}", output_name)
+                };
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::gelu(&{}, {});",
+                    tab, output_name, input, buf_expr
                 )?;
                 Ok(())
             }),

@@ -663,6 +663,7 @@ fn add_inner<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Deb
     // that repeats to fill the output (e.g. [1,8,H,W] + [1,1,H,W] attention mask).
     #[cfg(target_arch = "aarch64")]
     {
+        use core::arch::aarch64::*;
         if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
             let out_shape = utils::broadcast_shapes(&a.shape, &b.shape);
             if let Some(ref os) = out_shape {
@@ -670,6 +671,64 @@ fn add_inner<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Deb
                 let a_len = a.data.len();
                 let b_len = b.data.len();
                 let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
+
+                // Per-channel broadcast: [N,C,H,W] + [N,C,1,1] or [1,C,1,1] or [C]
+                if os.len() == 4 {
+                    let c = os[1];
+                    let hw = os[2] * os[3];
+                    let n = os[0];
+                    // Case A: a is full [N,C,H,W], b is [N,C,1,1] or [1,C,1,1] or [C,1,1] etc.
+                    if a_len == numel && (b_len == n * c || b_len == c) {
+                        utils::ensure_capacity(out_f32, numel);
+                        unsafe { out_f32.set_len(numel); }
+                        let a_ptr = a.data.as_ptr() as *const f32;
+                        let b_ptr = b.data.as_ptr() as *const f32;
+                        let o_ptr = out_f32.as_mut_ptr();
+                        unsafe {
+                            for nc in 0..n * c {
+                                let bias_val = *b_ptr.add(nc % b_len);
+                                let off = nc * hw;
+                                let bv = vdupq_n_f32(bias_val);
+                                let mut i = 0;
+                                while i + 4 <= hw {
+                                    vst1q_f32(o_ptr.add(off + i), vaddq_f32(vld1q_f32(a_ptr.add(off + i)), bv));
+                                    i += 4;
+                                }
+                                while i < hw {
+                                    *o_ptr.add(off + i) = *a_ptr.add(off + i) + bias_val;
+                                    i += 1;
+                                }
+                            }
+                        }
+                        return TensorView { data: Cow::Borrowed(out), shape: Cow::Owned(os.clone()) };
+                    }
+                    // Case B: b is full [N,C,H,W], a is [N,C,1,1] or [1,C,1,1] or [C,1,1] etc.
+                    if b_len == numel && (a_len == n * c || a_len == c) {
+                        utils::ensure_capacity(out_f32, numel);
+                        unsafe { out_f32.set_len(numel); }
+                        let a_ptr = a.data.as_ptr() as *const f32;
+                        let b_ptr = b.data.as_ptr() as *const f32;
+                        let o_ptr = out_f32.as_mut_ptr();
+                        unsafe {
+                            for nc in 0..n * c {
+                                let bias_val = *a_ptr.add(nc % a_len);
+                                let off = nc * hw;
+                                let bv = vdupq_n_f32(bias_val);
+                                let mut i = 0;
+                                while i + 4 <= hw {
+                                    vst1q_f32(o_ptr.add(off + i), vaddq_f32(vld1q_f32(b_ptr.add(off + i)), bv));
+                                    i += 4;
+                                }
+                                while i < hw {
+                                    *o_ptr.add(off + i) = *b_ptr.add(off + i) + bias_val;
+                                    i += 1;
+                                }
+                            }
+                        }
+                        return TensorView { data: Cow::Borrowed(out), shape: Cow::Owned(os.clone()) };
+                    }
+                }
+
                 if a_len == numel && b_len < numel && b_len > 1 && numel % b_len == 0 {
                     utils::ensure_capacity(out_f32, numel);
                     unsafe { out_f32.set_len(numel); }
@@ -850,6 +909,74 @@ fn mul_inner<'b, 'a, T: Clone + Copy + std::ops::Mul<Output = T> + std::fmt::Deb
                     data: Cow::Borrowed(out),
                     shape: Cow::Owned(out_shape),
                 };
+            }
+        }
+    }
+    // Per-channel broadcast mul for f32 on aarch64: [N,C,H,W] * [N,C,1,1] or [C]
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::*;
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+            let out_shape = utils::broadcast_shapes(&a.shape, &b.shape);
+            if let Some(ref os) = out_shape {
+                let numel: usize = os.iter().product();
+                let a_len = a.data.len();
+                let b_len = b.data.len();
+                let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
+
+                if os.len() == 4 {
+                    let c = os[1];
+                    let hw = os[2] * os[3];
+                    let n = os[0];
+                    if a_len == numel && (b_len == n * c || b_len == c) {
+                        utils::ensure_capacity(out_f32, numel);
+                        unsafe { out_f32.set_len(numel); }
+                        let a_ptr = a.data.as_ptr() as *const f32;
+                        let b_ptr = b.data.as_ptr() as *const f32;
+                        let o_ptr = out_f32.as_mut_ptr();
+                        unsafe {
+                            for nc in 0..n * c {
+                                let scale = *b_ptr.add(nc % b_len);
+                                let off = nc * hw;
+                                let sv = vdupq_n_f32(scale);
+                                let mut i = 0;
+                                while i + 4 <= hw {
+                                    vst1q_f32(o_ptr.add(off + i), vmulq_f32(vld1q_f32(a_ptr.add(off + i)), sv));
+                                    i += 4;
+                                }
+                                while i < hw {
+                                    *o_ptr.add(off + i) = *a_ptr.add(off + i) * scale;
+                                    i += 1;
+                                }
+                            }
+                        }
+                        return TensorView { data: Cow::Borrowed(out), shape: Cow::Owned(os.clone()) };
+                    }
+                    if b_len == numel && (a_len == n * c || a_len == c) {
+                        utils::ensure_capacity(out_f32, numel);
+                        unsafe { out_f32.set_len(numel); }
+                        let a_ptr = a.data.as_ptr() as *const f32;
+                        let b_ptr = b.data.as_ptr() as *const f32;
+                        let o_ptr = out_f32.as_mut_ptr();
+                        unsafe {
+                            for nc in 0..n * c {
+                                let scale = *a_ptr.add(nc % a_len);
+                                let off = nc * hw;
+                                let sv = vdupq_n_f32(scale);
+                                let mut i = 0;
+                                while i + 4 <= hw {
+                                    vst1q_f32(o_ptr.add(off + i), vmulq_f32(vld1q_f32(b_ptr.add(off + i)), sv));
+                                    i += 4;
+                                }
+                                while i < hw {
+                                    *o_ptr.add(off + i) = *b_ptr.add(off + i) * scale;
+                                    i += 1;
+                                }
+                            }
+                        }
+                        return TensorView { data: Cow::Borrowed(out), shape: Cow::Owned(os.clone()) };
+                    }
+                }
             }
         }
     }
@@ -1147,6 +1274,49 @@ pub fn softplus<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> Tensor
     for i in 0..numel {
         let x = input.data[i];
         out[i] = if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
+    }
+    TensorView {
+        data: Cow::Borrowed(out),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
+}
+pub fn hard_sigmoid<'b, 'a>(
+    input: &TensorView<'b>,
+    alpha: f32,
+    beta: f32,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let numel = input.data.len();
+    utils::ensure_capacity(out, numel);
+    unsafe {
+        out.set_len(numel);
+    }
+    let i_slice = &input.data;
+    let o_slice = out.as_mut_slice();
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        let alpha_v = vdupq_n_f32(alpha);
+        let beta_v = vdupq_n_f32(beta);
+        let zero_v = vdupq_n_f32(0.0);
+        let one_v = vdupq_n_f32(1.0);
+        let mut i = 0;
+        while i + 4 <= numel {
+            let x = vld1q_f32(i_slice.as_ptr().add(i));
+            let mut r = vfmaq_f32(beta_v, alpha_v, x);
+            r = vmaxq_f32(r, zero_v);
+            r = vminq_f32(r, one_v);
+            vst1q_f32(o_slice.as_mut_ptr().add(i), r);
+            i += 4;
+        }
+        while i < numel {
+            o_slice[i] = (alpha * i_slice[i] + beta).clamp(0.0, 1.0);
+            i += 1;
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for i in 0..numel {
+        o_slice[i] = (alpha * i_slice[i] + beta).clamp(0.0, 1.0);
     }
     TensorView {
         data: Cow::Borrowed(out),
@@ -1754,6 +1924,69 @@ pub fn reduce_mean<'b, 'a>(
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     let dims = input.dim();
+
+    // Fast path: reduce [N,C,H,W] over axes [2,3] with keepdims
+    if dims == 4 && keepdims && axes.len() == 2 {
+        let mut sorted_axes: Vec<i64> = axes.to_vec();
+        sorted_axes.sort_unstable();
+        let a0 = if sorted_axes[0] < 0 { sorted_axes[0] + dims as i64 } else { sorted_axes[0] };
+        let a1 = if sorted_axes[1] < 0 { sorted_axes[1] + dims as i64 } else { sorted_axes[1] };
+        if a0 == 2 && a1 == 3 {
+            let n = input.shape[0];
+            let c = input.shape[1];
+            let h = input.shape[2];
+            let w = input.shape[3];
+            let hw = h * w;
+            let scale = 1.0f32 / hw as f32;
+            let out_numel = n * c;
+            utils::ensure_capacity(out, out_numel);
+            unsafe { out.set_len(out_numel); }
+            let i_data = &input.data;
+            #[cfg(target_arch = "aarch64")]
+            {
+                use core::arch::aarch64::*;
+                for nc in 0..n * c {
+                    let base = nc * hw;
+                    unsafe {
+                    let mut sum = vdupq_n_f32(0.0);
+                    let mut i = 0usize;
+                    while i + 8 <= hw {
+                        let v0 = vld1q_f32(i_data.as_ptr().add(base + i));
+                        let v1 = vld1q_f32(i_data.as_ptr().add(base + i + 4));
+                        sum = vaddq_f32(sum, v0);
+                        sum = vaddq_f32(sum, v1);
+                        i += 8;
+                    }
+                    let mut s = vaddvq_f32(sum);
+                    while i < hw {
+                        s += *i_data.get_unchecked(base + i);
+                        i += 1;
+                    }
+                    *out.get_unchecked_mut(nc) = s * scale;
+                    }
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                for nc in 0..n * c {
+                    let base = nc * hw;
+                    let mut s = 0.0f32;
+                    for i in 0..hw {
+                        s += i_data[base + i];
+                    }
+                    out[nc] = s * scale;
+                }
+            }
+            let mut out_shape = input.shape.to_vec();
+            out_shape[2] = 1;
+            out_shape[3] = 1;
+            return TensorView {
+                data: Cow::Borrowed(out),
+                shape: Cow::Owned(out_shape),
+            };
+        }
+    }
+
     let mut resolved_axes: Vec<usize> = axes
         .iter()
         .map(|&x| {

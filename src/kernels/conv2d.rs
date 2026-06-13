@@ -564,12 +564,47 @@ fn conv2d_activation<'b, 'a>(
             return TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w]);
         }
 
+        #[cfg(target_arch = "aarch64")]
+        {
+            if kernel_h == 3 && kernel_w == 3 && stride_h == 1 && stride_w == 1
+                && pad_top == 1 && pad_left == 1
+            {
+                let bias_slice: Option<&[f32]> = bias.map(|b| b.data.as_ref());
+                unsafe {
+                    depthwise_conv2d_3x3_s1_neon(
+                        input_data, weight_data, bias_slice, out_slice,
+                        batch_size, in_channels, in_h, in_w, out_h, out_w, act,
+                    );
+                }
+                if timing::TIMING_ENABLED {
+                    let ns = _t0.unwrap().elapsed().as_nanos() as u64;
+                    timing::CONV_DW_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+                }
+                return TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w]);
+            }
+            let bias_slice: Option<&[f32]> = bias.map(|b| b.data.as_ref());
+            unsafe {
+                depthwise_conv2d_neon(
+                    input_data, weight_data, bias_slice, out_slice,
+                    batch_size, in_channels, in_h, in_w,
+                    kernel_h, kernel_w, stride_h, stride_w,
+                    pad_top, pad_left, out_h, out_w, act,
+                );
+            }
+            if timing::TIMING_ENABLED {
+                let ns = _t0.unwrap().elapsed().as_nanos() as u64;
+                timing::CONV_DW_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+            }
+            return TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w]);
+        }
+
         // Scalar depthwise fallback
         for n in 0..batch_size {
             for c in 0..in_channels {
                 let in_base = n * in_channels * in_h * in_w + c * in_h * in_w;
                 let w_base = c * kernel_h * kernel_w;
                 let out_base = n * out_channels * out_h * out_w + c * out_h * out_w;
+                let bias_val = if let Some(b) = bias { b.data[c] } else { 0.0 };
                 for oh in 0..out_h {
                     for ow in 0..out_w {
                         let mut sum = 0.0f32;
@@ -583,6 +618,7 @@ fn conv2d_activation<'b, 'a>(
                                     * weight_data[w_base + kh * kernel_w + kw];
                             }
                         }
+                        sum += bias_val;
                         out_slice[out_base + oh * out_w + ow] = match act {
                             Activation::Relu => if sum < 0.0 { 0.0 } else { sum },
                             _ => sum,
@@ -1346,33 +1382,44 @@ fn resize_nearest_inner<'b, 'a>(
     let h_scale = in_h as f32 / out_h as f32;
     let w_scale = in_w as f32 / out_w as f32;
 
+    let asym = coordinate_transform_mode == "asymmetric";
+
+    let row_map: Vec<usize> = (0..out_h)
+        .map(|oh| {
+            if asym {
+                (oh as f32 * h_scale).floor().min((in_h - 1) as f32) as usize
+            } else {
+                ((oh as f32 + 0.5) * h_scale - 0.5)
+                    .round()
+                    .max(0.0)
+                    .min((in_h - 1) as f32) as usize
+            }
+        })
+        .collect();
+
+    let col_map: Vec<usize> = (0..out_w)
+        .map(|ow| {
+            if asym {
+                (ow as f32 * w_scale).floor().min((in_w - 1) as f32) as usize
+            } else {
+                ((ow as f32 + 0.5) * w_scale - 0.5)
+                    .round()
+                    .max(0.0)
+                    .min((in_w - 1) as f32) as usize
+            }
+        })
+        .collect();
+
     for n in 0..batch {
         for c in 0..channels {
-            let in_offset = (n as u64 * channels as u64 + c as u64) * in_h as u64 * in_w as u64;
-            let out_offset = (n as u64 * channels as u64 + c as u64) * out_h as u64 * out_w as u64;
-            let in_offset = in_offset as usize;
-            let out_offset = out_offset as usize;
+            let in_offset = (n * channels + c) * in_h * in_w;
+            let out_offset = (n * channels + c) * out_h * out_w;
             for oh in 0..out_h {
-                let ih = if coordinate_transform_mode == "asymmetric" {
-                    // asymmetric + floor: ih = floor(oh * in_h / out_h)
-                    (oh as f32 * h_scale).floor().min((in_h - 1) as f32) as usize
-                } else {
-                    // half_pixel: ih = round((oh+0.5)*scale - 0.5)
-                    ((oh as f32 + 0.5) * h_scale - 0.5)
-                        .round()
-                        .max(0.0)
-                        .min((in_h - 1) as f32) as usize
-                };
+                let ih = row_map[oh];
+                let in_row = in_offset + ih * in_w;
+                let out_row = out_offset + oh * out_w;
                 for ow in 0..out_w {
-                    let iw = if coordinate_transform_mode == "asymmetric" {
-                        (ow as f32 * w_scale).floor().min((in_w - 1) as f32) as usize
-                    } else {
-                        ((ow as f32 + 0.5) * w_scale - 0.5)
-                            .round()
-                            .max(0.0)
-                            .min((in_w - 1) as f32) as usize
-                    };
-                    out[out_offset + oh * out_w + ow] = data[in_offset + ih * in_w + iw];
+                    out[out_row + ow] = data[in_row + col_map[ow]];
                 }
             }
         }
@@ -3139,7 +3186,17 @@ fn conv_transpose_inner<'b, 'a>(
     // then scatter col into output according to stride/dilation/padding.
     let hw = in_h * in_w;
     let col_rows = out_channels * kernel_h * kernel_w;
-    let mut col = vec![0.0f32; col_rows * hw];
+
+    thread_local! {
+        static CT_COL_BUF: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+    }
+    let col_len = col_rows * hw;
+    CT_COL_BUF.with(|buf_cell| {
+        let mut col_ref = buf_cell.borrow_mut();
+        if col_ref.len() < col_len {
+            col_ref.resize(col_len, 0.0);
+        }
+        let col = &mut col_ref[..col_len];
 
     for n in 0..batch_size {
         let batch_offset = n * out_channels * out_h * out_w;
@@ -3217,7 +3274,422 @@ fn conv_transpose_inner<'b, 'a>(
         }
     }
 
+    }); // end CT_COL_BUF.with
+
     TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w])
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn depthwise_conv2d_3x3_s1_neon(
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+    batch: usize,
+    channels: usize,
+    in_h: usize,
+    in_w: usize,
+    out_h: usize,
+    out_w: usize,
+    act: Activation,
+) {
+    use core::arch::aarch64::*;
+    let zero_v = vdupq_n_f32(0.0);
+    let pad = 1usize;
+    let first_valid_oh = pad;
+    let last_valid_oh = in_h.saturating_sub(pad);
+
+    for n in 0..batch {
+        for c in 0..channels {
+            let in_base = n * channels * in_h * in_w + c * in_h * in_w;
+            let w_base = c * 9;
+            let out_base = n * channels * out_h * out_w + c * out_h * out_w;
+
+            let w0 = vld1q_dup_f32(weight.as_ptr().add(w_base));
+            let w1 = vld1q_dup_f32(weight.as_ptr().add(w_base + 1));
+            let w2 = vld1q_dup_f32(weight.as_ptr().add(w_base + 2));
+            let w3 = vld1q_dup_f32(weight.as_ptr().add(w_base + 3));
+            let w4 = vld1q_dup_f32(weight.as_ptr().add(w_base + 4));
+            let w5 = vld1q_dup_f32(weight.as_ptr().add(w_base + 5));
+            let w6 = vld1q_dup_f32(weight.as_ptr().add(w_base + 6));
+            let w7 = vld1q_dup_f32(weight.as_ptr().add(w_base + 7));
+            let w8 = vld1q_dup_f32(weight.as_ptr().add(w_base + 8));
+
+            let bias_val = bias.map(|b| *b.get_unchecked(c)).unwrap_or(0.0f32);
+            let bias_v = vdupq_n_f32(bias_val);
+
+            for oh in 0..out_h {
+                let out_row = out_base + oh * out_w;
+                let mut ow = 0usize;
+
+                if oh >= first_valid_oh && oh < last_valid_oh {
+                    let r0 = input.as_ptr().add(in_base + (oh - 1) * in_w);
+                    let r1 = input.as_ptr().add(in_base + oh * in_w);
+                    let r2 = input.as_ptr().add(in_base + (oh + 1) * in_w);
+
+                    // Scalar: ow=0 (left pad)
+                    {
+                        let mut s = bias_val;
+                        for ki in 0..3usize {
+                            let rp = [r0, r1, r2][ki];
+                            for kj in 0..3usize {
+                                let iw = (kj as isize) - 1;
+                                if iw >= 0 && (iw as usize) < in_w {
+                                    s += *rp.add(iw as usize) * *weight.get_unchecked(w_base + ki * 3 + kj);
+                                }
+                            }
+                        }
+                        let v = if act == Activation::Relu && s < 0.0 { 0.0 } else { s };
+                        *out.get_unchecked_mut(out_row + ow) = v;
+                        ow += 1;
+                    }
+
+                    // NEON middle: 16 pixels (4 accumulators for FMA latency hiding)
+                    while ow + 16 <= out_w && ow + 16 < in_w {
+                        let off = ow - 1;
+                        let mut a0 = bias_v;
+                        let mut a1 = bias_v;
+                        let mut a2 = bias_v;
+                        let mut a3 = bias_v;
+                        // Row 0
+                        a0 = vfmaq_f32(a0, w0, vld1q_f32(r0.add(off)));
+                        a1 = vfmaq_f32(a1, w0, vld1q_f32(r0.add(off + 4)));
+                        a2 = vfmaq_f32(a2, w0, vld1q_f32(r0.add(off + 8)));
+                        a3 = vfmaq_f32(a3, w0, vld1q_f32(r0.add(off + 12)));
+                        a0 = vfmaq_f32(a0, w1, vld1q_f32(r0.add(off + 1)));
+                        a1 = vfmaq_f32(a1, w1, vld1q_f32(r0.add(off + 5)));
+                        a2 = vfmaq_f32(a2, w1, vld1q_f32(r0.add(off + 9)));
+                        a3 = vfmaq_f32(a3, w1, vld1q_f32(r0.add(off + 13)));
+                        a0 = vfmaq_f32(a0, w2, vld1q_f32(r0.add(off + 2)));
+                        a1 = vfmaq_f32(a1, w2, vld1q_f32(r0.add(off + 6)));
+                        a2 = vfmaq_f32(a2, w2, vld1q_f32(r0.add(off + 10)));
+                        a3 = vfmaq_f32(a3, w2, vld1q_f32(r0.add(off + 14)));
+                        // Row 1
+                        a0 = vfmaq_f32(a0, w3, vld1q_f32(r1.add(off)));
+                        a1 = vfmaq_f32(a1, w3, vld1q_f32(r1.add(off + 4)));
+                        a2 = vfmaq_f32(a2, w3, vld1q_f32(r1.add(off + 8)));
+                        a3 = vfmaq_f32(a3, w3, vld1q_f32(r1.add(off + 12)));
+                        a0 = vfmaq_f32(a0, w4, vld1q_f32(r1.add(off + 1)));
+                        a1 = vfmaq_f32(a1, w4, vld1q_f32(r1.add(off + 5)));
+                        a2 = vfmaq_f32(a2, w4, vld1q_f32(r1.add(off + 9)));
+                        a3 = vfmaq_f32(a3, w4, vld1q_f32(r1.add(off + 13)));
+                        a0 = vfmaq_f32(a0, w5, vld1q_f32(r1.add(off + 2)));
+                        a1 = vfmaq_f32(a1, w5, vld1q_f32(r1.add(off + 6)));
+                        a2 = vfmaq_f32(a2, w5, vld1q_f32(r1.add(off + 10)));
+                        a3 = vfmaq_f32(a3, w5, vld1q_f32(r1.add(off + 14)));
+                        // Row 2
+                        a0 = vfmaq_f32(a0, w6, vld1q_f32(r2.add(off)));
+                        a1 = vfmaq_f32(a1, w6, vld1q_f32(r2.add(off + 4)));
+                        a2 = vfmaq_f32(a2, w6, vld1q_f32(r2.add(off + 8)));
+                        a3 = vfmaq_f32(a3, w6, vld1q_f32(r2.add(off + 12)));
+                        a0 = vfmaq_f32(a0, w7, vld1q_f32(r2.add(off + 1)));
+                        a1 = vfmaq_f32(a1, w7, vld1q_f32(r2.add(off + 5)));
+                        a2 = vfmaq_f32(a2, w7, vld1q_f32(r2.add(off + 9)));
+                        a3 = vfmaq_f32(a3, w7, vld1q_f32(r2.add(off + 13)));
+                        a0 = vfmaq_f32(a0, w8, vld1q_f32(r2.add(off + 2)));
+                        a1 = vfmaq_f32(a1, w8, vld1q_f32(r2.add(off + 6)));
+                        a2 = vfmaq_f32(a2, w8, vld1q_f32(r2.add(off + 10)));
+                        a3 = vfmaq_f32(a3, w8, vld1q_f32(r2.add(off + 14)));
+                        if act == Activation::Relu {
+                            a0 = vmaxq_f32(a0, zero_v);
+                            a1 = vmaxq_f32(a1, zero_v);
+                            a2 = vmaxq_f32(a2, zero_v);
+                            a3 = vmaxq_f32(a3, zero_v);
+                        }
+                        let out_ptr = out.as_mut_ptr().add(out_row + ow);
+                        vst1q_f32(out_ptr, a0);
+                        vst1q_f32(out_ptr.add(4), a1);
+                        vst1q_f32(out_ptr.add(8), a2);
+                        vst1q_f32(out_ptr.add(12), a3);
+                        ow += 16;
+                    }
+
+                    // 8-pixel fallback
+                    while ow + 8 <= out_w && ow + 8 < in_w {
+                        let off = ow - 1;
+                        let mut acc0 = bias_v;
+                        let mut acc1 = bias_v;
+                        acc0 = vfmaq_f32(acc0, w0, vld1q_f32(r0.add(off)));
+                        acc1 = vfmaq_f32(acc1, w0, vld1q_f32(r0.add(off + 4)));
+                        acc0 = vfmaq_f32(acc0, w1, vld1q_f32(r0.add(off + 1)));
+                        acc1 = vfmaq_f32(acc1, w1, vld1q_f32(r0.add(off + 5)));
+                        acc0 = vfmaq_f32(acc0, w2, vld1q_f32(r0.add(off + 2)));
+                        acc1 = vfmaq_f32(acc1, w2, vld1q_f32(r0.add(off + 6)));
+                        acc0 = vfmaq_f32(acc0, w3, vld1q_f32(r1.add(off)));
+                        acc1 = vfmaq_f32(acc1, w3, vld1q_f32(r1.add(off + 4)));
+                        acc0 = vfmaq_f32(acc0, w4, vld1q_f32(r1.add(off + 1)));
+                        acc1 = vfmaq_f32(acc1, w4, vld1q_f32(r1.add(off + 5)));
+                        acc0 = vfmaq_f32(acc0, w5, vld1q_f32(r1.add(off + 2)));
+                        acc1 = vfmaq_f32(acc1, w5, vld1q_f32(r1.add(off + 6)));
+                        acc0 = vfmaq_f32(acc0, w6, vld1q_f32(r2.add(off)));
+                        acc1 = vfmaq_f32(acc1, w6, vld1q_f32(r2.add(off + 4)));
+                        acc0 = vfmaq_f32(acc0, w7, vld1q_f32(r2.add(off + 1)));
+                        acc1 = vfmaq_f32(acc1, w7, vld1q_f32(r2.add(off + 5)));
+                        acc0 = vfmaq_f32(acc0, w8, vld1q_f32(r2.add(off + 2)));
+                        acc1 = vfmaq_f32(acc1, w8, vld1q_f32(r2.add(off + 6)));
+                        if act == Activation::Relu {
+                            acc0 = vmaxq_f32(acc0, zero_v);
+                            acc1 = vmaxq_f32(acc1, zero_v);
+                        }
+                        vst1q_f32(out.as_mut_ptr().add(out_row + ow), acc0);
+                        vst1q_f32(out.as_mut_ptr().add(out_row + ow + 4), acc1);
+                        ow += 8;
+                    }
+
+                    // 4-pixel tail of the vectorized region
+                    while ow + 4 <= out_w && ow + 4 < in_w {
+                        let off = ow - 1;
+                        let mut acc = bias_v;
+                        acc = vfmaq_f32(acc, w0, vld1q_f32(r0.add(off)));
+                        acc = vfmaq_f32(acc, w1, vld1q_f32(r0.add(off + 1)));
+                        acc = vfmaq_f32(acc, w2, vld1q_f32(r0.add(off + 2)));
+                        acc = vfmaq_f32(acc, w3, vld1q_f32(r1.add(off)));
+                        acc = vfmaq_f32(acc, w4, vld1q_f32(r1.add(off + 1)));
+                        acc = vfmaq_f32(acc, w5, vld1q_f32(r1.add(off + 2)));
+                        acc = vfmaq_f32(acc, w6, vld1q_f32(r2.add(off)));
+                        acc = vfmaq_f32(acc, w7, vld1q_f32(r2.add(off + 1)));
+                        acc = vfmaq_f32(acc, w8, vld1q_f32(r2.add(off + 2)));
+                        if act == Activation::Relu {
+                            acc = vmaxq_f32(acc, zero_v);
+                        }
+                        vst1q_f32(out.as_mut_ptr().add(out_row + ow), acc);
+                        ow += 4;
+                    }
+
+                    // Scalar tail (handles right edge with bounds checking)
+                    while ow < out_w {
+                        let mut s = bias_val;
+                        for ki in 0..3usize {
+                            let rp = [r0, r1, r2][ki];
+                            for kj in 0..3usize {
+                                let iw = (ow as isize) + (kj as isize) - 1;
+                                if iw >= 0 && (iw as usize) < in_w {
+                                    s += *rp.add(iw as usize) * *weight.get_unchecked(w_base + ki * 3 + kj);
+                                }
+                            }
+                        }
+                        let v = if act == Activation::Relu && s < 0.0 { 0.0 } else { s };
+                        *out.get_unchecked_mut(out_row + ow) = v;
+                        ow += 1;
+                    }
+                } else {
+                    // Edge rows: scalar with full bounds checking
+                    while ow < out_w {
+                        let mut s = bias_val;
+                        for ki in 0..3usize {
+                            let ih = oh + ki;
+                            if ih < pad || ih >= in_h + pad { continue; }
+                            let rp = input.as_ptr().add(in_base + (ih - pad) * in_w);
+                            for kj in 0..3usize {
+                                let iw = ow + kj;
+                                if iw < pad || iw >= in_w + pad { continue; }
+                                s += *rp.add(iw - pad) * *weight.get_unchecked(w_base + ki * 3 + kj);
+                            }
+                        }
+                        let v = if act == Activation::Relu && s < 0.0 { 0.0 } else { s };
+                        *out.get_unchecked_mut(out_row + ow) = v;
+                        ow += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn depthwise_conv2d_neon(
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+    batch: usize,
+    channels: usize,
+    in_h: usize,
+    in_w: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    pad_top: usize,
+    pad_left: usize,
+    out_h: usize,
+    out_w: usize,
+    act: Activation,
+) {
+    use core::arch::aarch64::*;
+    let zero_v = vdupq_n_f32(0.0);
+
+    let max_vec_ow = (in_w + pad_left).saturating_sub(kw + 3);
+    let vec_ow_end = if sw == 1 { max_vec_ow } else { 0 };
+    let vec_ow_end = (vec_ow_end / 4) * 4;
+    let vec_ow_start = if sw == 1 { pad_left } else { out_w };
+
+    for n in 0..batch {
+        for c in 0..channels {
+            let in_base = n * channels * in_h * in_w + c * in_h * in_w;
+            let w_base = c * kh * kw;
+            let out_base = n * channels * out_h * out_w + c * out_h * out_w;
+            let bias_val = bias.map(|b| *b.get_unchecked(c)).unwrap_or(0.0f32);
+            let bias_v = vdupq_n_f32(bias_val);
+
+            for oh in 0..out_h {
+                let mut ow = 0usize;
+
+                // Scalar prefix
+                while ow < vec_ow_start.min(out_w) {
+                    let mut s = bias_val;
+                    for ki in 0..kh {
+                        let ih = (oh * sh + ki) as isize - pad_top as isize;
+                        if ih < 0 || ih >= in_h as isize { continue; }
+                        for kj in 0..kw {
+                            let iw = (ow * sw + kj) as isize - pad_left as isize;
+                            if iw < 0 || iw >= in_w as isize { continue; }
+                            s += input.get_unchecked(in_base + ih as usize * in_w + iw as usize)
+                                * weight.get_unchecked(w_base + ki * kw + kj);
+                        }
+                    }
+                    let v = if act == Activation::Relu && s < 0.0 { 0.0 } else { s };
+                    *out.get_unchecked_mut(out_base + oh * out_w + ow) = v;
+                    ow += 1;
+                }
+
+                // NEON stride-2 4-pixel block using vld2q for decimation
+                while sw == 2 && sh == 1 && kh <= 5 && kw <= 5 && oh > 0 && oh < in_h && ow + 4 <= out_w {
+                    let base_iw = ow * 2 - pad_left;
+                    let max_read = base_iw + (kw - 1) + 7;
+                    if max_read >= in_w { break; }
+                    if base_iw < 0 { break; }
+                    let mut acc = bias_v;
+                    let all_rows_in = oh >= 1 && oh + kh - 1 < in_h + pad_top && oh >= pad_top;
+                    if all_rows_in {
+                        for ki in 0..kh {
+                            let ih_valid = oh + ki - pad_top;
+                            let row_ptr = input.as_ptr().add(in_base + ih_valid * in_w);
+                            for kj in 0..kw {
+                                let pair = vld2q_f32(row_ptr.add(base_iw + kj));
+                                let w_val = vdupq_n_f32(*weight.get_unchecked(w_base + ki * kw + kj));
+                                acc = vfmaq_f32(acc, w_val, pair.0);
+                            }
+                        }
+                    } else {
+                        for ki in 0..kh {
+                            let ih = (oh * sh + ki) as isize - pad_top as isize;
+                            if ih < 0 || ih >= in_h as isize { continue; }
+                            let row_ptr = input.as_ptr().add(in_base + ih as usize * in_w);
+                            for kj in 0..kw {
+                                let pair = vld2q_f32(row_ptr.add(base_iw + kj));
+                                let w_val = vdupq_n_f32(*weight.get_unchecked(w_base + ki * kw + kj));
+                                acc = vfmaq_f32(acc, w_val, pair.0);
+                            }
+                        }
+                    }
+                    if act == Activation::Relu {
+                        acc = vmaxq_f32(acc, zero_v);
+                    }
+                    vst1q_f32(out.as_mut_ptr().add(out_base + oh * out_w + ow), acc);
+                    ow += 4;
+                }
+
+                // NEON 16-pixel block (4 accumulators for FMA latency hiding)
+                while sw == 1 && ow + 16 <= vec_ow_end && ow + 16 <= out_w {
+                    let mut a0 = bias_v;
+                    let mut a1 = bias_v;
+                    let mut a2 = bias_v;
+                    let mut a3 = bias_v;
+                    for ki in 0..kh {
+                        let ih = oh * sh + ki;
+                        if ih < pad_top || ih >= in_h + pad_top { continue; }
+                        let ih_valid = ih - pad_top;
+                        let row_ptr = input.as_ptr().add(in_base + ih_valid * in_w);
+                        for kj in 0..kw {
+                            let off = ow + kj - pad_left;
+                            let w_val = vld1q_dup_f32(weight.as_ptr().add(w_base + ki * kw + kj));
+                            a0 = vfmaq_f32(a0, w_val, vld1q_f32(row_ptr.add(off)));
+                            a1 = vfmaq_f32(a1, w_val, vld1q_f32(row_ptr.add(off + 4)));
+                            a2 = vfmaq_f32(a2, w_val, vld1q_f32(row_ptr.add(off + 8)));
+                            a3 = vfmaq_f32(a3, w_val, vld1q_f32(row_ptr.add(off + 12)));
+                        }
+                    }
+                    if act == Activation::Relu {
+                        a0 = vmaxq_f32(a0, zero_v);
+                        a1 = vmaxq_f32(a1, zero_v);
+                        a2 = vmaxq_f32(a2, zero_v);
+                        a3 = vmaxq_f32(a3, zero_v);
+                    }
+                    let out_ptr = out.as_mut_ptr().add(out_base + oh * out_w + ow);
+                    vst1q_f32(out_ptr, a0);
+                    vst1q_f32(out_ptr.add(4), a1);
+                    vst1q_f32(out_ptr.add(8), a2);
+                    vst1q_f32(out_ptr.add(12), a3);
+                    ow += 16;
+                }
+
+                // NEON 8-pixel block (2 accumulators)
+                while sw == 1 && ow + 8 <= vec_ow_end && ow + 8 <= out_w {
+                    let mut a0 = bias_v;
+                    let mut a1 = bias_v;
+                    for ki in 0..kh {
+                        let ih = oh * sh + ki;
+                        if ih < pad_top || ih >= in_h + pad_top { continue; }
+                        let ih_valid = ih - pad_top;
+                        let row_ptr = input.as_ptr().add(in_base + ih_valid * in_w);
+                        for kj in 0..kw {
+                            let off = ow + kj - pad_left;
+                            let w_val = vld1q_dup_f32(weight.as_ptr().add(w_base + ki * kw + kj));
+                            a0 = vfmaq_f32(a0, w_val, vld1q_f32(row_ptr.add(off)));
+                            a1 = vfmaq_f32(a1, w_val, vld1q_f32(row_ptr.add(off + 4)));
+                        }
+                    }
+                    if act == Activation::Relu {
+                        a0 = vmaxq_f32(a0, zero_v);
+                        a1 = vmaxq_f32(a1, zero_v);
+                    }
+                    vst1q_f32(out.as_mut_ptr().add(out_base + oh * out_w + ow), a0);
+                    vst1q_f32(out.as_mut_ptr().add(out_base + oh * out_w + ow + 4), a1);
+                    ow += 8;
+                }
+
+                // NEON 4-pixel block (1 accumulator)
+                while sw == 1 && ow + 4 <= vec_ow_end && ow + 4 <= out_w {
+                    let mut acc = bias_v;
+                    for ki in 0..kh {
+                        let ih = oh * sh + ki;
+                        if ih < pad_top || ih >= in_h + pad_top { continue; }
+                        let ih_valid = ih - pad_top;
+                        let row_ptr = input.as_ptr().add(in_base + ih_valid * in_w);
+                        for kj in 0..kw {
+                            let iw_valid = ow + kj - pad_left;
+                            let w_val = vld1q_dup_f32(weight.as_ptr().add(w_base + ki * kw + kj));
+                            acc = vfmaq_f32(acc, w_val, vld1q_f32(row_ptr.add(iw_valid)));
+                        }
+                    }
+                    if act == Activation::Relu {
+                        acc = vmaxq_f32(acc, zero_v);
+                    }
+                    vst1q_f32(out.as_mut_ptr().add(out_base + oh * out_w + ow), acc);
+                    ow += 4;
+                }
+
+                // Scalar tail
+                while ow < out_w {
+                    let mut s = bias_val;
+                    for ki in 0..kh {
+                        let ih = (oh * sh + ki) as isize - pad_top as isize;
+                        if ih < 0 || ih >= in_h as isize { continue; }
+                        for kj in 0..kw {
+                            let iw = (ow * sw + kj) as isize - pad_left as isize;
+                            if iw < 0 || iw >= in_w as isize { continue; }
+                            s += input.get_unchecked(in_base + ih as usize * in_w + iw as usize)
+                                * weight.get_unchecked(w_base + ki * kw + kj);
+                        }
+                    }
+                    let v = if act == Activation::Relu && s < 0.0 { 0.0 } else { s };
+                    *out.get_unchecked_mut(out_base + oh * out_w + ow) = v;
+                    ow += 1;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]

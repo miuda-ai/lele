@@ -1,0 +1,16 @@
+[package]
+name = "ppocr-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "ppocr"
+path = "src/main.rs"
+
+[dependencies]
+lele = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+[build-dependencies]
+lele-build = { workspace = true }
