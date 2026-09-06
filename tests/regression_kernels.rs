@@ -197,6 +197,25 @@ fn test_conv2d_depthwise_3x3_s1_widths() {
 }
 
 #[test]
+fn test_conv2d_depthwise_3x3_s1_heights() {
+    // The top and bottom output rows read a row that does not exist. Sweep the
+    // height so those rows are every possible fraction of the output, including
+    // ih = 1 and 2 where every row is an edge row.
+    let groups = 3;
+    let (n, iw) = (1, 24);
+    for ih in [1usize, 2, 3, 4, 5, 8, 9] {
+        let input: Vec<f32> = (0..n * groups * ih * iw)
+            .map(|i| (i % 53) as f32 * 0.11 - 2.0)
+            .collect();
+        let weight: Vec<f32> = (0..groups * 9).map(|i| (i % 17) as f32 * 0.07 - 0.4).collect();
+        assert_depthwise_matches_im2col(
+            n, groups, ih, iw, &input, &weight,
+            &format!("dw_3x3_s1_ih{}", ih),
+        );
+    }
+}
+
+#[test]
 fn test_conv2d_depthwise_3x3_s1_64ch() {
     let groups = 64;
     let (n, ih, iw) = (1, 8, 8);
