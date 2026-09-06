@@ -494,6 +494,9 @@ impl Compiler {
                     .find(|a| a.name == "to")
                     .map(|a| a.i as i32)
                     .unwrap_or(input_dt),
+                // QDQ weights fold back to plain float initializers.
+                "DequantizeLinear" => 1,
+                "QuantizeLinear" => Self::quantize_output_dtype(node, &constants),
                 _ => input_dt, // Preserve input type for Slice, Concat, Unsqueeze, Squeeze, etc.
             };
             // Try folding common ops
@@ -546,16 +549,98 @@ impl Compiler {
         }
     }
 
+    /// Resolves the integer element type a `QuantizeLinear` node saturates to:
+    /// the `output_dtype` attribute (opset 21+), else the zero-point dtype,
+    /// else the ONNX default of uint8.
+    fn quantize_output_dtype(
+        node: &NodeProto,
+        constants: &HashMap<String, (Vec<f32>, Vec<usize>, i32)>,
+    ) -> i32 {
+        node.attribute
+            .iter()
+            .find(|a| a.name == "output_dtype")
+            .map(|a| a.i as i32)
+            .or_else(|| {
+                node.input
+                    .get(2)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|zp| constants.get(zp))
+                    .map(|c| c.2)
+            })
+            .unwrap_or(2)
+    }
+
     /// Try to fold a single node with all-constant inputs. Returns Some((data, shape)) on success.
     fn try_fold_op(
         node: &NodeProto,
         constants: &HashMap<String, (Vec<f32>, Vec<usize>, i32)>,
     ) -> Option<(Vec<f32>, Vec<usize>)> {
         match node.op_type.as_str() {
+            "DequantizeLinear" | "QuantizeLinear" => {
+                use crate::tensor::TensorView;
+                let (x, x_shape, _) = constants.get(&node.input[0])?;
+                let (scale, scale_shape, _) = constants.get(&node.input[1])?;
+                let zp = node
+                    .input
+                    .get(2)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|n| constants.get(n));
+                let attr_i = |name: &str, default: i64| {
+                    node.attribute
+                        .iter()
+                        .find(|a| a.name == name)
+                        .map(|a| a.i)
+                        .unwrap_or(default)
+                };
+                let axis = attr_i("axis", 1);
+                let block_size = attr_i("block_size", 0) as usize;
+
+                let xv = TensorView::from_slice(x.as_slice(), x_shape.clone());
+                let sv = TensorView::from_slice(scale.as_slice(), scale_shape.clone());
+                let zv = zp.map(|(d, s, _)| TensorView::from_slice(d.as_slice(), s.clone()));
+
+                let mut out = Vec::new();
+                if node.op_type == "DequantizeLinear" {
+                    crate::kernels::dequantize_linear(
+                        &xv,
+                        &sv,
+                        zv.as_ref(),
+                        axis,
+                        block_size,
+                        &mut out,
+                    );
+                } else {
+                    let (qmin, qmax) =
+                        crate::kernels::quant_range(Self::quantize_output_dtype(node, constants))
+                            .unwrap_or((0.0, 255.0));
+                    crate::kernels::quantize_linear(
+                        &xv,
+                        &sv,
+                        zv.as_ref(),
+                        axis,
+                        block_size,
+                        qmin,
+                        qmax,
+                        &mut out,
+                    );
+                }
+                Some((out, x_shape.clone()))
+            }
             "Shape" => {
                 let (_, shape, _) = &constants[&node.input[0]];
-                let data: Vec<f32> = shape.iter().map(|&s| s as f32).collect();
-                let out_shape = vec![shape.len()];
+                // opset-15 `start`/`end` slice the reported shape.
+                let rank = shape.len() as i64;
+                let attr = |name: &str| {
+                    node.attribute
+                        .iter()
+                        .find(|a| a.name == name)
+                        .map(|a| a.i)
+                };
+                let clamp = |v: i64| (if v < 0 { v + rank } else { v }).clamp(0, rank) as usize;
+                let start = clamp(attr("start").unwrap_or(0));
+                let end = clamp(attr("end").unwrap_or(rank)).max(start);
+                let data: Vec<f32> = shape[start..end].iter().map(|&s| s as f32).collect();
+                let out_shape = vec![data.len()];
                 Some((data, out_shape))
             }
             "Unsqueeze" => {

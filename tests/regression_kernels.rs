@@ -995,3 +995,169 @@ fn test_lstm_single_step() {
     for v in yr.data.iter() { assert!(v.is_finite()); }
     for v in cr.data.iter() { assert!(v.is_finite()); }
 }
+
+// --- Conv1d ---------------------------------------------------------------
+
+/// Naive NCW convolution used as ground truth for the SIMD conv1d paths.
+fn ref_conv1d(
+    input: &[f32],
+    weights: &[f32],
+    bias: Option<&[f32]>,
+    batch: usize,
+    in_ch: usize,
+    in_len: usize,
+    out_ch: usize,
+    k: usize,
+    stride: usize,
+    pad: usize,
+) -> (Vec<f32>, usize) {
+    let out_len = (in_len + 2 * pad - k) / stride + 1;
+    let mut out = vec![0.0f32; batch * out_ch * out_len];
+    for b in 0..batch {
+        for oc in 0..out_ch {
+            for t in 0..out_len {
+                let mut acc = bias.map(|v| v[oc]).unwrap_or(0.0);
+                for ic in 0..in_ch {
+                    for kk in 0..k {
+                        let idx = (t * stride) as isize + kk as isize - pad as isize;
+                        if idx >= 0 && (idx as usize) < in_len {
+                            acc += input[(b * in_ch + ic) * in_len + idx as usize]
+                                * weights[(oc * in_ch + ic) * k + kk];
+                        }
+                    }
+                }
+                out[(b * out_ch + oc) * out_len + t] = acc;
+            }
+        }
+    }
+    (out, out_len)
+}
+
+#[test]
+fn test_conv1d_k3_pad1_matches_reference() {
+    // Covers the AVX2/NEON k=3 pad=1 direct paths: the channel count is not a
+    // multiple of 4 and the length is not a multiple of 8, so both the vector
+    // block and the scalar cleanup loops run.
+    let (batch, in_ch, in_len, out_ch, k, pad) = (2, 3, 37, 6, 3, 1);
+    let input: Vec<f32> = (0..batch * in_ch * in_len)
+        .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+        .collect();
+    let weights: Vec<f32> = (0..out_ch * in_ch * k)
+        .map(|i| ((i * 17 % 29) as f32 - 14.0) / 13.0)
+        .collect();
+    let bias: Vec<f32> = (0..out_ch).map(|i| i as f32 * 0.1 - 0.25).collect();
+
+    let input_t = TensorView::from_slice(&input, vec![batch, in_ch, in_len]);
+    let w_t = TensorView::from_slice(&weights, vec![out_ch, in_ch, k]);
+    let b_t = TensorView::from_slice(&bias, vec![out_ch]);
+
+    for stride in [1usize, 2] {
+        let (expected, out_len) = ref_conv1d(
+            &input, &weights, Some(&bias), batch, in_ch, in_len, out_ch, k, stride, pad,
+        );
+        let mut buf = Vec::new();
+        let got = conv1d(
+            &input_t,
+            &w_t,
+            Some(&b_t),
+            &[1],
+            1,
+            &[pad as i64, pad as i64],
+            &[stride as i64],
+            &mut buf,
+        );
+        assert_eq!(got.shape.as_ref(), &[batch, out_ch, out_len]);
+        assert_close(&got.data, &expected, 1e-5, &format!("conv1d k3 pad1 s{}", stride));
+    }
+}
+
+// --- QuantizeLinear / DequantizeLinear ------------------------------------
+
+#[test]
+fn test_quantize_linear_per_tensor_rounds_half_even_and_saturates() {
+    let x = vec![-1.0, 0.0, 0.25, 0.75, 100.0, -100.0];
+    let scale = vec![0.5f32];
+    let zp = vec![128.0f32];
+    let x_t = TensorView::from_slice(&x, vec![6]);
+    let s_t = TensorView::from_slice(&scale, vec![]);
+    let z_t = TensorView::from_slice(&zp, vec![]);
+
+    let mut buf = Vec::new();
+    let y = quantize_linear(&x_t, &s_t, Some(&z_t), 1, 0, 0.0, 255.0, &mut buf);
+    // 0.25/0.5 = 0.5 -> 0 (ties to even), 0.75/0.5 = 1.5 -> 2 (ties to even).
+    assert_eq!(y.data.as_ref(), &[126.0, 128.0, 128.0, 130.0, 255.0, 0.0]);
+}
+
+#[test]
+fn test_dequantize_linear_per_tensor_inverts_quantize() {
+    let x: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.03).collect();
+    let scale = vec![0.01f32];
+    let zp = vec![-5.0f32];
+    let x_t = TensorView::from_slice(&x, vec![8, 8]);
+    let s_t = TensorView::from_slice(&scale, vec![1]);
+    let z_t = TensorView::from_slice(&zp, vec![1]);
+
+    let mut qbuf = Vec::new();
+    let q = quantize_linear(&x_t, &s_t, Some(&z_t), 1, 0, -128.0, 127.0, &mut qbuf);
+    let q_owned = q.to_owned();
+    let mut dbuf = Vec::new();
+    let d = dequantize_linear(&q_owned, &s_t, Some(&z_t), 1, 0, &mut dbuf);
+
+    assert_eq!(d.shape.as_ref(), &[8, 8]);
+    // Round-trip error is bounded by half a quantization step.
+    assert_close(&d.data, &x, 0.005, "qdq round trip");
+}
+
+#[test]
+fn test_dequantize_linear_per_axis() {
+    // shape [2, 3, 2], per-channel scales along axis 1.
+    let x: Vec<f32> = (0..12).map(|i| i as f32).collect();
+    let scale = vec![0.5f32, 2.0, 10.0];
+    let zp = vec![1.0f32, 0.0, -2.0];
+    let x_t = TensorView::from_slice(&x, vec![2, 3, 2]);
+    let s_t = TensorView::from_slice(&scale, vec![3]);
+    let z_t = TensorView::from_slice(&zp, vec![3]);
+
+    let mut buf = Vec::new();
+    let y = dequantize_linear(&x_t, &s_t, Some(&z_t), 1, 0, &mut buf);
+
+    let expected: Vec<f32> = (0..12)
+        .map(|i| {
+            let c = (i / 2) % 3;
+            (i as f32 - zp[c]) * scale[c]
+        })
+        .collect();
+    assert_close(&y.data, &expected, 1e-6, "dequantize per-axis");
+}
+
+#[test]
+fn test_dequantize_linear_without_zero_point_defaults_to_zero() {
+    let x = vec![1.0f32, 2.0, 3.0, 4.0];
+    let scale = vec![0.25f32];
+    let x_t = TensorView::from_slice(&x, vec![4]);
+    let s_t = TensorView::from_slice(&scale, vec![]);
+
+    let mut buf = Vec::new();
+    let y = dequantize_linear(&x_t, &s_t, None, 1, 0, &mut buf);
+    assert_eq!(y.data.as_ref(), &[0.25, 0.5, 0.75, 1.0]);
+}
+
+#[test]
+fn test_dequantize_linear_blocked() {
+    // shape [4, 2], block_size 2 along axis 0 -> scale shape [2, 2].
+    let x: Vec<f32> = (0..8).map(|i| i as f32).collect();
+    let scale = vec![1.0f32, 2.0, 10.0, 20.0];
+    let x_t = TensorView::from_slice(&x, vec![4, 2]);
+    let s_t = TensorView::from_slice(&scale, vec![2, 2]);
+
+    let mut buf = Vec::new();
+    let y = dequantize_linear(&x_t, &s_t, None, 0, 2, &mut buf);
+    assert_eq!(y.data.as_ref(), &[0.0, 2.0, 2.0, 6.0, 40.0, 100.0, 60.0, 140.0]);
+}
+
+#[test]
+fn test_quant_range_known_types() {
+    assert_eq!(quant_range(2), Some((0.0, 255.0)));
+    assert_eq!(quant_range(3), Some((-128.0, 127.0)));
+    assert_eq!(quant_range(1), None);
+}
