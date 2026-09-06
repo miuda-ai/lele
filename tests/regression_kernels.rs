@@ -216,6 +216,48 @@ fn test_conv2d_depthwise_3x3_s1_heights() {
 }
 
 #[test]
+fn test_conv2d_3x3_row_stride_only() {
+    // stride (2, 1): rows are subsampled but each output row is still one
+    // contiguous run of an input row, which is its own im2col path.
+    let (n, ic, oc, ih, iw) = (1, 3, 4, 9, 20);
+    let (kh, kw) = (3, 3);
+
+    let input: Vec<f32> = (0..n * ic * ih * iw).map(|i| (i % 61) as f32 * 0.02 - 1.0).collect();
+    let weight: Vec<f32> = (0..oc * ic * kh * kw).map(|i| (i % 23) as f32 * 0.03).collect();
+    let bias: Vec<f32> = vec![0.1; oc];
+
+    let inp_t = TensorView::from_slice(&input, vec![n, ic, ih, iw]);
+    let w_t = TensorView::from_slice(&weight, vec![oc, ic, kh, kw]);
+    let b_t = TensorView::from_slice(&bias, vec![oc]);
+
+    let mut out_buf = Vec::new();
+    let result = conv2d_fused(&inp_t, &w_t, Some(&b_t), &[1, 1], 1, &[1, 1, 1, 1], &[2, 1], true, &mut out_buf);
+
+    let expected = ref_conv2d(&input, &weight, Some(&bias), n, oc, ic, ih, iw, kh, kw, 2, 1, 1, 1, 1, 1, 1, true);
+    assert_close(&result.data, &expected, 1e-3, "conv2d_3x3_s2x1");
+}
+
+#[test]
+fn test_conv2d_3x3_column_stride_only() {
+    // stride (1, 2) still needs the per-element general path; check it did not
+    // get captured by the row-contiguous one.
+    let (n, ic, oc, ih, iw) = (1, 2, 3, 7, 15);
+    let (kh, kw) = (3, 3);
+
+    let input: Vec<f32> = (0..n * ic * ih * iw).map(|i| (i % 41) as f32 * 0.05 - 1.0).collect();
+    let weight: Vec<f32> = (0..oc * ic * kh * kw).map(|i| (i % 13) as f32 * 0.04).collect();
+
+    let inp_t = TensorView::from_slice(&input, vec![n, ic, ih, iw]);
+    let w_t = TensorView::from_slice(&weight, vec![oc, ic, kh, kw]);
+
+    let mut out_buf = Vec::new();
+    let result = conv2d_fused(&inp_t, &w_t, None, &[1, 1], 1, &[1, 1, 1, 1], &[1, 2], false, &mut out_buf);
+
+    let expected = ref_conv2d(&input, &weight, None, n, oc, ic, ih, iw, kh, kw, 1, 2, 1, 1, 1, 1, 1, false);
+    assert_close(&result.data, &expected, 1e-3, "conv2d_3x3_s1x2");
+}
+
+#[test]
 fn test_conv2d_depthwise_3x3_s1_64ch() {
     let groups = 64;
     let (n, ih, iw) = (1, 8, 8);

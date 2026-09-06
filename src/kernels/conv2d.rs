@@ -974,68 +974,48 @@ fn im2col(
             }
             return;
         }
+    }
 
-        // Scalar fallback
+    // Row-contiguous path: any row stride, unit column stride and dilation. One
+    // output row is then a single memcpy out of one input row, so the strided
+    // downsampling convolutions in a ResNet stem never touch the per-element
+    // general path below.
+    if stride_w == 1 && dilation_h == 1 && dilation_w == 1 {
         for c in 0..channels {
             let ch_offset = batch_offset + (ch_start + c) * in_h * in_w;
             for kh in 0..kernel_h {
                 for kw in 0..kernel_w {
                     let col_row_offset = ((c * kernel_h + kh) * kernel_w + kw) * spatial_cols;
 
-                    let oh_start = if kh < pad_top { pad_top - kh } else { 0 };
-                    let oh_end = (in_h + pad_top).saturating_sub(kh).min(out_h);
-                    let ow_start = if kw < pad_left { pad_left - kw } else { 0 };
+                    // Columns whose source `iw = ow + kw - pad_left` is in range.
+                    let ow_start = pad_left.saturating_sub(kw).min(out_w);
                     let ow_end = (in_w + pad_left).saturating_sub(kw).min(out_w);
-                    let iw_start = (ow_start + kw) as isize - pad_left as isize;
+                    let iw_start = (ow_start + kw).saturating_sub(pad_left);
                     let count = ow_end.saturating_sub(ow_start);
 
-                    // Zero the top padding rows
-                    unsafe {
-                        let col_ptr = col.as_mut_ptr().add(col_row_offset);
-                        if oh_start > 0 {
-                            std::ptr::write_bytes(col_ptr, 0, oh_start * out_w);
-                        }
-                    }
-
-                    // Process valid rows
-                    for oh in oh_start..oh_end {
-                        let ih = (oh + kh) as isize - pad_top as isize;
-                        let ih = ih as usize;
-                        let in_row_offset = ch_offset + ih * in_w;
+                    for oh in 0..out_h {
+                        let ih = (oh * stride_h + kh * dilation_h) as isize - pad_top as isize;
                         let col_base = col_row_offset + oh * out_w;
-
                         unsafe {
                             let col_ptr = col.as_mut_ptr().add(col_base);
-                            let in_ptr = input.as_ptr().add(in_row_offset);
-
-                            // Zero left padding
+                            if ih < 0 || ih >= in_h as isize {
+                                std::ptr::write_bytes(col_ptr, 0, out_w);
+                                continue;
+                            }
+                            let in_ptr = input.as_ptr().add(ch_offset + ih as usize * in_w);
                             if ow_start > 0 {
                                 std::ptr::write_bytes(col_ptr, 0, ow_start);
                             }
-                            // Copy valid region
                             if count > 0 {
                                 std::ptr::copy_nonoverlapping(
-                                    in_ptr.add(iw_start as usize),
+                                    in_ptr.add(iw_start),
                                     col_ptr.add(ow_start),
                                     count,
                                 );
                             }
-                            // Zero right padding
                             if ow_end < out_w {
                                 std::ptr::write_bytes(col_ptr.add(ow_end), 0, out_w - ow_end);
                             }
-                        }
-                    }
-
-                    // Zero the bottom padding rows
-                    unsafe {
-                        let col_ptr = col.as_mut_ptr().add(col_row_offset);
-                        if oh_end < out_h {
-                            std::ptr::write_bytes(
-                                col_ptr.add(oh_end * out_w),
-                                0,
-                                (out_h - oh_end) * out_w,
-                            );
                         }
                     }
                 }
@@ -1044,7 +1024,7 @@ fn im2col(
         return;
     }
 
-    // General path for non-unit stride/dilation
+    // General path for non-unit column stride/dilation
     for c in 0..channels {
         let in_ch = ch_start + c;
         let ch_offset = batch_offset + in_ch * in_h * in_w;
