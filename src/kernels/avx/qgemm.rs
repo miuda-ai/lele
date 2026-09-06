@@ -19,10 +19,16 @@
 
 use std::arch::x86_64::*;
 
-/// Output columns handled by one pass of the microkernel: two `ymm` lanes.
-pub const N_PANEL: usize = 16;
+/// `ymm` lanes of output columns handled by one pass of the microkernel.
+pub const NR: usize = 2;
+/// Output columns handled by one pass of the microkernel.
+pub const N_PANEL: usize = NR * 8;
 /// Rows handled by one pass of the microkernel.
-pub const MR: usize = 6;
+///
+/// `MR * NR` accumulators plus one B operand and one broadcast have to live in
+/// sixteen registers, and the loop wants as many multiplies per load as it can
+/// get: loads are `NR + MR` against `MR * NR` multiplies.
+pub const MR: usize = 5;
 
 /// Weights packed for `vpmaddwd`, widened to i16 at pack time so the inner loop
 /// never pays for the conversion, plus the column sums the zero-point
@@ -91,20 +97,28 @@ unsafe fn accumulate_panel<const M: usize>(
     lda: usize,
     bp: *const i16,
     kb_count: usize,
-) -> [[__m256i; 2]; M] {
+) -> [[__m256i; NR]; M] {
     unsafe {
-        let mut acc = [[_mm256_setzero_si256(); 2]; M];
+        let mut acc = [[_mm256_setzero_si256(); NR]; M];
+        // The B panel is held across the row loop and each broadcast is used
+        // and discarded, so only NR + 1 registers are live beyond the
+        // accumulators. Holding the broadcasts instead costs M, which is worse
+        // whenever there are more rows than column groups, and spilling an
+        // accumulator undoes far more than the loads save.
+        let mut bv = [_mm256_setzero_si256(); NR];
         for kb in 0..kb_count {
             let block = bp.add(kb * (N_PANEL * 2));
-            let b0 = _mm256_loadu_si256(block as *const __m256i);
-            let b1 = _mm256_loadu_si256(block.add(16) as *const __m256i);
+            for (g, b) in bv.iter_mut().enumerate() {
+                *b = _mm256_loadu_si256(block.add(g * 16) as *const __m256i);
+            }
             for (r, accr) in acc.iter_mut().enumerate() {
                 // Two consecutive i16 of this row, splatted across the vector,
                 // to line up with the two K values interleaved in each column.
                 let pair = (a.add(r * lda + kb * 2) as *const i32).read_unaligned();
                 let av = _mm256_set1_epi32(pair);
-                accr[0] = _mm256_add_epi32(accr[0], _mm256_madd_epi16(av, b0));
-                accr[1] = _mm256_add_epi32(accr[1], _mm256_madd_epi16(av, b1));
+                for g in 0..NR {
+                    accr[g] = _mm256_add_epi32(accr[g], _mm256_madd_epi16(av, bv[g]));
+                }
             }
         }
         acc
@@ -116,7 +130,7 @@ unsafe fn accumulate_panel<const M: usize>(
 #[target_feature(enable = "avx2", enable = "fma")]
 #[inline]
 unsafe fn store_panel<const M: usize>(
-    acc: &[[__m256i; 2]; M],
+    acc: &[[__m256i; NR]; M],
     col_base: usize,
     n: usize,
     col_sums: *const i32,
@@ -131,7 +145,7 @@ unsafe fn store_panel<const M: usize>(
     unsafe {
         let zp = _mm256_set1_epi32(a_zero_point);
         let sa = _mm256_set1_ps(a_scale);
-        for sub in 0..2 {
+        for sub in 0..NR {
             let col = col_base + sub * 8;
             if col >= n {
                 break;
