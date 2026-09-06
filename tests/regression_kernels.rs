@@ -1616,6 +1616,116 @@ fn test_avx2_qgemm_matches_integer_reference() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Reductions
+// ---------------------------------------------------------------------------
+
+/// Straightforward reference: sum every input element into the output slot its
+/// non-reduced coordinates address, then divide by the number of elements that
+/// landed in each slot.
+fn ref_reduce(shape: &[usize], data: &[f32], axes: &[i64], keepdims: bool, mean: bool) -> (Vec<usize>, Vec<f32>) {
+    let dims = shape.len();
+    let resolved: Vec<usize> = axes
+        .iter()
+        .map(|&a| if a < 0 { (dims as i64 + a) as usize } else { a as usize })
+        .collect();
+    let mut out_shape = Vec::new();
+    for (i, &d) in shape.iter().enumerate() {
+        if !resolved.contains(&i) {
+            out_shape.push(d);
+        } else if keepdims {
+            out_shape.push(1);
+        }
+    }
+    let kept: Vec<usize> = (0..dims).filter(|i| !resolved.contains(i)).collect();
+    let mut out = vec![0.0f32; out_shape.iter().product::<usize>().max(1)];
+    let mut count = 1usize;
+    for &a in &resolved {
+        count *= shape[a];
+    }
+    let mut coords = vec![0usize; dims];
+    for v in data {
+        let mut off = 0usize;
+        for &d in &kept {
+            off = off * shape[d] + coords[d];
+        }
+        out[off] += v;
+        for d in (0..dims).rev() {
+            coords[d] += 1;
+            if coords[d] < shape[d] {
+                break;
+            }
+            coords[d] = 0;
+        }
+    }
+    if mean {
+        for v in out.iter_mut() {
+            *v /= count as f32;
+        }
+    }
+    (out_shape, out)
+}
+
+#[test]
+fn test_reduce_mean_axis_combinations() {
+    // The trailing-axes cases take a contiguous-run fast path and the rest fall
+    // through to the general coordinate walk; both must agree with the
+    // reference, and the fast path must still report the right shape.
+    let shape = vec![2usize, 3, 4, 5];
+    let data: Vec<f32> = (0..2 * 3 * 4 * 5).map(|i| (i % 29) as f32 * 0.37 - 4.0).collect();
+    let t = TensorView::from_slice(&data, shape.clone());
+
+    let cases: &[&[i64]] = &[
+        &[-1],
+        &[3],
+        &[2, 3],
+        &[1, 2, 3],
+        &[0, 1, 2, 3],
+        &[0],
+        &[1],
+        &[0, 2],
+        &[1, 2],
+    ];
+    for axes in cases {
+        for keepdims in [false, true] {
+            let mut buf = Vec::new();
+            let got = reduce_mean(&t, axes, keepdims, &mut buf);
+            let (want_shape, want) = ref_reduce(&shape, &data, axes, keepdims, true);
+            assert_eq!(
+                got.shape.as_ref(),
+                want_shape.as_slice(),
+                "reduce_mean shape for axes {axes:?} keepdims={keepdims}"
+            );
+            assert_close(
+                &got.data,
+                &want,
+                1e-4,
+                &format!("reduce_mean axes {axes:?} keepdims={keepdims}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_reduce_mean_long_row_matches_scalar_sum() {
+    // The fast path sums with eight accumulators; over a long row that must
+    // still match a plain left-to-right sum to within f32 rounding.
+    let (rows, cols) = (3usize, 1000usize);
+    let data: Vec<f32> = (0..rows * cols).map(|i| (i % 101) as f32 * 0.013).collect();
+    let t = TensorView::from_slice(&data, vec![rows, cols]);
+    let mut buf = Vec::new();
+    let got = reduce_mean(&t, &[-1], false, &mut buf);
+    assert_eq!(got.shape.as_ref(), &[rows]);
+    for r in 0..rows {
+        let want: f32 = data[r * cols..(r + 1) * cols].iter().sum::<f32>() / cols as f32;
+        assert!(
+            (got.data[r] - want).abs() <= 1e-5 * want.abs().max(1.0),
+            "row {r}: got {}, want {want}",
+            got.data[r]
+        );
+    }
+}
+
 #[test]
 fn test_reduce_prod_matches_reference() {
     let shape = vec![2usize, 3, 4];

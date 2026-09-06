@@ -1955,68 +1955,6 @@ pub fn reduce_mean<'b, 'a>(
 ) -> TensorView<'a> {
     let dims = input.dim();
 
-    // Fast path: reduce [N,C,H,W] over axes [2,3] with keepdims
-    if dims == 4 && keepdims && axes.len() == 2 {
-        let mut sorted_axes: Vec<i64> = axes.to_vec();
-        sorted_axes.sort_unstable();
-        let a0 = if sorted_axes[0] < 0 { sorted_axes[0] + dims as i64 } else { sorted_axes[0] };
-        let a1 = if sorted_axes[1] < 0 { sorted_axes[1] + dims as i64 } else { sorted_axes[1] };
-        if a0 == 2 && a1 == 3 {
-            let n = input.shape[0];
-            let c = input.shape[1];
-            let h = input.shape[2];
-            let w = input.shape[3];
-            let hw = h * w;
-            let scale = 1.0f32 / hw as f32;
-            let out_numel = n * c;
-            utils::ensure_capacity(out, out_numel);
-            unsafe { out.set_len(out_numel); }
-            let i_data = &input.data;
-            #[cfg(target_arch = "aarch64")]
-            {
-                use core::arch::aarch64::*;
-                for nc in 0..n * c {
-                    let base = nc * hw;
-                    unsafe {
-                    let mut sum = vdupq_n_f32(0.0);
-                    let mut i = 0usize;
-                    while i + 8 <= hw {
-                        let v0 = vld1q_f32(i_data.as_ptr().add(base + i));
-                        let v1 = vld1q_f32(i_data.as_ptr().add(base + i + 4));
-                        sum = vaddq_f32(sum, v0);
-                        sum = vaddq_f32(sum, v1);
-                        i += 8;
-                    }
-                    let mut s = vaddvq_f32(sum);
-                    while i < hw {
-                        s += *i_data.get_unchecked(base + i);
-                        i += 1;
-                    }
-                    *out.get_unchecked_mut(nc) = s * scale;
-                    }
-                }
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                for nc in 0..n * c {
-                    let base = nc * hw;
-                    let mut s = 0.0f32;
-                    for i in 0..hw {
-                        s += i_data[base + i];
-                    }
-                    out[nc] = s * scale;
-                }
-            }
-            let mut out_shape = input.shape.to_vec();
-            out_shape[2] = 1;
-            out_shape[3] = 1;
-            return TensorView {
-                data: Cow::Borrowed(out),
-                shape: Cow::Owned(out_shape),
-            };
-        }
-    }
-
     let mut resolved_axes: Vec<usize> = axes
         .iter()
         .map(|&x| {
@@ -2029,6 +1967,45 @@ pub fn reduce_mean<'b, 'a>(
         .collect();
     resolved_axes.sort();
     resolved_axes.dedup();
+
+    // Fast path: the reduced axes are the trailing ones, so each output is the
+    // sum of one contiguous run. This is what pooling asks for — the last axis,
+    // or [H, W] of an NCHW tensor — and the generic path below costs a
+    // multi-dimensional index computation per element.
+    if !resolved_axes.is_empty() && resolved_axes[0] + resolved_axes.len() == dims {
+        let inner: usize = input.shape[resolved_axes[0]..].iter().product();
+        let outer: usize = input.shape[..resolved_axes[0]].iter().product();
+        let mut out_shape: Vec<usize> = input.shape[..resolved_axes[0]].to_vec();
+        if keepdims {
+            out_shape.resize(dims, 1);
+        }
+        let scale = 1.0f32 / inner as f32;
+        utils::ensure_capacity(out, outer);
+        unsafe { out.set_len(outer) };
+        for (o, dst) in out.iter_mut().enumerate() {
+            let run = &input.data[o * inner..(o + 1) * inner];
+            // Eight independent accumulators: f32 addition is not associative,
+            // so a single one would keep the loop serial on the add latency.
+            let mut acc = [0.0f32; 8];
+            let mut chunks = run.chunks_exact(8);
+            for c in &mut chunks {
+                for (a, &v) in acc.iter_mut().zip(c) {
+                    *a += v;
+                }
+            }
+            let mut s = ((acc[0] + acc[4]) + (acc[1] + acc[5]))
+                + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
+            for &v in chunks.remainder() {
+                s += v;
+            }
+            *dst = s * scale;
+        }
+        return TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(out_shape),
+        };
+    }
+
     let mut out_shape = Vec::new();
     let mut reduce_mask = vec![false; dims];
     for &ax in &resolved_axes {
