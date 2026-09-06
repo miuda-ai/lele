@@ -2066,3 +2066,249 @@ unsafe fn wasm_apply_scale_bias_relu(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// QuantizeLinear / DequantizeLinear (static QDQ models)
+//
+// Integer tensors are carried in `TensorView<f32>` holding the integer codes as
+// f32 values, matching the convention already used by `dynamic_quantize_linear`
+// and `mat_mul_integer`.
+// ---------------------------------------------------------------------------
+
+/// Layout of the scale/zero-point operands relative to the data tensor.
+enum QParamLayout {
+    /// One scale for the whole tensor.
+    PerTensor,
+    /// One scale per slice along `axis`.
+    PerAxis { outer: usize, dim: usize, inner: usize },
+    /// One scale per block of `block_size` elements along `axis`.
+    Blocked {
+        outer: usize,
+        dim: usize,
+        inner: usize,
+        block_size: usize,
+        blocks: usize,
+    },
+}
+
+fn qparam_layout(
+    shape: &[usize],
+    scale_len: usize,
+    scale_rank: usize,
+    axis: i64,
+    block_size: usize,
+) -> QParamLayout {
+    if scale_len <= 1 {
+        return QParamLayout::PerTensor;
+    }
+    let rank = shape.len();
+    let axis = if axis < 0 { axis + rank as i64 } else { axis };
+    let axis = (axis.max(0) as usize).min(rank.saturating_sub(1));
+    let outer: usize = shape[..axis].iter().product();
+    let dim = shape.get(axis).copied().unwrap_or(1);
+    let inner: usize = shape[axis + 1..].iter().product();
+    if block_size > 0 && scale_rank > 1 {
+        let blocks = dim.div_ceil(block_size);
+        QParamLayout::Blocked {
+            outer,
+            dim,
+            inner,
+            block_size,
+            blocks,
+        }
+    } else {
+        QParamLayout::PerAxis { outer, dim, inner }
+    }
+}
+
+/// Applies `f(value, scale, zero_point)` over `x`, broadcasting the quantization
+/// parameters according to `axis` / `block_size`.
+fn qdq_apply<F>(
+    x: &TensorView<'_, f32>,
+    scale: &TensorView<'_, f32>,
+    zero_point: Option<&TensorView<'_, f32>>,
+    axis: i64,
+    block_size: usize,
+    out: &mut Vec<f32>,
+    f: F,
+) where
+    F: Fn(f32, f32, f32) -> f32,
+{
+    let zp_data: &[f32] = zero_point.map(|z| z.data.as_ref()).unwrap_or(&[]);
+    let scale_data = scale.data.as_ref();
+    let zp_at = |i: usize| -> f32 {
+        match zp_data.len() {
+            0 => 0.0,
+            1 => zp_data[0],
+            _ => zp_data[i],
+        }
+    };
+
+    out.clear();
+    out.reserve(x.data.len());
+
+    match qparam_layout(
+        &x.shape,
+        scale_data.len(),
+        scale.shape.len(),
+        axis,
+        block_size,
+    ) {
+        QParamLayout::PerTensor => {
+            let s = scale_data.first().copied().unwrap_or(1.0);
+            let z = zp_at(0);
+            out.extend(x.data.iter().map(|&v| f(v, s, z)));
+        }
+        QParamLayout::PerAxis { outer, dim, inner } => {
+            for _o in 0..outer {
+                for d in 0..dim {
+                    let s = scale_data[d];
+                    let z = zp_at(d);
+                    let base = out.len();
+                    out.extend(x.data[base..base + inner].iter().map(|&v| f(v, s, z)));
+                }
+            }
+        }
+        QParamLayout::Blocked {
+            outer,
+            dim,
+            inner,
+            block_size,
+            blocks,
+        } => {
+            for o in 0..outer {
+                for d in 0..dim {
+                    let block = d / block_size;
+                    let p_base = (o * blocks + block) * inner;
+                    let base = out.len();
+                    for i in 0..inner {
+                        let s = scale_data[p_base + i];
+                        let z = zp_at(p_base + i);
+                        out.push(f(x.data[base + i], s, z));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// ONNX `QuantizeLinear`: `y = saturate(round_half_even(x / scale) + zero_point)`.
+///
+/// `qmin`/`qmax` are the saturation bounds of the target integer type and are
+/// resolved by the compiler from the zero-point dtype (or the `output_dtype`
+/// attribute).
+pub fn quantize_linear<'a>(
+    x: &TensorView<'_, f32>,
+    y_scale: &TensorView<'_, f32>,
+    y_zero_point: Option<&TensorView<'_, f32>>,
+    axis: i64,
+    block_size: usize,
+    qmin: f32,
+    qmax: f32,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a, f32> {
+    qdq_apply(
+        x,
+        y_scale,
+        y_zero_point,
+        axis,
+        block_size,
+        out,
+        |v, s, z| ((v / s).round_ties_even() + z).clamp(qmin, qmax),
+    );
+    TensorView::from_slice(out.as_slice(), x.shape.to_vec())
+}
+
+/// ONNX `DequantizeLinear`: `y = (x - zero_point) * scale`.
+pub fn dequantize_linear<'a>(
+    x: &TensorView<'_, f32>,
+    x_scale: &TensorView<'_, f32>,
+    x_zero_point: Option<&TensorView<'_, f32>>,
+    axis: i64,
+    block_size: usize,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a, f32> {
+    qdq_apply(x, x_scale, x_zero_point, axis, block_size, out, |v, s, z| {
+        (v - z) * s
+    });
+    TensorView::from_slice(out.as_slice(), x.shape.to_vec())
+}
+
+/// Fused `QuantizeLinear` → `DequantizeLinear` round trip ("fake quantize").
+///
+/// QDQ graphs express activation quantization as a `QuantizeLinear` immediately
+/// followed by a `DequantizeLinear` sharing the same scale and zero point, so
+/// the pair is a no-op on the tensor type and only exists to clamp the value to
+/// the quantization grid. Computing both steps in a single pass gives a
+/// bit-identical result while halving the memory traffic and removing the
+/// intermediate buffer.
+///
+/// A per-tensor scale — what activation quantization almost always uses — takes
+/// a division-free SIMD path; see
+/// [`fake_quantize_per_tensor_avx2`](crate::kernels::avx::quantization::fake_quantize_per_tensor_avx2)
+/// for why, and for the one way its result can differ.
+pub fn fake_quantize_linear<'a>(
+    x: &TensorView<'_, f32>,
+    scale: &TensorView<'_, f32>,
+    zero_point: Option<&TensorView<'_, f32>>,
+    axis: i64,
+    block_size: usize,
+    qmin: f32,
+    qmax: f32,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a, f32> {
+    #[cfg(target_arch = "x86_64")]
+    if matches!(
+        qparam_layout(
+            &x.shape,
+            scale.data.len(),
+            scale.shape.len(),
+            axis,
+            block_size
+        ),
+        QParamLayout::PerTensor
+    ) && is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("fma")
+    {
+        let s = scale.data.first().copied().unwrap_or(1.0);
+        let z = zero_point
+            .and_then(|z| z.data.first().copied())
+            .unwrap_or(0.0);
+        let len = x.data.len();
+        crate::kernels::utils::ensure_capacity(out, len);
+        unsafe {
+            out.set_len(len);
+            crate::kernels::avx::quantization::fake_quantize_per_tensor_avx2(
+                x.data.as_ptr(),
+                out.as_mut_ptr(),
+                len,
+                s,
+                z,
+                qmin,
+                qmax,
+            );
+        }
+        return TensorView::from_slice(out.as_slice(), x.shape.to_vec());
+    }
+
+    qdq_apply(x, scale, zero_point, axis, block_size, out, |v, s, z| {
+        (((v / s).round_ties_even() + z).clamp(qmin, qmax) - z) * s
+    });
+    TensorView::from_slice(out.as_slice(), x.shape.to_vec())
+}
+
+/// Saturation bounds for an ONNX integer tensor element type.
+/// Returns `None` for types that are not valid quantization targets.
+pub fn quant_range(onnx_dtype: i32) -> Option<(f32, f32)> {
+    match onnx_dtype {
+        2 => Some((0.0, 255.0)),                            // UINT8
+        3 => Some((-128.0, 127.0)),                         // INT8
+        4 => Some((0.0, 65535.0)),                          // UINT16
+        5 => Some((-32768.0, 32767.0)),                     // INT16
+        6 => Some((i32::MIN as f32, i32::MAX as f32)),      // INT32
+        12 => Some((0.0, u32::MAX as f32)),                 // UINT32
+        21 => Some((0.0, 15.0)),                            // UINT4
+        22 => Some((-8.0, 7.0)),                            // INT4
+        _ => None,
+    }
+}

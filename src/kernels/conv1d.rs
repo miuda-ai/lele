@@ -1022,7 +1022,7 @@ pub fn conv1d_fused<'b, 'a>(
     if group == 1
         && kernel_size == 3
         && dilation == 1
-        && (stride == 1 || stride == 2)
+        && stride == 1
         && pad_left == 1
         && pad_right == 1
     {
