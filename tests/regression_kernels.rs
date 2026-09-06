@@ -1596,3 +1596,65 @@ fn test_avx2_qgemm_matches_integer_reference() {
         }
     }
 }
+
+#[test]
+fn test_reduce_prod_matches_reference() {
+    let shape = vec![2usize, 3, 4];
+    // Values near one so the products stay in a range f32 represents exactly
+    // enough to compare against a scalar reference.
+    let data: Vec<f32> = (0..2 * 3 * 4).map(|i| 1.0 + (i % 5) as f32 * 0.25).collect();
+    let t = TensorView::from_slice(&data, shape.clone());
+
+    let cases: &[&[i64]] = &[&[-1], &[0], &[1], &[0, 2], &[0, 1, 2]];
+    for axes in cases {
+        for keepdims in [false, true] {
+            let mut buf = Vec::new();
+            let got = reduce_prod(&t, axes, keepdims, &mut buf);
+
+            let dims = shape.len();
+            let resolved: Vec<usize> = axes
+                .iter()
+                .map(|&a| if a < 0 { (dims as i64 + a) as usize } else { a as usize })
+                .collect();
+            let mut want_shape = Vec::new();
+            for (i, &d) in shape.iter().enumerate() {
+                if !resolved.contains(&i) {
+                    want_shape.push(d);
+                } else if keepdims {
+                    want_shape.push(1);
+                }
+            }
+            assert_eq!(got.shape.as_ref(), want_shape.as_slice(), "axes {axes:?}");
+
+            let kept: Vec<usize> = (0..dims).filter(|i| !resolved.contains(i)).collect();
+            let mut want = vec![1.0f32; want_shape.iter().product::<usize>().max(1)];
+            let mut coords = vec![0usize; dims];
+            for v in &data {
+                let mut off = 0usize;
+                for &d in &kept {
+                    off = off * shape[d] + coords[d];
+                }
+                want[off] *= v;
+                for d in (0..dims).rev() {
+                    coords[d] += 1;
+                    if coords[d] < shape[d] {
+                        break;
+                    }
+                    coords[d] = 0;
+                }
+            }
+            assert_close(&got.data, &want, 1e-3, &format!("reduce_prod axes {axes:?}"));
+        }
+    }
+}
+
+#[test]
+fn test_reduce_prod_of_shape_vector() {
+    // How the op actually shows up: an i64 element count pulled out of Shape,
+    // which the pooling layer divides by.
+    let dims: Vec<i64> = vec![7];
+    let t = TensorView::from_slice(&dims, vec![1usize]);
+    let mut buf = Vec::new();
+    let got = reduce_prod(&t, &[], false, &mut buf);
+    assert_eq!(got.data.as_ref(), &[7i64]);
+}

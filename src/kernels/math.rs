@@ -2174,6 +2174,84 @@ pub fn reduce_sum<'b, 'a, T: ElementOps + std::ops::AddAssign>(
     }
 }
 
+pub fn reduce_prod<'b, 'a, T: ElementOps + std::ops::MulAssign>(
+    input: &TensorView<'b, T>,
+    axes: &[i64],
+    keepdims: bool,
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
+    let dims = input.dim();
+    let mut resolved_axes: Vec<usize> = axes
+        .iter()
+        .map(|&x| {
+            if x < 0 {
+                (dims as i64 + x) as usize
+            } else {
+                x as usize
+            }
+        })
+        .collect();
+    resolved_axes.sort();
+    resolved_axes.dedup();
+    // No axes means reduce everything, per the ONNX default.
+    if resolved_axes.is_empty() {
+        resolved_axes = (0..dims).collect();
+    }
+    let mut out_shape = Vec::new();
+    let mut reduce_mask = vec![false; dims];
+    for &ax in &resolved_axes {
+        reduce_mask[ax] = true;
+    }
+    for i in 0..dims {
+        if !reduce_mask[i] {
+            out_shape.push(input.shape[i]);
+        } else if keepdims {
+            out_shape.push(1);
+        }
+    }
+    let out_numel = out_shape.iter().product::<usize>();
+    let one = T::from_f32(1.0);
+    out.clear();
+    out.resize(out_numel, one);
+
+    let real_out_strides = utils::compute_strides(&out_shape);
+    let mut input_to_out_strides = vec![0; dims];
+    let mut out_dim_idx = 0;
+    for i in 0..dims {
+        if reduce_mask[i] {
+            input_to_out_strides[i] = 0;
+            if keepdims {
+                out_dim_idx += 1;
+            }
+        } else {
+            input_to_out_strides[i] = real_out_strides[out_dim_idx];
+            out_dim_idx += 1;
+        }
+    }
+    let mut coords = vec![0; dims];
+    for i in 0..input.data.len() {
+        let val = unsafe { *input.data.get_unchecked(i) };
+        let mut out_off = 0;
+        for d in 0..dims {
+            out_off += coords[d] * input_to_out_strides[d];
+        }
+        unsafe {
+            *out.get_unchecked_mut(out_off) *= val;
+        }
+        for d in (0..dims).rev() {
+            coords[d] += 1;
+            if coords[d] < input.shape[d] {
+                break;
+            }
+            coords[d] = 0;
+        }
+    }
+    TensorView {
+        data: Cow::Borrowed(out),
+        shape: Cow::Owned(out_shape),
+    }
+}
+
 pub fn reduce_max<'b, 'a, T>(
     input: &TensorView<'b, T>,
     axes: &[i64],
