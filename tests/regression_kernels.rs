@@ -1405,13 +1405,15 @@ fn test_qmatmul_i8_accepts_per_tensor_weight_scale() {
 /// pin which path was actually chosen to what the CPU reports.
 #[test]
 #[cfg(target_arch = "x86_64")]
-fn test_quantized_weights_take_the_integer_path_when_vnni_is_available() {
+fn test_quantized_weights_take_the_integer_path_when_the_cpu_allows() {
+    use lele::kernels::avx::qgemm::has_avx2_int8;
+    use lele::kernels::avx512::qgemm::has_vnni;
     let (_, _, _, raw, w_scale, _) = qdq_layer(4, 8, 16);
     let qw = lele::kernels::prepare_quantized_weights(&raw, 8, 16, &w_scale);
     assert_eq!(
         qw.is_integer(),
-        lele::kernels::avx512::qgemm::has_vnni(),
-        "the integer kernel should run exactly when the CPU supports VNNI"
+        has_vnni() || has_avx2_int8(),
+        "an integer kernel should run whenever the CPU has VNNI or AVX2"
     );
 }
 
@@ -1546,6 +1548,51 @@ fn test_fake_quantize_per_axis_still_divides_exactly() {
                 let want = (((x[idx] / s).round_ties_even() + z).clamp(0.0, 255.0) - z) * s;
                 assert_eq!(got.data[idx].to_bits(), want.to_bits(), "index {idx}");
             }
+        }
+    }
+}
+
+/// Exact check of the AVX2 packed kernel against integer arithmetic.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_avx2_qgemm_matches_integer_reference() {
+    use lele::kernels::avx::qgemm::{has_avx2_int8, pack_i8_weights_avx2, qgemm_u8s8_f32_avx2};
+    if !has_avx2_int8() {
+        return;
+    }
+    // K odd and N not a multiple of 16, so the packing padding, the row tail
+    // and the masked store are all exercised.
+    let (m, k, n) = (11usize, 37usize, 70usize);
+    let lda = k.next_multiple_of(2);
+    let codes: Vec<i32> = (0..m * lda).map(|i| (i * 37 % 256) as i32).collect();
+    let a: Vec<i16> = codes.iter().map(|&v| v as i16).collect();
+    let b: Vec<i8> = (0..k * n)
+        .map(|i| ((i * 53 % 255) as i32 - 127) as i8)
+        .collect();
+    let w_scale: Vec<f32> = (0..n).map(|j| 0.001 + (j % 7) as f32 * 1e-4).collect();
+    let bias: Vec<f32> = (0..n).map(|j| (j % 11) as f32 * 0.01).collect();
+    let (a_scale, a_zp) = (0.0037f32, 131i32);
+
+    let pw = pack_i8_weights_avx2(&b, k, n);
+    let mut out = vec![0f32; m * n];
+    unsafe {
+        qgemm_u8s8_f32_avx2(
+            a.as_ptr(), m, lda, &pw, a_zp, a_scale,
+            w_scale.as_ptr(), w_scale.len(), Some(bias.as_ptr()),
+            out.as_mut_ptr(), n,
+        );
+    }
+
+    for i in 0..m {
+        for j in 0..n {
+            let dot: i32 = (0..k).map(|kk| codes[i * lda + kk] * b[kk * n + j] as i32).sum();
+            let col: i32 = (0..k).map(|kk| b[kk * n + j] as i32).sum();
+            let want = a_scale * w_scale[j] * (dot - a_zp * col) as f32 + bias[j];
+            let got = out[i * n + j];
+            assert!(
+                (got - want).abs() <= 1e-5 * want.abs().max(1.0),
+                "avx2 qgemm differs at ({i},{j}): got {got}, want {want}"
+            );
         }
     }
 }
