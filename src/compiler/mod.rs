@@ -637,6 +637,161 @@ impl Compiler {
         });
     }
 
+    /// Rewrites `MatMul(dequantized activation, DequantizeLinear(int8 weight))`
+    /// into a single `QLinearMatMulI8` node that keeps the weight in int8.
+    ///
+    /// This has to run *before* constant folding. Folding would turn the
+    /// weight's `DequantizeLinear` into an f32 constant, which is exactly the
+    /// information an integer kernel needs and cannot recover. Dropping the
+    /// node here means folding never sees it and the int8 initializer plus its
+    /// scale reach code generation intact.
+    ///
+    /// The pattern is only taken when the arithmetic actually reduces to an
+    /// integer GEMM with a single correction term:
+    ///
+    /// * the weight is a 2-D int8 initializer, quantized symmetrically (zero
+    ///   point absent or all zero) with a per-output-channel or per-tensor
+    ///   scale, i.e. `axis` selects the N dimension;
+    /// * the activation comes from a `DequantizeLinear` with a scalar scale and
+    ///   a uint8 scalar zero point, so `a_zp * colsum(w)` is the whole
+    ///   correction;
+    /// * the dequantized weight feeds nothing but this one `MatMul`.
+    ///
+    /// The activation's own `DequantizeLinear` is left alone: it commonly feeds
+    /// several matmuls (one per attention projection), and [`Self::fuse_qdq`]
+    /// still collapses it later.
+    fn fuse_qdq_matmul(graph: &mut GraphProto) {
+        let init: HashMap<&str, &TensorProto> = graph
+            .initializer
+            .iter()
+            .map(|t| (t.name.as_str(), t))
+            .collect();
+
+        let mut uses: HashMap<&str, usize> = HashMap::new();
+        for node in &graph.node {
+            for input in &node.input {
+                *uses.entry(input.as_str()).or_default() += 1;
+            }
+        }
+        for out in &graph.output {
+            *uses.entry(out.name.as_str()).or_default() += 1;
+        }
+
+        let mut producer: HashMap<&str, usize> = HashMap::new();
+        for (i, node) in graph.node.iter().enumerate() {
+            for out in &node.output {
+                if !out.is_empty() {
+                    producer.insert(out.as_str(), i);
+                }
+            }
+        }
+
+        // Every byte of an initializer is zero, so the tensor is too. Zero
+        // points live in `raw_data` or `int32_data` depending on the exporter.
+        let all_zero = |t: &TensorProto| {
+            t.raw_data.iter().all(|&b| b == 0)
+                && t.int32_data.iter().all(|&v| v == 0)
+                && t.float_data.iter().all(|&v| v == 0.0)
+        };
+
+        // (MatMul index, DequantizeLinear index, activation DQ index)
+        let mut rewrites: Vec<(usize, usize, usize)> = Vec::new();
+        for (mm_idx, mm) in graph.node.iter().enumerate() {
+            if mm.op_type != "MatMul" || mm.input.len() < 2 {
+                continue;
+            }
+            let Some(&dq_w_idx) = producer.get(mm.input[1].as_str()) else {
+                continue;
+            };
+            let dq_w = &graph.node[dq_w_idx];
+            if dq_w.op_type != "DequantizeLinear" || dq_w.input.len() < 2 {
+                continue;
+            }
+            if uses.get(dq_w.output[0].as_str()).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            let Some(w) = init.get(dq_w.input[0].as_str()) else {
+                continue;
+            };
+            // 3 = INT8. u8 weights would need a second correction term.
+            if w.data_type != 3 || w.dims.len() != 2 {
+                continue;
+            }
+            let Some(w_scale) = init.get(dq_w.input[1].as_str()) else {
+                continue;
+            };
+            let n = w.dims[1] as usize;
+            let scale_len: usize = w_scale.dims.iter().product::<i64>().max(1) as usize;
+            if scale_len != 1 && scale_len != n {
+                continue;
+            }
+            // Per-channel scale must select the output dimension; a scale along
+            // K cannot be pulled out of the accumulation.
+            let axis = dq_w
+                .attribute
+                .iter()
+                .find(|a| a.name == "axis")
+                .map(|a| a.i)
+                .unwrap_or(1);
+            if scale_len != 1 && axis != 1 {
+                continue;
+            }
+            if let Some(zp) = dq_w.input.get(2)
+                && !zp.is_empty()
+                && !init.get(zp.as_str()).is_some_and(|t| all_zero(t))
+            {
+                continue;
+            }
+
+            let Some(&dq_a_idx) = producer.get(mm.input[0].as_str()) else {
+                continue;
+            };
+            let dq_a = &graph.node[dq_a_idx];
+            if dq_a.op_type != "DequantizeLinear" || dq_a.input.len() < 3 {
+                continue;
+            }
+            let Some(a_scale) = init.get(dq_a.input[1].as_str()) else {
+                continue;
+            };
+            if a_scale.dims.iter().product::<i64>().max(1) != 1 {
+                continue;
+            }
+            // 2 = UINT8, the operand type `vpdpbusd` takes for A.
+            let Some(a_zp) = init.get(dq_a.input[2].as_str()) else {
+                continue;
+            };
+            if a_zp.data_type != 2 || a_zp.dims.iter().product::<i64>().max(1) != 1 {
+                continue;
+            }
+
+            rewrites.push((mm_idx, dq_w_idx, dq_a_idx));
+        }
+        if rewrites.is_empty() {
+            return;
+        }
+
+        let mut dropped: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (mm_idx, dq_w_idx, dq_a_idx) in rewrites {
+            let dq_w = &graph.node[dq_w_idx];
+            let weight = dq_w.input[0].clone();
+            let w_scale = dq_w.input[1].clone();
+            let dq_a = &graph.node[dq_a_idx];
+            let a_scale = dq_a.input[1].clone();
+            let a_zp = dq_a.input[2].clone();
+
+            let mm = &mut graph.node[mm_idx];
+            mm.op_type = "QLinearMatMulI8".to_string();
+            mm.input = vec![mm.input[0].clone(), a_scale, a_zp, weight, w_scale];
+            dropped.insert(dq_w_idx);
+        }
+        let mut idx = 0;
+        graph.node.retain(|_| {
+            let keep = !dropped.contains(&idx);
+            idx += 1;
+            keep
+        });
+    }
+
     /// Resolves the integer element type a `QuantizeLinear` node saturates to:
     /// the `output_dtype` attribute (opset 21+), else the zero-point dtype,
     /// else the ONNX default of uint8.
@@ -969,6 +1124,8 @@ impl Compiler {
         graph: &GraphProto,
     ) -> Result<CompilationResult, Box<dyn std::error::Error>> {
         let mut graph_storage = graph.clone();
+        // Must precede folding, which would otherwise consume the int8 weights.
+        Self::fuse_qdq_matmul(&mut graph_storage);
         if self.constant_folding {
             Self::simplify_dynamic_shapes(&mut graph_storage);
             self.fold_constants(&mut graph_storage);
@@ -1277,6 +1434,10 @@ impl Compiler {
             &mut code,
             "    prepared_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::PreparedWeightsArm>>>,"
         )?;
+        writeln!(
+            &mut code,
+            "    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::QuantizedWeights>>>,"
+        )?;
         writeln!(&mut code, "}}")?;
         writeln!(&mut code, "\nimpl<'a> {}<'a> {{", struct_name)?;
         writeln!(&mut code, "    pub fn new(data: &'a [u8]) -> Self {{")?;
@@ -1287,6 +1448,10 @@ impl Compiler {
         writeln!(
             &mut code,
             "            prepared_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
+        )?;
+        writeln!(
+            &mut code,
+            "            quantized_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
         )?;
         writeln!(&mut code, "        }}")?;
         writeln!(&mut code, "    }}")?;
@@ -1330,6 +1495,38 @@ impl Compiler {
             "        self.prepared_weights_cache.borrow_mut().insert(key, pw.clone());"
         )?;
         writeln!(&mut code, "        pw")?;
+        writeln!(&mut code, "    }}")?;
+
+        // Int8 weights for QLinearMatMulI8. Preparing is architecture
+        // dependent and costs a full pass over the weight, so it happens once
+        // per tensor and the result is cached for the life of the model.
+        writeln!(
+            &mut code,
+            "    fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &lele::tensor::TensorView<f32>) -> std::sync::Arc<lele::kernels::QuantizedWeights> {{"
+        )?;
+        writeln!(&mut code, "        let key = (offset, len);")?;
+        writeln!(&mut code, "        {{")?;
+        writeln!(
+            &mut code,
+            "            let cache = self.quantized_weights_cache.borrow();"
+        )?;
+        writeln!(&mut code, "            if let Some(qw) = cache.get(&key) {{")?;
+        writeln!(&mut code, "                return qw.clone();")?;
+        writeln!(&mut code, "            }}")?;
+        writeln!(&mut code, "        }}")?;
+        writeln!(
+            &mut code,
+            "        let raw = &self.data[offset..offset+len];"
+        )?;
+        writeln!(
+            &mut code,
+            "        let qw = std::sync::Arc::new(lele::kernels::prepare_quantized_weights(raw, k, n, &scale.data));"
+        )?;
+        writeln!(
+            &mut code,
+            "        self.quantized_weights_cache.borrow_mut().insert(key, qw.clone());"
+        )?;
+        writeln!(&mut code, "        qw")?;
         writeln!(&mut code, "    }}")?;
 
         // Helpers for weights
@@ -1831,5 +2028,206 @@ mod qdq_fusion_tests {
         ]);
         Compiler::fuse_qdq(&mut g);
         assert_eq!(op_types(&g), ["QuantizeLinear", "DequantizeLinear"]);
+    }
+}
+
+#[cfg(test)]
+mod qdq_matmul_fusion_tests {
+    use super::*;
+    use crate::model::onnx_proto::{AttributeProto, ValueInfoProto};
+
+    fn node(op: &str, inputs: &[&str], output: &str, attrs: &[(&str, i64)]) -> NodeProto {
+        NodeProto {
+            op_type: op.to_string(),
+            input: inputs.iter().map(|s| s.to_string()).collect(),
+            output: vec![output.to_string()],
+            attribute: attrs
+                .iter()
+                .map(|(name, i)| AttributeProto {
+                    name: name.to_string(),
+                    i: *i,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn init(name: &str, data_type: i32, dims: &[i64], raw: Vec<u8>) -> TensorProto {
+        TensorProto {
+            name: name.to_string(),
+            data_type,
+            dims: dims.to_vec(),
+            raw_data: raw,
+            ..Default::default()
+        }
+    }
+
+    /// int8 weight, per-channel f32 scale, uint8 activation scale/zero point:
+    /// the shapes `fuse_qdq_matmul` is meant to accept.
+    fn initializers() -> Vec<TensorProto> {
+        vec![
+            init("w", 3, &[4, 2], vec![1u8; 8]),
+            init("w_scale", 1, &[2], vec![0u8; 8]),
+            init("w_zp", 3, &[2], vec![0u8; 2]),
+            init("a_scale", 1, &[], vec![0u8; 4]),
+            init("a_zp", 2, &[], vec![7u8]),
+        ]
+    }
+
+    fn graph(nodes: Vec<NodeProto>) -> GraphProto {
+        let last = nodes.last().unwrap().output[0].clone();
+        GraphProto {
+            node: nodes,
+            initializer: initializers(),
+            output: vec![ValueInfoProto {
+                name: last,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Activation dequantize, weight dequantize, matmul.
+    fn nodes() -> Vec<NodeProto> {
+        vec![
+            node("DequantizeLinear", &["xq", "a_scale", "a_zp"], "a", &[]),
+            node("DequantizeLinear", &["w", "w_scale", "w_zp"], "wd", &[("axis", 1)]),
+            node("MatMul", &["a", "wd"], "y", &[]),
+        ]
+    }
+
+    fn op_types(g: &GraphProto) -> Vec<&str> {
+        g.node.iter().map(|n| n.op_type.as_str()).collect()
+    }
+
+    #[test]
+    fn rewrites_matmul_against_dequantized_int8_weight() {
+        let mut g = graph(nodes());
+        Compiler::fuse_qdq_matmul(&mut g);
+        // The weight's DequantizeLinear is gone; the activation's stays.
+        assert_eq!(op_types(&g), ["DequantizeLinear", "QLinearMatMulI8"]);
+        assert_eq!(
+            g.node[1].input,
+            ["a", "a_scale", "a_zp", "w", "w_scale"],
+            "the fused node carries both quantizations' parameters"
+        );
+        assert_eq!(g.node[1].output, ["y"]);
+    }
+
+    #[test]
+    fn keeps_matmul_when_weight_zero_point_is_not_zero() {
+        // An asymmetric weight needs a second correction term the kernel does
+        // not compute.
+        let mut g = graph(nodes());
+        g.initializer
+            .iter_mut()
+            .find(|t| t.name == "w_zp")
+            .unwrap()
+            .raw_data = vec![3u8, 0u8];
+        Compiler::fuse_qdq_matmul(&mut g);
+        assert_eq!(op_types(&g).last(), Some(&"MatMul"));
+    }
+
+    #[test]
+    fn keeps_matmul_when_weight_is_uint8() {
+        let mut g = graph(nodes());
+        g.initializer
+            .iter_mut()
+            .find(|t| t.name == "w")
+            .unwrap()
+            .data_type = 2;
+        Compiler::fuse_qdq_matmul(&mut g);
+        assert_eq!(op_types(&g).last(), Some(&"MatMul"));
+    }
+
+    #[test]
+    fn keeps_matmul_when_weight_scale_runs_along_k() {
+        // axis 0 scales each input channel, which cannot be lifted out of the
+        // accumulation the way an output-channel scale can.
+        let mut g = graph(nodes());
+        let dq_w = g.node.iter_mut().find(|n| n.input[0] == "w").unwrap();
+        dq_w.attribute[0].i = 0;
+        g.initializer
+            .iter_mut()
+            .find(|t| t.name == "w_scale")
+            .unwrap()
+            .dims = vec![4];
+        Compiler::fuse_qdq_matmul(&mut g);
+        assert_eq!(op_types(&g).last(), Some(&"MatMul"));
+    }
+
+    #[test]
+    fn fuses_when_weight_scale_is_per_tensor() {
+        // A single scale has no axis to disagree about.
+        let mut g = graph(nodes());
+        let dq_w = g.node.iter_mut().find(|n| n.input[0] == "w").unwrap();
+        dq_w.attribute[0].i = 0;
+        g.initializer
+            .iter_mut()
+            .find(|t| t.name == "w_scale")
+            .unwrap()
+            .dims = vec![];
+        Compiler::fuse_qdq_matmul(&mut g);
+        assert_eq!(op_types(&g).last(), Some(&"QLinearMatMulI8"));
+    }
+
+    #[test]
+    fn keeps_matmul_when_dequantized_weight_has_another_consumer() {
+        // Dropping the DequantizeLinear would leave the other consumer without
+        // its input.
+        let mut n = nodes();
+        n.push(node("Relu", &["wd"], "other", &[]));
+        let mut g = graph(n);
+        Compiler::fuse_qdq_matmul(&mut g);
+        assert!(op_types(&g).contains(&"MatMul"));
+        assert_eq!(op_types(&g).iter().filter(|o| **o == "DequantizeLinear").count(), 2);
+    }
+
+    #[test]
+    fn keeps_matmul_when_activation_is_not_dequantized() {
+        // Without the activation's scale and zero point there is nothing to
+        // requantize against.
+        let mut n = nodes();
+        n[0] = node("Relu", &["xq"], "a", &[]);
+        let mut g = graph(n);
+        Compiler::fuse_qdq_matmul(&mut g);
+        assert_eq!(op_types(&g).last(), Some(&"MatMul"));
+    }
+
+    #[test]
+    fn keeps_matmul_when_activation_zero_point_is_int8() {
+        // The integer kernel multiplies unsigned activations by signed weights.
+        let mut g = graph(nodes());
+        g.initializer
+            .iter_mut()
+            .find(|t| t.name == "a_zp")
+            .unwrap()
+            .data_type = 3;
+        Compiler::fuse_qdq_matmul(&mut g);
+        assert_eq!(op_types(&g).last(), Some(&"MatMul"));
+    }
+
+    #[test]
+    fn keeps_matmul_when_activation_scale_is_per_channel() {
+        let mut g = graph(nodes());
+        g.initializer
+            .iter_mut()
+            .find(|t| t.name == "a_scale")
+            .unwrap()
+            .dims = vec![4];
+        Compiler::fuse_qdq_matmul(&mut g);
+        assert_eq!(op_types(&g).last(), Some(&"MatMul"));
+    }
+
+    #[test]
+    fn keeps_matmul_between_two_activations() {
+        // Attention scores: both operands are dequantized activations, so there
+        // is no static weight to pack.
+        let mut n = nodes();
+        n[1] = node("DequantizeLinear", &["vq", "a_scale", "a_zp"], "wd", &[]);
+        let mut g = graph(n);
+        Compiler::fuse_qdq_matmul(&mut g);
+        assert_eq!(op_types(&g).last(), Some(&"MatMul"));
     }
 }
