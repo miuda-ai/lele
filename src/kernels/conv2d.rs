@@ -3875,15 +3875,29 @@ unsafe fn depthwise_conv2d_3x3_s1_avx2(
                     while ow < out_w {
                         let off = ow - 1;
                         let mut s = bias.map(|b| *b.get_unchecked(c)).unwrap_or(0.0f32);
-                        s += *r0.add(off)     * *weight.get_unchecked(w_base);
-                        s += *r0.add(off + 1) * *weight.get_unchecked(w_base + 1);
-                        s += *r0.add(off + 2) * *weight.get_unchecked(w_base + 2);
-                        s += *r1.add(off)     * *weight.get_unchecked(w_base + 3);
-                        s += *r1.add(off + 1) * *weight.get_unchecked(w_base + 4);
-                        s += *r1.add(off + 2) * *weight.get_unchecked(w_base + 5);
-                        s += *r2.add(off)     * *weight.get_unchecked(w_base + 6);
-                        s += *r2.add(off + 1) * *weight.get_unchecked(w_base + 7);
-                        s += *r2.add(off + 2) * *weight.get_unchecked(w_base + 8);
+                        if off + 3 <= in_w {
+                            // Whole 3-wide window is inside the row.
+                            s += *r0.add(off)     * *weight.get_unchecked(w_base);
+                            s += *r0.add(off + 1) * *weight.get_unchecked(w_base + 1);
+                            s += *r0.add(off + 2) * *weight.get_unchecked(w_base + 2);
+                            s += *r1.add(off)     * *weight.get_unchecked(w_base + 3);
+                            s += *r1.add(off + 1) * *weight.get_unchecked(w_base + 4);
+                            s += *r1.add(off + 2) * *weight.get_unchecked(w_base + 5);
+                            s += *r2.add(off)     * *weight.get_unchecked(w_base + 6);
+                            s += *r2.add(off + 1) * *weight.get_unchecked(w_base + 7);
+                            s += *r2.add(off + 2) * *weight.get_unchecked(w_base + 8);
+                        } else {
+                            // Right edge: taps past the row are zero padding.
+                            for ki in 0..3usize {
+                                let rp = [r0, r1, r2][ki];
+                                for kj in 0..3usize {
+                                    if off + kj < in_w {
+                                        s += *rp.add(off + kj)
+                                            * *weight.get_unchecked(w_base + ki * 3 + kj);
+                                    }
+                                }
+                            }
+                        }
                         let v = if act == Activation::Relu && s < 0.0 { 0.0 } else { s };
                         *out.get_unchecked_mut(out_row + ow) = v;
                         ow += 1;
