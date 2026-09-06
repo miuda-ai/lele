@@ -2242,6 +2242,11 @@ pub fn dequantize_linear<'a>(
 /// the quantization grid. Computing both steps in a single pass gives a
 /// bit-identical result while halving the memory traffic and removing the
 /// intermediate buffer.
+///
+/// A per-tensor scale — what activation quantization almost always uses — takes
+/// a division-free SIMD path; see
+/// [`fake_quantize_per_tensor_avx2`](crate::kernels::avx::quantization::fake_quantize_per_tensor_avx2)
+/// for why, and for the one way its result can differ.
 pub fn fake_quantize_linear<'a>(
     x: &TensorView<'_, f32>,
     scale: &TensorView<'_, f32>,
@@ -2252,6 +2257,40 @@ pub fn fake_quantize_linear<'a>(
     qmax: f32,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
+    #[cfg(target_arch = "x86_64")]
+    if matches!(
+        qparam_layout(
+            &x.shape,
+            scale.data.len(),
+            scale.shape.len(),
+            axis,
+            block_size
+        ),
+        QParamLayout::PerTensor
+    ) && is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("fma")
+    {
+        let s = scale.data.first().copied().unwrap_or(1.0);
+        let z = zero_point
+            .and_then(|z| z.data.first().copied())
+            .unwrap_or(0.0);
+        let len = x.data.len();
+        crate::kernels::utils::ensure_capacity(out, len);
+        unsafe {
+            out.set_len(len);
+            crate::kernels::avx::quantization::fake_quantize_per_tensor_avx2(
+                x.data.as_ptr(),
+                out.as_mut_ptr(),
+                len,
+                s,
+                z,
+                qmin,
+                qmax,
+            );
+        }
+        return TensorView::from_slice(out.as_slice(), x.shape.to_vec());
+    }
+
     qdq_apply(x, scale, zero_point, axis, block_size, out, |v, s, z| {
         (((v / s).round_ties_even() + z).clamp(qmin, qmax) - z) * s
     });

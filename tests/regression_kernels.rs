@@ -1461,3 +1461,91 @@ fn test_vnni_qgemm_matches_integer_reference() {
         }
     }
 }
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_fake_quantize_per_tensor_matches_exact_division() {
+    // The SIMD path multiplies by the reciprocal and refines with an FMA
+    // instead of dividing, which can only change the result where the true
+    // quotient falls on a rounding tie. Sweep a wide range of magnitudes and
+    // scales and require it to agree with an exact division everywhere.
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        return;
+    }
+    // Lengths that land on and off the 32- and 8-wide steps, so the vector
+    // body and the scalar tail are both exercised.
+    for &len in &[1usize, 7, 8, 31, 32, 33, 1000, 4099] {
+        for &scale in &[0.0037f32, 1.0, 0.5, 1e-4, 7.25e-3, 123.5] {
+            for &zp in &[0.0f32, 128.0, 255.0] {
+                let x: Vec<f32> = (0..len)
+                    .map(|i| {
+                        // Spread over several orders of magnitude and both
+                        // signs, and hit exact half-steps of the grid.
+                        let t = i as f32;
+                        match i % 4 {
+                            0 => (t - len as f32 / 2.0) * scale,
+                            1 => (t - len as f32 / 2.0) * scale * 0.5,
+                            2 => (t * 0.5 + 0.5) * scale,
+                            _ => (t - len as f32 / 2.0) * 1e-3,
+                        }
+                    })
+                    .collect();
+                let x_view = TensorView::from_slice(&x, vec![len]);
+                let s = [scale];
+                let z = [zp];
+                let s_view = TensorView::from_slice(&s, vec![]);
+                let z_view = TensorView::from_slice(&z, vec![]);
+
+                let mut buf = Vec::new();
+                let got = lele::kernels::fake_quantize_linear(
+                    &x_view,
+                    &s_view,
+                    Some(&z_view),
+                    1,
+                    0,
+                    0.0,
+                    255.0,
+                    &mut buf,
+                );
+
+                for (i, (&g, &v)) in got.data.iter().zip(x.iter()).enumerate() {
+                    let want =
+                        (((v / scale).round_ties_even() + zp).clamp(0.0, 255.0) - zp) * scale;
+                    assert_eq!(
+                        g.to_bits(),
+                        want.to_bits(),
+                        "len={len} scale={scale} zp={zp} index {i} (x={v}): got {g}, want {want}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_fake_quantize_per_axis_still_divides_exactly() {
+    // Only the per-tensor layout takes the SIMD path; a per-channel scale must
+    // still go through the general routine.
+    let x: Vec<f32> = (0..24).map(|i| (i as f32 - 12.0) * 0.031).collect();
+    let x_view = TensorView::from_slice(&x, vec![4, 3, 2]);
+    let scale = [0.01f32, 0.02, 0.04];
+    let zp = [10.0f32, 20.0, 30.0];
+    let s_view = TensorView::from_slice(&scale, vec![3]);
+    let z_view = TensorView::from_slice(&zp, vec![3]);
+
+    let mut buf = Vec::new();
+    let got =
+        lele::kernels::fake_quantize_linear(&x_view, &s_view, Some(&z_view), 1, 0, 0.0, 255.0, &mut buf);
+
+    for o in 0..4 {
+        for d in 0..3 {
+            for i in 0..2 {
+                let idx = (o * 3 + d) * 2 + i;
+                let (s, z) = (scale[d], zp[d]);
+                let want = (((x[idx] / s).round_ties_even() + z).clamp(0.0, 255.0) - z) * s;
+                assert_eq!(got.data[idx].to_bits(), want.to_bits(), "index {idx}");
+            }
+        }
+    }
+}
