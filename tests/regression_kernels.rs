@@ -1170,3 +1170,85 @@ fn test_quant_range_known_types() {
     assert_eq!(quant_range(3), Some((-128.0, 127.0)));
     assert_eq!(quant_range(1), None);
 }
+
+/// The compiler collapses `QuantizeLinear` -> `DequantizeLinear` round trips
+/// into `fake_quantize_linear`, so the fused kernel must be bit-identical to
+/// running the two separately for every parameter layout.
+#[test]
+fn test_fake_quantize_linear_matches_unfused_round_trip() {
+    // Values chosen to straddle the saturation bounds and land on rounding ties.
+    let x: Vec<f32> = (0..24).map(|i| (i as f32 - 11.5) * 0.75).collect();
+    let x_t = TensorView::from_slice(&x, vec![4, 3, 2]);
+
+    let per_tensor = vec![0.5f32];
+    let per_axis = vec![0.25f32, 0.5, 1.0];
+    // shape [4, 3, 2] with block_size 2 along axis 0 -> 2 blocks of 6 inner
+    // elements, so the scale has shape [2, 3, 2].
+    let blocked: Vec<f32> = (0..12).map(|i| 0.25 * (i + 1) as f32).collect();
+    let zp_tensor = vec![128.0f32];
+    let zp_axis = vec![120.0f32, 128.0, 140.0];
+
+    let cases: [(&str, &[f32], Vec<usize>, Option<&[f32]>, i64, usize); 5] = [
+        ("per-tensor", &per_tensor, vec![], Some(&zp_tensor), 1, 0),
+        ("per-tensor, no zero point", &per_tensor, vec![], None, 1, 0),
+        ("per-axis", &per_axis, vec![3], Some(&zp_axis), 1, 0),
+        ("per-axis, no zero point", &per_axis, vec![3], None, 1, 0),
+        ("blocked", &blocked, vec![2, 3, 2], None, 0, 2),
+    ];
+
+    for (name, scale, scale_shape, zp, axis, block_size) in cases {
+        let scale_shape = if scale_shape.is_empty() {
+            vec![scale.len()]
+        } else {
+            scale_shape
+        };
+        let s_t = TensorView::from_slice(scale, scale_shape);
+        let zp_t = zp.map(|z| TensorView::from_slice(z, vec![z.len()]));
+
+        let mut q_buf = Vec::new();
+        let mut dq_buf = Vec::new();
+        let q = quantize_linear(
+            &x_t,
+            &s_t,
+            zp_t.as_ref(),
+            axis,
+            block_size,
+            0.0,
+            255.0,
+            &mut q_buf,
+        );
+        let unfused = dequantize_linear(&q, &s_t, zp_t.as_ref(), axis, block_size, &mut dq_buf);
+        let expected = unfused.data.to_vec();
+
+        let mut fused_buf = Vec::new();
+        let fused = fake_quantize_linear(
+            &x_t,
+            &s_t,
+            zp_t.as_ref(),
+            axis,
+            block_size,
+            0.0,
+            255.0,
+            &mut fused_buf,
+        );
+
+        assert_eq!(fused.shape, x_t.shape, "{name}: shape");
+        assert_eq!(fused.data.as_ref(), expected.as_slice(), "{name}");
+    }
+}
+
+#[test]
+fn test_fake_quantize_linear_saturates() {
+    // Inputs far outside the uint8 grid clamp to the ends of the range, which
+    // dequantize back to (qmin - zp) * scale and (qmax - zp) * scale.
+    let x = vec![-1e6f32, 1e6, 0.0];
+    let scale = vec![0.5f32];
+    let zp = vec![128.0f32];
+    let x_t = TensorView::from_slice(&x, vec![3]);
+    let s_t = TensorView::from_slice(&scale, vec![]);
+    let z_t = TensorView::from_slice(&zp, vec![]);
+
+    let mut buf = Vec::new();
+    let y = fake_quantize_linear(&x_t, &s_t, Some(&z_t), 1, 0, 0.0, 255.0, &mut buf);
+    assert_eq!(y.data.as_ref(), &[-64.0, 63.5, 0.0]);
+}
