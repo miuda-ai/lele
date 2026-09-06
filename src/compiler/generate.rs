@@ -271,7 +271,8 @@ pub(crate) fn infer_variable_types(
                 "Reshape" | "Unsqueeze" | "Squeeze" | "Slice" | "Flatten" | "Transpose"
                 | "Identity" | "Add" | "Sub" | "Mul" | "Div" | "Tile" | "Split" | "Expand"
                 | "Pow" | "Clip" | "PRelu" | "LeakyRelu" | "Range" | "ReduceSum" | "ReduceMean"
-                | "ReduceMax" | "Pad" | "MaxPool" | "Resize" | "Neg" | "GatherElements" => {
+                | "ReduceMax" | "ReduceProd" | "Pad" | "MaxPool" | "Resize" | "Neg"
+                | "GatherElements" => {
                     // All data-carrying inputs and outputs share the same type
                     let relevant_inputs: Vec<String> = if op == "Pad" {
                         node.input

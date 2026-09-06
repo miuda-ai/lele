@@ -416,6 +416,82 @@ pub unsafe fn fused_dq_gemm_avx2(
     }
 }
 
+/// Fused `QuantizeLinear` → `DequantizeLinear` round trip for a per-tensor
+/// scale and zero point.
+///
+/// The obvious loop is division bound rather than memory bound: `vdivps` retires
+/// one vector roughly every ten cycles, so even fully vectorized the round trip
+/// only manages about 1.4 elements per cycle. Multiplying by the reciprocal and
+/// refining once with an FMA — `q + (x - q*s) * (1/s)` — costs three cheap
+/// operations instead and leaves the loop bound by memory.
+///
+/// The refinement lands within half an ulp of the true quotient, so the integer
+/// code it rounds to can only disagree with an exact division where the true
+/// quotient falls on a rounding tie. NaN inputs clamp rather than propagate,
+/// because `vmaxps`/`vminps` return their second operand for NaN; quantized
+/// activations are finite by construction.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn fake_quantize_per_tensor_avx2(
+    src: *const f32,
+    dst: *mut f32,
+    len: usize,
+    scale: f32,
+    zero_point: f32,
+    qmin: f32,
+    qmax: f32,
+) {
+    unsafe {
+        let recip = 1.0f32 / scale;
+        let sv = _mm256_set1_ps(scale);
+        let rv = _mm256_set1_ps(recip);
+        let zv = _mm256_set1_ps(zero_point);
+        let lo = _mm256_set1_ps(qmin);
+        let hi = _mm256_set1_ps(qmax);
+
+        macro_rules! round_trip {
+            ($x:expr) => {{
+                let x = $x;
+                let q = _mm256_mul_ps(x, rv);
+                // One Newton step on the reciprocal quotient.
+                let q = _mm256_fmadd_ps(_mm256_fnmadd_ps(q, sv, x), rv, q);
+                let q = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(q);
+                let c = _mm256_min_ps(_mm256_max_ps(_mm256_add_ps(q, zv), lo), hi);
+                _mm256_mul_ps(_mm256_sub_ps(c, zv), sv)
+            }};
+        }
+
+        // Ordinary stores, deliberately: the output is read back by the very
+        // next operator, so a non-temporal store only forces a round trip to
+        // memory. Measured on Ice Lake it doubles the cost of the large
+        // tensors rather than saving the read-for-ownership traffic.
+        let mut i = 0;
+        while i + 32 <= len {
+            let r0 = round_trip!(_mm256_loadu_ps(src.add(i)));
+            let r1 = round_trip!(_mm256_loadu_ps(src.add(i + 8)));
+            let r2 = round_trip!(_mm256_loadu_ps(src.add(i + 16)));
+            let r3 = round_trip!(_mm256_loadu_ps(src.add(i + 24)));
+            _mm256_storeu_ps(dst.add(i), r0);
+            _mm256_storeu_ps(dst.add(i + 8), r1);
+            _mm256_storeu_ps(dst.add(i + 16), r2);
+            _mm256_storeu_ps(dst.add(i + 24), r3);
+            i += 32;
+        }
+        while i + 8 <= len {
+            _mm256_storeu_ps(dst.add(i), round_trip!(_mm256_loadu_ps(src.add(i))));
+            i += 8;
+        }
+        // The tail divides exactly; it is too short for the reciprocal to pay
+        // for itself and this keeps the fallback path's arithmetic.
+        while i < len {
+            let v = *src.add(i);
+            let q = (v / scale).round_ties_even() + zero_point;
+            *dst.add(i) = (q.clamp(qmin, qmax) - zero_point) * scale;
+            i += 1;
+        }
+    }
+}
+
 /// AVX2 vectorized f32→u8 conversion.
 /// Each f32 value is expected to be in [0, 255]; values are truncated to u8.
 #[cfg(target_arch = "x86_64")]

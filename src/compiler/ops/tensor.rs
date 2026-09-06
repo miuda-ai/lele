@@ -200,11 +200,33 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 tab, outputs[0], inputs[0], inputs[1], axis, buf_expr
             )?;
         }
-        "Shape" => writeln!(
-            w,
-            "{}let {} = lele::kernels::shape(&{});",
-            tab, outputs[0], inputs[0]
-        )?,
+        "Shape" => {
+            let attr = |name: &str| {
+                ctx.node
+                    .attribute
+                    .iter()
+                    .find(|a| a.name == name)
+                    .map(|a| a.i)
+            };
+            let (start, end) = (attr("start"), attr("end"));
+            if start.is_none() && end.is_none() {
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::shape(&{});",
+                    tab, outputs[0], inputs[0]
+                )?;
+            } else {
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::shape_slice(&{}, {}, {:?});",
+                    tab,
+                    outputs[0],
+                    inputs[0],
+                    start.unwrap_or(0),
+                    end
+                )?;
+            }
+        }
         "Size" => writeln!(
             w,
             "{}let {} = lele::kernels::size(&{});",
@@ -414,6 +436,94 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 w,
                 "{}let {} = lele::kernels::pad(&{}, {}, {}, {:?}, {});",
                 tab, outputs[0], inputs[0], pads_expr, constant_value, mode, buf_expr
+            )?;
+        }
+        "QuantizeLinear" | "DequantizeLinear" | "FakeQuantizeLinear" => {
+            let attr_i = |name: &str, default: i64| {
+                ctx.node
+                    .attribute
+                    .iter()
+                    .find(|a| a.name == name)
+                    .map(|a| a.i)
+                    .unwrap_or(default)
+            };
+            let axis = attr_i("axis", 1);
+            let block_size = attr_i("block_size", 0);
+            let zp_expr = match inputs.get(2) {
+                Some(zp) if !ctx.node.input[2].is_empty() => format!("Some(&{})", zp),
+                _ => "None".to_string(),
+            };
+            if op == "DequantizeLinear" {
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::dequantize_linear(&{}, &{}, {}, {}, {}, {});",
+                    tab, outputs[0], inputs[0], inputs[1], zp_expr, axis, block_size, buf_expr
+                )?;
+            } else {
+                // Saturation bounds come from `output_dtype` (opset 21+) or the
+                // zero-point dtype; ONNX defaults to uint8 when neither is given.
+                let zp_dt = ctx
+                    .node
+                    .input
+                    .get(2)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|zp| ctx.known_weights.get(&crate::compiler::sanitize_name(zp)))
+                    .map(|w| w.3);
+                let out_dt = ctx
+                    .node
+                    .attribute
+                    .iter()
+                    .find(|a| a.name == "output_dtype")
+                    .map(|a| a.i as i32)
+                    .or(zp_dt)
+                    .unwrap_or(2);
+                let (qmin, qmax) =
+                    crate::kernels::quant_range(out_dt).unwrap_or((0.0, 255.0));
+                let kernel = if op == "FakeQuantizeLinear" {
+                    "fake_quantize_linear"
+                } else {
+                    "quantize_linear"
+                };
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::{}(&{}, &{}, {}, {}, {}, {:?}, {:?}, {});",
+                    tab,
+                    outputs[0],
+                    kernel,
+                    inputs[0],
+                    inputs[1],
+                    zp_expr,
+                    axis,
+                    block_size,
+                    qmin,
+                    qmax,
+                    buf_expr
+                )?;
+            }
+        }
+        "QLinearMatMulI8" => {
+            // Produced by `Compiler::fuse_qdq_matmul`, so the weight is always
+            // an int8 initializer with a known blob offset. It is passed by
+            // offset rather than as a `TensorView` because the runtime packs it
+            // into an architecture-specific layout once and caches that.
+            let weight = crate::compiler::sanitize_name(&ctx.node.input[3]);
+            let Some((offset, len, shape, _)) = ctx.known_weights.get(&weight) else {
+                panic!("QLinearMatMulI8 weight {weight} is not a known initializer");
+            };
+            writeln!(
+                w,
+                "{}let {} = self.qmatmul_i8(&{}, &{}, &{}, {}, {}, {}, {}, &{}, {});",
+                tab,
+                outputs[0],
+                inputs[0],
+                inputs[1],
+                inputs[2],
+                offset,
+                len,
+                shape[0],
+                shape[1],
+                inputs[4],
+                buf_expr
             )?;
         }
         "DynamicQuantizeLinear" => {

@@ -974,68 +974,48 @@ fn im2col(
             }
             return;
         }
+    }
 
-        // Scalar fallback
+    // Row-contiguous path: any row stride, unit column stride and dilation. One
+    // output row is then a single memcpy out of one input row, so the strided
+    // downsampling convolutions in a ResNet stem never touch the per-element
+    // general path below.
+    if stride_w == 1 && dilation_h == 1 && dilation_w == 1 {
         for c in 0..channels {
             let ch_offset = batch_offset + (ch_start + c) * in_h * in_w;
             for kh in 0..kernel_h {
                 for kw in 0..kernel_w {
                     let col_row_offset = ((c * kernel_h + kh) * kernel_w + kw) * spatial_cols;
 
-                    let oh_start = if kh < pad_top { pad_top - kh } else { 0 };
-                    let oh_end = (in_h + pad_top).saturating_sub(kh).min(out_h);
-                    let ow_start = if kw < pad_left { pad_left - kw } else { 0 };
+                    // Columns whose source `iw = ow + kw - pad_left` is in range.
+                    let ow_start = pad_left.saturating_sub(kw).min(out_w);
                     let ow_end = (in_w + pad_left).saturating_sub(kw).min(out_w);
-                    let iw_start = (ow_start + kw) as isize - pad_left as isize;
+                    let iw_start = (ow_start + kw).saturating_sub(pad_left);
                     let count = ow_end.saturating_sub(ow_start);
 
-                    // Zero the top padding rows
-                    unsafe {
-                        let col_ptr = col.as_mut_ptr().add(col_row_offset);
-                        if oh_start > 0 {
-                            std::ptr::write_bytes(col_ptr, 0, oh_start * out_w);
-                        }
-                    }
-
-                    // Process valid rows
-                    for oh in oh_start..oh_end {
-                        let ih = (oh + kh) as isize - pad_top as isize;
-                        let ih = ih as usize;
-                        let in_row_offset = ch_offset + ih * in_w;
+                    for oh in 0..out_h {
+                        let ih = (oh * stride_h + kh * dilation_h) as isize - pad_top as isize;
                         let col_base = col_row_offset + oh * out_w;
-
                         unsafe {
                             let col_ptr = col.as_mut_ptr().add(col_base);
-                            let in_ptr = input.as_ptr().add(in_row_offset);
-
-                            // Zero left padding
+                            if ih < 0 || ih >= in_h as isize {
+                                std::ptr::write_bytes(col_ptr, 0, out_w);
+                                continue;
+                            }
+                            let in_ptr = input.as_ptr().add(ch_offset + ih as usize * in_w);
                             if ow_start > 0 {
                                 std::ptr::write_bytes(col_ptr, 0, ow_start);
                             }
-                            // Copy valid region
                             if count > 0 {
                                 std::ptr::copy_nonoverlapping(
-                                    in_ptr.add(iw_start as usize),
+                                    in_ptr.add(iw_start),
                                     col_ptr.add(ow_start),
                                     count,
                                 );
                             }
-                            // Zero right padding
                             if ow_end < out_w {
                                 std::ptr::write_bytes(col_ptr.add(ow_end), 0, out_w - ow_end);
                             }
-                        }
-                    }
-
-                    // Zero the bottom padding rows
-                    unsafe {
-                        let col_ptr = col.as_mut_ptr().add(col_row_offset);
-                        if oh_end < out_h {
-                            std::ptr::write_bytes(
-                                col_ptr.add(oh_end * out_w),
-                                0,
-                                (out_h - oh_end) * out_w,
-                            );
                         }
                     }
                 }
@@ -1044,7 +1024,7 @@ fn im2col(
         return;
     }
 
-    // General path for non-unit stride/dilation
+    // General path for non-unit column stride/dilation
     for c in 0..channels {
         let in_ch = ch_start + c;
         let ch_offset = batch_offset + in_ch * in_h * in_w;
@@ -3801,8 +3781,11 @@ unsafe fn depthwise_conv2d_3x3_s1_avx2(
     use std::arch::x86_64::*;
     let zero_v = _mm256_setzero_ps();
     let pad = 1usize;
-    let first_valid_oh = pad;
-    let last_valid_oh = in_h.saturating_sub(pad);
+    // The top and bottom output rows read one input row that does not exist.
+    // Pointing those taps at a row of zeros keeps every output row on the same
+    // vector path; branching to a scalar path for them instead costs 2/in_h of
+    // the work, and in_h here is as small as 5.
+    let zero_row = vec![0.0f32; in_w];
 
     for n in 0..batch {
         for c in 0..channels {
@@ -3828,11 +3811,18 @@ unsafe fn depthwise_conv2d_3x3_s1_avx2(
                 let out_row = out_base + oh * out_w;
                 let mut ow = 0usize;
 
-                if oh >= first_valid_oh && oh < last_valid_oh {
-                    // Fully valid rows: all 3 input rows are in bounds
-                    let r0 = input.as_ptr().add(in_base + (oh - 1) * in_w);
-                    let r1 = input.as_ptr().add(in_base + oh * in_w);
-                    let r2 = input.as_ptr().add(in_base + (oh + 1) * in_w);
+                {
+                    let row = |ki: usize| {
+                        let ih = oh + ki;
+                        if ih >= pad && ih < in_h + pad {
+                            input.as_ptr().add(in_base + (ih - pad) * in_w)
+                        } else {
+                            zero_row.as_ptr()
+                        }
+                    };
+                    let r0 = row(0);
+                    let r1 = row(1);
+                    let r2 = row(2);
 
                     // Scalar: ow=0 (left pad)
                     {
@@ -3875,31 +3865,27 @@ unsafe fn depthwise_conv2d_3x3_s1_avx2(
                     while ow < out_w {
                         let off = ow - 1;
                         let mut s = bias.map(|b| *b.get_unchecked(c)).unwrap_or(0.0f32);
-                        s += *r0.add(off)     * *weight.get_unchecked(w_base);
-                        s += *r0.add(off + 1) * *weight.get_unchecked(w_base + 1);
-                        s += *r0.add(off + 2) * *weight.get_unchecked(w_base + 2);
-                        s += *r1.add(off)     * *weight.get_unchecked(w_base + 3);
-                        s += *r1.add(off + 1) * *weight.get_unchecked(w_base + 4);
-                        s += *r1.add(off + 2) * *weight.get_unchecked(w_base + 5);
-                        s += *r2.add(off)     * *weight.get_unchecked(w_base + 6);
-                        s += *r2.add(off + 1) * *weight.get_unchecked(w_base + 7);
-                        s += *r2.add(off + 2) * *weight.get_unchecked(w_base + 8);
-                        let v = if act == Activation::Relu && s < 0.0 { 0.0 } else { s };
-                        *out.get_unchecked_mut(out_row + ow) = v;
-                        ow += 1;
-                    }
-                } else {
-                    // Edge rows: use generic scalar
-                    while ow < out_w {
-                        let mut s = bias.map(|b| *b.get_unchecked(c)).unwrap_or(0.0f32);
-                        for ki in 0..3usize {
-                            let ih = oh + ki;
-                            if ih < pad || ih >= in_h + pad { continue; }
-                            let rp = input.as_ptr().add(in_base + (ih - pad) * in_w);
-                            for kj in 0..3usize {
-                                let iw = ow + kj;
-                                if iw < pad || iw >= in_w + pad { continue; }
-                                s += *rp.add(iw - pad) * *weight.get_unchecked(w_base + ki * 3 + kj);
+                        if off + 3 <= in_w {
+                            // Whole 3-wide window is inside the row.
+                            s += *r0.add(off)     * *weight.get_unchecked(w_base);
+                            s += *r0.add(off + 1) * *weight.get_unchecked(w_base + 1);
+                            s += *r0.add(off + 2) * *weight.get_unchecked(w_base + 2);
+                            s += *r1.add(off)     * *weight.get_unchecked(w_base + 3);
+                            s += *r1.add(off + 1) * *weight.get_unchecked(w_base + 4);
+                            s += *r1.add(off + 2) * *weight.get_unchecked(w_base + 5);
+                            s += *r2.add(off)     * *weight.get_unchecked(w_base + 6);
+                            s += *r2.add(off + 1) * *weight.get_unchecked(w_base + 7);
+                            s += *r2.add(off + 2) * *weight.get_unchecked(w_base + 8);
+                        } else {
+                            // Right edge: taps past the row are zero padding.
+                            for ki in 0..3usize {
+                                let rp = [r0, r1, r2][ki];
+                                for kj in 0..3usize {
+                                    if off + kj < in_w {
+                                        s += *rp.add(off + kj)
+                                            * *weight.get_unchecked(w_base + ki * 3 + kj);
+                                    }
+                                }
                             }
                         }
                         let v = if act == Activation::Relu && s < 0.0 { 0.0 } else { s };
