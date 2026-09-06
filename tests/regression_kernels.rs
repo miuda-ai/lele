@@ -1252,3 +1252,44 @@ fn test_fake_quantize_linear_saturates() {
     let y = fake_quantize_linear(&x_t, &s_t, Some(&z_t), 1, 0, 0.0, 255.0, &mut buf);
     assert_eq!(y.data.as_ref(), &[-64.0, 63.5, 0.0]);
 }
+
+/// The compiler fuses `Div -> Erf -> Add -> Mul -> Mul` into `gelu_erf`, so the
+/// fused kernel has to reproduce that chain bit for bit. `gelu` folds the
+/// division into a reciprocal multiply and reassociates, so it does not.
+#[test]
+fn test_gelu_erf_matches_unfused_chain() {
+    // Spans the saturating tails of erf as well as the linear region, and
+    // deliberately has a length that is not a multiple of the 32- or 8-wide
+    // blocks so the scalar tail runs too.
+    let n = 1000 + 7;
+    let x: Vec<f32> = (0..n).map(|i| (i as f32 - n as f32 / 2.0) * 0.01).collect();
+    let x_t = TensorView::from_slice(&x, vec![n]);
+
+    let sqrt2 = [std::f32::consts::SQRT_2];
+    let one = [1.0f32];
+    let half = [0.5f32];
+    let sqrt2_t = TensorView::from_slice(&sqrt2, vec![]);
+    let one_t = TensorView::from_slice(&one, vec![]);
+    let half_t = TensorView::from_slice(&half, vec![]);
+
+    let (mut b0, mut b1, mut b2, mut b3, mut b4) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let scaled = div(&x_t, &sqrt2_t, &mut b0);
+    let e = erf(&scaled, &mut b1);
+    let shifted = add(&e, &one_t, &mut b2);
+    let halved = mul(&half_t, &shifted, &mut b3);
+    let expected = mul(&x_t, &halved, &mut b4).data.to_vec();
+
+    let mut fused_buf = Vec::new();
+    let fused = gelu_erf(&x_t, &mut fused_buf);
+
+    assert_eq!(fused.shape.as_ref(), &[n]);
+    for (i, (&got, &want)) in fused.data.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "gelu_erf differs at index {i} (x = {}): got {got}, want {want}",
+            x[i]
+        );
+    }
+}

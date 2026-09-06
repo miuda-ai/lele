@@ -1128,6 +1128,36 @@ pub fn reciprocal<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> Tens
 }
 
 /// Standard GELU activation: x * 0.5 * (1 + erf(x / sqrt(2)))
+/// GELU evaluated in the exact operation order of the ONNX
+/// `Div -> Erf -> Add -> Mul -> Mul` subgraph the compiler fuses:
+/// `x * (0.5 * (1 + erf(x / sqrt(2))))`.
+///
+/// [`gelu`] is the same function with the division folded into a multiply and
+/// the multiplies reassociated, which costs a fraction of an ulp. Fusing a
+/// graph must not change results, so the compiler emits this instead.
+pub fn gelu_erf<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let numel = input.data.len();
+        utils::ensure_capacity(out, numel);
+        unsafe {
+            crate::kernels::avx::math::gelu_erf_kernel(
+                input.data.as_ptr(),
+                out.as_mut_ptr(),
+                numel,
+            );
+        }
+        TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(input.shape.to_vec()),
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        gelu(input, out)
+    }
+}
+
 pub fn gelu<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     #[cfg(target_arch = "aarch64")]
     {
