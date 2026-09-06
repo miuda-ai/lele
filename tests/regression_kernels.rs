@@ -130,28 +130,30 @@ fn test_conv2d_3x3_stride2() {
     assert_close(&result.data, &expected, 1e-3, "conv2d_3x3_s2");
 }
 
-#[test]
-fn test_conv2d_depthwise_3x3_s1() {
-    let groups = 4;
-    let (n, ih, iw) = (1, 10, 10);
+/// Runs a 3x3 stride-1 pad-1 depthwise conv through the dedicated depthwise
+/// path and through the generic im2col+GEMM path (same conv, weights expanded
+/// to a dense block-diagonal kernel) and asserts the two agree.
+fn assert_depthwise_matches_im2col(
+    n: usize,
+    groups: usize,
+    ih: usize,
+    iw: usize,
+    input: &[f32],
+    weight: &[f32],
+    name: &str,
+) {
     let (kh, kw) = (3, 3);
-
-    let input: Vec<f32> = (0..n * groups * ih * iw).map(|i| i as f32 * 0.2 - 3.0).collect();
-    let weight: Vec<f32> = (0..groups * kh * kw).map(|i| i as f32 * 0.1 - 0.5).collect();
-
-    let inp_t = TensorView::from_slice(&input, vec![n, groups, ih, iw]);
-    let w_dw = TensorView::from_slice(&weight, vec![groups, 1, kh, kw]);
+    let inp_t = TensorView::from_slice(input, vec![n, groups, ih, iw]);
+    let w_dw = TensorView::from_slice(weight, vec![groups, 1, kh, kw]);
 
     let mut out_buf = Vec::new();
     let result = conv2d(&inp_t, &w_dw, None, &[1, 1], groups as i64, &[1, 1, 1, 1], &[1, 1], &mut out_buf);
 
-    // Verify output shape is correct
     assert_eq!(result.shape.as_ref(), &[n, groups, ih, iw]);
-    // Verify all values are finite
     for v in result.data.iter() {
-        assert!(v.is_finite(), "depthwise output should be finite");
+        assert!(v.is_finite(), "{}: depthwise output should be finite", name);
     }
-    // Cross-check: run via im2col path with expanded weights
+
     let mut full_w = vec![0.0f32; groups * groups * kh * kw];
     for g in 0..groups {
         for k in 0..kh * kw {
@@ -161,10 +163,37 @@ fn test_conv2d_depthwise_3x3_s1() {
     let w_full = TensorView::from_slice(&full_w, vec![groups, groups, kh, kw]);
     let mut out_buf2 = Vec::new();
     let ref_result = conv2d_fused(&inp_t, &w_full, None, &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], false, &mut out_buf2);
-    assert_close(&result.data, &ref_result.data, 600.0, "dw_3x3_s1_crosscheck");
-    // TODO: investigate why depthwise 4ch path differs from im2col+GEMM
-    // The difference only manifests with small group counts; the production
-    // model uses groups=64/128 where the AVX2 path matches well.
+    assert_close(&result.data, &ref_result.data, 1e-3, name);
+}
+
+#[test]
+fn test_conv2d_depthwise_3x3_s1() {
+    // iw = 10 leaves a 2-wide scalar tail after the 8-wide vector block, so the
+    // right-edge padding column is produced by the tail path.
+    let groups = 4;
+    let (n, ih, iw) = (1, 10, 10);
+    let input: Vec<f32> = (0..n * groups * ih * iw).map(|i| i as f32 * 0.2 - 3.0).collect();
+    let weight: Vec<f32> = (0..groups * 9).map(|i| i as f32 * 0.1 - 0.5).collect();
+    assert_depthwise_matches_im2col(n, groups, ih, iw, &input, &weight, "dw_3x3_s1_crosscheck");
+}
+
+#[test]
+fn test_conv2d_depthwise_3x3_s1_widths() {
+    // Sweep widths so the last output column is produced by each of the vector
+    // block boundary cases: no vector iterations, exact multiples of 8, and
+    // assorted remainders.
+    let groups = 3;
+    let (n, ih) = (1, 5);
+    for iw in [1usize, 2, 3, 7, 8, 9, 15, 16, 17, 24] {
+        let input: Vec<f32> = (0..n * groups * ih * iw)
+            .map(|i| (i % 53) as f32 * 0.11 - 2.0)
+            .collect();
+        let weight: Vec<f32> = (0..groups * 9).map(|i| (i % 17) as f32 * 0.07 - 0.4).collect();
+        assert_depthwise_matches_im2col(
+            n, groups, ih, iw, &input, &weight,
+            &format!("dw_3x3_s1_iw{}", iw),
+        );
+    }
 }
 
 #[test]
@@ -175,17 +204,7 @@ fn test_conv2d_depthwise_3x3_s1_64ch() {
 
     let input: Vec<f32> = (0..n * groups * ih * iw).map(|i| (i % 97) as f32 * 0.07 - 1.0).collect();
     let weight: Vec<f32> = (0..groups * kh * kw).map(|i| (i % 31) as f32 * 0.05 - 0.3).collect();
-
-    let inp_t = TensorView::from_slice(&input, vec![n, groups, ih, iw]);
-    let w_dw = TensorView::from_slice(&weight, vec![groups, 1, kh, kw]);
-
-    let mut out_buf = Vec::new();
-    let result = conv2d(&inp_t, &w_dw, None, &[1, 1], groups as i64, &[1, 1, 1, 1], &[1, 1], &mut out_buf);
-
-    assert_eq!(result.shape.as_ref(), &[n, groups, ih, iw]);
-    for v in result.data.iter() {
-        assert!(v.is_finite(), "depthwise output should be finite");
-    }
+    assert_depthwise_matches_im2col(n, groups, ih, iw, &input, &weight, "dw_3x3_s1_64ch");
 }
 
 #[test]
@@ -196,17 +215,7 @@ fn test_conv2d_depthwise_3x3_s1_128ch() {
 
     let input: Vec<f32> = (0..n * groups * ih * iw).map(|i| (i % 73) as f32 * 0.03).collect();
     let weight: Vec<f32> = (0..groups * kh * kw).map(|i| (i % 19) as f32 * 0.1 - 0.5).collect();
-
-    let inp_t = TensorView::from_slice(&input, vec![n, groups, ih, iw]);
-    let w_dw = TensorView::from_slice(&weight, vec![groups, 1, kh, kw]);
-
-    let mut out_buf = Vec::new();
-    let result = conv2d(&inp_t, &w_dw, None, &[1, 1], groups as i64, &[1, 1, 1, 1], &[1, 1], &mut out_buf);
-
-    assert_eq!(result.shape.as_ref(), &[n, groups, ih, iw]);
-    for v in result.data.iter() {
-        assert!(v.is_finite(), "depthwise output should be finite");
-    }
+    assert_depthwise_matches_im2col(n, groups, ih, iw, &input, &weight, "dw_3x3_s1_128ch");
 }
 
 #[test]
