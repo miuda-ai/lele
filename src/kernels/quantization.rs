@@ -2234,6 +2234,30 @@ pub fn dequantize_linear<'a>(
     TensorView::from_slice(out.as_slice(), x.shape.to_vec())
 }
 
+/// Fused `QuantizeLinear` → `DequantizeLinear` round trip ("fake quantize").
+///
+/// QDQ graphs express activation quantization as a `QuantizeLinear` immediately
+/// followed by a `DequantizeLinear` sharing the same scale and zero point, so
+/// the pair is a no-op on the tensor type and only exists to clamp the value to
+/// the quantization grid. Computing both steps in a single pass gives a
+/// bit-identical result while halving the memory traffic and removing the
+/// intermediate buffer.
+pub fn fake_quantize_linear<'a>(
+    x: &TensorView<'_, f32>,
+    scale: &TensorView<'_, f32>,
+    zero_point: Option<&TensorView<'_, f32>>,
+    axis: i64,
+    block_size: usize,
+    qmin: f32,
+    qmax: f32,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a, f32> {
+    qdq_apply(x, scale, zero_point, axis, block_size, out, |v, s, z| {
+        (((v / s).round_ties_even() + z).clamp(qmin, qmax) - z) * s
+    });
+    TensorView::from_slice(out.as_slice(), x.shape.to_vec())
+}
+
 /// Saturation bounds for an ONNX integer tensor element type.
 /// Returns `None` for types that are not valid quantization targets.
 pub fn quant_range(onnx_dtype: i32) -> Option<(f32, f32)> {

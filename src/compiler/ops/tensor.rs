@@ -438,7 +438,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 tab, outputs[0], inputs[0], pads_expr, constant_value, mode, buf_expr
             )?;
         }
-        "QuantizeLinear" | "DequantizeLinear" => {
+        "QuantizeLinear" | "DequantizeLinear" | "FakeQuantizeLinear" => {
             let attr_i = |name: &str, default: i64| {
                 ctx.node
                     .attribute
@@ -479,11 +479,17 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                     .unwrap_or(2);
                 let (qmin, qmax) =
                     crate::kernels::quant_range(out_dt).unwrap_or((0.0, 255.0));
+                let kernel = if op == "FakeQuantizeLinear" {
+                    "fake_quantize_linear"
+                } else {
+                    "quantize_linear"
+                };
                 writeln!(
                     w,
-                    "{}let {} = lele::kernels::quantize_linear(&{}, &{}, {}, {}, {}, {:?}, {:?}, {});",
+                    "{}let {} = lele::kernels::{}(&{}, &{}, {}, {}, {}, {:?}, {:?}, {});",
                     tab,
                     outputs[0],
+                    kernel,
                     inputs[0],
                     inputs[1],
                     zp_expr,

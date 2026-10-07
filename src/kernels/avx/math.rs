@@ -522,6 +522,50 @@ pub unsafe fn exp_kernel(input: *const f32, output: *mut f32, len: usize) {
     }
 }
 
+/// AVX2 GELU buffer kernel evaluated in the exact operation order an ONNX
+/// `Div -> Erf -> Add -> Mul -> Mul` subgraph uses: `x * (0.5 * (1 + erf(x /
+/// sqrt(2))))`, dividing rather than multiplying by the reciprocal.
+///
+/// [`gelu_kernel`] folds the division into a multiply and associates the
+/// multiplies differently, which is a fraction of an ulp off. This variant
+/// exists so the compiler can fuse that subgraph without moving any bits.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn gelu_erf_kernel(input: *const f32, output: *mut f32, len: usize) {
+    let sqrt2 = _mm256_set1_ps(std::f32::consts::SQRT_2);
+    let half = _mm256_set1_ps(0.5f32);
+    let one = _mm256_set1_ps(1.0f32);
+    // out = x * (0.5 * (1 + erf(x / sqrt2)))
+    macro_rules! gelu {
+        ($x:expr) => {{
+            let e = avx2_erf_ps(_mm256_div_ps($x, sqrt2));
+            _mm256_mul_ps($x, _mm256_mul_ps(half, _mm256_add_ps(one, e)))
+        }};
+    }
+    let mut i = 0;
+    while i + 32 <= len {
+        let x0 = _mm256_loadu_ps(input.add(i));
+        let x1 = _mm256_loadu_ps(input.add(i + 8));
+        let x2 = _mm256_loadu_ps(input.add(i + 16));
+        let x3 = _mm256_loadu_ps(input.add(i + 24));
+        _mm256_storeu_ps(output.add(i), gelu!(x0));
+        _mm256_storeu_ps(output.add(i + 8), gelu!(x1));
+        _mm256_storeu_ps(output.add(i + 16), gelu!(x2));
+        _mm256_storeu_ps(output.add(i + 24), gelu!(x3));
+        i += 32;
+    }
+    while i + 8 <= len {
+        let x = _mm256_loadu_ps(input.add(i));
+        _mm256_storeu_ps(output.add(i), gelu!(x));
+        i += 8;
+    }
+    while i < len {
+        let x = *input.add(i);
+        *output.add(i) = x * (0.5 * (1.0 + libm::erff(x / std::f32::consts::SQRT_2)));
+        i += 1;
+    }
+}
+
 /// AVX2 GELU buffer kernel: out[i] = x * 0.5 * (1 + erf(x / sqrt(2)))
 /// Uses avx2_erf_ps for accurate computation (max error ~1.5e-7).
 /// 4-way unrolled to match throughput of add_f32/mul_f32.

@@ -1357,9 +1357,16 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 if !uses_erf { return None; }
                 let mul1_out = &nodes[3].output[0];
                 let uses_add = nodes[3].input[0] == *add_out || nodes[3].input[1] == *add_out;
-                let uses_input = nodes[3].input[0] == *gelu_input || nodes[3].input[1] == *gelu_input;
-                if !uses_add || !uses_input { return None; }
-                if nodes[4].input[0] != *mul1_out { return None; }
+                if !uses_add { return None; }
+                let chains = nodes[4].input[0] == *mul1_out || nodes[4].input[1] == *mul1_out;
+                if !chains { return None; }
+                // The two Muls apply the GELU input and the 0.5 scale in either
+                // order: `(x * (1 + erf)) * 0.5` or `x * (0.5 * (1 + erf))`.
+                // Exactly one of them must take the input; the other takes the
+                // constant.
+                let mul1_uses_input = nodes[3].input[0] == *gelu_input || nodes[3].input[1] == *gelu_input;
+                let mul2_uses_input = nodes[4].input[0] == *gelu_input || nodes[4].input[1] == *gelu_input;
+                if mul1_uses_input == mul2_uses_input { return None; }
                 Some(5)
             }),
             generator: Box::new(|nodes, _weights, allocator, w, indent| {
@@ -1379,11 +1386,98 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 };
                 writeln!(
                     w,
-                    "{}let {} = lele::kernels::gelu(&{}, {});",
+                    "{}let {} = lele::kernels::gelu_erf(&{}, {});",
                     tab, output_name, input, buf_expr
                 )?;
                 Ok(())
             }),
         },
     ]
+}
+
+#[cfg(test)]
+mod gelu_pattern_tests {
+    use super::*;
+    use crate::model::onnx_proto::NodeProto;
+
+    fn node(op: &str, inputs: &[&str], output: &str) -> NodeProto {
+        NodeProto {
+            op_type: op.to_string(),
+            input: inputs.iter().map(|s| s.to_string()).collect(),
+            output: vec![output.to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn matches(nodes: &[NodeProto]) -> Option<usize> {
+        let pattern = get_default_patterns()
+            .into_iter()
+            .find(|p| p.name == "GELU (Erf)")
+            .expect("GELU (Erf) pattern");
+        let refs: Vec<&NodeProto> = nodes.iter().collect();
+        (pattern.matcher)(&refs)
+    }
+
+    /// `(x * (1 + erf(x / sqrt2))) * 0.5`
+    #[test]
+    fn matches_scale_applied_last() {
+        let nodes = [
+            node("Div", &["x", "sqrt2"], "d"),
+            node("Erf", &["d"], "e"),
+            node("Add", &["e", "one"], "a"),
+            node("Mul", &["x", "a"], "m1"),
+            node("Mul", &["m1", "half"], "y"),
+        ];
+        assert_eq!(matches(&nodes), Some(5));
+    }
+
+    /// `x * (0.5 * (1 + erf(x / sqrt2)))`, which is what torch.onnx emits.
+    #[test]
+    fn matches_scale_applied_first() {
+        let nodes = [
+            node("Div", &["x", "sqrt2"], "d"),
+            node("Erf", &["d"], "e"),
+            node("Add", &["e", "one"], "a"),
+            node("Mul", &["half", "a"], "m1"),
+            node("Mul", &["x", "m1"], "y"),
+        ];
+        assert_eq!(matches(&nodes), Some(5));
+    }
+
+    #[test]
+    fn rejects_chain_that_never_multiplies_by_the_input() {
+        // Both Muls take constants, so this is not GELU of `x`.
+        let nodes = [
+            node("Div", &["x", "sqrt2"], "d"),
+            node("Erf", &["d"], "e"),
+            node("Add", &["e", "one"], "a"),
+            node("Mul", &["half", "a"], "m1"),
+            node("Mul", &["m1", "half"], "y"),
+        ];
+        assert_eq!(matches(&nodes), None);
+    }
+
+    #[test]
+    fn rejects_chain_that_multiplies_by_the_input_twice() {
+        let nodes = [
+            node("Div", &["x", "sqrt2"], "d"),
+            node("Erf", &["d"], "e"),
+            node("Add", &["e", "one"], "a"),
+            node("Mul", &["x", "a"], "m1"),
+            node("Mul", &["x", "m1"], "y"),
+        ];
+        assert_eq!(matches(&nodes), None);
+    }
+
+    #[test]
+    fn rejects_second_mul_that_does_not_consume_the_first() {
+        let nodes = [
+            node("Div", &["x", "sqrt2"], "d"),
+            node("Erf", &["d"], "e"),
+            node("Add", &["e", "one"], "a"),
+            node("Mul", &["half", "a"], "m1"),
+            node("Mul", &["x", "other"], "y"),
+        ];
+        assert_eq!(matches(&nodes), None);
+    }
 }
