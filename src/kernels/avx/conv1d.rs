@@ -63,10 +63,11 @@ pub unsafe fn conv1d_direct_k3_x86(
                             for ic in 0..in_channels {
                                 let in_ptr_base = in_base.add(ic * in_stride_ch);
 
-                                // Because unaligned loads are cheap on AVX2
-                                let v_left = _mm256_loadu_ps(in_ptr_base.offset(t_in_start - 1));
-                                let v_center = _mm256_loadu_ps(in_ptr_base.offset(t_in_start));
-                                let v_right = _mm256_loadu_ps(in_ptr_base.offset(t_in_start + 1));
+                                // Because unaligned loads are cheap on AVX2.
+                                // Tap k covers input[t_in_start + k], k in 0..3.
+                                let v_left = _mm256_loadu_ps(in_ptr_base.offset(t_in_start));
+                                let v_center = _mm256_loadu_ps(in_ptr_base.offset(t_in_start + 1));
+                                let v_right = _mm256_loadu_ps(in_ptr_base.offset(t_in_start + 2));
 
                                 // Weights
                                 let w0 = w_base0.add(ic * 3);
@@ -108,9 +109,9 @@ pub unsafe fn conv1d_direct_k3_x86(
                             for ic in 0..in_channels {
                                 let in_ptr_base = in_base.add(ic * in_stride_ch);
                                 // Load using scalar loads into temporary array
-                                let mut tmp = [0.0f32; 10]; // t-1 to t+8 (10 elements)
+                                let mut tmp = [0.0f32; 10]; // t_in_start .. t_in_start+9
                                 for k in 0..10 {
-                                    let idx = t_in_start - 1 + k as isize;
+                                    let idx = t_in_start + k as isize;
                                     if idx >= 0 && idx < limit {
                                         tmp[k] = *in_ptr_base.add(idx as usize);
                                     }

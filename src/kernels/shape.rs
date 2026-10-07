@@ -196,6 +196,23 @@ pub fn shape<T: Clone + std::fmt::Debug>(input: &TensorView<T>) -> TensorView<'s
     let rank = input.dim();
     TensorView::from_owned(shape_data, vec![rank])
 }
+/// ONNX `Shape` with the opset-15 `start`/`end` attributes: returns
+/// `shape[start:end]`, where both bounds may be negative and are clamped to the
+/// rank. `end == None` means "to the end".
+pub fn shape_slice<T: Clone + std::fmt::Debug>(
+    input: &TensorView<T>,
+    start: i64,
+    end: Option<i64>,
+) -> TensorView<'static, i64> {
+    let rank = input.dim() as i64;
+    let clamp = |v: i64| (if v < 0 { v + rank } else { v }).clamp(0, rank) as usize;
+    let start = clamp(start);
+    let end = clamp(end.unwrap_or(rank)).max(start);
+    let shape_data: Vec<i64> = input.shape[start..end].iter().map(|&x| x as i64).collect();
+    let len = shape_data.len();
+    TensorView::from_owned(shape_data, vec![len])
+}
+
 pub fn flatten<'a, T: Clone + std::fmt::Debug>(
     input: &TensorView<'a, T>,
     axis: i64,
