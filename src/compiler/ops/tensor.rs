@@ -501,6 +501,31 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 )?;
             }
         }
+        "QLinearMatMulI8" => {
+            // Produced by `Compiler::fuse_qdq_matmul`, so the weight is always
+            // an int8 initializer with a known blob offset. It is passed by
+            // offset rather than as a `TensorView` because the runtime packs it
+            // into an architecture-specific layout once and caches that.
+            let weight = crate::compiler::sanitize_name(&ctx.node.input[3]);
+            let Some((offset, len, shape, _)) = ctx.known_weights.get(&weight) else {
+                panic!("QLinearMatMulI8 weight {weight} is not a known initializer");
+            };
+            writeln!(
+                w,
+                "{}let {} = self.qmatmul_i8(&{}, &{}, &{}, {}, {}, {}, {}, &{}, {});",
+                tab,
+                outputs[0],
+                inputs[0],
+                inputs[1],
+                inputs[2],
+                offset,
+                len,
+                shape[0],
+                shape[1],
+                inputs[4],
+                buf_expr
+            )?;
+        }
         "DynamicQuantizeLinear" => {
             writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[0])?;
             writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[1])?;

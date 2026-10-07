@@ -1293,3 +1293,306 @@ fn test_gelu_erf_matches_unfused_chain() {
         );
     }
 }
+
+/// Builds a static-QDQ layer: an activation already snapped onto its
+/// quantization grid, and an int8 weight with a per-output-channel scale.
+fn qdq_layer(
+    m: usize,
+    k: usize,
+    n: usize,
+) -> (Vec<f32>, f32, f32, Vec<u8>, Vec<f32>, Vec<f32>) {
+    let a_scale = 0.0037f32;
+    let a_zp = 131f32;
+    // Activation codes are uint8, so the dequantized value is exactly
+    // scale * (code - zero_point).
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| a_scale * ((i * 37 % 256) as f32 - a_zp))
+        .collect();
+    let w_i8: Vec<i8> = (0..k * n)
+        .map(|i| ((i * 53 % 255) as i32 - 127) as i8)
+        .collect();
+    let raw: Vec<u8> = w_i8.iter().map(|&v| v as u8).collect();
+    let w_scale: Vec<f32> = (0..n).map(|j| 0.001 + (j % 7) as f32 * 1e-4).collect();
+    // Reference weight, dequantized the way the unfused graph would.
+    let w_f32: Vec<f32> = (0..k * n)
+        .map(|i| w_i8[i] as f32 * w_scale[i % n])
+        .collect();
+    (a, a_scale, a_zp, raw, w_scale, w_f32)
+}
+
+#[test]
+fn test_qmatmul_i8_matches_dequantized_matmul() {
+    // Shapes chosen to exercise the row tail (400 % 6) and the column tail
+    // (100 % 64) of the packed kernel, plus one clean shape.
+    for &(m, k, n) in &[(7usize, 12usize, 20usize), (13, 36, 100), (64, 128, 64)] {
+        let (a, a_scale, a_zp, raw, w_scale, w_f32) = qdq_layer(m, k, n);
+        let a_view = TensorView::from_slice(&a, vec![m, k]);
+        let w_view = TensorView::from_slice(&w_f32, vec![k, n]);
+        let mut expected_buf = Vec::new();
+        let expected = lele::kernels::matmul(&a_view, &w_view, &mut expected_buf);
+
+        let qw = lele::kernels::prepare_quantized_weights(&raw, k, n, &w_scale);
+        let scale_view = TensorView::from_slice(std::slice::from_ref(&a_scale), vec![]);
+        let zp_view = TensorView::from_slice(std::slice::from_ref(&a_zp), vec![]);
+        let mut got_buf = Vec::new();
+        let got = lele::kernels::qmatmul_i8(&a_view, &scale_view, &zp_view, &qw, &mut got_buf);
+
+        assert_eq!(got.shape.as_ref(), &[m, n]);
+        // The integer path accumulates exactly and scales once at the end, so
+        // it differs from the f32 reference only by f32 rounding of the inputs.
+        let tol = 2e-4 * (k as f32).sqrt();
+        for (i, (&g, &e)) in got.data.iter().zip(expected.data.iter()).enumerate() {
+            assert!(
+                (g - e).abs() <= tol * e.abs().max(1.0),
+                "qmatmul_i8 differs at {i} for m={m} k={k} n={n}: got {g}, want {e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_qmatmul_i8_handles_batched_activations() {
+    let (m, k, n) = (5usize, 16usize, 32usize);
+    let batch = 3usize;
+    let (a, a_scale, a_zp, raw, w_scale, w_f32) = qdq_layer(batch * m, k, n);
+    let a_view = TensorView::from_slice(&a, vec![batch, m, k]);
+    let w_view = TensorView::from_slice(&w_f32, vec![k, n]);
+    let mut expected_buf = Vec::new();
+    let expected = lele::kernels::matmul(&a_view, &w_view, &mut expected_buf);
+
+    let qw = lele::kernels::prepare_quantized_weights(&raw, k, n, &w_scale);
+    let scale_view = TensorView::from_slice(std::slice::from_ref(&a_scale), vec![]);
+    let zp_view = TensorView::from_slice(std::slice::from_ref(&a_zp), vec![]);
+    let mut got_buf = Vec::new();
+    let got = lele::kernels::qmatmul_i8(&a_view, &scale_view, &zp_view, &qw, &mut got_buf);
+
+    assert_eq!(got.shape.as_ref(), &[batch, m, n]);
+    for (i, (&g, &e)) in got.data.iter().zip(expected.data.iter()).enumerate() {
+        assert!(
+            (g - e).abs() <= 1e-3 * e.abs().max(1.0),
+            "batched qmatmul_i8 differs at {i}: got {g}, want {e}"
+        );
+    }
+}
+
+#[test]
+fn test_qmatmul_i8_accepts_per_tensor_weight_scale() {
+    let (m, k, n) = (9usize, 20usize, 24usize);
+    let (a, a_scale, a_zp, raw, _, _) = qdq_layer(m, k, n);
+    let w_scale = vec![0.0025f32];
+    let w_f32: Vec<f32> = raw.iter().map(|&b| (b as i8) as f32 * w_scale[0]).collect();
+
+    let a_view = TensorView::from_slice(&a, vec![m, k]);
+    let w_view = TensorView::from_slice(&w_f32, vec![k, n]);
+    let mut expected_buf = Vec::new();
+    let expected = lele::kernels::matmul(&a_view, &w_view, &mut expected_buf);
+
+    let qw = lele::kernels::prepare_quantized_weights(&raw, k, n, &w_scale);
+    let scale_view = TensorView::from_slice(std::slice::from_ref(&a_scale), vec![]);
+    let zp_view = TensorView::from_slice(std::slice::from_ref(&a_zp), vec![]);
+    let mut got_buf = Vec::new();
+    let got = lele::kernels::qmatmul_i8(&a_view, &scale_view, &zp_view, &qw, &mut got_buf);
+
+    for (i, (&g, &e)) in got.data.iter().zip(expected.data.iter()).enumerate() {
+        assert!(
+            (g - e).abs() <= 1e-3 * e.abs().max(1.0),
+            "per-tensor qmatmul_i8 differs at {i}: got {g}, want {e}"
+        );
+    }
+}
+
+/// The tests above pass trivially if every machine takes the f32 fallback, so
+/// pin which path was actually chosen to what the CPU reports.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_quantized_weights_take_the_integer_path_when_the_cpu_allows() {
+    use lele::kernels::avx::qgemm::has_avx2_int8;
+    use lele::kernels::avx512::qgemm::has_vnni;
+    let (_, _, _, raw, w_scale, _) = qdq_layer(4, 8, 16);
+    let qw = lele::kernels::prepare_quantized_weights(&raw, 8, 16, &w_scale);
+    assert_eq!(
+        qw.is_integer(),
+        has_vnni() || has_avx2_int8(),
+        "an integer kernel should run whenever the CPU has VNNI or AVX2"
+    );
+}
+
+/// Exact check of the packed kernel against integer arithmetic, skipped on
+/// machines that cannot run it.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_vnni_qgemm_matches_integer_reference() {
+    use lele::kernels::avx512::qgemm::{has_vnni, pack_i8_weights, qgemm_u8s8_f32};
+    if !has_vnni() {
+        return;
+    }
+    // K is not a multiple of 4 and N is not a multiple of 64, so both the
+    // packing padding and the masked store are exercised.
+    let (m, k, n) = (11usize, 37usize, 70usize);
+    let a: Vec<u8> = (0..m * k.next_multiple_of(4))
+        .map(|i| (i * 37 % 256) as u8)
+        .collect();
+    let b: Vec<i8> = (0..k * n)
+        .map(|i| ((i * 53 % 255) as i32 - 127) as i8)
+        .collect();
+    let w_scale: Vec<f32> = (0..n).map(|j| 0.001 + (j % 7) as f32 * 1e-4).collect();
+    let bias: Vec<f32> = (0..n).map(|j| (j % 11) as f32 * 0.01).collect();
+    let (a_scale, a_zp) = (0.0037f32, 131i32);
+    let lda = k.next_multiple_of(4);
+
+    let pw = pack_i8_weights(&b, k, n);
+    let mut out = vec![0f32; m * n];
+    unsafe {
+        qgemm_u8s8_f32(
+            a.as_ptr(), m, lda, &pw, a_zp, a_scale,
+            w_scale.as_ptr(), w_scale.len(), Some(bias.as_ptr()),
+            out.as_mut_ptr(), n,
+        );
+    }
+
+    for i in 0..m {
+        for j in 0..n {
+            let dot: i32 = (0..k).map(|kk| a[i * lda + kk] as i32 * b[kk * n + j] as i32).sum();
+            let col: i32 = (0..k).map(|kk| b[kk * n + j] as i32).sum();
+            let want = a_scale * w_scale[j] * (dot - a_zp * col) as f32 + bias[j];
+            let got = out[i * n + j];
+            assert!(
+                (got - want).abs() <= 1e-5 * want.abs().max(1.0),
+                "vnni qgemm differs at ({i},{j}): got {got}, want {want}"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_fake_quantize_per_tensor_matches_exact_division() {
+    // The SIMD path multiplies by the reciprocal and refines with an FMA
+    // instead of dividing, which can only change the result where the true
+    // quotient falls on a rounding tie. Sweep a wide range of magnitudes and
+    // scales and require it to agree with an exact division everywhere.
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        return;
+    }
+    // Lengths that land on and off the 32- and 8-wide steps, so the vector
+    // body and the scalar tail are both exercised.
+    for &len in &[1usize, 7, 8, 31, 32, 33, 1000, 4099] {
+        for &scale in &[0.0037f32, 1.0, 0.5, 1e-4, 7.25e-3, 123.5] {
+            for &zp in &[0.0f32, 128.0, 255.0] {
+                let x: Vec<f32> = (0..len)
+                    .map(|i| {
+                        // Spread over several orders of magnitude and both
+                        // signs, and hit exact half-steps of the grid.
+                        let t = i as f32;
+                        match i % 4 {
+                            0 => (t - len as f32 / 2.0) * scale,
+                            1 => (t - len as f32 / 2.0) * scale * 0.5,
+                            2 => (t * 0.5 + 0.5) * scale,
+                            _ => (t - len as f32 / 2.0) * 1e-3,
+                        }
+                    })
+                    .collect();
+                let x_view = TensorView::from_slice(&x, vec![len]);
+                let s = [scale];
+                let z = [zp];
+                let s_view = TensorView::from_slice(&s, vec![]);
+                let z_view = TensorView::from_slice(&z, vec![]);
+
+                let mut buf = Vec::new();
+                let got = lele::kernels::fake_quantize_linear(
+                    &x_view,
+                    &s_view,
+                    Some(&z_view),
+                    1,
+                    0,
+                    0.0,
+                    255.0,
+                    &mut buf,
+                );
+
+                for (i, (&g, &v)) in got.data.iter().zip(x.iter()).enumerate() {
+                    let want =
+                        (((v / scale).round_ties_even() + zp).clamp(0.0, 255.0) - zp) * scale;
+                    assert_eq!(
+                        g.to_bits(),
+                        want.to_bits(),
+                        "len={len} scale={scale} zp={zp} index {i} (x={v}): got {g}, want {want}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_fake_quantize_per_axis_still_divides_exactly() {
+    // Only the per-tensor layout takes the SIMD path; a per-channel scale must
+    // still go through the general routine.
+    let x: Vec<f32> = (0..24).map(|i| (i as f32 - 12.0) * 0.031).collect();
+    let x_view = TensorView::from_slice(&x, vec![4, 3, 2]);
+    let scale = [0.01f32, 0.02, 0.04];
+    let zp = [10.0f32, 20.0, 30.0];
+    let s_view = TensorView::from_slice(&scale, vec![3]);
+    let z_view = TensorView::from_slice(&zp, vec![3]);
+
+    let mut buf = Vec::new();
+    let got =
+        lele::kernels::fake_quantize_linear(&x_view, &s_view, Some(&z_view), 1, 0, 0.0, 255.0, &mut buf);
+
+    for o in 0..4 {
+        for d in 0..3 {
+            for i in 0..2 {
+                let idx = (o * 3 + d) * 2 + i;
+                let (s, z) = (scale[d], zp[d]);
+                let want = (((x[idx] / s).round_ties_even() + z).clamp(0.0, 255.0) - z) * s;
+                assert_eq!(got.data[idx].to_bits(), want.to_bits(), "index {idx}");
+            }
+        }
+    }
+}
+
+/// Exact check of the AVX2 packed kernel against integer arithmetic.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_avx2_qgemm_matches_integer_reference() {
+    use lele::kernels::avx::qgemm::{has_avx2_int8, pack_i8_weights_avx2, qgemm_u8s8_f32_avx2};
+    if !has_avx2_int8() {
+        return;
+    }
+    // K odd and N not a multiple of 16, so the packing padding, the row tail
+    // and the masked store are all exercised.
+    let (m, k, n) = (11usize, 37usize, 70usize);
+    let lda = k.next_multiple_of(2);
+    let codes: Vec<i32> = (0..m * lda).map(|i| (i * 37 % 256) as i32).collect();
+    let a: Vec<i16> = codes.iter().map(|&v| v as i16).collect();
+    let b: Vec<i8> = (0..k * n)
+        .map(|i| ((i * 53 % 255) as i32 - 127) as i8)
+        .collect();
+    let w_scale: Vec<f32> = (0..n).map(|j| 0.001 + (j % 7) as f32 * 1e-4).collect();
+    let bias: Vec<f32> = (0..n).map(|j| (j % 11) as f32 * 0.01).collect();
+    let (a_scale, a_zp) = (0.0037f32, 131i32);
+
+    let pw = pack_i8_weights_avx2(&b, k, n);
+    let mut out = vec![0f32; m * n];
+    unsafe {
+        qgemm_u8s8_f32_avx2(
+            a.as_ptr(), m, lda, &pw, a_zp, a_scale,
+            w_scale.as_ptr(), w_scale.len(), Some(bias.as_ptr()),
+            out.as_mut_ptr(), n,
+        );
+    }
+
+    for i in 0..m {
+        for j in 0..n {
+            let dot: i32 = (0..k).map(|kk| codes[i * lda + kk] * b[kk * n + j] as i32).sum();
+            let col: i32 = (0..k).map(|kk| b[kk * n + j] as i32).sum();
+            let want = a_scale * w_scale[j] * (dot - a_zp * col) as f32 + bias[j];
+            let got = out[i * n + j];
+            assert!(
+                (got - want).abs() <= 1e-5 * want.abs().max(1.0),
+                "avx2 qgemm differs at ({i},{j}): got {got}, want {want}"
+            );
+        }
+    }
+}

@@ -117,6 +117,7 @@ pub struct LocalFixedSampledFrame<'a> {
     _phantom: std::marker::PhantomData<&'a ()>,
     #[cfg(target_arch = "aarch64")]
     prepared_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::PreparedWeightsArm>>>,
+    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::QuantizedWeights>>>,
 }
 
 impl<'a> LocalFixedSampledFrame<'a> {
@@ -126,6 +127,7 @@ impl<'a> LocalFixedSampledFrame<'a> {
             _phantom: std::marker::PhantomData,
             #[cfg(target_arch = "aarch64")]
             prepared_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            quantized_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 fn conv1d_relu<'c, 'd>(
@@ -297,6 +299,24 @@ fn linear_quantized_prequant<'c, 'd>(
         output_buf,
     )
 }
+/// Static-QDQ matmul: activation already on the quantization grid, weight kept
+/// in int8 so an integer GEMM can run where the hardware supports one.
+fn qmatmul_i8<'c, 'd>(
+    &self,
+    input: &lele::tensor::TensorView<'c, f32>,
+    input_scale: &lele::tensor::TensorView<'c, f32>,
+    input_zero_point: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_k: usize,
+    weight_n: usize,
+    weight_scale: &lele::tensor::TensorView<'c, f32>,
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let qw = self.get_quantized_weight(weight_offset, weight_len, weight_k, weight_n, weight_scale);
+    lele::kernels::qmatmul_i8(input, input_scale, input_zero_point, &qw, output_buf)
+}
+
 fn linear<'c, 'd>(
     &self,
     input: &lele::tensor::TensorView<'c>,
@@ -5244,6 +5264,19 @@ fn embedding_concat_i64<'c, 'd>(
         let pw = std::sync::Arc::new(lele::kernels::prepare_weights_arm(raw_bytes, k, n));
         self.prepared_weights_cache.borrow_mut().insert(key, pw.clone());
         pw
+    }
+    fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &lele::tensor::TensorView<f32>) -> std::sync::Arc<lele::kernels::QuantizedWeights> {
+        let key = (offset, len);
+        {
+            let cache = self.quantized_weights_cache.borrow();
+            if let Some(qw) = cache.get(&key) {
+                return qw.clone();
+            }
+        }
+        let raw = &self.data[offset..offset+len];
+        let qw = std::sync::Arc::new(lele::kernels::prepare_quantized_weights(raw, k, n, &scale.data));
+        self.quantized_weights_cache.borrow_mut().insert(key, qw.clone());
+        qw
     }
     pub fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {
         TensorView::from_bytes_f32(&self.data[offset..offset+len], shape)

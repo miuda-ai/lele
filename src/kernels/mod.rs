@@ -1,6 +1,8 @@
 pub mod activations;
 #[cfg(target_arch = "x86_64")]
 pub mod avx;
+#[cfg(target_arch = "x86_64")]
+pub mod avx512;
 pub mod conv1d;
 pub mod conv2d;
 pub mod fft;
@@ -11,6 +13,7 @@ pub mod math;
 pub mod neon;
 pub mod norm;
 pub mod pooling;
+pub mod qmatmul_i8;
 pub mod quantization;
 pub mod rnn;
 pub mod shape;
@@ -35,6 +38,7 @@ pub use math::{cos, cumsum, einsum_bs_d_bsd, exp, expand, greater_or_equal, hard
 pub use norm::*;
 pub use pooling::*;
 pub use pooling::{average_pool2d, global_average_pool};
+pub use qmatmul_i8::{QuantizedWeights, prepare_quantized_weights, qmatmul_i8};
 pub use quantization::*;
 pub use rnn::*;
 pub use shape::*;

@@ -167,6 +167,24 @@ fn linear_quantized_prequant<'c, 'd>(
         output_buf,
     )
 }
+/// Static-QDQ matmul: activation already on the quantization grid, weight kept
+/// in int8 so an integer GEMM can run where the hardware supports one.
+fn qmatmul_i8<'c, 'd>(
+    &self,
+    input: &lele::tensor::TensorView<'c, f32>,
+    input_scale: &lele::tensor::TensorView<'c, f32>,
+    input_zero_point: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_k: usize,
+    weight_n: usize,
+    weight_scale: &lele::tensor::TensorView<'c, f32>,
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let qw = self.get_quantized_weight(weight_offset, weight_len, weight_k, weight_n, weight_scale);
+    lele::kernels::qmatmul_i8(input, input_scale, input_zero_point, &qw, output_buf)
+}
+
 fn linear<'c, 'd>(
     &self,
     input: &lele::tensor::TensorView<'c>,
