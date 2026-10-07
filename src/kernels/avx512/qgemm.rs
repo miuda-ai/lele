@@ -6,6 +6,12 @@
 //! for f32 FMA — the reason an int8 path is worth having at all on this class
 //! of machine.
 //!
+//! "Exact" means every product is summed in i32; the accumulator itself is
+//! still i32 and wraps past its 32 bits. The worst case is
+//! `2 * 255 * 128 * K ≈ 65k * K`, so K would have to reach ~32k with
+//! adversarially extreme data before wrapping is possible; real quantized
+//! models sit orders of magnitude below that.
+//!
 //! Weights are quantized symmetrically (zero point 0) with a per-output-channel
 //! scale, which is what ONNX QDQ graphs produced by the standard quantizers
 //! emit, so the only correction term is the activation zero point:

@@ -462,11 +462,8 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             } else {
                 // Saturation bounds come from `output_dtype` (opset 21+) or the
                 // zero-point dtype; ONNX defaults to uint8 when neither is given.
-                let zp_dt = ctx
-                    .node
-                    .input
-                    .get(2)
-                    .filter(|s| !s.is_empty())
+                let zp_input = ctx.node.input.get(2).filter(|s| !s.is_empty());
+                let zp_dt = zp_input
                     .and_then(|zp| ctx.known_weights.get(&crate::compiler::sanitize_name(zp)))
                     .map(|w| w.3);
                 let out_dt = ctx
@@ -476,9 +473,22 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                     .find(|a| a.name == "output_dtype")
                     .map(|a| a.i as i32)
                     .or(zp_dt)
-                    .unwrap_or(2);
+                    // No zero point at all: the ONNX uint8 default applies.
+                    .or(if zp_input.is_none() { Some(2) } else { None });
+                // A zero point that is not an initializer hides its dtype.
+                // Guessing uint8 would silently clamp every negative code to 0
+                // on an int8 model, so refuse to compile instead.
+                if out_dt.is_none() {
+                    panic!(
+                        "QuantizeLinear '{}': zero point '{}' is not an initializer and no \
+                         output_dtype attribute is present; add output_dtype so the saturation \
+                         bounds are known",
+                        ctx.node.name,
+                        zp_input.unwrap_or(&String::new())
+                    );
+                }
                 let (qmin, qmax) =
-                    crate::kernels::quant_range(out_dt).unwrap_or((0.0, 255.0));
+                    crate::kernels::quant_range(out_dt.unwrap()).unwrap_or((0.0, 255.0));
                 let kernel = if op == "FakeQuantizeLinear" {
                     "fake_quantize_linear"
                 } else {

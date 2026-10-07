@@ -3276,8 +3276,11 @@ unsafe fn depthwise_conv2d_3x3_s1_neon(
     use core::arch::aarch64::*;
     let zero_v = vdupq_n_f32(0.0);
     let pad = 1usize;
-    let first_valid_oh = pad;
-    let last_valid_oh = in_h.saturating_sub(pad);
+    // Same trick as the AVX2 kernel: the top and bottom output rows read one
+    // input row that does not exist. Point those taps at a row of zeros so
+    // every output row stays on the same vector body; a scalar edge path
+    // costs 2/in_h of the work, and in_h here is as small as 5.
+    let zero_row = vec![0.0f32; in_w];
 
     for n in 0..batch {
         for c in 0..channels {
@@ -3302,10 +3305,18 @@ unsafe fn depthwise_conv2d_3x3_s1_neon(
                 let out_row = out_base + oh * out_w;
                 let mut ow = 0usize;
 
-                if oh >= first_valid_oh && oh < last_valid_oh {
-                    let r0 = input.as_ptr().add(in_base + (oh - 1) * in_w);
-                    let r1 = input.as_ptr().add(in_base + oh * in_w);
-                    let r2 = input.as_ptr().add(in_base + (oh + 1) * in_w);
+                {
+                    let row = |ki: usize| {
+                        let ih = oh + ki;
+                        if ih >= pad && ih < in_h + pad {
+                            input.as_ptr().add(in_base + (ih - pad) * in_w)
+                        } else {
+                            zero_row.as_ptr()
+                        }
+                    };
+                    let r0 = row(0);
+                    let r1 = row(1);
+                    let r2 = row(2);
 
                     // Scalar: ow=0 (left pad)
                     {
@@ -3446,24 +3457,6 @@ unsafe fn depthwise_conv2d_3x3_s1_neon(
                                 if iw >= 0 && (iw as usize) < in_w {
                                     s += *rp.add(iw as usize) * *weight.get_unchecked(w_base + ki * 3 + kj);
                                 }
-                            }
-                        }
-                        let v = if act == Activation::Relu && s < 0.0 { 0.0 } else { s };
-                        *out.get_unchecked_mut(out_row + ow) = v;
-                        ow += 1;
-                    }
-                } else {
-                    // Edge rows: scalar with full bounds checking
-                    while ow < out_w {
-                        let mut s = bias_val;
-                        for ki in 0..3usize {
-                            let ih = oh + ki;
-                            if ih < pad || ih >= in_h + pad { continue; }
-                            let rp = input.as_ptr().add(in_base + (ih - pad) * in_w);
-                            for kj in 0..3usize {
-                                let iw = ow + kj;
-                                if iw < pad || iw >= in_w + pad { continue; }
-                                s += *rp.add(iw - pad) * *weight.get_unchecked(w_base + ki * 3 + kj);
                             }
                         }
                         let v = if act == Activation::Relu && s < 0.0 { 0.0 } else { s };

@@ -1152,9 +1152,40 @@ pub fn gelu_erf<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> Tensor
             shape: Cow::Owned(input.shape.to_vec()),
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     {
-        gelu(input, out)
+        crate::kernels::neon::math::gelu_erf(input, out)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let numel = input.data.len();
+        utils::ensure_capacity(out, numel);
+        unsafe {
+            crate::kernels::wasm::math::gelu_erf(input.data.as_ptr(), out.as_mut_ptr(), numel);
+        }
+        TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(input.shape.to_vec()),
+        }
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "wasm32"
+    )))]
+    {
+        let numel = input.data.len();
+        utils::ensure_capacity(out, numel);
+        // True division and libm erf — the same operations the generic Div and
+        // Erf kernels run on this arch — so fusion does not move any bits.
+        for i in 0..numel {
+            let x = input.data[i];
+            out[i] = x * (0.5 * (1.0 + libm::erff(x / std::f32::consts::SQRT_2)));
+        }
+        TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(input.shape.to_vec()),
+        }
     }
 }
 
@@ -2177,6 +2208,12 @@ pub fn reduce_prod<'b, 'a, T: ElementOps + std::ops::MulAssign>(
     let mut out_shape = Vec::new();
     let mut reduce_mask = vec![false; dims];
     for &ax in &resolved_axes {
+        if ax >= dims {
+            panic!(
+                "ReduceProd: axis {} out of range for a rank-{} input",
+                ax, dims
+            );
+        }
         reduce_mask[ax] = true;
     }
     for i in 0..dims {

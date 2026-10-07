@@ -1817,15 +1817,60 @@ fn test_reduce_prod_matches_reference() {
             assert_close(&got.data, &want, 1e-3, &format!("reduce_prod axes {axes:?}"));
         }
     }
+
+    // The model's actual use: an i64 element count pulled out of Shape. A
+    // multi-element product must reduce in i64, not just f32.
+    let dims_shape = vec![2usize, 3, 4];
+    let dims: Vec<i64> = (0..2 * 3 * 4).map(|i| (i % 3 + 1) as i64).collect();
+    let t_i64 = TensorView::from_slice(&dims, dims_shape.clone());
+    for axes in [&[1i64, 2][..], &[-1][..], &[][..]] {
+        let mut buf = Vec::new();
+        let got = reduce_prod(&t_i64, axes, false, &mut buf);
+        let want: Vec<i64> = if axes.is_empty() {
+            vec![dims.iter().product::<i64>()]
+        } else {
+            let resolved: Vec<usize> = axes
+                .iter()
+                .map(|&a| if a < 0 { 3 - (-a) as usize } else { a as usize })
+                .collect();
+            let kept: Vec<usize> = (0..3).filter(|i| !resolved.contains(i)).collect();
+            let mut want = vec![1i64; kept.iter().map(|&i| dims_shape[i]).product::<usize>().max(1)];
+            let mut coords = [0usize; 3];
+            for &v in &dims {
+                let mut off = 0usize;
+                for &d in &kept {
+                    off = off * dims_shape[d] + coords[d];
+                }
+                want[off] *= v;
+                for d in (0..3).rev() {
+                    coords[d] += 1;
+                    if coords[d] < dims_shape[d] {
+                        break;
+                    }
+                    coords[d] = 0;
+                }
+            }
+            want
+        };
+        assert_eq!(got.data.as_ref(), want.as_slice(), "i64 reduce_prod axes {axes:?}");
+    }
 }
 
 #[test]
 fn test_reduce_prod_of_shape_vector() {
-    // How the op actually shows up: an i64 element count pulled out of Shape,
-    // which the pooling layer divides by.
+    // How the op actually shows up: i64 dims pulled out of Shape, which the
+    // pooling layer multiplies into a frame count.
     let dims: Vec<i64> = vec![7];
     let t = TensorView::from_slice(&dims, vec![1usize]);
     let mut buf = Vec::new();
     let got = reduce_prod(&t, &[], false, &mut buf);
     assert_eq!(got.data.as_ref(), &[7i64]);
+
+    // The DF-ResNet pooling shape: Shape -> [B, T, F], sliced to [T, F], then
+    // reduced over its only axis into a frame count.
+    let dims: Vec<i64> = vec![300, 80];
+    let t = TensorView::from_slice(&dims, vec![2usize]);
+    let mut buf = Vec::new();
+    let got = reduce_prod(&t, &[0], false, &mut buf);
+    assert_eq!(got.data.as_ref(), &[24_000i64]);
 }

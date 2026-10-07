@@ -2102,6 +2102,13 @@ fn qparam_layout(
         return QParamLayout::PerTensor;
     }
     let rank = shape.len();
+    // ONNX: "When the rank of the input is 1, per-tensor quantization is
+    // applied", even when block_size is set — a rank-1 input with a blocked
+    // scale is the shape the blocked formula itself cannot produce, so
+    // classifying it as per-axis would index the scale out of bounds.
+    if rank <= 1 && block_size > 0 {
+        return QParamLayout::PerTensor;
+    }
     let axis = if axis < 0 { axis + rank as i64 } else { axis };
     let axis = (axis.max(0) as usize).min(rank.saturating_sub(1));
     let outer: usize = shape[..axis].iter().product();
@@ -2117,6 +2124,11 @@ fn qparam_layout(
             blocks,
         }
     } else {
+        assert!(
+            scale_len == dim,
+            "per-axis quantization needs one scale per element of axis {axis} \
+             (axis dim {dim}, got {scale_len} scales)"
+        );
         QParamLayout::PerAxis { outer, dim, inner }
     }
 }

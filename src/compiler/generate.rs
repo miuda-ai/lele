@@ -309,6 +309,12 @@ pub(crate) fn infer_variable_types(
                         if op == "Pad" && i >= 1 {
                             continue;
                         }
+                        // For the reduce ops, input 1 is the i64 axes tensor
+                        if matches!(op, "ReduceSum" | "ReduceMean" | "ReduceMax" | "ReduceProd")
+                            && i == 1
+                        {
+                            continue;
+                        }
                         if op == "GatherElements" && i >= 1 {
                             continue;
                         }
@@ -368,6 +374,12 @@ pub(crate) fn infer_variable_types(
                             if op == "Pad" && i >= 1 {
                                 continue;
                             }
+                            // The reduce ops' axes tensor must keep its i64 type
+                            if matches!(op, "ReduceSum" | "ReduceMean" | "ReduceMax" | "ReduceProd")
+                                && i == 1
+                            {
+                                continue;
+                            }
                             if op == "GatherElements" && i >= 1 {
                                 continue;
                             }
@@ -402,6 +414,8 @@ pub(crate) fn infer_variable_types(
                             }
                             "Slice" => i >= 1,
                             "Pad" => i == 1,
+                            // The reduce ops take the axes as an i64 input tensor
+                            "ReduceSum" | "ReduceMean" | "ReduceMax" | "ReduceProd" => i == 1,
                             _ => false,
                         };
                         if is_metadata {

@@ -436,6 +436,85 @@ pub fn gelu<'b, 'a>(input: &TensorView<'b>, output_buf: &'a mut Vec<f32>) -> Ten
     }
 }
 
+/// GELU evaluated in the exact operation order of the ONNX
+/// `Div -> Erf -> Add -> Mul -> Mul` subgraph the compiler fuses:
+/// `x * (0.5 * (1 + erf(x / sqrt(2))))`.
+///
+/// Unlike [`gelu`] above, the scaling is a true division (not a multiply by
+/// the reciprocal) and the erf body mirrors [`erf`] lane-for-lane — the same
+/// A&S vector approximation over the first `len & !3` elements and
+/// `libm::erff` on the scalar tail — so the fused kernel is bit-identical to
+/// running the five unfused kernels.
+pub fn gelu_erf<'b, 'a>(input: &TensorView<'_>, output_buf: &'a mut Vec<f32>) -> TensorView<'a> {
+    let len = input.data.len();
+    utils::ensure_capacity(output_buf, len);
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+
+        let data = input.data.as_ptr();
+        let out = output_buf.as_mut_ptr();
+
+        let sqrt2 = vdupq_n_f32(std::f32::consts::SQRT_2);
+        let half = vdupq_n_f32(0.5f32);
+        let one = vdupq_n_f32(1.0f32);
+        // Same A&S constants as erf() above.
+        let p = vdupq_n_f32(0.3275911f32);
+        let a1 = vdupq_n_f32(0.254829592f32);
+        let a2 = vdupq_n_f32(-0.284496736f32);
+        let a3 = vdupq_n_f32(1.421413741f32);
+        let a4 = vdupq_n_f32(-1.453152027f32);
+        let a5 = vdupq_n_f32(1.061405429f32);
+        let neg_one = vdupq_n_f32(-1.0f32);
+
+        let mut i = 0;
+        let simd_end = len & !3;
+        while i < simd_end {
+            let x = vld1q_f32(data.add(i));
+            // Div kernel: x / sqrt(2), true division.
+            let x_scaled = vdivq_f32(x, sqrt2);
+            // Erf kernel — same instruction sequence as erf() above.
+            let sign_mask = vcgeq_f32(x_scaled, vdupq_n_f32(0.0));
+            let sign = vbslq_f32(sign_mask, one, neg_one);
+            let x_abs = vabsq_f32(x_scaled);
+            let t = vdivq_f32(one, vfmaq_f32(one, p, x_abs));
+            let mut y = a5;
+            y = vfmaq_f32(a4, y, t);
+            y = vfmaq_f32(a3, y, t);
+            y = vfmaq_f32(a2, y, t);
+            y = vfmaq_f32(a1, y, t);
+            y = vmulq_f32(y, t);
+            let neg_x2 = vnegq_f32(vmulq_f32(x_abs, x_abs));
+            let exp_val = neon_exp_f32x4(neg_x2);
+            let erf_val = vmulq_f32(sign, vsubq_f32(one, vmulq_f32(y, exp_val)));
+            // Add + Mul + Mul: x * (0.5 * (1 + e)).
+            let result = vmulq_f32(x, vmulq_f32(half, vaddq_f32(one, erf_val)));
+            vst1q_f32(out.add(i), result);
+            i += 4;
+        }
+        // Scalar tail — libm::erff, matching erf()'s tail.
+        while i < len {
+            let x = *data.add(i);
+            *out.add(i) = x * (0.5 * (1.0 + libm::erff(x / std::f32::consts::SQRT_2)));
+            i += 1;
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for i in 0..len {
+            let x = input.data[i];
+            output_buf[i] = x * (0.5 * (1.0 + libm::erff(x / std::f32::consts::SQRT_2)));
+        }
+    }
+
+    TensorView {
+        data: Cow::Borrowed(output_buf),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
+}
+
 /// Fast GELU approximation (used in GPT-2, BERT):
 /// fast_gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 /// This is faster than standard GELU and commonly used in transformers.

@@ -419,17 +419,18 @@ pub unsafe fn fused_dq_gemm_avx2(
 /// Fused `QuantizeLinear` → `DequantizeLinear` round trip for a per-tensor
 /// scale and zero point.
 ///
-/// The obvious loop is division bound rather than memory bound: `vdivps` retires
-/// one vector roughly every ten cycles, so even fully vectorized the round trip
-/// only manages about 1.4 elements per cycle. Multiplying by the reciprocal and
-/// refining once with an FMA — `q + (x - q*s) * (1/s)` — costs three cheap
-/// operations instead and leaves the loop bound by memory.
+/// Division by exact `vdivps` on purpose. A reciprocal-plus-FMA-refine
+/// replacement was measured here and dropped: it is bit-identical on
+/// well-separated inputs but sits within half an ulp of every rounding tie,
+/// and the kernel is memory-bound anyway — removing the divide bought only
+/// 3-7% of the kernel and ~0.4 ms of a 58 ms inference, inside run-to-run
+/// noise. Keep the arithmetic identical to the scalar fallback and the other
+/// layouts; if the divide ever shows in a profile, revisit with a
+/// bit-identicalness proof in hand.
 ///
-/// The refinement lands within half an ulp of the true quotient, so the integer
-/// code it rounds to can only disagree with an exact division where the true
-/// quotient falls on a rounding tie. NaN inputs clamp rather than propagate,
-/// because `vmaxps`/`vminps` return their second operand for NaN; quantized
-/// activations are finite by construction.
+/// NaN inputs clamp rather than propagate, because `vmaxps`/`vminps` return
+/// their second operand for NaN; quantized activations are finite by
+/// construction.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 pub unsafe fn fake_quantize_per_tensor_avx2(
@@ -442,9 +443,7 @@ pub unsafe fn fake_quantize_per_tensor_avx2(
     qmax: f32,
 ) {
     unsafe {
-        let recip = 1.0f32 / scale;
         let sv = _mm256_set1_ps(scale);
-        let rv = _mm256_set1_ps(recip);
         let zv = _mm256_set1_ps(zero_point);
         let lo = _mm256_set1_ps(qmin);
         let hi = _mm256_set1_ps(qmax);
@@ -452,9 +451,7 @@ pub unsafe fn fake_quantize_per_tensor_avx2(
         macro_rules! round_trip {
             ($x:expr) => {{
                 let x = $x;
-                let q = _mm256_mul_ps(x, rv);
-                // One Newton step on the reciprocal quotient.
-                let q = _mm256_fmadd_ps(_mm256_fnmadd_ps(q, sv, x), rv, q);
+                let q = _mm256_div_ps(x, sv);
                 let q = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(q);
                 let c = _mm256_min_ps(_mm256_max_ps(_mm256_add_ps(q, zv), lo), hi);
                 _mm256_mul_ps(_mm256_sub_ps(c, zv), sv)
@@ -481,8 +478,7 @@ pub unsafe fn fake_quantize_per_tensor_avx2(
             _mm256_storeu_ps(dst.add(i), round_trip!(_mm256_loadu_ps(src.add(i))));
             i += 8;
         }
-        // The tail divides exactly; it is too short for the reciprocal to pay
-        // for itself and this keeps the fallback path's arithmetic.
+        // The tail uses the same exact division as the vector body.
         while i < len {
             let v = *src.add(i);
             let q = (v / scale).round_ties_even() + zero_point;

@@ -203,6 +203,33 @@ pub unsafe fn gelu(input: *const f32, output: *mut f32, len: usize) {
     }
 }
 
+/// WASM SIMD128 GELU evaluated in the exact operation order of the ONNX
+/// `Div -> Erf -> Add -> Mul -> Mul` subgraph the compiler fuses:
+/// `x * (0.5 * (1 + erf(x / sqrt(2))))`.
+///
+/// Unlike [`gelu`] above, the scaling is a true division (not a multiply by
+/// the reciprocal) and the erf body mirrors [`erf`] lane-for-lane, so the
+/// fused kernel is bit-identical to the unfused chain.
+pub unsafe fn gelu_erf(input: *const f32, output: *mut f32, len: usize) {
+    let mut i = 0;
+    let sqrt2 = f32x4_splat(std::f32::consts::SQRT_2);
+    let half = f32x4_splat(0.5);
+    let one = f32x4_splat(1.0);
+
+    while i + 4 <= len {
+        let x = v128_load(input.add(i) as *const v128);
+        let erf_val = erf_f32x4(f32x4_div(x, sqrt2));
+        let result = f32x4_mul(x, f32x4_mul(half, f32x4_add(one, erf_val)));
+        v128_store(output.add(i) as *mut v128, result);
+        i += 4;
+    }
+    while i < len {
+        let x = *input.add(i);
+        *output.add(i) = x * (0.5 * (1.0 + libm::erff(x / std::f32::consts::SQRT_2)));
+        i += 1;
+    }
+}
+
 /// WASM SIMD128 fast GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x³)))
 pub unsafe fn fast_gelu(input: *const f32, output: *mut f32, len: usize) {
     let mut i = 0;

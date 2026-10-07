@@ -1436,7 +1436,7 @@ impl Compiler {
         )?;
         writeln!(
             &mut code,
-            "    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::QuantizedWeights>>>,"
+            "    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QuantizedWeights>)>>,"
         )?;
         writeln!(&mut code, "}}")?;
         writeln!(&mut code, "\nimpl<'a> {}<'a> {{", struct_name)?;
@@ -1504,14 +1504,26 @@ impl Compiler {
             &mut code,
             "    fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &lele::tensor::TensorView<f32>) -> std::sync::Arc<lele::kernels::QuantizedWeights> {{"
         )?;
-        writeln!(&mut code, "        let key = (offset, len);")?;
+        writeln!(
+            &mut code,
+            "        // Distinct initializers can share identical bytes, and one initializer can sit behind several DequantizeLinear nodes carrying different scales, so the key must include the shape and the cached entry must match the exact scale."
+        )?;
+        writeln!(&mut code, "        let key = (offset, len, k, n);")?;
         writeln!(&mut code, "        {{")?;
         writeln!(
             &mut code,
             "            let cache = self.quantized_weights_cache.borrow();"
         )?;
-        writeln!(&mut code, "            if let Some(qw) = cache.get(&key) {{")?;
-        writeln!(&mut code, "                return qw.clone();")?;
+        writeln!(
+            &mut code,
+            "            if let Some((cached_scale, qw)) = cache.get(&key) {{"
+        )?;
+        writeln!(
+            &mut code,
+            "                if cached_scale.len() == scale.data.len() && cached_scale.iter().zip(scale.data.iter()).all(|(a, b)| a.to_bits() == b.to_bits()) {{"
+        )?;
+        writeln!(&mut code, "                    return qw.clone();")?;
+        writeln!(&mut code, "                }}")?;
         writeln!(&mut code, "            }}")?;
         writeln!(&mut code, "        }}")?;
         writeln!(
@@ -1524,7 +1536,7 @@ impl Compiler {
         )?;
         writeln!(
             &mut code,
-            "        self.quantized_weights_cache.borrow_mut().insert(key, qw.clone());"
+            "        self.quantized_weights_cache.borrow_mut().insert(key, (scale.data.clone(), qw.clone()));"
         )?;
         writeln!(&mut code, "        qw")?;
         writeln!(&mut code, "    }}")?;

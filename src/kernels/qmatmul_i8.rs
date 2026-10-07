@@ -219,6 +219,18 @@ pub fn qmatmul_i8<'a>(
     qw: &QuantizedWeights,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
+    // ONNX MatMul semantics: a 1-D activation is a vector @ matrix product.
+    // The integer kernels below index `dims - 2`, so view the vector as a
+    // single row, compute `[1, n]`, and drop the leading dimension.
+    if a.shape.len() == 1 {
+        let k = a.shape[0];
+        let row = TensorView::from_slice(&a.data, vec![1, k]);
+        let n = {
+            let r = qmatmul_i8(&row, a_scale, a_zero_point, qw, out);
+            r.shape[r.shape.len() - 1]
+        };
+        return TensorView::from_slice(out, vec![n]);
+    }
     match qw {
         QuantizedWeights::Float { data, k, n } => {
             let w = TensorView::from_slice(data.as_slice(), vec![*k, *n]);
