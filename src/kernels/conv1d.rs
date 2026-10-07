@@ -467,7 +467,13 @@ unsafe fn conv1d_direct_k3_t4_oc4_neon(
             }
 
             let mut oc = 0;
-            // OC Loop unrolled by 4
+            // OC Loop unrolled by 4.
+            // The vector body and the remainder-T loops below index outputs at `t`
+            // (no stride multiplication), so they are only valid for stride 1.
+            // For any other stride, skip them and let the per-OC loop at the bottom
+            // (which indexes inputs at `t * stride` and applies bias/ReLU) do all
+            // the work: `oc` stays 0, so it covers every output channel.
+            if stride == 1 {
             while oc + 4 <= out_channels {
                 let w_base0 = weights.add(oc * w_stride_oc);
                 let w_base1 = weights.add((oc + 1) * w_stride_oc);
@@ -561,6 +567,19 @@ unsafe fn conv1d_direct_k3_t4_oc4_neon(
                         acc3 = vfmaq_f32(acc3, v_in_2, w2);
                     }
 
+                    if let Some(b_ptr) = bias {
+                        acc0 = vaddq_f32(acc0, vdupq_n_f32(*b_ptr.add(oc)));
+                        acc1 = vaddq_f32(acc1, vdupq_n_f32(*b_ptr.add(oc + 1)));
+                        acc2 = vaddq_f32(acc2, vdupq_n_f32(*b_ptr.add(oc + 2)));
+                        acc3 = vaddq_f32(acc3, vdupq_n_f32(*b_ptr.add(oc + 3)));
+                    }
+                    if relu {
+                        acc0 = vmaxq_f32(acc0, zero_v);
+                        acc1 = vmaxq_f32(acc1, zero_v);
+                        acc2 = vmaxq_f32(acc2, zero_v);
+                        acc3 = vmaxq_f32(acc3, zero_v);
+                    }
+
                     vst1q_f32(out_ptr0.add(t), acc0);
                     vst1q_f32(out_ptr1.add(t), acc1);
                     vst1q_f32(out_ptr2.add(t), acc2);
@@ -612,6 +631,18 @@ unsafe fn conv1d_direct_k3_t4_oc4_neon(
                             s1 += i_val * *w_base1.add(k_ic * 3 + 1);
                             s2 += i_val * *w_base2.add(k_ic * 3 + 1);
                             s3 += i_val * *w_base3.add(k_ic * 3 + 1);
+                        }
+                        if let Some(b_ptr) = bias {
+                            s0 += *b_ptr.add(oc);
+                            s1 += *b_ptr.add(oc + 1);
+                            s2 += *b_ptr.add(oc + 2);
+                            s3 += *b_ptr.add(oc + 3);
+                        }
+                        if relu {
+                            s0 = s0.max(0.0);
+                            s1 = s1.max(0.0);
+                            s2 = s2.max(0.0);
+                            s3 = s3.max(0.0);
                         }
                         *out_base.add(oc * out_stride_ch + t) = s0;
                         *out_base.add((oc + 1) * out_stride_ch + t) = s1;
@@ -759,6 +790,18 @@ unsafe fn conv1d_direct_k3_t4_oc4_neon(
                                 s3 += i1 * w0 + i2 * w1;
                             }
                         }
+                        if let Some(b_ptr) = bias {
+                            s0 += *b_ptr.add(oc);
+                            s1 += *b_ptr.add(oc + 1);
+                            s2 += *b_ptr.add(oc + 2);
+                            s3 += *b_ptr.add(oc + 3);
+                        }
+                        if relu {
+                            s0 = s0.max(0.0);
+                            s1 = s1.max(0.0);
+                            s2 = s2.max(0.0);
+                            s3 = s3.max(0.0);
+                        }
                         *out_base.add(oc * out_stride_ch + t) = s0;
                         *out_base.add((oc + 1) * out_stride_ch + t) = s1;
                         *out_base.add((oc + 2) * out_stride_ch + t) = s2;
@@ -787,6 +830,12 @@ unsafe fn conv1d_direct_k3_t4_oc4_neon(
                                     sum += *in_ptr_row.add(idx2 as usize) * *w_ptr.add(2);
                                 }
                             }
+                            if let Some(b_ptr) = bias {
+                                sum += *b_ptr.add(real_oc);
+                            }
+                            if relu {
+                                sum = sum.max(0.0);
+                            }
                             *out_ptr.add(t) = sum;
                         }
                     }
@@ -795,6 +844,7 @@ unsafe fn conv1d_direct_k3_t4_oc4_neon(
 
                 oc += 4;
             }
+            } // stride == 1
 
             // Remainder OC Loop... (If OutChannels not div by 4)
             while oc < out_channels {
