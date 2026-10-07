@@ -197,6 +197,67 @@ fn test_conv2d_depthwise_3x3_s1_widths() {
 }
 
 #[test]
+fn test_conv2d_depthwise_3x3_s1_heights() {
+    // The top and bottom output rows read a row that does not exist. Sweep the
+    // height so those rows are every possible fraction of the output, including
+    // ih = 1 and 2 where every row is an edge row.
+    let groups = 3;
+    let (n, iw) = (1, 24);
+    for ih in [1usize, 2, 3, 4, 5, 8, 9] {
+        let input: Vec<f32> = (0..n * groups * ih * iw)
+            .map(|i| (i % 53) as f32 * 0.11 - 2.0)
+            .collect();
+        let weight: Vec<f32> = (0..groups * 9).map(|i| (i % 17) as f32 * 0.07 - 0.4).collect();
+        assert_depthwise_matches_im2col(
+            n, groups, ih, iw, &input, &weight,
+            &format!("dw_3x3_s1_ih{}", ih),
+        );
+    }
+}
+
+#[test]
+fn test_conv2d_3x3_row_stride_only() {
+    // stride (2, 1): rows are subsampled but each output row is still one
+    // contiguous run of an input row, which is its own im2col path.
+    let (n, ic, oc, ih, iw) = (1, 3, 4, 9, 20);
+    let (kh, kw) = (3, 3);
+
+    let input: Vec<f32> = (0..n * ic * ih * iw).map(|i| (i % 61) as f32 * 0.02 - 1.0).collect();
+    let weight: Vec<f32> = (0..oc * ic * kh * kw).map(|i| (i % 23) as f32 * 0.03).collect();
+    let bias: Vec<f32> = vec![0.1; oc];
+
+    let inp_t = TensorView::from_slice(&input, vec![n, ic, ih, iw]);
+    let w_t = TensorView::from_slice(&weight, vec![oc, ic, kh, kw]);
+    let b_t = TensorView::from_slice(&bias, vec![oc]);
+
+    let mut out_buf = Vec::new();
+    let result = conv2d_fused(&inp_t, &w_t, Some(&b_t), &[1, 1], 1, &[1, 1, 1, 1], &[2, 1], true, &mut out_buf);
+
+    let expected = ref_conv2d(&input, &weight, Some(&bias), n, oc, ic, ih, iw, kh, kw, 2, 1, 1, 1, 1, 1, 1, true);
+    assert_close(&result.data, &expected, 1e-3, "conv2d_3x3_s2x1");
+}
+
+#[test]
+fn test_conv2d_3x3_column_stride_only() {
+    // stride (1, 2) still needs the per-element general path; check it did not
+    // get captured by the row-contiguous one.
+    let (n, ic, oc, ih, iw) = (1, 2, 3, 7, 15);
+    let (kh, kw) = (3, 3);
+
+    let input: Vec<f32> = (0..n * ic * ih * iw).map(|i| (i % 41) as f32 * 0.05 - 1.0).collect();
+    let weight: Vec<f32> = (0..oc * ic * kh * kw).map(|i| (i % 13) as f32 * 0.04).collect();
+
+    let inp_t = TensorView::from_slice(&input, vec![n, ic, ih, iw]);
+    let w_t = TensorView::from_slice(&weight, vec![oc, ic, kh, kw]);
+
+    let mut out_buf = Vec::new();
+    let result = conv2d_fused(&inp_t, &w_t, None, &[1, 1], 1, &[1, 1, 1, 1], &[1, 2], false, &mut out_buf);
+
+    let expected = ref_conv2d(&input, &weight, None, n, oc, ic, ih, iw, kh, kw, 1, 2, 1, 1, 1, 1, 1, false);
+    assert_close(&result.data, &expected, 1e-3, "conv2d_3x3_s1x2");
+}
+
+#[test]
 fn test_conv2d_depthwise_3x3_s1_64ch() {
     let groups = 64;
     let (n, ih, iw) = (1, 8, 8);
@@ -1595,4 +1656,176 @@ fn test_avx2_qgemm_matches_integer_reference() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reductions
+// ---------------------------------------------------------------------------
+
+/// Straightforward reference: sum every input element into the output slot its
+/// non-reduced coordinates address, then divide by the number of elements that
+/// landed in each slot.
+fn ref_reduce(shape: &[usize], data: &[f32], axes: &[i64], keepdims: bool, mean: bool) -> (Vec<usize>, Vec<f32>) {
+    let dims = shape.len();
+    let resolved: Vec<usize> = axes
+        .iter()
+        .map(|&a| if a < 0 { (dims as i64 + a) as usize } else { a as usize })
+        .collect();
+    let mut out_shape = Vec::new();
+    for (i, &d) in shape.iter().enumerate() {
+        if !resolved.contains(&i) {
+            out_shape.push(d);
+        } else if keepdims {
+            out_shape.push(1);
+        }
+    }
+    let kept: Vec<usize> = (0..dims).filter(|i| !resolved.contains(i)).collect();
+    let mut out = vec![0.0f32; out_shape.iter().product::<usize>().max(1)];
+    let mut count = 1usize;
+    for &a in &resolved {
+        count *= shape[a];
+    }
+    let mut coords = vec![0usize; dims];
+    for v in data {
+        let mut off = 0usize;
+        for &d in &kept {
+            off = off * shape[d] + coords[d];
+        }
+        out[off] += v;
+        for d in (0..dims).rev() {
+            coords[d] += 1;
+            if coords[d] < shape[d] {
+                break;
+            }
+            coords[d] = 0;
+        }
+    }
+    if mean {
+        for v in out.iter_mut() {
+            *v /= count as f32;
+        }
+    }
+    (out_shape, out)
+}
+
+#[test]
+fn test_reduce_mean_axis_combinations() {
+    // The trailing-axes cases take a contiguous-run fast path and the rest fall
+    // through to the general coordinate walk; both must agree with the
+    // reference, and the fast path must still report the right shape.
+    let shape = vec![2usize, 3, 4, 5];
+    let data: Vec<f32> = (0..2 * 3 * 4 * 5).map(|i| (i % 29) as f32 * 0.37 - 4.0).collect();
+    let t = TensorView::from_slice(&data, shape.clone());
+
+    let cases: &[&[i64]] = &[
+        &[-1],
+        &[3],
+        &[2, 3],
+        &[1, 2, 3],
+        &[0, 1, 2, 3],
+        &[0],
+        &[1],
+        &[0, 2],
+        &[1, 2],
+    ];
+    for axes in cases {
+        for keepdims in [false, true] {
+            let mut buf = Vec::new();
+            let got = reduce_mean(&t, axes, keepdims, &mut buf);
+            let (want_shape, want) = ref_reduce(&shape, &data, axes, keepdims, true);
+            assert_eq!(
+                got.shape.as_ref(),
+                want_shape.as_slice(),
+                "reduce_mean shape for axes {axes:?} keepdims={keepdims}"
+            );
+            assert_close(
+                &got.data,
+                &want,
+                1e-4,
+                &format!("reduce_mean axes {axes:?} keepdims={keepdims}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_reduce_mean_long_row_matches_scalar_sum() {
+    // The fast path sums with eight accumulators; over a long row that must
+    // still match a plain left-to-right sum to within f32 rounding.
+    let (rows, cols) = (3usize, 1000usize);
+    let data: Vec<f32> = (0..rows * cols).map(|i| (i % 101) as f32 * 0.013).collect();
+    let t = TensorView::from_slice(&data, vec![rows, cols]);
+    let mut buf = Vec::new();
+    let got = reduce_mean(&t, &[-1], false, &mut buf);
+    assert_eq!(got.shape.as_ref(), &[rows]);
+    for r in 0..rows {
+        let want: f32 = data[r * cols..(r + 1) * cols].iter().sum::<f32>() / cols as f32;
+        assert!(
+            (got.data[r] - want).abs() <= 1e-5 * want.abs().max(1.0),
+            "row {r}: got {}, want {want}",
+            got.data[r]
+        );
+    }
+}
+
+#[test]
+fn test_reduce_prod_matches_reference() {
+    let shape = vec![2usize, 3, 4];
+    // Values near one so the products stay in a range f32 represents exactly
+    // enough to compare against a scalar reference.
+    let data: Vec<f32> = (0..2 * 3 * 4).map(|i| 1.0 + (i % 5) as f32 * 0.25).collect();
+    let t = TensorView::from_slice(&data, shape.clone());
+
+    let cases: &[&[i64]] = &[&[-1], &[0], &[1], &[0, 2], &[0, 1, 2]];
+    for axes in cases {
+        for keepdims in [false, true] {
+            let mut buf = Vec::new();
+            let got = reduce_prod(&t, axes, keepdims, &mut buf);
+
+            let dims = shape.len();
+            let resolved: Vec<usize> = axes
+                .iter()
+                .map(|&a| if a < 0 { (dims as i64 + a) as usize } else { a as usize })
+                .collect();
+            let mut want_shape = Vec::new();
+            for (i, &d) in shape.iter().enumerate() {
+                if !resolved.contains(&i) {
+                    want_shape.push(d);
+                } else if keepdims {
+                    want_shape.push(1);
+                }
+            }
+            assert_eq!(got.shape.as_ref(), want_shape.as_slice(), "axes {axes:?}");
+
+            let kept: Vec<usize> = (0..dims).filter(|i| !resolved.contains(i)).collect();
+            let mut want = vec![1.0f32; want_shape.iter().product::<usize>().max(1)];
+            let mut coords = vec![0usize; dims];
+            for v in &data {
+                let mut off = 0usize;
+                for &d in &kept {
+                    off = off * shape[d] + coords[d];
+                }
+                want[off] *= v;
+                for d in (0..dims).rev() {
+                    coords[d] += 1;
+                    if coords[d] < shape[d] {
+                        break;
+                    }
+                    coords[d] = 0;
+                }
+            }
+            assert_close(&got.data, &want, 1e-3, &format!("reduce_prod axes {axes:?}"));
+        }
+    }
+}
+
+#[test]
+fn test_reduce_prod_of_shape_vector() {
+    // How the op actually shows up: an i64 element count pulled out of Shape,
+    // which the pooling layer divides by.
+    let dims: Vec<i64> = vec![7];
+    let t = TensorView::from_slice(&dims, vec![1usize]);
+    let mut buf = Vec::new();
+    let got = reduce_prod(&t, &[], false, &mut buf);
+    assert_eq!(got.data.as_ref(), &[7i64]);
 }

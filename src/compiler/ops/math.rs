@@ -300,6 +300,38 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 tab, outputs[0], inputs[0], axes, keepdims, buf_expr
             )?;
         }
+        "ReduceProd" => {
+            let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
+                let name = &ctx.node.input[1];
+                if let Some((ints, _)) = ctx.int64_map.get(name) {
+                    format!("&{:?}", ints)
+                } else {
+                    format!("&lele::kernels::to_i64_vec(&{})", inputs[1])
+                }
+            } else {
+                let axes_attr = ctx
+                    .node
+                    .attribute
+                    .iter()
+                    .find(|a| a.name == "axes")
+                    .map(|a| a.ints.clone())
+                    .unwrap_or(vec![]);
+                format!("&{:?}", axes_attr)
+            };
+            let keepdims = ctx
+                .node
+                .attribute
+                .iter()
+                .find(|a| a.name == "keepdims")
+                .map(|a| a.i)
+                .unwrap_or(1)
+                != 0;
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::reduce_prod(&{}, {}, {}, {});",
+                tab, outputs[0], inputs[0], axes, keepdims, buf_expr
+            )?;
+        }
         "ReduceMax" => {
             let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
                 let name = &ctx.node.input[1];
