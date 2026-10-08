@@ -217,7 +217,7 @@ pub(crate) fn infer_variable_types(
                         }
                     }
                 }
-                "Exp" | "Log" | "Sqrt" | "Sin" | "Cos" | "Sigmoid" | "Tanh" | "Softmax" => {
+                "Exp" | "Log" | "Sqrt" | "Sin" | "Cos" | "Sigmoid" | "Tanh" | "Softmax" | "LogSoftmax" => {
                     for out in &node.output {
                         if !out.is_empty() {
                             let name = sanitize_name(out);

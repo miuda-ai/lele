@@ -1829,3 +1829,39 @@ fn test_reduce_prod_of_shape_vector() {
     let got = reduce_prod(&t, &[], false, &mut buf);
     assert_eq!(got.data.as_ref(), &[7i64]);
 }
+
+#[test]
+fn test_log_softmax_matches_reference() {
+    // [2, 3, 4], reduced over each axis in turn, so the strided (inner > 1)
+    // paths are covered as well as the contiguous last axis.
+    let shape = [2usize, 3, 4];
+    let data: Vec<f32> = (0..24).map(|i| ((i * 7 % 11) as f32 - 5.0) * 1.3).collect();
+    let t = TensorView::from_slice(&data, shape.to_vec());
+    for axis in [-1i32, 0, 1, 2] {
+        let a = if axis < 0 { 2 } else { axis as usize };
+        let inner: usize = shape[a + 1..].iter().product();
+        let mut want = vec![0f32; 24];
+        for (i, w) in want.iter_mut().enumerate() {
+            let base = i - (i / inner % shape[a]) * inner;
+            let sum: f64 = (0..shape[a])
+                .map(|k| (data[base + k * inner] as f64).exp())
+                .sum();
+            *w = (data[i] as f64 - sum.ln()) as f32;
+        }
+        let mut buf = Vec::new();
+        let got = log_softmax(&t, axis, &mut buf);
+        assert_eq!(got.shape.as_ref(), &shape);
+        assert_close(&got.data, &want, 1e-5, &format!("log_softmax axis {axis}"));
+    }
+}
+
+#[test]
+fn test_log_softmax_keeps_far_tail() {
+    // A CTC head's blank logit often dwarfs the rest; the tail must stay
+    // finite and exact rather than underflowing through exp().
+    let data = vec![100.0f32, 0.0, -50.0];
+    let t = TensorView::from_slice(&data, vec![1usize, 3]);
+    let mut buf = Vec::new();
+    let got = log_softmax(&t, -1, &mut buf);
+    assert_close(&got.data, &[0.0, -100.0, -150.0], 1e-4, "log_softmax tail");
+}
