@@ -1015,10 +1015,14 @@ pub fn conv1d_fused<'b, 'a>(
     if group == 1
         && kernel_size == 3
         && dilation == 1
-        && (stride == 1 || stride == 2)
+        && stride == 1
         && pad_left == 1
         && pad_right == 1
     {
+        // Stride 1 only, mirroring the x86 k=3 dispatch: the kernel below
+        // vectorizes stride-1 time steps. A strided convolution would fall
+        // into its per-output-channel scalar loop, so let it take the generic
+        // im2col+GEMM path instead.
         let bias_ptr = bias.map(|b| b.data.as_ptr());
         unsafe {
             conv1d_direct_k3_t4_oc4_neon(
