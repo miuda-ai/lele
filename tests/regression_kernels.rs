@@ -1893,6 +1893,31 @@ fn test_matmul_2d_by_3d_keeps_batch_dim() {
 }
 
 #[test]
+fn test_split_without_sizes_splits_evenly() {
+    // No `split` input or attribute: the compiler passes zeros, meaning
+    // equal parts (the GLU in a conformer's conv module).
+    let data: Vec<f32> = (0..2 * 6 * 3).map(|i| i as f32).collect();
+    let t = TensorView::from_slice(&data, vec![2usize, 6, 3]);
+    let parts = split_owned(&t, 1, &[0, 0]);
+    assert_eq!(parts.len(), 2);
+    for (p, part) in parts.iter().enumerate() {
+        assert_eq!(part.shape.as_ref(), &[2, 3, 3]);
+        let want: Vec<f32> = (0..2)
+            .flat_map(|o| (0..9).map(move |r| (o * 18 + p * 9 + r) as f32))
+            .collect();
+        assert_eq!(part.data.as_ref(), want.as_slice());
+    }
+    // Uneven: the last part takes the remainder.
+    let data: Vec<f32> = (0..7).map(|i| i as f32).collect();
+    let t = TensorView::from_slice(&data, vec![7usize]);
+    let mut bufs = vec![Vec::new(), Vec::new(), Vec::new()];
+    let parts = split(&t, 0, &[0, 0, 0], &mut bufs);
+    let sizes: Vec<usize> = parts.iter().map(|p| p.shape[0]).collect();
+    assert_eq!(sizes, [3, 3, 1]);
+    assert_eq!(parts[2].data.as_ref(), &[6.0]);
+}
+
+#[test]
 fn test_bool_weights_load_one_byte_per_element() {
     // 16 bools is a multiple of 8 bytes, which `from_bytes_i64` reads as two
     // int64s; masks must go through the bool loader.
