@@ -1,5 +1,8 @@
 use crate::kernels::utils;
 use crate::tensor::TensorView;
+use crate::kernels::simd::simd_call;
+use fearless_simd::{Level, Simd, f32x16, prelude::*};
+use fearless_simd_macros::simd;
 use std::borrow::Cow;
 
 #[cfg(target_arch = "aarch64")]
@@ -238,73 +241,16 @@ pub fn layer_norm<'b, 'a>(
     utils::ensure_capacity(out_buf, input.data.len());
     let out_slice =
         unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), input.data.len()) };
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        crate::kernels::avx::norm::layer_norm_x86(
-            input.data.as_ptr(),
-            scale.data.as_ptr(),
-            bias.data.as_ptr(),
-            out_buf.as_mut_ptr(),
-            norm_size,
-            outer_size,
-            epsilon,
-        );
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
-        crate::kernels::wasm::norm::layer_norm(
-            input.data.as_ptr(),
-            scale.data.as_ptr(),
-            bias.data.as_ptr(),
-            out_buf.as_mut_ptr(),
-            norm_size,
-            outer_size,
-            epsilon,
-        );
-    }
-
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "wasm32")))]
-    {
-        let src = &input.data;
-        let gamma = &scale.data;
-        let beta = &bias.data;
-
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            crate::kernels::neon::normalization::layer_norm_neon(
-                src.as_ptr(),
-                gamma.as_ptr(),
-                beta.as_ptr(),
-                out_slice.as_mut_ptr(),
-                norm_size,
-                outer_size,
-                epsilon,
-            );
-        }
-
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let inv_n = 1.0 / norm_size as f32;
-            for i in 0..outer_size {
-                let offset = i * norm_size;
-                let chunk = &src[offset..offset + norm_size];
-                let out_chunk = &mut out_slice[offset..offset + norm_size];
-                let mut sum = 0.0f32;
-                let mut sumsq = 0.0f32;
-                for &x in chunk.iter() {
-                    sum += x;
-                    sumsq += x * x;
-                }
-                let mean = sum * inv_n;
-                let var = sumsq * inv_n - mean * mean;
-                let inv_std = 1.0 / (var + epsilon).sqrt();
-                for j in 0..norm_size {
-                    out_chunk[j] = (chunk[j] - mean) * inv_std * gamma[j] + beta[j];
-                }
-            }
-        }
-    }
+    debug_assert_eq!(outer_size * norm_size, input.data.len());
+    layer_norm_rows(
+        Level::new(),
+        outer_size,
+        &input.data,
+        &scale.data[..norm_size],
+        &bias.data[..norm_size],
+        out_slice,
+        epsilon,
+    );
     TensorView {
         data: Cow::Borrowed(out_slice),
         shape: std::borrow::Cow::Owned(input.shape.to_vec()),
@@ -431,76 +377,342 @@ pub fn rms_norm<'b, 'a>(
     utils::ensure_capacity(out_buf, input.data.len());
     let out_slice =
         unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), input.data.len()) };
-
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        crate::kernels::neon::normalization::rms_norm_neon(
-            input.data.as_ptr(),
-            weight.data.as_ptr(),
-            out_slice.as_mut_ptr(),
-            norm_size,
-            outer_size,
-            epsilon,
-        );
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        crate::kernels::avx::norm::rms_norm_x86(
-            input.data.as_ptr(),
-            weight.data.as_ptr(),
-            out_slice.as_mut_ptr(),
-            norm_size,
-            outer_size,
-            epsilon,
-        );
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
-        crate::kernels::wasm::norm::rms_norm(
-            input.data.as_ptr(),
-            weight.data.as_ptr(),
-            out_slice.as_mut_ptr(),
-            norm_size,
-            outer_size,
-            epsilon,
-        );
-    }
-
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        target_arch = "x86_64",
-        target_arch = "wasm32"
-    )))]
-    {
-        let src = &input.data;
-        let w = &weight.data;
-        let inv_n = 1.0 / norm_size as f32;
-
-        for i in 0..outer_size {
-            let offset = i * norm_size;
-            let chunk = &src[offset..offset + norm_size];
-            let out_chunk = &mut out_slice[offset..offset + norm_size];
-
-            // Compute sum of squares
-            let mut sumsq = 0.0f32;
-            for &x in chunk.iter() {
-                sumsq += x * x;
-            }
-
-            // Compute RMS and normalize
-            let mean_sq = sumsq * inv_n;
-            let rms_inv = 1.0 / (mean_sq + epsilon).sqrt();
-
-            for j in 0..norm_size {
-                out_chunk[j] = chunk[j] * rms_inv * w[j];
-            }
-        }
-    }
+    debug_assert_eq!(outer_size * norm_size, input.data.len());
+    rms_norm_rows(Level::new(), outer_size, &input.data, &weight.data[..norm_size], out_slice, epsilon);
 
     TensorView {
         data: Cow::Borrowed(out_slice),
         shape: std::borrow::Cow::Owned(input.shape.to_vec()),
+    }
+}
+
+/// Lanes per vector in the norm kernels. Fixed rather than native: AVX2 runs
+/// it as two registers and NEON or WASM as four, which gives each loop
+/// independent work to overlap.
+const LANES: usize = 16;
+
+/// LayerNorm of the first `rows` `gamma.len()`-wide rows of `src` into `out`.
+///
+/// The row count is passed rather than derived: deriving it, as
+/// `chunks_exact` does, costs an integer division per call, which is a
+/// noticeable share of a call on one short row.
+///
+/// Both norms stream memory, so they run AVX-512 machines at AVX2; see
+/// `simd_call!`.
+fn layer_norm_rows(
+    level: Level,
+    rows: usize,
+    src: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    out: &mut [f32],
+    epsilon: f32,
+) {
+    simd_call!(level, max = Avx2, layer_norm_rows_simd(rows, src, gamma, beta, out, epsilon))
+}
+
+#[simd]
+fn layer_norm_rows_simd<S: Simd>(
+    simd: S,
+    rows: usize,
+    src: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    out: &mut [f32],
+    epsilon: f32,
+) {
+    let n = gamma.len();
+    // Multiplying by 1/n keeps a division off each row's chain from its sums
+    // to its first output, which short rows spend most of their time on.
+    let inv_n = 1.0 / n as f32;
+    // Peeling rows off the front checks each split once, where indexing by
+    // `r * n` checks both ends of every row.
+    let (mut src, mut out) = (&src[..rows * n], &mut out[..rows * n]);
+    for _ in 0..rows {
+        let row;
+        (row, src) = src.split_at(n);
+        let out_row;
+        (out_row, out) = std::mem::take(&mut out).split_at_mut(n);
+        let (sum, sumsq) = sums(simd, row, 0.0);
+        let mut mean = sum * inv_n;
+        let mut var = sumsq * inv_n - mean * mean;
+        // E[x²] - E[x]² loses log2(E[x²] / var) bits of the variance to
+        // cancellation. Rows centred near zero lose almost none; for the rest
+        // a second pass over the deviations is cheaper than the error. Its
+        // deviations also sum to the rounding error of `mean`, which corrects
+        // both.
+        if mean * mean > VAR_CANCEL_LIMIT * var {
+            std::hint::cold_path();
+            let (dev, devsq) = sums(simd, row, mean);
+            let shift = dev * inv_n;
+            mean += shift;
+            var = devsq * inv_n - shift * shift;
+        }
+        let inv_std = 1.0 / (var + epsilon).sqrt();
+
+        let mean_v = f32x16::splat(simd, mean);
+        let inv_std_v = f32x16::splat(simd, inv_std);
+        let norm = |x, g, b, o| {
+            let normed = (f32x16::load_array_ref(simd, x) - mean_v) * inv_std_v;
+            normed
+                .mul_add(f32x16::load_array_ref(simd, g), f32x16::load_array_ref(simd, b))
+                .store_array(o);
+        };
+        let (x, x_tail) = row.as_chunks::<LANES>();
+        let (g, g_tail) = gamma.as_chunks::<LANES>();
+        let (b, b_tail) = beta.as_chunks::<LANES>();
+        let (o, o_tail) = out_row.as_chunks_mut::<LANES>();
+        // Two vectors per step, like the reductions: this loop is bound by
+        // stores, and halving its steps halves its loop overhead.
+        let ((x2, x1), (g2, g1), (b2, b1)) = (x.as_chunks::<2>(), g.as_chunks::<2>(), b.as_chunks::<2>());
+        let (o2, o1) = o.as_chunks_mut::<2>();
+        for ((([x0, x1], [g0, g1]), [b0, b1]), [o0, o1]) in x2.iter().zip(g2).zip(b2).zip(o2) {
+            norm(x0, g0, b0, o0);
+            norm(x1, g1, b1, o1);
+        }
+        for (((x, g), b), o) in x1.iter().zip(g1).zip(b1).zip(o1) {
+            norm(x, g, b, o);
+        }
+        if !x_tail.is_empty() {
+            layer_norm_tail(x_tail, g_tail, b_tail, o_tail, mean, inv_std);
+        }
+    }
+}
+
+// The scalar tails past the last full vector live out of line. Widths are
+// almost always multiples of 16, and inlined, each tail's unrolled loop costs
+// its setup on every call whether or not it runs; a cold call costs nothing
+// until it does.
+
+#[cold]
+#[inline(never)]
+fn layer_norm_tail(x: &[f32], g: &[f32], b: &[f32], out: &mut [f32], mean: f32, inv_std: f32) {
+    for (((&x, &g), &b), o) in x.iter().zip(g).zip(b).zip(out) {
+        *o = (x - mean) * inv_std * g + b;
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn rms_norm_tail(x: &[f32], w: &[f32], out: &mut [f32], inv_rms: f32) {
+    for ((&x, &w), o) in x.iter().zip(w).zip(out) {
+        *o = x * inv_rms * w;
+    }
+}
+
+/// Sum and sum of squares of `tail - shift`.
+#[cold]
+#[inline(never)]
+fn tail_sums(tail: &[f32], shift: f32) -> (f32, f32) {
+    tail.iter().fold((0.0, 0.0), |(sum, sumsq), &x| {
+        let d = x - shift;
+        (sum + d, sumsq + d * d)
+    })
+}
+
+/// How far E[x]² may exceed the variance before LayerNorm recomputes the
+/// variance from deviations: past 16, E[x²] - E[x]² has lost over 4 bits.
+const VAR_CANCEL_LIMIT: f32 = 16.0;
+
+/// Sum and sum of squares of `row - shift`. Each sum is split across two
+/// accumulators so consecutive adds need not wait on one another.
+#[inline(always)]
+fn sums<S: Simd>(simd: S, row: &[f32], shift: f32) -> (f32, f32) {
+    let shift_v = f32x16::splat(simd, shift);
+    let zero = f32x16::splat(simd, 0.0);
+    let (mut sum0, mut sum1, mut sq0, mut sq1) = (zero, zero, zero, zero);
+    let (vectors, tail) = row.as_chunks::<LANES>();
+    let (pairs, single) = vectors.as_chunks::<2>();
+    for [a, b] in pairs {
+        let a = f32x16::load_array_ref(simd, a) - shift_v;
+        let b = f32x16::load_array_ref(simd, b) - shift_v;
+        sum0 = sum0 + a;
+        sum1 = sum1 + b;
+        sq0 = a.mul_add(a, sq0);
+        sq1 = b.mul_add(b, sq1);
+    }
+    for x in single {
+        let x = f32x16::load_array_ref(simd, x) - shift_v;
+        sum0 = sum0 + x;
+        sq0 = x.mul_add(x, sq0);
+    }
+    let (mut sum, mut sumsq) = ((sum0 + sum1).reduce_sum(), (sq0 + sq1).reduce_sum());
+    if !tail.is_empty() {
+        let (s, q) = tail_sums(tail, shift);
+        sum += s;
+        sumsq += q;
+    }
+    (sum, sumsq)
+}
+
+/// RMSNorm of the first `rows` `weight.len()`-wide rows of `src` into `out`;
+/// see [`layer_norm_rows`] for why the row count is passed.
+fn rms_norm_rows(level: Level, rows: usize, src: &[f32], weight: &[f32], out: &mut [f32], epsilon: f32) {
+    simd_call!(level, max = Avx2, rms_norm_rows_simd(rows, src, weight, out, epsilon))
+}
+
+#[simd]
+fn rms_norm_rows_simd<S: Simd>(
+    simd: S,
+    rows: usize,
+    src: &[f32],
+    weight: &[f32],
+    out: &mut [f32],
+    epsilon: f32,
+) {
+    let n = weight.len();
+    let inv_n = 1.0 / n as f32;
+    // Peeling rows off the front checks each split once, where indexing by
+    // `r * n` checks both ends of every row.
+    let (mut src, mut out) = (&src[..rows * n], &mut out[..rows * n]);
+    for _ in 0..rows {
+        let row;
+        (row, src) = src.split_at(n);
+        let out_row;
+        (out_row, out) = std::mem::take(&mut out).split_at_mut(n);
+        let zero = f32x16::splat(simd, 0.0);
+        let (mut sq0, mut sq1) = (zero, zero);
+        let (vectors, tail) = row.as_chunks::<LANES>();
+        let (pairs, single) = vectors.as_chunks::<2>();
+        for [a, b] in pairs {
+            let a = f32x16::load_array_ref(simd, a);
+            let b = f32x16::load_array_ref(simd, b);
+            sq0 = a.mul_add(a, sq0);
+            sq1 = b.mul_add(b, sq1);
+        }
+        for x in single {
+            let x = f32x16::load_array_ref(simd, x);
+            sq0 = x.mul_add(x, sq0);
+        }
+        let mut sumsq = (sq0 + sq1).reduce_sum();
+        if !tail.is_empty() {
+            sumsq += tail_sums(tail, 0.0).1;
+        }
+        let inv_rms = 1.0 / (sumsq * inv_n + epsilon).sqrt();
+
+        let inv_rms_v = f32x16::splat(simd, inv_rms);
+        let (w, w_tail) = weight.as_chunks::<LANES>();
+        let (o, o_tail) = out_row.as_chunks_mut::<LANES>();
+        let scale = |x, w, o| {
+            (f32x16::load_array_ref(simd, x) * inv_rms_v * f32x16::load_array_ref(simd, w)).store_array(o);
+        };
+        // Two vectors per step; see layer_norm_rows_simd.
+        let ((x2, x1), (w2, w1)) = (vectors.as_chunks::<2>(), w.as_chunks::<2>());
+        let (o2, o1) = o.as_chunks_mut::<2>();
+        for (([x0, x1], [w0, w1]), [o0, o1]) in x2.iter().zip(w2).zip(o2) {
+            scale(x0, w0, o0);
+            scale(x1, w1, o1);
+        }
+        for ((x, w), o) in x1.iter().zip(w1).zip(o1) {
+            scale(x, w, o);
+        }
+        if !tail.is_empty() {
+            rms_norm_tail(tail, w_tail, o_tail, inv_rms);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_close, levels};
+
+    const EPS: f32 = 1e-5;
+    const ROWS: usize = 3;
+
+    fn layer_norm_ref(x: &[f32], gamma: &[f32], beta: &[f32]) -> Vec<f64> {
+        let n = gamma.len();
+        x.chunks_exact(n)
+            .flat_map(|row| {
+                let mean = row.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+                let var = row.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n as f64;
+                let inv_std = 1.0 / (var + EPS as f64).sqrt();
+                row.iter()
+                    .zip(gamma.iter().zip(beta))
+                    .map(move |(&v, (&g, &b))| (v as f64 - mean) * inv_std * g as f64 + b as f64)
+            })
+            .collect()
+    }
+
+    fn rms_norm_ref(x: &[f32], weight: &[f32]) -> Vec<f64> {
+        let n = weight.len();
+        x.chunks_exact(n)
+            .flat_map(|row| {
+                let mean_sq = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / n as f64;
+                let inv_rms = 1.0 / (mean_sq + EPS as f64).sqrt();
+                row.iter()
+                    .zip(weight)
+                    .map(move |(&v, &w)| v as f64 * inv_rms * w as f64)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_layer_norm_matches_reference_at_every_length_and_level() {
+        // Rows centred on zero take the single pass; rows centred on 3 have
+        // E[x]² 27 times their variance, so they take the second pass.
+        for (lo, hi) in [(-1.0, 1.0), (2.0, 4.0)] {
+            for level in levels() {
+                let mut rng = Rng::new(1);
+                for &n in AWKWARD_LENS {
+                    let x = rng.vec(ROWS * n, lo, hi);
+                    let gamma = rng.vec(n, 0.5, 1.5);
+                    let beta = rng.vec(n, -0.5, 0.5);
+                    let mut out = vec![0.0; x.len()];
+                    layer_norm_rows(level, ROWS, &x, &gamma, &beta, &mut out, EPS);
+                    let want = layer_norm_ref(&x, &gamma, &beta);
+                    assert_close(&out, &want, 1e-5, &format!("{level:?} x in [{lo}, {hi}) n={n}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_layer_norm_keeps_variance_under_large_mean() {
+        // Spread 1 around 1000: E[x²] - E[x]² on raw values keeps only a few
+        // bits of the variance here.
+        let mut rng = Rng::new(4);
+        let n = 384;
+        let x: Vec<f32> = rng.vec(ROWS * n, -1.0, 1.0).iter().map(|v| v + 1000.0).collect();
+        let gamma = vec![1.0; n];
+        let beta = vec![0.0; n];
+        for level in levels() {
+            let mut out = vec![0.0; x.len()];
+            layer_norm_rows(level, ROWS, &x, &gamma, &beta, &mut out, EPS);
+            assert_close(&out, &layer_norm_ref(&x, &gamma, &beta), 1e-4, &format!("{level:?}"));
+        }
+    }
+
+    #[test]
+    fn test_rms_norm_matches_reference_at_every_length_and_level() {
+        for level in levels() {
+            let mut rng = Rng::new(2);
+            for &n in AWKWARD_LENS {
+                let x = rng.vec(ROWS * n, -3.0, 3.0);
+                let weight = rng.vec(n, 0.5, 1.5);
+                let mut out = vec![0.0; x.len()];
+                rms_norm_rows(level, ROWS, &x, &weight, &mut out, EPS);
+                let want = rms_norm_ref(&x, &weight);
+                assert_close(&out, &want, 1e-6, &format!("{level:?} n={n}"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_norms_accept_unaligned_rows() {
+        // Slicing one element in leaves every row and weight off the vector alignment.
+        let mut rng = Rng::new(3);
+        let n = 67;
+        let x = rng.vec(ROWS * n + 1, -2.0, 2.0);
+        let w = rng.vec(n + 1, 0.5, 1.5);
+        let b = rng.vec(n + 1, -0.5, 0.5);
+        let (x, w, b) = (&x[1..], &w[1..], &b[1..]);
+        let input = TensorView::from_slice(x, vec![ROWS, n]);
+        let weight = TensorView::from_slice(w, vec![n]);
+        let mut out = Vec::new();
+        let got = layer_norm(&input, &weight, &TensorView::from_slice(b, vec![n]), -1, EPS, &mut out);
+        assert_close(&got.data, &layer_norm_ref(x, w, b), 1e-5, "layer_norm");
+        let got = rms_norm(&input, &weight, -1, EPS, &mut out);
+        assert_close(&got.data, &rms_norm_ref(x, w), 1e-6, "rms_norm");
     }
 }
