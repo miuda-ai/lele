@@ -883,6 +883,7 @@ pub(crate) fn generate_nodes(
                         match data_type {
                             7 => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape),
                             6 => format!("self.weight_i32_i64({}, {}, &{:?})", offset, len, shape),
+                            9 => format!("self.weight_bool_i64({}, {}, &{:?})", offset, len, shape),
                             _ => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape), // fallback
                         }
                     } else {
