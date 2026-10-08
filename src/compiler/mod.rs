@@ -1536,7 +1536,7 @@ impl Compiler {
         )?;
         writeln!(
             &mut code,
-            "        self.quantized_weights_cache.borrow_mut().insert(key, (scale.data.clone(), qw.clone()));"
+            "        self.quantized_weights_cache.borrow_mut().insert(key, (scale.data.to_vec(), qw.clone()));"
         )?;
         writeln!(&mut code, "        qw")?;
         writeln!(&mut code, "    }}")?;
@@ -2040,6 +2040,67 @@ mod qdq_fusion_tests {
         ]);
         Compiler::fuse_qdq(&mut g);
         assert_eq!(op_types(&g), ["QuantizeLinear", "DequantizeLinear"]);
+    }
+}
+
+#[cfg(test)]
+mod codegen_smoke_tests {
+    use super::*;
+    use crate::model::onnx_proto::ValueInfoProto;
+
+    fn graph(nodes: Vec<NodeProto>, inputs: &[&str]) -> GraphProto {
+        let last = nodes.last().unwrap().output[0].clone();
+        GraphProto {
+            node: nodes,
+            input: inputs
+                .iter()
+                .map(|name| ValueInfoProto {
+                    name: name.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            output: vec![ValueInfoProto {
+                name: last,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The weight-cache helper is emitted verbatim for every compiled model, so
+    /// a trivial graph is enough to exercise it. It must store an owned copy of
+    /// the DequantizeLinear scale: `TensorView::data` is a `Cow<[f32]>` while
+    /// the cache field is a `Vec<f32>`, so cloning the `Cow` produces code that
+    /// does not type-check (this regressed whenever a model was regenerated).
+    #[test]
+    fn weight_cache_stores_owned_scale() {
+        let g = graph(
+            vec![NodeProto {
+                op_type: "Relu".to_string(),
+                input: vec!["x".to_string()],
+                output: vec!["y".to_string()],
+                ..Default::default()
+            }],
+            &["x"],
+        );
+
+        let result = Compiler::new()
+            .with_name("WeightCacheSmoke")
+            .compile(&g)
+            .expect("compilation of a trivial graph should succeed");
+
+        assert!(
+            result.code.contains("quantized_weights_cache"),
+            "generated code should contain the quantized weight cache helper"
+        );
+        assert!(
+            result.code.contains("(scale.data.to_vec(), qw.clone())"),
+            "weight cache must store an owned Vec<f32> scale copy"
+        );
+        assert!(
+            !result.code.contains("scale.data.clone()"),
+            "weight cache must not clone the Cow<[f32]> scale (does not type-check)"
+        );
     }
 }
 

@@ -117,7 +117,7 @@ pub struct LocalFixedSampledFrame<'a> {
     _phantom: std::marker::PhantomData<&'a ()>,
     #[cfg(target_arch = "aarch64")]
     prepared_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::PreparedWeightsArm>>>,
-    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::QuantizedWeights>>>,
+    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QuantizedWeights>)>>,
 }
 
 impl<'a> LocalFixedSampledFrame<'a> {
@@ -5266,16 +5266,19 @@ fn embedding_concat_i64<'c, 'd>(
         pw
     }
     fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &lele::tensor::TensorView<f32>) -> std::sync::Arc<lele::kernels::QuantizedWeights> {
-        let key = (offset, len);
+        // Distinct initializers can share identical bytes, and one initializer can sit behind several DequantizeLinear nodes carrying different scales, so the key must include the shape and the cached entry must match the exact scale.
+        let key = (offset, len, k, n);
         {
             let cache = self.quantized_weights_cache.borrow();
-            if let Some(qw) = cache.get(&key) {
-                return qw.clone();
+            if let Some((cached_scale, qw)) = cache.get(&key) {
+                if cached_scale.len() == scale.data.len() && cached_scale.iter().zip(scale.data.iter()).all(|(a, b)| a.to_bits() == b.to_bits()) {
+                    return qw.clone();
+                }
             }
         }
         let raw = &self.data[offset..offset+len];
         let qw = std::sync::Arc::new(lele::kernels::prepare_quantized_weights(raw, k, n, &scale.data));
-        self.quantized_weights_cache.borrow_mut().insert(key, qw.clone());
+        self.quantized_weights_cache.borrow_mut().insert(key, (scale.data.to_vec(), qw.clone()));
         qw
     }
     pub fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {
