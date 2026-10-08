@@ -1076,6 +1076,23 @@ pub fn to_i64_vec<T: crate::kernels::utils::AsI64 + Copy + std::fmt::Debug>(
     }
     out
 }
+
+/// The compiler emits all-zero sizes for a Split with no `split` input or
+/// attribute, which ONNX defines as equal parts, the last one smaller when
+/// the axis does not divide evenly.
+fn resolve_split_sizes(splits: &[i64], dim: usize) -> std::borrow::Cow<'_, [i64]> {
+    if splits.is_empty() || splits.iter().any(|&s| s != 0) {
+        return std::borrow::Cow::Borrowed(splits);
+    }
+    let n = splits.len();
+    let part = dim.div_ceil(n);
+    std::borrow::Cow::Owned(
+        (0..n)
+            .map(|i| part.min(dim.saturating_sub(i * part)) as i64)
+            .collect(),
+    )
+}
+
 pub fn split<'a, T: Clone + Copy + std::fmt::Debug>(
     input: &TensorView<'_, T>,
     axis: i64,
@@ -1089,6 +1106,7 @@ pub fn split<'a, T: Clone + Copy + std::fmt::Debug>(
         axis as usize
     };
     assert!(axis < ndim, "Split: axis out of bounds (axis={}, ndim={}, shape={:?})", axis, ndim, &*input.shape);
+    let splits = &*resolve_split_sizes(splits, input.shape[axis]);
     let num_splits = splits.len();
     assert_eq!(
         outputs.len(),
@@ -1155,6 +1173,7 @@ pub fn split_owned<T: Clone + Copy + std::fmt::Debug>(
         axis as usize
     };
     assert!(axis < ndim, "Split: axis out of bounds (axis={}, ndim={}, shape={:?})", axis, ndim, &*input.shape);
+    let splits = &*resolve_split_sizes(splits, input.shape[axis]);
 
     let num_splits = splits.len();
     let total: i64 = splits.iter().sum();
