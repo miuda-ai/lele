@@ -39,8 +39,6 @@ keywords = [
     "onnx",
     "speech-synthesis",
     "text-to-speech",
-    "computer-vision",
-    "wasm",
 ]
 categories = ["algorithms", "compilers", "science", "wasm"]
 exclude = [
