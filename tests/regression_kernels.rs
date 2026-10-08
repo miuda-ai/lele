@@ -1831,3 +1831,13 @@ fn test_matmul_2d_by_3d_keeps_batch_dim() {
         assert_close(&got.data, &want, 1e-4, &format!("matmul 2d x [{batch},k,n]"));
     }
 }
+
+#[test]
+fn test_bool_weights_load_one_byte_per_element() {
+    // 16 bools is a multiple of 8 bytes, which `from_bytes_i64` reads as two
+    // int64s; masks must go through the bool loader.
+    let mask: Vec<u8> = (0..16).map(|i| (i % 3 == 0) as u8).collect();
+    let t = TensorView::from_bytes_bool_as_i64(&mask, vec![4, 4]);
+    let want: Vec<i64> = mask.iter().map(|&b| b as i64).collect();
+    assert_eq!(t.data.as_ref(), want.as_slice());
+}

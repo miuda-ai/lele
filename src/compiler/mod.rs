@@ -1612,6 +1612,16 @@ impl Compiler {
 
         writeln!(
             &mut code,
+            "    pub fn weight_bool_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {{"
+        )?;
+        writeln!(
+            &mut code,
+            "        TensorView::from_bytes_bool_as_i64(&self.data[offset..offset+len], shape.to_vec())"
+        )?;
+        writeln!(&mut code, "    }}")?;
+
+        writeln!(
+            &mut code,
             "    pub fn weight_i32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i32> {{"
         )?;
         writeln!(
@@ -1772,6 +1782,7 @@ impl Compiler {
                         match data_type {
                             7 => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape),
                             6 => format!("self.weight_i32_i64({}, {}, &{:?})", offset, len, shape),
+                            9 => format!("self.weight_bool_i64({}, {}, &{:?})", offset, len, shape),
                             _ => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape),
                         }
                     } else {
