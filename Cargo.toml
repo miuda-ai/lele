@@ -4,6 +4,7 @@ members = [
     "crates/lele-build",
     "examples/sensevoice",
     "examples/silero",
+    "examples/tone",
     "examples/supertonic",
     "examples/supertonic3",
     "examples/yolo26",
