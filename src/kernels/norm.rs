@@ -504,3 +504,98 @@ pub fn rms_norm<'b, 'a>(
         shape: std::borrow::Cow::Owned(input.shape.to_vec()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_close};
+
+    const EPS: f32 = 1e-5;
+    const ROWS: usize = 3;
+
+    fn layer_norm_ref(x: &[f32], gamma: &[f32], beta: &[f32]) -> Vec<f64> {
+        let n = gamma.len();
+        x.chunks_exact(n)
+            .flat_map(|row| {
+                let mean = row.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+                let var = row.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n as f64;
+                let inv_std = 1.0 / (var + EPS as f64).sqrt();
+                row.iter()
+                    .zip(gamma.iter().zip(beta))
+                    .map(move |(&v, (&g, &b))| (v as f64 - mean) * inv_std * g as f64 + b as f64)
+            })
+            .collect()
+    }
+
+    fn rms_norm_ref(x: &[f32], weight: &[f32]) -> Vec<f64> {
+        let n = weight.len();
+        x.chunks_exact(n)
+            .flat_map(|row| {
+                let mean_sq = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / n as f64;
+                let inv_rms = 1.0 / (mean_sq + EPS as f64).sqrt();
+                row.iter()
+                    .zip(weight)
+                    .map(move |(&v, &w)| v as f64 * inv_rms * w as f64)
+            })
+            .collect()
+    }
+
+    // The single-pass E[x²] - E[x]² these kernels use loses up to 1.7e-4 on
+    // these offset rows (at n = 2); the tolerance admits that.
+    #[test]
+    fn test_layer_norm_matches_reference_at_every_length() {
+        let mut rng = Rng::new(1);
+        for &n in AWKWARD_LENS {
+            // An offset mean makes the variance cancel the way activations do.
+            let x = rng.vec(ROWS * n, 2.0, 4.0);
+            let gamma = rng.vec(n, 0.5, 1.5);
+            let beta = rng.vec(n, -0.5, 0.5);
+            let mut out = Vec::new();
+            let got = layer_norm(
+                &TensorView::from_slice(&x, vec![ROWS, n]),
+                &TensorView::from_slice(&gamma, vec![n]),
+                &TensorView::from_slice(&beta, vec![n]),
+                -1,
+                EPS,
+                &mut out,
+            );
+            assert_close(&got.data, &layer_norm_ref(&x, &gamma, &beta), 5e-4, &format!("n={n}"));
+        }
+    }
+
+    #[test]
+    fn test_rms_norm_matches_reference_at_every_length() {
+        let mut rng = Rng::new(2);
+        for &n in AWKWARD_LENS {
+            let x = rng.vec(ROWS * n, -3.0, 3.0);
+            let weight = rng.vec(n, 0.5, 1.5);
+            let mut out = Vec::new();
+            let got = rms_norm(
+                &TensorView::from_slice(&x, vec![ROWS, n]),
+                &TensorView::from_slice(&weight, vec![n]),
+                -1,
+                EPS,
+                &mut out,
+            );
+            assert_close(&got.data, &rms_norm_ref(&x, &weight), 1e-6, &format!("n={n}"));
+        }
+    }
+
+    #[test]
+    fn test_norms_accept_unaligned_rows() {
+        // Slicing one element in leaves every row and weight off the vector alignment.
+        let mut rng = Rng::new(3);
+        let n = 67;
+        let x = rng.vec(ROWS * n + 1, -2.0, 2.0);
+        let w = rng.vec(n + 1, 0.5, 1.5);
+        let b = rng.vec(n + 1, -0.5, 0.5);
+        let (x, w, b) = (&x[1..], &w[1..], &b[1..]);
+        let input = TensorView::from_slice(x, vec![ROWS, n]);
+        let weight = TensorView::from_slice(w, vec![n]);
+        let mut out = Vec::new();
+        let got = layer_norm(&input, &weight, &TensorView::from_slice(b, vec![n]), -1, EPS, &mut out);
+        assert_close(&got.data, &layer_norm_ref(x, w, b), 5e-4, "layer_norm");
+        let got = rms_norm(&input, &weight, -1, EPS, &mut out);
+        assert_close(&got.data, &rms_norm_ref(x, w), 1e-6, "rms_norm");
+    }
+}
