@@ -1865,3 +1865,29 @@ fn test_log_softmax_keeps_far_tail() {
     let got = log_softmax(&t, -1, &mut buf);
     assert_close(&got.data, &[0.0, -100.0, -150.0], 1e-4, "log_softmax tail");
 }
+
+#[test]
+fn test_matmul_2d_by_3d_keeps_batch_dim() {
+    // T-one's mel filterbank: [64, 81] x [1, 81, T]. The batch dim used to be
+    // dropped, giving [64, T].
+    let (m, k, n) = (3usize, 4usize, 5usize);
+    let a: Vec<f32> = (0..m * k).map(|i| i as f32 * 0.5 - 2.0).collect();
+    let mut want = Vec::new();
+    for batch in [1usize, 2] {
+        let b: Vec<f32> = (0..batch * k * n).map(|i| (i % 7) as f32 - 3.0).collect();
+        want.clear();
+        for bi in 0..batch {
+            for i in 0..m {
+                for j in 0..n {
+                    want.push((0..k).map(|p| a[i * k + p] * b[bi * k * n + p * n + j]).sum());
+                }
+            }
+        }
+        let ta = TensorView::from_slice(&a, vec![m, k]);
+        let tb = TensorView::from_slice(&b, vec![batch, k, n]);
+        let mut buf = Vec::new();
+        let got = matmul(&ta, &tb, &mut buf);
+        assert_eq!(got.shape.as_ref(), &[batch, m, n]);
+        assert_close(&got.data, &want, 1e-4, &format!("matmul 2d x [{batch},k,n]"));
+    }
+}

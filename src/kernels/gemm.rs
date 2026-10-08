@@ -130,15 +130,15 @@ pub fn matmul<'a>(
     let batch_b: usize = b.shape[..b_dims - 2].iter().product();
     let final_batch = batch_a.max(batch_b);
 
+    // Batch dims broadcast numpy-style, so `[M,K] x [1,K,N]` is `[1,M,N]`: the
+    // lower-rank operand's missing leading dims still appear in the output.
+    let mut out_shape = utils::broadcast_shapes(&a.shape[..a_dims - 2], &b.shape[..b_dims - 2])
+        .expect("MatMul batch dims do not broadcast");
     assert!(
-        batch_b == 1 || batch_b == batch_a,
+        (batch_a == 1 || batch_b == 1 || batch_a == batch_b)
+            && out_shape.iter().product::<usize>() == final_batch,
         "MatMul broadcast not fully supported yet"
     );
-    let mut out_shape = if batch_a >= batch_b {
-        a.shape[..a_dims - 2].to_vec()
-    } else {
-        b.shape[..b_dims - 2].to_vec()
-    };
     out_shape.push(m);
     out_shape.push(n);
 
