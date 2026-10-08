@@ -157,6 +157,42 @@ fn softmax_rows_simd<S: Simd>(simd: S, rows: usize, n: usize, src: &[f32], out: 
 const LANE_INDEX: [f32; LANES] =
     [0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15.];
 
+/// `x - max - ln(sum(exp(x - max)))` along `axis`. Scalar on purpose: CTC heads
+/// apply it once to a few hundred logits, and the exact `exp`/`ln` keep the
+/// log-probabilities faithful far into the tail, where beam search reads them.
+pub fn log_softmax<'b, 'a>(
+    input: &TensorView<'b>,
+    axis: i32,
+    out_buf: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let ndim = input.shape.len();
+    let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
+    assert!(axis < ndim);
+    let numel = input.data.len();
+    utils::ensure_capacity(out_buf, numel);
+    let out_slice = unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), numel) };
+    let inner_size: usize = input.shape[axis + 1..].iter().product();
+    let axis_size = input.shape[axis];
+    let outer_size: usize = input.shape[..axis].iter().product();
+    let data = &input.data;
+    for o in 0..outer_size {
+        for i in 0..inner_size {
+            let base = o * axis_size * inner_size + i;
+            let at = |k: usize| base + k * inner_size;
+            let max_val = (0..axis_size).fold(f32::NEG_INFINITY, |m, k| m.max(data[at(k)]));
+            let sum: f32 = (0..axis_size).map(|k| (data[at(k)] - max_val).exp()).sum();
+            let shift = max_val + sum.ln();
+            for k in 0..axis_size {
+                out_slice[at(k)] = data[at(k)] - shift;
+            }
+        }
+    }
+    TensorView {
+        data: Cow::Borrowed(out_slice),
+        shape: std::borrow::Cow::Owned(input.shape.to_vec()),
+    }
+}
+
 pub fn layer_norm<'b, 'a>(
     input: &TensorView<'b>,
     scale: &TensorView<'b>,
