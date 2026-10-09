@@ -29,14 +29,20 @@ pub(crate) fn depthwise(
     out: &mut [f32],
 ) {
     // Each channel is copied into `padded` between zeros, so no tap needs a
-    // bounds test and a vector load never runs off the end.
-    let padded_len = (shape.pad_left + shape.len).max((shape.out_len - 1) * shape.stride + shape.kernel)
-        + 2 * VECTOR;
+    // bounds test and a vector load never runs off the end. Stride 2 also
+    // keeps the even and the odd entries of the row apart, after the copy.
+    let phases = if shape.stride == 2 { padded_row_len(shape) } else { 0 };
     DEPTHWISE_PADDED.with_borrow_mut(|padded| {
         padded.clear();
-        padded.resize(padded_len, 0.0);
+        padded.resize(padded_row_len(shape) + phases, 0.0);
         simd_call!(level, depthwise_simd(shape, input, weights, out, padded))
     })
+}
+
+/// Room for a row between zeros, as an even number of entries.
+fn padded_row_len(shape: &Depthwise) -> usize {
+    let used = (shape.pad_left + shape.len).max((shape.out_len - 1) * shape.stride + shape.kernel);
+    (used + 2 * VECTOR).next_multiple_of(2)
 }
 
 const VECTOR: usize = 16;
@@ -56,6 +62,8 @@ fn depthwise_simd<S: Simd>(
 ) {
     use fearless_simd::prelude::*;
     let (k, len, out_len, stride) = (s.kernel, s.len, s.out_len, s.stride);
+    let (padded, phases) = padded.split_at_mut(padded_row_len(s));
+    let (even, odd) = phases.split_at_mut(phases.len() / 2);
     for c in 0..s.batch * s.channels {
         // Only the row's own span changes between channels; the zeros around it stay.
         let (dst, src) = (&mut padded[s.pad_left..][..len], &input[c * len..][..len]);
@@ -68,10 +76,16 @@ fn depthwise_simd<S: Simd>(
             dst.copy_from_slice(src);
         }
         let x = &*padded;
+        if stride == 2 {
+            for ((e, o), pair) in even.iter_mut().zip(odd.iter_mut()).zip(x.chunks_exact(2)) {
+                (*e, *o) = (pair[0], pair[1]);
+            }
+        }
+        let phase: [&[f32]; 2] = [&*even, &*odd];
         let y = &mut out[c * out_len..][..out_len];
         let w = &weights[(c % s.channels) * k..][..k];
         let bias = s.bias.map_or(0.0, |b| b[c % s.channels]);
-        if stride != 1 {
+        if stride > 2 {
             for (t, y) in y.iter_mut().enumerate() {
                 let mut sum = bias;
                 for (&xv, &w) in x[t * stride..][..k].iter().zip(w) {
@@ -83,13 +97,14 @@ fn depthwise_simd<S: Simd>(
         }
         // `$n` outputs at a time with vectors of type `$v`.
         macro_rules! sweep {
-            ($v:ident, $n:literal) => {{
+            // `$src` is where tap `$kk` of output `$t` starts in the padded row.
+            ($v:ident, $n:literal, |$t:ident, $kk:ident| $src:expr) => {{
                 let vbias = $v::splat(simd, bias);
                 let zero = $v::splat(simd, 0.0);
-                let at = |t: usize| {
+                let at = |$t: usize| {
                     let mut acc = vbias;
-                    for (kk, &w) in w.iter().enumerate() {
-                        let xv = $v::from_slice(simd, &x[t + kk..][..$n]);
+                    for ($kk, &w) in w.iter().enumerate() {
+                        let xv = $v::from_slice(simd, &$src[..$n]);
                         acc = $v::splat(simd, w).mul_add(xv, acc);
                     }
                     if s.relu { acc.max(zero) } else { acc }
@@ -111,10 +126,13 @@ fn depthwise_simd<S: Simd>(
                 }
             }};
         }
-        if out_len >= 16 {
-            sweep!(f32x16, 16)
-        } else {
-            sweep!(f32x8, 8)
+        // Stride 2 reads input `2t + kk`, which is entry `t + kk / 2` of phase `kk % 2`.
+        // The branches are outside the sweeps so each one compiles as a unit.
+        match (stride, out_len >= 16) {
+            (1, true) => sweep!(f32x16, 16, |t, kk| x[t + kk..]),
+            (1, false) => sweep!(f32x8, 8, |t, kk| x[t + kk..]),
+            (_, true) => sweep!(f32x16, 16, |t, kk| phase[kk % 2][t + kk / 2..]),
+            (_, false) => sweep!(f32x8, 8, |t, kk| phase[kk % 2][t + kk / 2..]),
         }
     }
 }
