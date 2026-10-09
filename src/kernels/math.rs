@@ -370,8 +370,18 @@ where
         let a_prev = if a.shape.len() >= 2 { a.shape[a.shape.len() - 2] } else { 1 };
         let b_last = b.shape[b.shape.len() - 1];
         let b_prev = if b.shape.len() >= 2 { b.shape[b.shape.len() - 2] } else { 1 };
-        // a is [1,N] (a_prev==1, a_last==cols), b is [M,1] (b_prev==rows, b_last==1)
-        if a_prev == 1 && a_last == cols && b_prev == rows && b_last == 1 && cols > 1 && rows > 1 {
+        // a is [1,N] (a_prev==1, a_last==cols), b is [M,1] (b_prev==rows, b_last==1).
+        // Only when they have no leading dimensions: the loops below index a by
+        // column and b by row alone.
+        if a_prev == 1
+            && a_last == cols
+            && b_prev == rows
+            && b_last == 1
+            && cols > 1
+            && rows > 1
+            && a.data.len() == cols
+            && b.data.len() == rows
+        {
             let a_slice = &a.data;
             let b_slice = &b.data;
             for l in 0..leading {
@@ -392,7 +402,15 @@ where
             };
         }
         // a is [M,1] (a_prev==rows, a_last==1), b is [1,N] (b_prev==1, b_last==cols)
-        if a_prev == rows && a_last == 1 && b_prev == 1 && b_last == cols && cols > 1 && rows > 1 {
+        if a_prev == rows
+            && a_last == 1
+            && b_prev == 1
+            && b_last == cols
+            && cols > 1
+            && rows > 1
+            && a.data.len() == rows
+            && b.data.len() == cols
+        {
             let a_slice = &a.data;
             let b_slice = &b.data;
             for l in 0..leading {
@@ -2907,6 +2925,131 @@ mod tests {
         assert_eq!(res.shape, vec![2, 3]);
         assert_eq!(res.data, vec![11.0, 21.0, 31.0, 12.0, 22.0, 32.0]);
     }
+    /// `op` over `a` and `b` under numpy broadcasting, element by element.
+    fn broadcast_reference(
+        a: &[f32],
+        a_shape: &[usize],
+        b: &[f32],
+        b_shape: &[usize],
+        op: impl Fn(f32, f32) -> f32,
+    ) -> (Vec<usize>, Vec<f32>) {
+        let shape = utils::broadcast_shapes(a_shape, b_shape).unwrap();
+        let rank = shape.len();
+        let index = |operand: &[usize], coords: &[usize]| {
+            let skipped = rank - operand.len();
+            operand.iter().enumerate().fold(0, |idx, (d, &n)| {
+                idx * n + if n == 1 { 0 } else { coords[skipped + d] }
+            })
+        };
+        let out = (0..shape.iter().product::<usize>())
+            .map(|flat| {
+                let mut coords = vec![0; rank];
+                let mut rest = flat;
+                for d in (0..rank).rev() {
+                    coords[d] = rest % shape[d];
+                    rest /= shape[d];
+                }
+                op(a[index(a_shape, &coords)], b[index(b_shape, &coords)])
+            })
+            .collect();
+        (shape, out)
+    }
+
+    #[test]
+    fn test_add_sub_mul_div_match_broadcast_reference() {
+        use crate::kernels::test_util::{Rng, AWKWARD_LENS};
+        let mut shapes: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
+        for &n in AWKWARD_LENS {
+            shapes.push((vec![n], vec![n]));
+            shapes.push((vec![n], vec![1]));
+            shapes.push((vec![1], vec![n]));
+            shapes.push((vec![2, n], vec![n]));
+            shapes.push((vec![n], vec![3, 1]));
+        }
+        for (a, b) in [
+            // a scalar on either side
+            (vec![2, 3, 5], vec![1, 1, 1]),
+            (vec![], vec![4, 5]),
+            // one value per channel, both ways round
+            (vec![1, 8, 7, 7], vec![8, 1, 1]),
+            (vec![1, 8, 7, 7], vec![1, 8, 1, 1]),
+            (vec![2, 8, 7, 7], vec![2, 8, 1, 1]),
+            (vec![2, 8, 7, 7], vec![1, 8, 1, 1]),
+            (vec![8, 1, 1], vec![1, 8, 7, 7]),
+            (vec![1, 64, 56, 56], vec![64, 1, 1]),
+            (vec![1, 3, 100, 100], vec![3, 1, 1]),
+            // one value per row
+            (vec![10, 35], vec![10, 1]),
+            (vec![10, 1], vec![10, 35]),
+            (vec![2, 40, 33], vec![2, 40, 1]),
+            // a trailing block repeated: a bias, a mask
+            (vec![2, 3, 5, 7], vec![7]),
+            (vec![2, 3, 5, 7], vec![5, 7]),
+            (vec![2, 3, 5, 7], vec![1, 1, 5, 7]),
+            (vec![7], vec![2, 3, 5, 7]),
+            // as many values as channels, but along the last dimension
+            (vec![1, 3, 4, 3], vec![3]),
+            (vec![3], vec![1, 3, 4, 3]),
+            (vec![1, 3, 4, 3], vec![1, 1, 1, 3]),
+            (vec![40, 1920], vec![1920]),
+            (vec![1, 8, 50, 50], vec![1, 1, 50, 50]),
+            (vec![1, 1, 50, 50], vec![1, 8, 50, 50]),
+            // a block in the middle
+            (vec![2, 3, 4, 5], vec![3, 4, 1]),
+            (vec![2, 3, 4, 5], vec![1, 3, 4, 1]),
+            // not one block: both sides broadcast
+            (vec![4, 1, 5], vec![1, 6, 1]),
+            (vec![2, 3, 1, 5], vec![2, 1, 4, 1]),
+            (vec![2, 1, 1, 5], vec![2, 3, 4, 5]),
+            (vec![17, 1], vec![1, 19]),
+        ] {
+            shapes.push((a, b));
+        }
+
+        let mut rng = Rng::new(11);
+        let ops: [(&str, fn(f32, f32) -> f32); 4] = [
+            ("add", |x, y| x + y),
+            ("sub", |x, y| x - y),
+            ("mul", |x, y| x * y),
+            ("div", |x, y| x / y),
+        ];
+        for (a_shape, b_shape) in &shapes {
+            let mut values = |shape: &[usize]| {
+                let mut v = rng.vec(shape.iter().product(), -4.0, 4.0);
+                // Exact zeros, so that division produces infinities and NaNs.
+                for x in v.iter_mut().step_by(7) {
+                    *x = 0.0;
+                }
+                v
+            };
+            let (a, b) = (values(a_shape), values(b_shape));
+            let (ta, tb) = (
+                TensorView::from_slice(&a, a_shape.clone()),
+                TensorView::from_slice(&b, b_shape.clone()),
+            );
+            for (name, op) in ops {
+                let (want_shape, want) = broadcast_reference(&a, a_shape, &b, b_shape, op);
+                let mut out = Vec::new();
+                let got = match name {
+                    "add" => add(&ta, &tb, &mut out),
+                    "sub" => sub(&ta, &tb, &mut out),
+                    "mul" => mul(&ta, &tb, &mut out),
+                    _ => div(&ta, &tb, &mut out),
+                };
+                let what = format!("{name} {a_shape:?} {b_shape:?}");
+                assert_eq!(got.shape.to_vec(), want_shape, "{what}: shape");
+                assert_eq!(got.data.len(), want.len(), "{what}: length");
+                for (i, (g, w)) in got.data.iter().zip(&want).enumerate() {
+                    // These operations are exactly rounded: bit for bit, NaNs aside.
+                    assert!(
+                        g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan()),
+                        "{what}: element {i}: got {g}, want {w}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_min_max() {
         let data = vec![1.0, -5.0, 10.0, 3.0];
