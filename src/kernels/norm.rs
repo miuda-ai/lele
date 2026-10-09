@@ -715,4 +715,116 @@ mod tests {
         let got = rms_norm(&input, &weight, -1, EPS, &mut out);
         assert_close(&got.data, &rms_norm_ref(x, w), 1e-6, "rms_norm");
     }
+
+    fn softmax_ref(x: &[f32], n: usize) -> Vec<f64> {
+        x.chunks_exact(n)
+            .flat_map(|row| {
+                let max = row.iter().fold(f64::MIN, |m, &v| m.max(v as f64));
+                let exps: Vec<f64> = row.iter().map(|&v| (v as f64 - max).exp()).collect();
+                let sum: f64 = exps.iter().sum();
+                exps.into_iter().map(move |e| e / sum)
+            })
+            .collect()
+    }
+
+    fn softmax_rows(x: &[f32], n: usize) -> Vec<f32> {
+        let input = TensorView::from_slice(x, vec![x.len() / n, n]);
+        let mut out = Vec::new();
+        softmax(&input, -1, &mut out).data.into_owned()
+    }
+
+    #[test]
+    fn test_softmax_matches_reference_at_every_length() {
+        // Probabilities are at most 1, so the check is effectively absolute.
+        for (lo, hi) in [(-5.0, 5.0), (-80.0, 80.0)] {
+            let mut rng = Rng::new(5);
+            for &n in AWKWARD_LENS {
+                let x = rng.vec(ROWS * n, lo, hi);
+                let got = softmax_rows(&x, n);
+                assert_close(&got, &softmax_ref(&x, n), 1e-5, &format!("x in [{lo}, {hi}) n={n}"));
+                for (r, row) in got.chunks_exact(n).enumerate() {
+                    let sum: f64 = row.iter().map(|&v| v as f64).sum();
+                    assert!((sum - 1.0).abs() < 1e-5, "n={n} row {r} sums to {sum}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_softmax_of_equal_logits_is_uniform() {
+        for &n in AWKWARD_LENS {
+            for v in [0.0, -30.0, 70.0] {
+                let got = softmax_rows(&vec![v; n], n);
+                assert_close(&got, &vec![1.0 / n as f64; n], 1e-6, &format!("v={v} n={n}"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_softmax_keeps_far_below_max_logits_finite() {
+        // Everything but the first logit sits past exp's underflow point.
+        for &n in AWKWARD_LENS.iter().filter(|&&n| n > 1) {
+            let mut x = vec![-200.0; n];
+            x[0] = 50.0;
+            let got = softmax_rows(&x, n);
+            assert_close(&got, &softmax_ref(&x, n), 1e-6, &format!("n={n}"));
+        }
+    }
+
+    fn batch_norm_ref(x: &[f32], c: usize, inner: usize, p: &BnParams) -> Vec<f64> {
+        x.iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let ch = (i / inner) % c;
+                let inv_std = 1.0 / (p.var[ch] as f64 + EPS as f64).sqrt();
+                (v as f64 - p.mean[ch] as f64) * inv_std * p.scale[ch] as f64 + p.bias[ch] as f64
+            })
+            .collect()
+    }
+
+    struct BnParams {
+        scale: Vec<f32>,
+        bias: Vec<f32>,
+        mean: Vec<f32>,
+        var: Vec<f32>,
+    }
+
+    fn check_batch_norm(shape: Vec<usize>, rng: &mut Rng) {
+        let c = shape[1];
+        let inner: usize = shape[2..].iter().product();
+        let x = rng.vec(shape.iter().product(), -3.0, 3.0);
+        let p = BnParams {
+            scale: rng.vec(c, 0.5, 1.5),
+            bias: rng.vec(c, -0.5, 0.5),
+            mean: rng.vec(c, -1.0, 1.0),
+            var: rng.vec(c, 0.5, 2.0),
+        };
+        let input = TensorView::from_slice(&x, shape.clone());
+        fn param(v: &[f32]) -> TensorView<'_> {
+            TensorView::from_slice(v, vec![v.len()])
+        }
+        let mut out = Vec::new();
+        let got = batch_norm(
+            &input,
+            &param(&p.scale),
+            &param(&p.bias),
+            &param(&p.mean),
+            &param(&p.var),
+            EPS,
+            &mut out,
+        );
+        assert_close(&got.data, &batch_norm_ref(&x, c, inner, &p), 1e-6, &format!("{shape:?}"));
+    }
+
+    #[test]
+    fn test_batch_norm_matches_reference_at_every_spatial_size() {
+        let mut rng = Rng::new(6);
+        for &n in AWKWARD_LENS {
+            // 4D takes the NCHW path, 3D and 2D the generic one.
+            check_batch_norm(vec![2, 3, 1, n], &mut rng);
+            check_batch_norm(vec![2, 3, n], &mut rng);
+        }
+        check_batch_norm(vec![2, 3, 5, 7], &mut rng);
+        check_batch_norm(vec![4, 67], &mut rng);
+    }
 }
