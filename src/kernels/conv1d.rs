@@ -147,13 +147,18 @@ fn conv1d_fused_at<'b, 'a>(
         return TensorView::from_slice(out, vec![batch_size, out_channels, output_len]);
     }
 
-    if group as usize == in_channels && group as usize == out_channels && dilation == 1 {
+    // Dilated taps are only handled with stride 1.
+    if group as usize == in_channels
+        && group as usize == out_channels
+        && (dilation == 1 || stride == 1)
+    {
         let shape = Depthwise {
             batch: batch_size,
             channels: in_channels,
             len: input_len,
             kernel: kernel_size,
             stride,
+            dilation,
             pad_left,
             out_len: output_len,
             bias: bias.map(|b| &b.data[..out_channels]),
@@ -516,6 +521,27 @@ mod tests {
             Case {
                 group: 3,
                 ..case(3, 3, 5, 7, 1, [3, 3])
+            },
+            Case {
+                group: 5,
+                dilation: 2,
+                ..case(5, 5, 60, 5, 1, [4, 4])
+            },
+            Case {
+                group: 5,
+                dilation: 4,
+                ..case(5, 5, 33, 5, 1, [0, 0])
+            },
+            Case {
+                group: 4,
+                dilation: 8,
+                ..case(4, 4, 90, 3, 1, [8, 3])
+            },
+            Case {
+                batch: 2,
+                group: 3,
+                dilation: 3,
+                ..case(3, 3, 20, 4, 1, [3, 3])
             },
             Case {
                 batch: 2,
