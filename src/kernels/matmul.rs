@@ -171,27 +171,34 @@ pub(crate) fn matmul_at(
                 BOperand::Columns(&b_rm, k)
             }
         }
+    } else if let Some(ldb) = row_major(k, n, b.rs, b.cs) {
+        BOperand::Rows(b_data, ldb)
+    } else if let Some(ldbt) = row_major(n, k, b.cs, b.rs) {
+        BOperand::Columns(b_data, ldbt)
     } else {
-        match row_major(k, n, b.rs, b.cs) {
-            Some(ldb) => BOperand::Rows(b_data, ldb),
-            None => {
-                b_rm = gather(b_data, k, n, b.rs as usize, b.cs as usize);
-                BOperand::Rows(&b_rm, n)
-            }
-        }
+        b_rm = gather(b_data, k, n, b.rs as usize, b.cs as usize);
+        BOperand::Rows(&b_rm, n)
     };
     let run = |c: &mut [f32], ldc: usize| match operand {
         BOperand::Rows(b, ldb) => {
-            let dims = Dims { m, n, k, lda, ldb, ldc, alpha, add };
+            let dims = Dims { m, n, k, lda, ldb, ldc, alpha, add, b_cols: false };
             if m <= SMALL_M {
                 gemm_small_m(level, &dims, a_data, b, c)
             } else {
                 gemm_nn(level, &dims, a_data, b, c)
             }
         }
-        BOperand::Columns(bt, ldbt) => {
+        // Few rows or columns of C: dot products. Otherwise the columns are packed.
+        BOperand::Columns(bt, ldbt) if n <= DOT_MAX_N || m <= SMALL_M => {
             gemm_dot(level, &DotDims { m, n, k, lda, ldbt, ldc, alpha, add }, a_data, bt, c)
         }
+        BOperand::Columns(bt, ldb) => gemm_nn(
+            level,
+            &Dims { m, n, k, lda, ldb, ldc, alpha, add, b_cols: true },
+            a_data,
+            bt,
+            c,
+        ),
     };
     match row_major(m, n, rsc, csc) {
         Some(ldc) => run(c, ldc),

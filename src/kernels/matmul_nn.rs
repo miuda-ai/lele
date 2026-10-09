@@ -38,6 +38,8 @@ pub(crate) struct Dims {
     pub ldc: usize,
     pub alpha: f32,
     pub add: bool,
+    /// `b` is the transpose of B, row-major with `ldb` between rows (`gemm_nn` only).
+    pub b_cols: bool,
 }
 
 pub(crate) fn gemm_nn(level: Level, d: &Dims, a: &[f32], b: &[f32], c: &mut [f32]) {
@@ -80,7 +82,7 @@ fn gemm_nn_simd<S: Simd>(
             let kc = KC.min(d.k - pc);
             // The first depth overwrites C unless asked to add; later ones add.
             let accumulate = d.add || pc > 0;
-            pack_b(b, d.ldb, pc, kc, jc, nc, bpack);
+            pack_b(b, d.ldb, d.b_cols, pc, kc, jc, nc, bpack);
             let mut ic = 0;
             while ic < d.m {
                 let mc = MC.min(d.m - ic);
@@ -221,13 +223,33 @@ fn row_tile<S: Simd, const R: usize, const V: usize>(
 
 /// Copies `B[pc.., jc..]` (`kc` rows, `nc` columns) into panels of `NR` columns, each
 /// `kc` rows of `NR`, zero beyond `nc`.
-fn pack_b(b: &[f32], ldb: usize, pc: usize, kc: usize, jc: usize, nc: usize, out: &mut [f32]) {
+///
+/// With `b_cols`, `b` holds the transpose of B (column `j` of B is the contiguous row
+/// `j` of `b`), and the panels are read side by side and written in order.
+fn pack_b(b: &[f32], ldb: usize, b_cols: bool, pc: usize, kc: usize, jc: usize, nc: usize, out: &mut [f32]) {
     for (jp, panel) in out.chunks_exact_mut(kc * NR).take(nc.div_ceil(NR)).enumerate() {
         let j = jc + jp * NR;
         let width = NR.min(jc + nc - j);
-        for (p, row) in panel.chunks_exact_mut(NR).enumerate() {
-            row[..width].copy_from_slice(&b[(pc + p) * ldb + j..][..width]);
-            row[width..].fill(0.0);
+        if !b_cols {
+            for (p, row) in panel.chunks_exact_mut(NR).enumerate() {
+                row[..width].copy_from_slice(&b[(pc + p) * ldb + j..][..width]);
+                row[width..].fill(0.0);
+            }
+        } else if width == NR {
+            let src: [&[f32]; NR] = core::array::from_fn(|jj| &b[(j + jj) * ldb + pc..][..kc]);
+            for (p, dst) in panel.as_chunks_mut::<NR>().0.iter_mut().enumerate() {
+                for jj in 0..NR {
+                    dst[jj] = src[jj][p];
+                }
+            }
+        } else {
+            panel.fill(0.0);
+            for jj in 0..width {
+                let src = &b[(j + jj) * ldb + pc..][..kc];
+                for (p, &x) in src.iter().enumerate() {
+                    panel[p * NR + jj] = x;
+                }
+            }
         }
     }
 }
