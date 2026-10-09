@@ -2,8 +2,114 @@
 //! im2col copy and no matrix multiply.
 
 use crate::kernels::simd::simd_call;
-use fearless_simd::{Level, Simd, f32x8};
+use fearless_simd::{Level, Simd, f32x8, f32x16};
 use fearless_simd_macros::simd;
+
+/// Shape of a depthwise convolution: every channel has its own `kernel` taps
+/// (`weights` is `[channels, kernel]`), and `pad_left` zeros precede the input.
+pub(crate) struct Depthwise<'a> {
+    pub batch: usize,
+    pub channels: usize,
+    pub len: usize,
+    pub kernel: usize,
+    pub stride: usize,
+    pub pad_left: usize,
+    pub out_len: usize,
+    pub bias: Option<&'a [f32]>,
+    pub relu: bool,
+}
+
+/// `out[b, c, t] = act(bias[c] + sum_k input[b, c, t * stride + k - pad_left] * weights[c, k])`,
+/// with the input zero outside `0..len`.
+pub(crate) fn depthwise(
+    level: Level,
+    shape: &Depthwise,
+    input: &[f32],
+    weights: &[f32],
+    out: &mut [f32],
+) {
+    // Each channel is copied into `padded` between zeros, so no tap needs a
+    // bounds test and a vector load never runs off the end.
+    let padded_len = (shape.pad_left + shape.len).max((shape.out_len - 1) * shape.stride + shape.kernel)
+        + 2 * VECTOR;
+    DEPTHWISE_PADDED.with_borrow_mut(|padded| {
+        padded.clear();
+        padded.resize(padded_len, 0.0);
+        simd_call!(level, depthwise_simd(shape, input, weights, out, padded))
+    })
+}
+
+const VECTOR: usize = 16;
+
+thread_local! {
+    static DEPTHWISE_PADDED: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[simd]
+fn depthwise_simd<S: Simd>(
+    simd: S,
+    s: &Depthwise,
+    input: &[f32],
+    weights: &[f32],
+    out: &mut [f32],
+    padded: &mut [f32],
+) {
+    use fearless_simd::prelude::*;
+    let (k, len, out_len, stride) = (s.kernel, s.len, s.out_len, s.stride);
+    for c in 0..s.batch * s.channels {
+        // Only the row's own span changes between channels; the zeros around it stay.
+        padded[s.pad_left..][..len].copy_from_slice(&input[c * len..][..len]);
+        let x = &*padded;
+        let y = &mut out[c * out_len..][..out_len];
+        let w = &weights[(c % s.channels) * k..][..k];
+        let bias = s.bias.map_or(0.0, |b| b[c % s.channels]);
+        if stride != 1 {
+            for (t, y) in y.iter_mut().enumerate() {
+                let mut sum = bias;
+                for (&xv, &w) in x[t * stride..][..k].iter().zip(w) {
+                    sum += xv * w;
+                }
+                *y = if s.relu { sum.max(0.0) } else { sum };
+            }
+            continue;
+        }
+        // `$n` outputs at a time with vectors of type `$v`.
+        macro_rules! sweep {
+            ($v:ident, $n:literal) => {{
+                let vbias = $v::splat(simd, bias);
+                let zero = $v::splat(simd, 0.0);
+                let at = |t: usize| {
+                    let mut acc = vbias;
+                    for (kk, &w) in w.iter().enumerate() {
+                        let xv = $v::from_slice(simd, &x[t + kk..][..$n]);
+                        acc = $v::splat(simd, w).mul_add(xv, acc);
+                    }
+                    if s.relu { acc.max(zero) } else { acc }
+                };
+                if out_len >= $n {
+                    let mut t = 0;
+                    while t + $n <= out_len {
+                        at(t).store_slice(&mut y[t..][..$n]);
+                        t += $n;
+                    }
+                    if t < out_len {
+                        // The last vector overlaps its predecessor.
+                        at(out_len - $n).store_slice(&mut y[out_len - $n..]);
+                    }
+                } else {
+                    let mut tile = [0.0f32; $n];
+                    at(0).store_slice(&mut tile);
+                    y.copy_from_slice(&tile[..out_len]);
+                }
+            }};
+        }
+        if out_len >= 16 {
+            sweep!(f32x16, 16)
+        } else {
+            sweep!(f32x8, 8)
+        }
+    }
+}
 
 /// Shape of a convolution of a single input channel (`weights` is
 /// `[out_channels, kernel]`) with no padding or dilation.

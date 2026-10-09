@@ -1,5 +1,5 @@
 use crate::kernels::bias_act::bias_act_inplace;
-use crate::kernels::conv1d_direct::{SingleChannel, single_channel};
+use crate::kernels::conv1d_direct::{Depthwise, SingleChannel, depthwise, single_channel};
 use crate::kernels::conv2d::Activation;
 use crate::kernels::utils;
 use fearless_simd::Level;
@@ -1053,31 +1053,25 @@ fn conv1d_fused_at<'b, 'a>(
         return TensorView::from_slice(out, vec![batch_size, out_channels, output_len]);
     }
 
-    #[cfg(target_arch = "x86_64")]
-    if group as usize == in_channels
-        && group as usize == out_channels
-        && (stride == 1 || stride == 2)
-        && dilation == 1
-    {
-        // Depthwise Convolution (dilation must be 1 for this fast path)
-        let bias_ptr = bias.map(|b| b.data.as_ptr());
-        unsafe {
-            crate::kernels::avx::conv1d::conv1d_dw_x86(
-                batch_size,
-                in_channels,
-                input_len,
-                out_channels,
-                pad_left, // Assuming symmetric padding or handling verify?
-                stride,
-                output_len,
-                kernel_size,
-                relu,
-                bias_ptr,
-                input.data.as_ptr(),
-                weights.data.as_ptr(),
-                out.as_mut_ptr(),
-            );
-        }
+    if group as usize == in_channels && group as usize == out_channels && dilation == 1 {
+        let shape = Depthwise {
+            batch: batch_size,
+            channels: in_channels,
+            len: input_len,
+            kernel: kernel_size,
+            stride,
+            pad_left,
+            out_len: output_len,
+            bias: bias.map(|b| &b.data[..out_channels]),
+            relu,
+        };
+        depthwise(
+            level,
+            &shape,
+            &input.data[..batch_size * in_channels * input_len],
+            &weights.data[..out_channels * kernel_size],
+            &mut out[..total_output_size],
+        );
         return TensorView::from_slice(out, vec![batch_size, out_channels, output_len]);
     }
 
@@ -1421,6 +1415,23 @@ mod tests {
             }
         }
         cases.extend([
+            Case {
+                group: 4,
+                ..case(4, 4, 70, 5, 1, [1, 3])
+            },
+            Case {
+                group: 4,
+                ..case(4, 4, 70, 4, 3, [2, 0])
+            },
+            Case {
+                group: 3,
+                ..case(3, 3, 5, 7, 1, [3, 3])
+            },
+            Case {
+                batch: 2,
+                group: 5,
+                ..case(5, 5, 47, 3, 1, [1, 1])
+            },
             case(3, 5, 40, 3, 2, [1, 1]),
             case(4, 6, 40, 5, 1, [2, 2]),
             case(4, 6, 40, 3, 1, [0, 2]),
