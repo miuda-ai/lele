@@ -18,6 +18,7 @@ pub mod quantization;
 pub mod rnn;
 pub mod shape;
 pub(crate) mod simd;
+pub(crate) mod simd_math;
 #[cfg(test)]
 pub(crate) mod test_util;
 pub mod timing;
