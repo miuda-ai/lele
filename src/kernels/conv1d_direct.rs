@@ -111,6 +111,158 @@ fn depthwise_simd<S: Simd>(
     }
 }
 
+/// Shape of a convolution with kernel 3, stride 1, padding 1 and one group
+/// (`weights` is `[out_channels, in_channels, 3]`); the output is as long as the input.
+pub(crate) struct Kernel3<'a> {
+    pub batch: usize,
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub len: usize,
+    pub bias: Option<&'a [f32]>,
+    pub relu: bool,
+}
+
+pub(crate) fn kernel3(
+    level: Level,
+    shape: &Kernel3,
+    input: &[f32],
+    weights: &[f32],
+    out: &mut [f32],
+) {
+    // Rows with a zero on each side, so no tap needs a bounds test.
+    // A row too short for a vector is padded out to one, and its outputs are
+    // computed into a vector-wide tile per channel and copied.
+    let row = shape.len.max(8) + 2;
+    let tile = if shape.len < 8 { shape.out_channels * 8 } else { 0 };
+    PADDED.with_borrow_mut(|padded| {
+        padded.clear();
+        padded.resize(shape.in_channels * row + tile, 0.0);
+        simd_call!(level, kernel3_simd(shape, input, weights, out, padded))
+    })
+}
+
+thread_local! {
+    static PADDED: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Computes `OC` output channels from `oc` over positions `t..t + $n`, with
+/// vectors of type `$v`.
+macro_rules! kernel3_tile {
+    ($name:ident, $v:ident, $n:literal) => {
+        #[inline(always)]
+        fn $name<S: Simd, const OC: usize>(
+            simd: S,
+            s: &Kernel3,
+            padded: &[f32],
+            weights: &[f32],
+            out: &mut [f32],
+            oc: usize,
+            t: usize,
+        ) {
+            use fearless_simd::prelude::*;
+            let ic = s.in_channels;
+            let w: [&[[f32; 3]]; OC] = core::array::from_fn(|j| {
+                weights[(oc + j) * ic * 3..][..ic * 3].as_chunks::<3>().0
+            });
+            let mut acc: [$v<S>; OC] = core::array::from_fn(|j| {
+                $v::splat(simd, s.bias.map_or(0.0, |b| b[oc + j]))
+            });
+            for (c, row) in padded.chunks_exact(s.len.max(8) + 2).take(ic).enumerate() {
+                // Taps 0, 1 and 2 of outputs `t..` read the input at `t - 1 + k`,
+                // which sits at `t + k` in the padded row.
+                let x0 = $v::from_slice(simd, &row[t..][..$n]);
+                let x1 = $v::from_slice(simd, &row[t + 1..][..$n]);
+                let x2 = $v::from_slice(simd, &row[t + 2..][..$n]);
+                for j in 0..OC {
+                    let [w0, w1, w2] = w[j][c];
+                    acc[j] = $v::splat(simd, w0).mul_add(x0, acc[j]);
+                    acc[j] = $v::splat(simd, w1).mul_add(x1, acc[j]);
+                    acc[j] = $v::splat(simd, w2).mul_add(x2, acc[j]);
+                }
+            }
+            let zero = $v::splat(simd, 0.0);
+            for j in 0..OC {
+                let y = if s.relu { acc[j].max(zero) } else { acc[j] };
+                y.store_slice(&mut out[(oc + j) * s.len.max(8) + t..][..$n]);
+            }
+        }
+    };
+}
+
+/// Runs `$tile` for `$rows` output channels from `$oc` over every position;
+/// the last vector overlaps its predecessor.
+macro_rules! kernel3_positions {
+    ($tile:ident, $n:literal, $rows:literal, $simd:expr, $s:expr, $padded:expr, $weights:expr, $out:expr, $oc:expr) => {{
+        let len = $s.len;
+        let mut t = 0;
+        while t + $n <= len {
+            $tile::<S, $rows>($simd, $s, $padded, $weights, $out, $oc, t);
+            t += $n;
+        }
+        if t < len {
+            $tile::<S, $rows>($simd, $s, $padded, $weights, $out, $oc, len - $n);
+        }
+    }};
+}
+
+kernel3_tile!(kernel3_tile16, f32x16, 16);
+kernel3_tile!(kernel3_tile8, f32x8, 8);
+
+#[simd]
+fn kernel3_simd<S: Simd>(
+    simd: S,
+    s: &Kernel3,
+    input: &[f32],
+    weights: &[f32],
+    out: &mut [f32],
+    padded: &mut [f32],
+) {
+    let len = s.len;
+    let (padded, tile) = padded.split_at_mut(s.in_channels * (len.max(8) + 2));
+    for b in 0..s.batch {
+        let x = &input[b * s.in_channels * len..][..s.in_channels * len];
+        let out = &mut out[b * s.out_channels * len..][..s.out_channels * len];
+        for (row, src) in padded.chunks_exact_mut(len.max(8) + 2).zip(x.chunks_exact(len)) {
+            row[1..=len].copy_from_slice(src);
+        }
+        let padded = &*padded;
+        // Four output channels at a time share the three input vectors.
+        // Macros rather than closures, which would not be compiled with the target features.
+        macro_rules! sweep {
+            ($tile:ident, $n:literal) => {{
+                let mut oc = 0;
+                while oc + 4 <= s.out_channels {
+                    kernel3_positions!($tile, $n, 4, simd, s, padded, weights, out, oc);
+                    oc += 4;
+                }
+                while oc < s.out_channels {
+                    kernel3_positions!($tile, $n, 1, simd, s, padded, weights, out, oc);
+                    oc += 1;
+                }
+            }};
+        }
+        if len >= 16 {
+            sweep!(kernel3_tile16, 16)
+        } else if len >= 8 {
+            sweep!(kernel3_tile8, 8)
+        } else {
+            // Too short for a vector: one vector-wide tile per channel.
+            let mut oc = 0;
+            while oc + 4 <= s.out_channels {
+                kernel3_tile8::<S, 4>(simd, s, padded, weights, tile, oc, 0);
+                oc += 4;
+            }
+            while oc < s.out_channels {
+                kernel3_tile8::<S, 1>(simd, s, padded, weights, tile, oc, 0);
+                oc += 1;
+            }
+            for (y, t) in out.chunks_exact_mut(len).zip(tile.chunks_exact(8)) {
+                y.copy_from_slice(&t[..len]);
+            }
+        }
+    }
+}
+
 /// Shape of a convolution of a single input channel (`weights` is
 /// `[out_channels, kernel]`) with no padding or dilation.
 pub(crate) struct SingleChannel<'a> {
