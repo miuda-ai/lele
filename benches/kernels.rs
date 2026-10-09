@@ -67,6 +67,8 @@ fn bench_softmax(c: &mut Criterion) {
         (64, 128),     // Large batch
         (128, 80),     // SenseVoice vocabulary
         (1, 1024),     // Large vocabulary
+        (12, 197),     // ViT attention rows, odd width
+        (64, 64),
     ];
 
     for &(batch, axis_size) in &sizes {
@@ -110,6 +112,7 @@ fn bench_layer_norm(c: &mut Criterion) {
         (16, 256),
         (64, 128),
         (128, 512),
+        (16, 1027),
     ];
 
     for &(outer, norm_size) in &sizes {
@@ -137,6 +140,101 @@ fn bench_layer_norm(c: &mut Criterion) {
                         black_box(&scale),
                         black_box(&bias),
                         -1,
+                        1e-5,
+                        &mut out_buf,
+                    );
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_rms_norm(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rms_norm");
+
+    let sizes = [(1, 512), (4, 512), (16, 256), (64, 128), (128, 512), (16, 1027)];
+
+    for &(outer, norm_size) in &sizes {
+        let input_data: Vec<f32> = (0..outer * norm_size)
+            .map(|i| ((i % 20) as f32 - 10.0) * 0.1)
+            .collect();
+        let weight: Vec<f32> = (0..norm_size).map(|i| 1.0 + ((i % 5) as f32) * 0.1).collect();
+        let mut out_buf = vec![0.0f32; outer * norm_size];
+
+        let input_shape = vec![outer, norm_size];
+        let weight_shape = vec![norm_size];
+        let input = TensorView { data: Cow::Borrowed(&input_data), shape: Cow::Borrowed(&input_shape) };
+        let weight = TensorView { data: Cow::Borrowed(&weight), shape: Cow::Borrowed(&weight_shape) };
+
+        group.throughput(Throughput::Elements((outer * norm_size) as u64));
+        group.bench_with_input(
+            BenchmarkId::new("rms_norm", format!("{}x{}", outer, norm_size)),
+            &(outer, norm_size),
+            |bencher, _| {
+                bencher.iter(|| {
+                    let _ = lele::kernels::norm::rms_norm(
+                        black_box(&input),
+                        black_box(&weight),
+                        -1,
+                        1e-5,
+                        &mut out_buf,
+                    );
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_batch_norm(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch_norm");
+
+    // NCHW shapes from convolutional models, plus an odd spatial size.
+    let shapes: [Vec<usize>; 5] = [
+        vec![1, 64, 56, 56],
+        vec![1, 256, 14, 14],
+        vec![4, 128, 28, 28],
+        vec![1, 512, 7, 7],
+        vec![2, 32, 13, 13],
+    ];
+
+    for shape in &shapes {
+        let numel: usize = shape.iter().product();
+        let ch = shape[1];
+        let input_data: Vec<f32> = (0..numel).map(|i| ((i % 20) as f32 - 10.0) * 0.1).collect();
+        let scale: Vec<f32> = (0..ch).map(|i| 1.0 + ((i % 5) as f32) * 0.1).collect();
+        let bias: Vec<f32> = (0..ch).map(|i| ((i % 5) as f32) * 0.01).collect();
+        let mean: Vec<f32> = (0..ch).map(|i| ((i % 7) as f32) * 0.05).collect();
+        let var: Vec<f32> = (0..ch).map(|i| 0.5 + ((i % 3) as f32) * 0.25).collect();
+        let mut out_buf = vec![0.0f32; numel];
+
+        let param_shape = vec![ch];
+        let input = TensorView { data: Cow::Borrowed(&input_data), shape: Cow::Borrowed(shape) };
+        fn view<'a>(v: &'a [f32], shape: &'a [usize]) -> TensorView<'a> {
+            TensorView { data: Cow::Borrowed(v), shape: Cow::Borrowed(shape) }
+        }
+        let (scale, bias, mean, var) = (
+            view(&scale, &param_shape),
+            view(&bias, &param_shape),
+            view(&mean, &param_shape),
+            view(&var, &param_shape),
+        );
+
+        group.throughput(Throughput::Elements(numel as u64));
+        group.bench_with_input(
+            BenchmarkId::new("batch_norm", format!("{shape:?}")),
+            shape,
+            |bencher, _| {
+                bencher.iter(|| {
+                    let _ = lele::kernels::norm::batch_norm(
+                        black_box(&input),
+                        black_box(&scale),
+                        black_box(&bias),
+                        black_box(&mean),
+                        black_box(&var),
                         1e-5,
                         &mut out_buf,
                     );
@@ -381,6 +479,8 @@ criterion_group!(
     bench_gemm,
     bench_softmax,
     bench_layer_norm,
+    bench_rms_norm,
+    bench_batch_norm,
     bench_transpose,
     bench_elementwise,
     bench_leaky_relu,
