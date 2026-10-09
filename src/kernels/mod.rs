@@ -3,6 +3,7 @@ pub mod activations;
 pub mod avx;
 #[cfg(target_arch = "x86_64")]
 pub mod avx512;
+pub(crate) mod bias_act;
 pub mod conv1d;
 pub mod conv2d;
 pub mod fft;
