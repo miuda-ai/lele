@@ -38,40 +38,49 @@ pub fn softmax<'b, 'a>(
 /// still runs AVX-512 machines at AVX2 until measured otherwise; see
 /// `simd_call!`.
 fn softmax_rows(level: Level, rows: usize, src: &[f32], out: &mut [f32], n: usize) {
+    if n < LANES {
+        return softmax_short_rows(rows, n, src, out);
+    }
     simd_call!(level, max = Avx2, softmax_rows_simd(rows, n, src, out))
 }
 
+/// Rows narrower than a vector, in scalar code. Padding one into a vector
+/// costs more than the row: a variable-length `copy_from_slice` is a `memcpy`
+/// call on each side, and filling the vector with scalar stores before a
+/// wide load stalls on store forwarding (80 ns against 51 for the scalar
+/// loop, on a row of 10).
+fn softmax_short_rows(rows: usize, n: usize, src: &[f32], out: &mut [f32]) {
+    for (row, out_row) in src[..rows * n].chunks_exact(n).zip(out[..rows * n].chunks_exact_mut(n)) {
+        let max = row.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x));
+        let mut sum = 0.0;
+        for (&x, o) in row.iter().zip(&mut *out_row) {
+            *o = (x - max).exp();
+            sum += *o;
+        }
+        let inv_sum = 1.0 / sum;
+        for o in out_row {
+            *o *= inv_sum;
+        }
+    }
+}
+
 /// The row's last `LANES` elements, which overlap the last full vector when
-/// the width is not a multiple of `LANES`. Rows shorter than a vector are
-/// padded in front with `-inf`, the identity for max.
+/// the width is not a multiple of `LANES`.
 ///
 /// Redoing elements is harmless for max, and for storing outputs that depend
 /// only on their own input; the sum must skip the overlap.
 #[inline(always)]
 fn last_vector<S: Simd>(simd: S, row: &[f32]) -> f32x16<S> {
-    match row.last_chunk::<LANES>() {
-        Some(last) => f32x16::load_array_ref(simd, last),
-        None => {
-            let mut buf = [f32::NEG_INFINITY; LANES];
-            buf[LANES - row.len()..].copy_from_slice(row);
-            f32x16::load_array_ref(simd, &buf)
-        }
-    }
+    f32x16::load_array_ref(simd, row.last_chunk::<LANES>().expect("row at least a vector wide"))
 }
 
 /// Stores the lanes of `v` that `last_vector` took from the end of `row`.
 #[inline(always)]
 fn store_last_vector<S: Simd>(v: f32x16<S>, out_row: &mut [f32]) {
-    match out_row.last_chunk_mut::<LANES>() {
-        Some(last) => v.store_array(last),
-        None => {
-            let mut buf = [0.0; LANES];
-            v.store_array(&mut buf);
-            out_row.copy_from_slice(&buf[LANES - out_row.len()..]);
-        }
-    }
+    v.store_array(out_row.last_chunk_mut::<LANES>().expect("row at least a vector wide"));
 }
 
+/// Rows at least `LANES` wide.
 #[simd]
 fn softmax_rows_simd<S: Simd>(simd: S, rows: usize, n: usize, src: &[f32], out: &mut [f32]) {
     let (mut src, mut out) = (&src[..rows * n], &mut out[..rows * n]);
