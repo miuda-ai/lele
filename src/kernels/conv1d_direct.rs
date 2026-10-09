@@ -97,45 +97,74 @@ fn depthwise_simd<S: Simd>(
         }
         // `$n` outputs at a time with vectors of type `$v`.
         macro_rules! sweep {
-            // `$src` is where tap `$kk` of output `$t` starts in the padded row.
-            ($v:ident, $n:literal, |$t:ident, $kk:ident| $src:expr) => {{
-                let vbias = $v::splat(simd, bias);
-                let zero = $v::splat(simd, 0.0);
-                let at = |$t: usize| {
-                    let mut acc = vbias;
-                    for ($kk, &w) in w.iter().enumerate() {
-                        let xv = $v::from_slice(simd, &$src[..$n]);
-                        acc = $v::splat(simd, w).mul_add(xv, acc);
-                    }
-                    if s.relu { acc.max(zero) } else { acc }
-                };
+            ($at:ident, $n:literal, $m:literal, $srcs:expr) => {{
+                let srcs: [&[f32]; 2] = $srcs;
                 if out_len >= $n {
                     let mut t = 0;
                     while t + $n <= out_len {
-                        at(t).store_slice(&mut y[t..][..$n]);
+                        $at::<S, $m>(simd, srcs, w, bias, s.relu, t).store_slice(&mut y[t..][..$n]);
                         t += $n;
                     }
                     if t < out_len {
                         // The last vector overlaps its predecessor.
-                        at(out_len - $n).store_slice(&mut y[out_len - $n..]);
+                        $at::<S, $m>(simd, srcs, w, bias, s.relu, out_len - $n)
+                            .store_slice(&mut y[out_len - $n..]);
                     }
                 } else {
                     let mut tile = [0.0f32; $n];
-                    at(0).store_slice(&mut tile);
+                    $at::<S, $m>(simd, srcs, w, bias, s.relu, 0).store_slice(&mut tile);
                     y.copy_from_slice(&tile[..out_len]);
                 }
             }};
         }
         // Stride 2 reads input `2t + kk`, which is entry `t + kk / 2` of phase `kk % 2`.
-        // The branches are outside the sweeps so each one compiles as a unit.
         match (stride, out_len >= 16) {
-            (1, true) => sweep!(f32x16, 16, |t, kk| x[t + kk..]),
-            (1, false) => sweep!(f32x8, 8, |t, kk| x[t + kk..]),
-            (_, true) => sweep!(f32x16, 16, |t, kk| phase[kk % 2][t + kk / 2..]),
-            (_, false) => sweep!(f32x8, 8, |t, kk| phase[kk % 2][t + kk / 2..]),
+            (1, true) => sweep!(depthwise_at16, 16, 1, [x, x]),
+            (1, false) => sweep!(depthwise_at8, 8, 1, [x, x]),
+            (_, true) => sweep!(depthwise_at16, 16, 2, phase),
+            (_, false) => sweep!(depthwise_at8, 8, 2, phase),
         }
     }
 }
+
+/// Outputs `t..t + $n` of one depthwise channel as a vector of type `$v`. Tap
+/// `kk` reads entry `t + kk / M` of `srcs[kk % M]`.
+macro_rules! depthwise_at {
+    ($name:ident, $v:ident, $n:literal) => {
+        #[inline(always)]
+        fn $name<S: Simd, const M: usize>(
+            simd: S,
+            srcs: [&[f32]; 2],
+            w: &[f32],
+            bias: f32,
+            relu: bool,
+            t: usize,
+        ) -> $v<S> {
+            use fearless_simd::prelude::*;
+            // Two chains of multiply-adds, so a short kernel is not bound by
+            // the latency of one.
+            let (mut acc, mut acc2) = ($v::splat(simd, bias), $v::splat(simd, 0.0));
+            let (pairs, odd) = w.as_chunks::<2>();
+            for (i, &[w0, w1]) in pairs.iter().enumerate() {
+                let (k0, k1) = (2 * i, 2 * i + 1);
+                let x0 = $v::from_slice(simd, &srcs[k0 % M][t + k0 / M..][..$n]);
+                let x1 = $v::from_slice(simd, &srcs[k1 % M][t + k1 / M..][..$n]);
+                acc = $v::splat(simd, w0).mul_add(x0, acc);
+                acc2 = $v::splat(simd, w1).mul_add(x1, acc2);
+            }
+            if let &[w0] = odd {
+                let k0 = 2 * pairs.len();
+                let x0 = $v::from_slice(simd, &srcs[k0 % M][t + k0 / M..][..$n]);
+                acc = $v::splat(simd, w0).mul_add(x0, acc);
+            }
+            acc = acc + acc2;
+            if relu { acc.max($v::splat(simd, 0.0)) } else { acc }
+        }
+    };
+}
+
+depthwise_at!(depthwise_at16, f32x16, 16);
+depthwise_at!(depthwise_at8, f32x8, 8);
 
 /// Shape of a convolution with kernel 3, stride 1, padding 1 and one group
 /// (`weights` is `[out_channels, in_channels, 3]`); the output is as long as the input.
