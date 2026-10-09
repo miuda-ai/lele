@@ -383,6 +383,18 @@ fn bench_activations(c: &mut Criterion) {
             });
         });
 
+        // GELU (multiply form) and its tanh approximation
+        group.bench_with_input(BenchmarkId::new("gelu", size), &size, |bencher, _| {
+            bencher.iter(|| {
+                let _ = lele::kernels::math::gelu(black_box(&input), &mut out_buf);
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("fast_gelu", size), &size, |bencher, _| {
+            bencher.iter(|| {
+                let _ = lele::kernels::math::fast_gelu(black_box(&input), &mut out_buf);
+            });
+        });
+
         // ReLU
         group.bench_with_input(BenchmarkId::new("relu", size), &size, |bencher, _| {
             bencher.iter(|| {

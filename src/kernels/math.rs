@@ -3157,10 +3157,21 @@ mod tests {
         want: fn(f64) -> f64,
         tol: f64,
     ) {
+        check_activation_in(name, f, want, tol, -12.0, 12.0)
+    }
+
+    fn check_activation_in(
+        name: &str,
+        f: impl for<'a, 'b> Fn(&TensorView<'b>, &'a mut Vec<f32>) -> TensorView<'a> + Copy,
+        want: fn(f64) -> f64,
+        tol: f64,
+        lo: f32,
+        hi: f32,
+    ) {
         use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_close};
         let mut rng = Rng::new(11);
         for &n in AWKWARD_LENS {
-            let x = rng.vec(n + 1, -12.0, 12.0);
+            let x = rng.vec(n + 1, lo, hi);
             for x in [&x[..n], &x[1..]] {
                 let want: Vec<f64> = x.iter().map(|&v| want(v as f64)).collect();
                 assert_close(&apply(f, x), &want, tol, &format!("{name} n={}", x.len()));
@@ -3218,6 +3229,76 @@ mod tests {
                     kernel(level, &x, &mut out);
                     let want: Vec<f64> = x.iter().map(|&v| want(v as f64)).collect();
                     assert_close(&out, &want, tol, &format!("{name} {level:?} n={n}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_gelu_matches_reference_at_every_length() {
+        check_activation(
+            "gelu",
+            gelu,
+            |x| 0.5 * x * (1.0 + libm::erf(x * std::f64::consts::FRAC_1_SQRT_2)),
+            2e-6,
+        );
+    }
+
+    #[test]
+    fn test_fast_gelu_matches_reference_at_every_length() {
+        check_activation_in(
+            "fast_gelu",
+            fast_gelu,
+            |x| {
+                let inner = (2.0 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x);
+                0.5 * x * (1.0 + inner.tanh())
+            },
+            2e-6,
+            -6.0,
+            6.0,
+        );
+    }
+
+    #[test]
+    fn test_exp_is_accurate_and_saturates() {
+        use crate::kernels::test_util::{AWKWARD_LENS, Rng};
+        let mut rng = Rng::new(13);
+        for &n in AWKWARD_LENS {
+            let x = rng.vec(n, -80.0, 80.0);
+            for (&x, &got) in x.iter().zip(&apply(exp, &x)) {
+                let want = (x as f64).exp();
+                let err = ((got as f64 - want) / want).abs();
+                assert!(err < 2e-6, "exp({x}) = {got}, want {want}, relative error {err:.2e}");
+            }
+        }
+        let got = apply(exp, &[100.0, 1000.0, -200.0, -1000.0, 0.0]);
+        assert!(got[0] == f32::INFINITY && got[1] == f32::INFINITY, "overflow: {got:?}");
+        assert!(got[2] < 1e-30 && got[3] < 1e-30 && got[2] >= 0.0, "underflow: {got:?}");
+        assert_eq!(got[4], 1.0);
+    }
+
+    #[test]
+    fn test_sqrt_is_exact_at_every_length() {
+        use crate::kernels::test_util::{AWKWARD_LENS, Rng};
+        let mut rng = Rng::new(14);
+        for &n in AWKWARD_LENS {
+            let x = rng.vec(n, 0.0, 100.0);
+            for (&x, &got) in x.iter().zip(&apply(sqrt, &x)) {
+                assert_eq!(got, x.sqrt(), "sqrt({x}) n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_leaky_relu_matches_reference_at_every_length() {
+        use crate::kernels::test_util::{AWKWARD_LENS, Rng};
+        let mut rng = Rng::new(15);
+        for &n in AWKWARD_LENS {
+            let x = rng.vec(n + 1, -12.0, 12.0);
+            for x in [&x[..n], &x[1..]] {
+                let got = apply(|i, o| leaky_relu(i, 0.1, o), x);
+                for (&x, &got) in x.iter().zip(&got) {
+                    assert_eq!(got, if x >= 0.0 { x } else { 0.1 * x }, "leaky_relu({x}) n={n}");
                 }
             }
         }
