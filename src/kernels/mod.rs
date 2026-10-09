@@ -3,7 +3,10 @@ pub mod activations;
 pub mod avx;
 #[cfg(target_arch = "x86_64")]
 pub mod avx512;
+pub(crate) mod bias_act;
+pub(crate) mod binary;
 pub mod conv1d;
+pub(crate) mod conv1d_direct;
 pub mod conv2d;
 pub mod fft;
 pub mod gemm;
@@ -17,10 +20,12 @@ pub mod qmatmul_i8;
 pub mod quantization;
 pub mod rnn;
 pub mod shape;
+pub(crate) mod simd;
+pub(crate) mod simd_math;
+#[cfg(test)]
+pub(crate) mod test_util;
 pub mod timing;
 pub mod utils;
-#[cfg(target_arch = "wasm32")]
-pub mod wasm;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_matmul;
 pub use conv1d::conv1d;
