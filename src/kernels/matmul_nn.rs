@@ -15,7 +15,7 @@ const MR: usize = 6;
 const NV: usize = 2;
 const NR: usize = 8 * NV;
 /// Depth of a panel.
-const KC: usize = 256;
+const KC: usize = 512;
 /// Rows of A per block.
 const MC: usize = 96;
 /// Columns of B per block.
@@ -196,8 +196,8 @@ fn row_tile<S: Simd, const R: usize, const V: usize>(
     let a_rows: [&[f32]; R] = core::array::from_fn(|r| &a[r * d.lda..][..d.k]);
     let zero = f32x8::splat(simd, 0.0);
     let mut acc = [[zero; V]; R];
-    for p in 0..d.k {
-        let brow = &b[p * d.ldb + j..][..8 * V];
+    for (p, brow) in b[j..].chunks(d.ldb).take(d.k).enumerate() {
+        let brow = &brow[..8 * V];
         let bv: [f32x8<S>; V] = core::array::from_fn(|v| f32x8::from_slice(simd, &brow[v * 8..][..8]));
         for r in 0..R {
             let av = f32x8::splat(simd, a_rows[r][p]);
@@ -230,7 +230,12 @@ fn pack_b(b: &[f32], ldb: usize, b_cols: bool, pc: usize, kc: usize, jc: usize, 
     for (jp, panel) in out.chunks_exact_mut(kc * NR).take(nc.div_ceil(NR)).enumerate() {
         let j = jc + jp * NR;
         let width = NR.min(jc + nc - j);
-        if !b_cols {
+        if !b_cols && width == NR {
+            // A copy of a length known at compile time is two vector moves; of one that is not, a call to `memcpy`.
+            for (p, row) in panel.as_chunks_mut::<NR>().0.iter_mut().enumerate() {
+                *row = *b[(pc + p) * ldb + j..].first_chunk::<NR>().unwrap();
+            }
+        } else if !b_cols {
             for (p, row) in panel.chunks_exact_mut(NR).enumerate() {
                 row[..width].copy_from_slice(&b[(pc + p) * ldb + j..][..width]);
                 row[width..].fill(0.0);
