@@ -6,6 +6,7 @@ pub mod avx512;
 pub(crate) mod bias_act;
 pub(crate) mod binary;
 pub mod conv1d;
+pub(crate) mod conv1d_direct;
 pub mod conv2d;
 pub mod fft;
 pub mod gemm;
