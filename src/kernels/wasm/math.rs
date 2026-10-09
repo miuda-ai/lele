@@ -2,10 +2,7 @@
 //! WASM SIMD128 math kernel implementations.
 //! Only compiled when `target_arch = "wasm32"`.
 
-use crate::kernels::utils;
-use crate::tensor::TensorView;
 use std::arch::wasm32::*;
-use std::borrow::Cow;
 
 // ─── Core exp approximation ─────────────────────────────────────────────────
 
@@ -81,75 +78,6 @@ pub unsafe fn erf_f32x4(x: v128) -> v128 {
 }
 
 // ─── Unary activation kernels ────────────────────────────────────────────────
-
-/// WASM SIMD128 ReLU: max(x, 0)
-pub unsafe fn relu(input: *const f32, output: *mut f32, len: usize) {
-    let zero = f32x4_splat(0.0);
-    let mut i = 0;
-    while i + 4 <= len {
-        let v = v128_load(input.add(i) as *const v128);
-        let r = f32x4_max(v, zero);
-        v128_store(output.add(i) as *mut v128, r);
-        i += 4;
-    }
-    while i < len {
-        let v = *input.add(i);
-        *output.add(i) = if v > 0.0 { v } else { 0.0 };
-        i += 1;
-    }
-}
-
-/// WASM SIMD128 GELU: x * 0.5 * (1 + erf(x / sqrt(2)))
-pub unsafe fn gelu(input: *const f32, output: *mut f32, len: usize) {
-    let mut i = 0;
-    let half = f32x4_splat(0.5);
-    let one = f32x4_splat(1.0);
-    let inv_sqrt2 = f32x4_splat(0.7071067811865475);
-
-    while i + 4 <= len {
-        let x = v128_load(input.add(i) as *const v128);
-        let erf_val = erf_f32x4(f32x4_mul(x, inv_sqrt2));
-        let result = f32x4_mul(f32x4_mul(x, half), f32x4_add(one, erf_val));
-        v128_store(output.add(i) as *mut v128, result);
-        i += 4;
-    }
-    while i < len {
-        let x = *input.add(i);
-        let erf_val = libm::erff(x * 0.7071067811865475);
-        *output.add(i) = x * 0.5 * (1.0 + erf_val);
-        i += 1;
-    }
-}
-
-/// WASM SIMD128 fast GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x³)))
-pub unsafe fn fast_gelu(input: *const f32, output: *mut f32, len: usize) {
-    let mut i = 0;
-    let half = f32x4_splat(0.5);
-    let one = f32x4_splat(1.0);
-    let two = f32x4_splat(2.0);
-    let neg_one = f32x4_splat(-1.0);
-    let sqrt_2_over_pi = f32x4_splat(0.7978845608028654);
-    let coeff = f32x4_splat(0.044715);
-
-    while i + 4 <= len {
-        let x = v128_load(input.add(i) as *const v128);
-        let x3 = f32x4_mul(f32x4_mul(x, x), x);
-        let inner = f32x4_mul(sqrt_2_over_pi, f32x4_add(x, f32x4_mul(coeff, x3)));
-        let two_inner = f32x4_mul(two, inner);
-        let exp_2inner = exp_f32x4(two_inner);
-        let tanh_val = f32x4_div(f32x4_sub(exp_2inner, one), f32x4_add(exp_2inner, one));
-        let tanh_val = f32x4_max(f32x4_min(tanh_val, one), neg_one);
-        let result = f32x4_mul(f32x4_mul(half, x), f32x4_add(one, tanh_val));
-        v128_store(output.add(i) as *mut v128, result);
-        i += 4;
-    }
-    while i < len {
-        let x = *input.add(i);
-        let inner = 0.7978845608028654 * (x + 0.044715 * x * x * x);
-        *output.add(i) = 0.5 * x * (1.0 + inner.tanh());
-        i += 1;
-    }
-}
 
 // ─── Binary elementwise ops ──────────────────────────────────────────────────
 
@@ -528,43 +456,5 @@ pub unsafe fn bias_relu_inplace(data: *mut f32, len: usize, bias: f32) {
         let x = *data.add(i) + bias;
         *data.add(i) = if x > 0.0 { x } else { 0.0 };
         i += 1;
-    }
-}
-
-// ─── Public TensorView-level functions (mirror the neon/math.rs style) ──────
-
-pub fn relu_kernel<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let len = input.data.len();
-    utils::ensure_capacity(out, len);
-    unsafe {
-        relu(input.data.as_ptr(), out.as_mut_ptr(), len);
-    }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: Cow::Owned(input.shape.to_vec()),
-    }
-}
-
-pub fn gelu_kernel<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let len = input.data.len();
-    utils::ensure_capacity(out, len);
-    unsafe {
-        gelu(input.data.as_ptr(), out.as_mut_ptr(), len);
-    }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: Cow::Owned(input.shape.to_vec()),
-    }
-}
-
-pub fn fast_gelu_kernel<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let len = input.data.len();
-    utils::ensure_capacity(out, len);
-    unsafe {
-        fast_gelu(input.data.as_ptr(), out.as_mut_ptr(), len);
-    }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: Cow::Owned(input.shape.to_vec()),
     }
 }

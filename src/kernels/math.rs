@@ -15,7 +15,7 @@ use std::borrow::Cow;
 fn unary<'a>(
     input: &TensorView<'_>,
     out: &'a mut Vec<f32>,
-    kernel: fn(Level, &[f32], &mut [f32]),
+    kernel: impl Fn(Level, &[f32], &mut [f32]),
 ) -> TensorView<'a> {
     const LANES: usize = 16;
     let n = input.data.len();
@@ -81,6 +81,65 @@ fn gelu_erf_into(level: Level, src: &[f32], out: &mut [f32]) {
 #[simd]
 fn gelu_erf_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
     vm::map!(simd, src, out, vm::gelu_erf)
+}
+
+fn gelu_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, gelu_simd(src, out))
+}
+
+#[simd]
+fn gelu_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::gelu)
+}
+
+fn fast_gelu_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, fast_gelu_simd(src, out))
+}
+
+#[simd]
+fn fast_gelu_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::fast_gelu)
+}
+
+fn exp_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, exp_simd(src, out))
+}
+
+#[simd]
+fn exp_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::exp_saturating)
+}
+
+// Pure streaming kernels with almost no arithmetic: these are the ones that
+// lose to a 512-bit access split across cache lines, so the cap matters most.
+
+fn relu_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, relu_simd(src, out))
+}
+
+#[simd]
+fn relu_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::relu)
+}
+
+fn leaky_relu_into(level: Level, src: &[f32], out: &mut [f32], alpha: f32) {
+    simd_call!(level, max = Avx2, leaky_relu_simd(src, out, alpha))
+}
+
+#[simd]
+fn leaky_relu_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32], alpha: f32) {
+    use fearless_simd::prelude::*;
+    let alpha = fearless_simd::f32x16::splat(simd, alpha);
+    vm::map!(simd, src, out, vm::leaky_relu, alpha)
+}
+
+fn sqrt_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, sqrt_simd(src, out))
+}
+
+#[simd]
+fn sqrt_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::sqrt)
 }
 
 pub trait ElementOps: Copy + PartialOrd + PartialEq + std::fmt::Debug + Sized + 'static {
@@ -1221,95 +1280,13 @@ pub fn gelu_erf<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> Tensor
 }
 
 pub fn gelu<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::kernels::neon::math::gelu(input, out)
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        unsafe {
-            crate::kernels::avx::math::gelu_kernel(input.data.as_ptr(), out.as_mut_ptr(), numel);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        crate::kernels::wasm::math::gelu_kernel(input, out)
-    }
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        target_arch = "x86_64",
-        target_arch = "wasm32"
-    )))]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        let inv_sqrt2 = 0.7071067811865475f32; // 1/sqrt(2)
-        for i in 0..numel {
-            let x = input.data[i];
-            let erf_val = libm::erff(x * inv_sqrt2);
-            out[i] = x * 0.5 * (1.0 + erf_val);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
+    unary(input, out, gelu_into)
 }
 
 /// Fast GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 /// This is faster than standard GELU and commonly used in GPT-2/BERT.
 pub fn fast_gelu<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::kernels::neon::math::fast_gelu(input, out)
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        unsafe {
-            crate::kernels::avx::math::fast_gelu_kernel(
-                input.data.as_ptr(),
-                out.as_mut_ptr(),
-                numel,
-            );
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        crate::kernels::wasm::math::fast_gelu_kernel(input, out)
-    }
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        target_arch = "x86_64",
-        target_arch = "wasm32"
-    )))]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        let sqrt_2_over_pi = 0.7978845608028654f32;
-        let coeff = 0.044715f32;
-        for i in 0..numel {
-            let x = input.data[i];
-            let inner = sqrt_2_over_pi * (x + coeff * x * x * x);
-            let tanh_val = inner.tanh();
-            out[i] = 0.5 * x * (1.0 + tanh_val);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
+    unary(input, out, fast_gelu_into)
 }
 
 pub fn erf<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
@@ -1587,48 +1564,7 @@ fn silu_inner<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorVi
 }
 
 pub fn relu<'a, 'b>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::kernels::neon::math::relu(input, out)
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let len = input.data.len();
-        utils::ensure_capacity(out, len);
-        let i_slice = &input.data;
-        let o_slice = out.as_mut_slice();
-        unsafe {
-            crate::kernels::avx::math::relu_kernel(i_slice.as_ptr(), o_slice.as_mut_ptr(), len);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        crate::kernels::wasm::math::relu_kernel(input, out)
-    }
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        target_arch = "x86_64",
-        target_arch = "wasm32"
-    )))]
-    {
-        let len = input.data.len();
-        utils::ensure_capacity(out, len);
-        let i_slice = &input.data;
-        let o_slice = out.as_mut_slice();
-        for i in 0..len {
-            unsafe {
-                *o_slice.get_unchecked_mut(i) = i_slice.get_unchecked(i).max(0.0);
-            }
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
+    unary(input, out, relu_into)
 }
 
 pub fn leaky_relu<'a, 'b>(
@@ -1636,65 +1572,11 @@ pub fn leaky_relu<'a, 'b>(
     alpha: f32,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let len = input.data.len();
-    utils::ensure_capacity(out, len);
-    let i_slice = &input.data;
-    let o_slice = out.as_mut_slice();
-    #[cfg(target_arch = "aarch64")]
-    {
-        use core::arch::aarch64::*;
-        let valpha = unsafe { vdupq_n_f32(alpha) };
-        let vzero = unsafe { vdupq_n_f32(0.0) };
-        let mut i = 0;
-        unsafe {
-            while i + 4 <= len {
-                let xv = vld1q_f32(i_slice.as_ptr().add(i));
-                let mask = vcgeq_f32(xv, vzero);
-                let neg = vmulq_f32(xv, valpha);
-                let result = vbslq_f32(mask, xv, neg);
-                vst1q_f32(o_slice.as_mut_ptr().add(i), result);
-                i += 4;
-            }
-        }
-        for j in i..len {
-            let x = i_slice[j];
-            o_slice[j] = if x >= 0.0 { x } else { alpha * x };
-        }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        for i in 0..len {
-            let x = i_slice[i];
-            unsafe {
-                *o_slice.get_unchecked_mut(i) = if x >= 0.0 { x } else { alpha * x };
-            }
-        }
-    }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: Cow::Owned(input.shape.to_vec()),
-    }
+    unary(input, out, |level, src, out| leaky_relu_into(level, src, out, alpha))
 }
 
 pub fn sqrt<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let len = input.data.len();
-    utils::ensure_capacity(out, len);
-    let in_slice = &input.data;
-    let out_slice = out.as_mut_slice();
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        crate::kernels::avx::math::sqrt_kernel(in_slice.as_ptr(), out_slice.as_mut_ptr(), len);
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    for i in 0..len {
-        unsafe {
-            *out_slice.get_unchecked_mut(i) = in_slice.get_unchecked(i).sqrt();
-        }
-    }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: std::borrow::Cow::Owned(input.shape.to_vec()),
-    }
+    unary(input, out, sqrt_into)
 }
 
 pub fn round<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
@@ -2535,26 +2417,7 @@ pub fn cos<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
     TensorView::from_slice(out, input.shape.to_vec())
 }
 pub fn exp<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        unsafe {
-            crate::kernels::avx::math::exp_kernel(input.data.as_ptr(), out.as_mut_ptr(), numel);
-        }
-        return TensorView::from_slice(out, input.shape.to_vec());
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let out_slice = out.as_mut_slice();
-        for i in 0..numel {
-            out_slice[i] = input.data[i].exp();
-        }
-        TensorView::from_slice(out, input.shape.to_vec())
-    }
+    unary(input, out, exp_into)
 }
 pub fn log<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
@@ -3213,7 +3076,12 @@ mod tests {
     fn test_activation_kernels_match_reference_at_every_level() {
         use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_close, levels};
         type Kernel = fn(Level, &[f32], &mut [f32]);
-        let kernels: [(&str, Kernel, fn(f64) -> f64, f64); 5] = [
+        let kernels: [(&str, Kernel, fn(f64) -> f64, f64); 7] = [
+            ("gelu", gelu_into, |x| 0.5 * x * (1.0 + libm::erf(x * std::f64::consts::FRAC_1_SQRT_2)), 2e-6),
+            ("fast_gelu", fast_gelu_into, |x| {
+                let inner = (2.0 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x);
+                0.5 * x * (1.0 + inner.tanh())
+            }, 2e-6),
             ("sigmoid", sigmoid_into, sigmoid_ref, 1e-6),
             ("tanh", tanh_into, f64::tanh, 1e-6),
             ("silu", silu_into, silu_ref, 1e-6),
@@ -3317,6 +3185,10 @@ mod tests {
             ("sigmoid", apply(sigmoid, &x), x.map(|v| sigmoid_ref(v as f64))),
             ("tanh", apply(tanh_kernel, &x), x.map(|v| (v as f64).tanh())),
             ("silu", apply(silu, &x), x.map(|v| silu_ref(v as f64))),
+            ("fast_gelu", apply(fast_gelu, &x), x.map(|v| {
+                let v = v as f64;
+                0.5 * v * (1.0 + ((2.0 / std::f64::consts::PI).sqrt() * (v + 0.044715 * v * v * v)).tanh())
+            })),
         ] {
             for ((&g, &w), &v) in got.iter().zip(&want).zip(&x) {
                 assert!(g.is_finite(), "{name}({v}) = {g}");

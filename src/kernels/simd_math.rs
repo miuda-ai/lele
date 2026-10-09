@@ -104,6 +104,50 @@ pub(crate) fn gelu_erf<S: Simd>(x: f32x16<S>) -> f32x16<S> {
     x * (half * (e + f32x16::splat(simd, 1.0)))
 }
 
+/// `x * (0.5 * (1 + erf(x / √2)))` with the division folded into a multiply:
+/// [`gelu_erf`] without the bit-for-bit contract, a fraction of an ulp off it.
+#[inline(always)]
+pub(crate) fn gelu<S: Simd>(x: f32x16<S>) -> f32x16<S> {
+    let simd = x.simd;
+    let e = erf(x * f32x16::splat(simd, std::f32::consts::FRAC_1_SQRT_2));
+    (x * f32x16::splat(simd, 0.5)) * (f32x16::splat(simd, 1.0) + e)
+}
+
+/// `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`.
+#[inline(always)]
+pub(crate) fn fast_gelu<S: Simd>(x: f32x16<S>) -> f32x16<S> {
+    let simd = x.simd;
+    let x3 = (x * x) * x;
+    let inner = f32x16::splat(simd, 0.7978845608028654)
+        * f32x16::splat(simd, 0.044715).mul_add(x3, x);
+    (x * f32x16::splat(simd, 0.5)) * (f32x16::splat(simd, 1.0) + tanh(inner))
+}
+
+/// `exp(x)` as the ONNX operator: [`exp`] clamps its input to stay finite,
+/// this restores infinity for inputs past `ln(f32::MAX)`.
+#[inline(always)]
+pub(crate) fn exp_saturating<S: Simd>(x: f32x16<S>) -> f32x16<S> {
+    let simd = x.simd;
+    let overflow = x.simd_gt(f32x16::splat(simd, 88.72284));
+    overflow.select(f32x16::splat(simd, f32::INFINITY), exp(x))
+}
+
+#[inline(always)]
+pub(crate) fn relu<S: Simd>(x: f32x16<S>) -> f32x16<S> {
+    x.max(f32x16::splat(x.simd, 0.0))
+}
+
+/// `x` for `x >= 0`, else `alpha · x`.
+#[inline(always)]
+pub(crate) fn leaky_relu<S: Simd>(x: f32x16<S>, alpha: f32x16<S>) -> f32x16<S> {
+    x.simd_ge(f32x16::splat(x.simd, 0.0)).select(x, x * alpha)
+}
+
+#[inline(always)]
+pub(crate) fn sqrt<S: Simd>(x: f32x16<S>) -> f32x16<S> {
+    x.sqrt()
+}
+
 /// Writes `$f(src[i])` to `out[i]` for every `i`, where `$f` is one of the
 /// vector functions above and `$simd` the token of the enclosing `#[simd]`
 /// function. Needs `src.len() >= 16`.
@@ -118,7 +162,7 @@ pub(crate) fn gelu_erf<S: Simd>(x: f32x16<S>) -> f32x16<S> {
 /// input and `src` and `out` are distinct, so recomputing the overlap writes
 /// the values already there.
 macro_rules! map {
-    ($simd:expr, $src:expr, $out:expr, $f:path) => {{
+    ($simd:expr, $src:expr, $out:expr, $f:path $(, $arg:expr)* $(,)?) => {{
         use fearless_simd::prelude::*;
         let (simd, src, out): (_, &[f32], &mut [f32]) = ($simd, $src, $out);
         let out = &mut out[..src.len()];
@@ -129,18 +173,18 @@ macro_rules! map {
         // Two vectors per step: the polynomials are long dependency chains,
         // and a second independent one fills the gaps.
         for ([a, b], [oa, ob]) in x2.iter().zip(o2) {
-            let ya = $f(fearless_simd::f32x16::load_array_ref(simd, a));
-            let yb = $f(fearless_simd::f32x16::load_array_ref(simd, b));
+            let ya = $f(fearless_simd::f32x16::load_array_ref(simd, a) $(, $arg)*);
+            let yb = $f(fearless_simd::f32x16::load_array_ref(simd, b) $(, $arg)*);
             ya.store_array(oa);
             yb.store_array(ob);
         }
         for (a, oa) in x1.iter().zip(o1) {
-            $f(fearless_simd::f32x16::load_array_ref(simd, a)).store_array(oa);
+            $f(fearless_simd::f32x16::load_array_ref(simd, a) $(, $arg)*).store_array(oa);
         }
         if !x_tail.is_empty() {
             let last = src.last_chunk::<16>().expect("at least a vector");
             let out_last = out.last_chunk_mut::<16>().expect("at least a vector");
-            $f(fearless_simd::f32x16::load_array_ref(simd, last)).store_array(out_last);
+            $f(fearless_simd::f32x16::load_array_ref(simd, last) $(, $arg)*).store_array(out_last);
         }
     }};
 }
