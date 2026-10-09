@@ -420,30 +420,43 @@ fn lanes_blocks<S: Simd, const U: usize>(
     }
 }
 
-/// Dot products of one input window with `N` weight rows, which share each
-/// input vector. The sums go 8 lanes at a time, then one by one.
+/// Dot products of `M` input windows with `N` weight rows: `sums[m][n]`. The
+/// windows share each weight vector and the rows share each input vector. The
+/// sums go 8 lanes at a time, then one by one.
 #[inline(always)]
-fn dots<S: Simd, const N: usize>(simd: S, x: &[f32], ws: [&[f32]; N]) -> [f32; N] {
+fn dots<S: Simd, const N: usize, const M: usize>(
+    simd: S,
+    xs: [&[f32]; M],
+    ws: [&[f32]; N],
+) -> [[f32; N]; M] {
     use fearless_simd::prelude::*;
-    let (x8, x_rest) = x.as_chunks::<8>();
+    let k = xs[0].len();
+    // One check each here instead of one per access in the loop.
+    let x8 = xs.map(|x| {
+        assert_eq!(x.len(), k);
+        x.as_chunks::<8>().0
+    });
     let w8 = ws.map(|w| {
         let chunks = w.as_chunks::<8>().0;
-        // One check here instead of one per access in the loop.
-        assert_eq!(chunks.len(), x8.len());
+        assert_eq!(chunks.len(), x8[0].len());
         chunks
     });
-    let mut acc = [f32x8::splat(simd, 0.0); N];
-    for (i, xv) in x8.iter().enumerate() {
-        let xv = f32x8::load_array_ref(simd, xv);
+    let mut acc = [[f32x8::splat(simd, 0.0); N]; M];
+    for i in 0..x8[0].len() {
+        let xv = x8.map(|x| f32x8::load_array_ref(simd, &x[i]));
         for j in 0..N {
-            acc[j] = f32x8::load_array_ref(simd, &w8[j][i]).mul_add(xv, acc[j]);
+            let wv = f32x8::load_array_ref(simd, &w8[j][i]);
+            for m in 0..M {
+                acc[m][j] = wv.mul_add(xv[m], acc[m][j]);
+            }
         }
     }
-    let mut sums = acc.map(|a| a.reduce_sum());
-    let done = x8.len() * 8;
-    for (r, &xv) in x_rest.iter().enumerate() {
-        for j in 0..N {
-            sums[j] += xv * ws[j][done + r];
+    let mut sums = acc.map(|a| a.map(|a| a.reduce_sum()));
+    for r in x8[0].len() * 8..k {
+        for m in 0..M {
+            for j in 0..N {
+                sums[m][j] += xs[m][r] * ws[j][r];
+            }
         }
     }
     sums
@@ -475,8 +488,21 @@ fn single_channel_simd<S: Simd>(
             let (r0, rest) = rows.split_at_mut(out_len);
             let (r1, rest) = rest.split_at_mut(out_len);
             let (r2, r3) = rest.split_at_mut(out_len);
-            for t in 0..out_len {
-                let sums = dots(simd, &x[t * s.stride..][..k], ws);
+            // Two output positions at a time share each weight vector.
+            let mut t = 0;
+            while t + 2 <= out_len {
+                let xs = [&x[t * s.stride..][..k], &x[(t + 1) * s.stride..][..k]];
+                let sums = dots(simd, xs, ws);
+                for (m, sums) in sums.iter().enumerate() {
+                    r0[t + m] = finish(sums[0], bias[0]);
+                    r1[t + m] = finish(sums[1], bias[1]);
+                    r2[t + m] = finish(sums[2], bias[2]);
+                    r3[t + m] = finish(sums[3], bias[3]);
+                }
+                t += 2;
+            }
+            if t < out_len {
+                let [sums] = dots(simd, [&x[t * s.stride..][..k]], ws);
                 r0[t] = finish(sums[0], bias[0]);
                 r1[t] = finish(sums[1], bias[1]);
                 r2[t] = finish(sums[2], bias[2]);
@@ -488,7 +514,7 @@ fn single_channel_simd<S: Simd>(
             let ws = [&weights[oc * k..][..k]];
             let bias = s.bias.map_or(0.0, |b| b[oc]);
             for (t, y) in row.iter_mut().enumerate() {
-                let [sum] = dots(simd, &x[t * s.stride..][..k], ws);
+                let [[sum]] = dots(simd, [&x[t * s.stride..][..k]], ws);
                 *y = finish(sum, bias);
             }
         }
