@@ -269,97 +269,102 @@ pub fn batch_norm<'b, 'a>(
     let numel = input.data.len();
     utils::ensure_capacity(out_buf, numel);
     let out_slice = unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), numel) };
-    if shape.len() == 4 {
-        let n = shape[0];
-        let c = shape[1];
-        let h = shape[2];
-        let w = shape[3];
-        let spatial_size = h * w;
-        let src = &input.data;
-        let s = &scale.data;
-        let b = &bias.data;
-        let m = &mean.data;
-        let v = &var.data;
-        for ni in 0..n {
-            for ci in 0..c {
-                let offset = (ni * c + ci) * spatial_size;
-                let scale_val = s[ci] / (v[ci] + epsilon).sqrt();
-                let bias_val = b[ci] - m[ci] * scale_val;
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    crate::kernels::avx::norm::batch_norm_spatial_x86(
-                        src.as_ptr().add(offset),
-                        out_slice.as_mut_ptr().add(offset),
-                        scale_val,
-                        bias_val,
-                        spatial_size,
-                    );
-                }
-                #[cfg(target_arch = "wasm32")]
-                unsafe {
-                    crate::kernels::wasm::norm::scale_bias_spatial(
-                        src.as_ptr().add(offset),
-                        out_slice.as_mut_ptr().add(offset),
-                        scale_val,
-                        bias_val,
-                        spatial_size,
-                    );
-                }
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "wasm32")))]
-                for i in 0..spatial_size {
-                    out_slice[offset + i] = src[offset + i] * scale_val + bias_val;
+    // [outer, channels, inner...]: every rank is the 4D NCHW case with the
+    // trailing dimensions flattened.
+    let (outer, c) = if shape.len() > 1 { (shape[0], shape[1]) } else { (1, shape[0]) };
+    let inner: usize = shape.iter().skip(2).product();
+    batch_norm_channels(
+        Level::new(),
+        outer,
+        inner,
+        &input.data,
+        [&scale.data[..c], &bias.data[..c], &mean.data[..c], &var.data[..c]],
+        epsilon,
+        out_slice,
+    );
+    TensorView {
+        data: Cow::Borrowed(out_slice),
+        shape: Cow::Owned(shape.to_vec()),
+    }
+}
+
+/// BatchNorm of `outer` samples of `[channels, inner]` into `out`, with
+/// per-channel `[scale, bias, mean, var]`.
+///
+/// Streams memory like the other norms, so it runs AVX-512 machines at AVX2;
+/// see `simd_call!`.
+fn batch_norm_channels(
+    level: Level,
+    outer: usize,
+    inner: usize,
+    src: &[f32],
+    params: [&[f32]; 4],
+    epsilon: f32,
+    out: &mut [f32],
+) {
+    simd_call!(level, max = Avx2, batch_norm_channels_simd(outer, inner, src, params, epsilon, out))
+}
+
+#[simd]
+fn batch_norm_channels_simd<S: Simd>(
+    simd: S,
+    outer: usize,
+    inner: usize,
+    src: &[f32],
+    [scale, bias, mean, var]: [&[f32]; 4],
+    epsilon: f32,
+    out: &mut [f32],
+) {
+    let c = scale.len();
+    let (mut src, mut out) = (&src[..outer * c * inner], &mut out[..outer * c * inner]);
+    for _ in 0..outer {
+        for ch in 0..c {
+            let row;
+            (row, src) = src.split_at(inner);
+            let out_row;
+            (out_row, out) = std::mem::take(&mut out).split_at_mut(inner);
+            // out = x * scale / sqrt(var + eps) + (bias - mean * scale / sqrt(var + eps))
+            let k = scale[ch] / (var[ch] + epsilon).sqrt();
+            let shift = bias[ch] - mean[ch] * k;
+
+            let k_v = f32x16::splat(simd, k);
+            let shift_v = f32x16::splat(simd, shift);
+            let (x, x_tail) = row.as_chunks::<LANES>();
+            let (o, _) = out_row.as_chunks_mut::<LANES>();
+            let (x4, x1) = x.as_chunks::<4>();
+            let (o4, o1) = o.as_chunks_mut::<4>();
+            for (x, o) in x4.iter().zip(o4) {
+                for (x, o) in x.iter().zip(o) {
+                    f32x16::load_array_ref(simd, x).mul_add(k_v, shift_v).store_array(o);
                 }
             }
-        }
-    } else {
-        let c = if shape.len() > 1 { shape[1] } else { shape[0] };
-        let outer_size = shape[0];
-        let inner_size: usize = if shape.len() > 2 {
-            shape[2..].iter().product()
-        } else {
-            1
-        };
-        let src = &input.data;
-        let s = &scale.data;
-        let b = &bias.data;
-        let m = &mean.data;
-        let v = &var.data;
-        for i in 0..outer_size {
-            for j in 0..c {
-                let scale_val = s[j] / (v[j] + epsilon).sqrt();
-                let bias_val = b[j] - m[j] * scale_val;
-                let offset = (i * c + j) * inner_size;
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    crate::kernels::avx::norm::batch_norm_spatial_x86(
-                        src.as_ptr().add(offset),
-                        out_slice.as_mut_ptr().add(offset),
-                        scale_val,
-                        bias_val,
-                        inner_size,
-                    );
-                }
-                #[cfg(target_arch = "wasm32")]
-                unsafe {
-                    crate::kernels::wasm::norm::scale_bias_spatial(
-                        src.as_ptr().add(offset),
-                        out_slice.as_mut_ptr().add(offset),
-                        scale_val,
-                        bias_val,
-                        inner_size,
-                    );
-                }
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "wasm32")))]
-                for k in 0..inner_size {
-                    let idx = offset + k;
-                    out_slice[idx] = src[idx] * scale_val + bias_val;
+            for (x, o) in x1.iter().zip(o1) {
+                f32x16::load_array_ref(simd, x).mul_add(k_v, shift_v).store_array(o);
+            }
+            if !x_tail.is_empty() {
+                if let (Some(x), Some(o)) =
+                    (row.last_chunk::<LANES>(), out_row.last_chunk_mut::<LANES>())
+                {
+                    // Spatial widths are rarely multiples of 16, so the tail
+                    // is common here: redo the last full vector, overlapping
+                    // the previous one, instead of finishing with scalars.
+                    // Each output depends only on its own input, and `src`
+                    // and `out` are distinct, so recomputing is harmless.
+                    f32x16::load_array_ref(simd, x).mul_add(k_v, shift_v).store_array(o);
+                } else {
+                    let from = inner - x_tail.len();
+                    scale_shift_tail(x_tail, &mut out_row[from..], k, shift);
                 }
             }
         }
     }
-    TensorView {
-        data: Cow::Borrowed(out_slice),
-        shape: Cow::Owned(shape.to_vec()),
+}
+
+#[cold]
+#[inline(never)]
+fn scale_shift_tail(x: &[f32], out: &mut [f32], k: f32, shift: f32) {
+    for (&x, o) in x.iter().zip(out) {
+        *o = x * k + shift;
     }
 }
 
@@ -814,6 +819,27 @@ mod tests {
             &mut out,
         );
         assert_close(&got.data, &batch_norm_ref(&x, c, inner, &p), 1e-6, &format!("{shape:?}"));
+    }
+
+    #[test]
+    fn test_batch_norm_matches_reference_at_every_level() {
+        let c = 3;
+        for level in levels() {
+            let mut rng = Rng::new(7);
+            for &inner in AWKWARD_LENS {
+                let x = rng.vec(2 * c * inner, -3.0, 3.0);
+                let p = BnParams {
+                    scale: rng.vec(c, 0.5, 1.5),
+                    bias: rng.vec(c, -0.5, 0.5),
+                    mean: rng.vec(c, -1.0, 1.0),
+                    var: rng.vec(c, 0.5, 2.0),
+                };
+                let mut out = vec![0.0; x.len()];
+                batch_norm_channels(level, 2, inner, &x, [&p.scale, &p.bias, &p.mean, &p.var], EPS, &mut out);
+                let want = batch_norm_ref(&x, c, inner, &p);
+                assert_close(&out, &want, 1e-6, &format!("{level:?} inner={inner}"));
+            }
+        }
     }
 
     #[test]

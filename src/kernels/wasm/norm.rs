@@ -4,20 +4,6 @@
 
 use std::arch::wasm32::*;
 
-/// Fused multiply-add: a*b + acc.
-/// Uses relaxed_madd when the `relaxed-simd` target feature is enabled.
-#[inline(always)]
-unsafe fn fmadd(a: v128, b: v128, acc: v128) -> v128 {
-    #[cfg(target_feature = "relaxed-simd")]
-    {
-        f32x4_relaxed_madd(a, b, acc)
-    }
-    #[cfg(not(target_feature = "relaxed-simd"))]
-    {
-        f32x4_add(acc, f32x4_mul(a, b))
-    }
-}
-
 /// Horizontal sum of f32x4 → f32
 #[inline(always)]
 pub unsafe fn hsum_f32x4(v: v128) -> f32 {
@@ -85,40 +71,5 @@ pub unsafe fn softmax(src: &[f32], dst: &mut [f32]) {
     }
     for k in simd_end..len {
         *dst_ptr.add(k) *= inv_sum;
-    }
-}
-
-/// WASM SIMD128 fused scale+bias for a contiguous spatial slice:
-/// out[i] = data[i] * scale + bias_val
-pub unsafe fn scale_bias_spatial(
-    src: *const f32,
-    out: *mut f32,
-    scale: f32,
-    bias_val: f32,
-    len: usize,
-) {
-    let vs = f32x4_splat(scale);
-    let vb = f32x4_splat(bias_val);
-    let mut i = 0;
-    let end16 = (len / 16) * 16;
-    while i < end16 {
-        let v0 = v128_load(src.add(i) as *const v128);
-        let v1 = v128_load(src.add(i + 4) as *const v128);
-        let v2 = v128_load(src.add(i + 8) as *const v128);
-        let v3 = v128_load(src.add(i + 12) as *const v128);
-        v128_store(out.add(i) as *mut v128, fmadd(v0, vs, vb));
-        v128_store(out.add(i + 4) as *mut v128, fmadd(v1, vs, vb));
-        v128_store(out.add(i + 8) as *mut v128, fmadd(v2, vs, vb));
-        v128_store(out.add(i + 12) as *mut v128, fmadd(v3, vs, vb));
-        i += 16;
-    }
-    while i + 4 <= len {
-        let v = v128_load(src.add(i) as *const v128);
-        v128_store(out.add(i) as *mut v128, fmadd(v, vs, vb));
-        i += 4;
-    }
-    while i < len {
-        *out.add(i) = *src.add(i) * scale + bias_val;
-        i += 1;
     }
 }
