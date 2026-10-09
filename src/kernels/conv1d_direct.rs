@@ -58,7 +58,15 @@ fn depthwise_simd<S: Simd>(
     let (k, len, out_len, stride) = (s.kernel, s.len, s.out_len, s.stride);
     for c in 0..s.batch * s.channels {
         // Only the row's own span changes between channels; the zeros around it stay.
-        padded[s.pad_left..][..len].copy_from_slice(&input[c * len..][..len]);
+        let (dst, src) = (&mut padded[s.pad_left..][..len], &input[c * len..][..len]);
+        if len < 32 {
+            // A short copy is cheaper written out than as a call to `memcpy`.
+            for (d, &v) in dst.iter_mut().zip(src) {
+                *d = v;
+            }
+        } else {
+            dst.copy_from_slice(src);
+        }
         let x = &*padded;
         let y = &mut out[c * out_len..][..out_len];
         let w = &weights[(c % s.channels) * k..][..k];
@@ -397,7 +405,15 @@ fn lanes_blocks<S: Simd, const U: usize>(
             // The positions of one channel are contiguous in the output.
             for l in 0..lanes {
                 let row = [y[0][l], y[1][l], y[2][l], y[3][l]];
-                out[(first + l) * out_len + t..][..n].copy_from_slice(&row[..n]);
+                let dst = &mut out[(first + l) * out_len + t..][..n];
+                if let Some(dst) = dst.first_chunk_mut::<4>() {
+                    *dst = row;
+                } else {
+                    // A copy of unknown length would be a call to `memcpy`.
+                    for (d, &v) in dst.iter_mut().zip(&row) {
+                        *d = v;
+                    }
+                }
             }
         }
         t += n;
