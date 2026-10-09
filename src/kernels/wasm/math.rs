@@ -82,73 +82,6 @@ pub unsafe fn erf_f32x4(x: v128) -> v128 {
 
 // ─── Unary activation kernels ────────────────────────────────────────────────
 
-/// WASM SIMD128 tanh: tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
-pub unsafe fn tanh(input: *const f32, output: *mut f32, len: usize) {
-    let mut i = 0;
-    let one = f32x4_splat(1.0);
-    let two = f32x4_splat(2.0);
-    let neg_one = f32x4_splat(-1.0);
-
-    while i + 4 <= len {
-        let x = v128_load(input.add(i) as *const v128);
-        let two_x = f32x4_mul(two, x);
-        let exp_2x = exp_f32x4(two_x);
-        let num = f32x4_sub(exp_2x, one);
-        let den = f32x4_add(exp_2x, one);
-        let result = f32x4_div(num, den);
-        // Clamp to [-1, 1] for numerical safety
-        let result = f32x4_max(result, neg_one);
-        let result = f32x4_min(result, one);
-        v128_store(output.add(i) as *mut v128, result);
-        i += 4;
-    }
-    while i < len {
-        *output.add(i) = (*input.add(i)).tanh();
-        i += 1;
-    }
-}
-
-/// WASM SIMD128 sigmoid: 1 / (1 + exp(-x))
-pub unsafe fn sigmoid(input: *const f32, output: *mut f32, len: usize) {
-    let mut i = 0;
-    let one = f32x4_splat(1.0);
-
-    while i + 4 <= len {
-        let x = v128_load(input.add(i) as *const v128);
-        let neg_x = f32x4_neg(x);
-        let exp_neg_x = exp_f32x4(neg_x);
-        let den = f32x4_add(one, exp_neg_x);
-        let result = f32x4_div(one, den);
-        v128_store(output.add(i) as *mut v128, result);
-        i += 4;
-    }
-    while i < len {
-        *output.add(i) = crate::kernels::activations::sigmoid(*input.add(i));
-        i += 1;
-    }
-}
-
-/// WASM SIMD128 SiLU: x * sigmoid(x) = x / (1 + exp(-x))
-pub unsafe fn silu(input: *const f32, output: *mut f32, len: usize) {
-    let mut i = 0;
-    let one = f32x4_splat(1.0);
-
-    while i + 4 <= len {
-        let x = v128_load(input.add(i) as *const v128);
-        let neg_x = f32x4_neg(x);
-        let exp_neg_x = exp_f32x4(neg_x);
-        let den = f32x4_add(one, exp_neg_x);
-        let result = f32x4_div(x, den);
-        v128_store(output.add(i) as *mut v128, result);
-        i += 4;
-    }
-    while i < len {
-        let x = *input.add(i);
-        *output.add(i) = x / (1.0 + (-x).exp());
-        i += 1;
-    }
-}
-
 /// WASM SIMD128 ReLU: max(x, 0)
 pub unsafe fn relu(input: *const f32, output: *mut f32, len: usize) {
     let zero = f32x4_splat(0.0);
@@ -162,21 +95,6 @@ pub unsafe fn relu(input: *const f32, output: *mut f32, len: usize) {
     while i < len {
         let v = *input.add(i);
         *output.add(i) = if v > 0.0 { v } else { 0.0 };
-        i += 1;
-    }
-}
-
-/// WASM SIMD128 erf for a buffer
-pub unsafe fn erf(input: *const f32, output: *mut f32, len: usize) {
-    let mut i = 0;
-    while i + 4 <= len {
-        let x = v128_load(input.add(i) as *const v128);
-        let result = erf_f32x4(x);
-        v128_store(output.add(i) as *mut v128, result);
-        i += 4;
-    }
-    while i < len {
-        *output.add(i) = libm::erff(*input.add(i));
         i += 1;
     }
 }
@@ -199,33 +117,6 @@ pub unsafe fn gelu(input: *const f32, output: *mut f32, len: usize) {
         let x = *input.add(i);
         let erf_val = libm::erff(x * 0.7071067811865475);
         *output.add(i) = x * 0.5 * (1.0 + erf_val);
-        i += 1;
-    }
-}
-
-/// WASM SIMD128 GELU evaluated in the exact operation order of the ONNX
-/// `Div -> Erf -> Add -> Mul -> Mul` subgraph the compiler fuses:
-/// `x * (0.5 * (1 + erf(x / sqrt(2))))`.
-///
-/// Unlike [`gelu`] above, the scaling is a true division (not a multiply by
-/// the reciprocal) and the erf body mirrors [`erf`] lane-for-lane, so the
-/// fused kernel is bit-identical to the unfused chain.
-pub unsafe fn gelu_erf(input: *const f32, output: *mut f32, len: usize) {
-    let mut i = 0;
-    let sqrt2 = f32x4_splat(std::f32::consts::SQRT_2);
-    let half = f32x4_splat(0.5);
-    let one = f32x4_splat(1.0);
-
-    while i + 4 <= len {
-        let x = v128_load(input.add(i) as *const v128);
-        let erf_val = erf_f32x4(f32x4_div(x, sqrt2));
-        let result = f32x4_mul(x, f32x4_mul(half, f32x4_add(one, erf_val)));
-        v128_store(output.add(i) as *mut v128, result);
-        i += 4;
-    }
-    while i < len {
-        let x = *input.add(i);
-        *output.add(i) = x * (0.5 * (1.0 + libm::erff(x / std::f32::consts::SQRT_2)));
         i += 1;
     }
 }
@@ -647,54 +538,6 @@ pub fn relu_kernel<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> Ten
     utils::ensure_capacity(out, len);
     unsafe {
         relu(input.data.as_ptr(), out.as_mut_ptr(), len);
-    }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: Cow::Owned(input.shape.to_vec()),
-    }
-}
-
-pub fn tanh_kernel<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let len = input.data.len();
-    utils::ensure_capacity(out, len);
-    unsafe {
-        tanh(input.data.as_ptr(), out.as_mut_ptr(), len);
-    }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: Cow::Owned(input.shape.to_vec()),
-    }
-}
-
-pub fn sigmoid_kernel<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let len = input.data.len();
-    utils::ensure_capacity(out, len);
-    unsafe {
-        sigmoid(input.data.as_ptr(), out.as_mut_ptr(), len);
-    }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: Cow::Owned(input.shape.to_vec()),
-    }
-}
-
-pub fn silu_kernel<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let len = input.data.len();
-    utils::ensure_capacity(out, len);
-    unsafe {
-        silu(input.data.as_ptr(), out.as_mut_ptr(), len);
-    }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: Cow::Owned(input.shape.to_vec()),
-    }
-}
-
-pub fn erf_kernel<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let len = input.data.len();
-    utils::ensure_capacity(out, len);
-    unsafe {
-        erf(input.data.as_ptr(), out.as_mut_ptr(), len);
     }
     TensorView {
         data: Cow::Borrowed(out),

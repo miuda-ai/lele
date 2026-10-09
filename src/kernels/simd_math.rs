@@ -48,6 +48,105 @@ pub(crate) fn exp<S: Simd>(x: f32x16<S>) -> f32x16<S> {
     y * bits.bitcast::<f32x16<S>>()
 }
 
+/// `1 / (1 + exp(-x))`. Saturates to 0 and 1 where `exp(-x)` is clamped.
+#[inline(always)]
+pub(crate) fn sigmoid<S: Simd>(x: f32x16<S>) -> f32x16<S> {
+    let one = f32x16::splat(x.simd, 1.0);
+    one / (one + exp(-x))
+}
+
+/// `x * sigmoid(x)`, as `x / (1 + exp(-x))`.
+#[inline(always)]
+pub(crate) fn silu<S: Simd>(x: f32x16<S>) -> f32x16<S> {
+    let one = f32x16::splat(x.simd, 1.0);
+    x / (one + exp(-x))
+}
+
+/// `tanh(x) = sign(x) * (1 - e) / (1 + e)` with `e = exp(-2|x|)`: the
+/// exponent never overflows, so large inputs saturate to ±1.
+#[inline(always)]
+pub(crate) fn tanh<S: Simd>(x: f32x16<S>) -> f32x16<S> {
+    let simd = x.simd;
+    let one = f32x16::splat(simd, 1.0);
+    let e = exp(-(x.abs() * f32x16::splat(simd, 2.0)));
+    ((one - e) / (one + e)).copysign(x)
+}
+
+/// `erf(x)` by Abramowitz & Stegun 7.1.26, to 1.5e-7 absolute:
+/// `1 - (a1·t + … + a5·t⁵)·exp(-x²)` with `t = 1 / (1 + 0.3275911·|x|)`.
+#[inline(always)]
+pub(crate) fn erf<S: Simd>(x: f32x16<S>) -> f32x16<S> {
+    const P: f32 = 0.3275911;
+    const A: [f32; 5] = [0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429];
+
+    let simd = x.simd;
+    let one = f32x16::splat(simd, 1.0);
+    let ax = x.abs();
+    let t = one / ax.mul_add(f32x16::splat(simd, P), one);
+    let mut poly = f32x16::splat(simd, A[4]);
+    for &a in A[..4].iter().rev() {
+        poly = poly.mul_add(t, f32x16::splat(simd, a));
+    }
+    // 1 - poly·t·exp(-x²)
+    let tail = exp(-(ax * ax));
+    (-(poly * t)).mul_add(tail, one).copysign(x)
+}
+
+/// `x * (0.5 * (1 + erf(x / √2)))`, in exactly the operations and order of
+/// the ONNX `Div -> Erf -> Add -> Mul -> Mul` subgraph the compiler fuses into
+/// it, so that fusing changes no bits: a true division rather than a
+/// reciprocal multiply, and the same `erf` as the standalone kernel.
+#[inline(always)]
+pub(crate) fn gelu_erf<S: Simd>(x: f32x16<S>) -> f32x16<S> {
+    let simd = x.simd;
+    let half = f32x16::splat(simd, 0.5);
+    let e = erf(x / f32x16::splat(simd, std::f32::consts::SQRT_2));
+    x * (half * (e + f32x16::splat(simd, 1.0)))
+}
+
+/// Writes `$f(src[i])` to `out[i]` for every `i`, where `$f` is one of the
+/// vector functions above and `$simd` the token of the enclosing `#[simd]`
+/// function. Needs `src.len() >= 16`.
+///
+/// A macro, not a function taking `f`: a function item or closure passed to a
+/// function is compiled on its own, without the caller's target features, and
+/// every vector operation in it becomes an out-of-line call (25x slower on
+/// AVX2). Expanded in the `#[simd]` body, the calls inline.
+///
+/// A length that is not a multiple of 16 ends with the last 16 elements,
+/// overlapping the previous vector: each output depends only on its own
+/// input and `src` and `out` are distinct, so recomputing the overlap writes
+/// the values already there.
+macro_rules! map {
+    ($simd:expr, $src:expr, $out:expr, $f:path) => {{
+        use fearless_simd::prelude::*;
+        let (simd, src, out): (_, &[f32], &mut [f32]) = ($simd, $src, $out);
+        let out = &mut out[..src.len()];
+        let (x, x_tail) = src.as_chunks::<16>();
+        let (o, _) = out.as_chunks_mut::<16>();
+        let (x2, x1) = x.as_chunks::<2>();
+        let (o2, o1) = o.as_chunks_mut::<2>();
+        // Two vectors per step: the polynomials are long dependency chains,
+        // and a second independent one fills the gaps.
+        for ([a, b], [oa, ob]) in x2.iter().zip(o2) {
+            let ya = $f(fearless_simd::f32x16::load_array_ref(simd, a));
+            let yb = $f(fearless_simd::f32x16::load_array_ref(simd, b));
+            ya.store_array(oa);
+            yb.store_array(ob);
+        }
+        for (a, oa) in x1.iter().zip(o1) {
+            $f(fearless_simd::f32x16::load_array_ref(simd, a)).store_array(oa);
+        }
+        if !x_tail.is_empty() {
+            let last = src.last_chunk::<16>().expect("at least a vector");
+            let out_last = out.last_chunk_mut::<16>().expect("at least a vector");
+            $f(fearless_simd::f32x16::load_array_ref(simd, last)).store_array(out_last);
+        }
+    }};
+}
+
+pub(crate) use map;
+
 #[cfg(test)]
 mod tests {
     use super::*;
