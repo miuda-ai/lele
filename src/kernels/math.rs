@@ -3283,6 +3283,93 @@ mod tests {
         }
     }
 
+    fn apply(
+        f: impl for<'a, 'b> Fn(&TensorView<'b>, &'a mut Vec<f32>) -> TensorView<'a>,
+        x: &[f32],
+    ) -> Vec<f32> {
+        let input = TensorView::from_slice(x, vec![x.len()]);
+        let mut out = Vec::new();
+        f(&input, &mut out).data.into_owned()
+    }
+
+    fn sigmoid_ref(x: f64) -> f64 {
+        1.0 / (1.0 + (-x).exp())
+    }
+
+    fn silu_ref(x: f64) -> f64 {
+        x * sigmoid_ref(x)
+    }
+
+    /// Each activation against its f64 definition, at every awkward length
+    /// (so main loops, vector tails and short rows all run) and from an
+    /// unaligned start.
+    fn check_activation(
+        name: &str,
+        f: impl for<'a, 'b> Fn(&TensorView<'b>, &'a mut Vec<f32>) -> TensorView<'a> + Copy,
+        want: fn(f64) -> f64,
+        tol: f64,
+    ) {
+        use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_close};
+        let mut rng = Rng::new(11);
+        for &n in AWKWARD_LENS {
+            let x = rng.vec(n + 1, -12.0, 12.0);
+            for x in [&x[..n], &x[1..]] {
+                let want: Vec<f64> = x.iter().map(|&v| want(v as f64)).collect();
+                assert_close(&apply(f, x), &want, tol, &format!("{name} n={}", x.len()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_sigmoid_matches_reference_at_every_length() {
+        check_activation("sigmoid", sigmoid, sigmoid_ref, 1e-6);
+    }
+
+    #[test]
+    fn test_tanh_matches_reference_at_every_length() {
+        check_activation("tanh", tanh_kernel, f64::tanh, 1e-6);
+    }
+
+    #[test]
+    fn test_silu_matches_reference_at_every_length() {
+        check_activation("silu", silu, silu_ref, 1e-6);
+    }
+
+    #[test]
+    fn test_erf_matches_reference_at_every_length() {
+        check_activation("erf", erf, libm::erf, 1e-6);
+    }
+
+    #[test]
+    fn test_gelu_erf_matches_reference_at_every_length() {
+        check_activation(
+            "gelu_erf",
+            gelu_erf,
+            |x| 0.5 * x * (1.0 + libm::erf(x * std::f64::consts::FRAC_1_SQRT_2)),
+            2e-6,
+        );
+    }
+
+    #[test]
+    fn test_relu_matches_reference_at_every_length() {
+        check_activation("relu", relu, |x| x.max(0.0), 0.0);
+    }
+
+    #[test]
+    fn test_activations_saturate_without_overflow() {
+        // Far past where exp overflows or underflows in f32.
+        let x = [-1000.0, -100.0, -88.0, -20.0, 20.0, 88.0, 100.0, 1000.0, 0.0, -0.5, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        for (name, got, want) in [
+            ("sigmoid", apply(sigmoid, &x), x.map(|v| sigmoid_ref(v as f64))),
+            ("silu", apply(silu, &x), x.map(|v| silu_ref(v as f64))),
+        ] {
+            for ((&g, &w), &v) in got.iter().zip(&want).zip(&x) {
+                assert!(g.is_finite(), "{name}({v}) = {g}");
+                assert!((g as f64 - w).abs() <= 1e-6 * w.abs().max(1.0), "{name}({v}) = {g}, want {w}");
+            }
+        }
+    }
+
     #[test]
     fn test_leaky_relu_large_aligned() {
         // Size multiple of 4 to exercise the NEON SIMD loop fully

@@ -331,11 +331,13 @@ fn bench_elementwise(c: &mut Criterion) {
 // Activation Functions Benchmarks
 // ============================================================================
 
-#[cfg(target_arch = "aarch64")]
 fn bench_activations(c: &mut Criterion) {
     let mut group = c.benchmark_group("activations");
 
-    let sizes = [512, 1024, 2048, 4096];
+    // Element counts logged from running the example models: T-one (silu,
+    // sigmoid: 1920 to 42240) and supertonic3 (tanh: 25600; gelu_erf, erf:
+    // 77824 and 438272). 197 is an odd size that leaves a vector tail.
+    let sizes = [197, 1920, 3840, 7680, 21760, 42240, 77824, 438272];
 
     for &size in &sizes {
         let input_data: Vec<f32> = (0..size).map(|i| ((i % 20) as f32 - 10.0) * 0.1).collect();
@@ -349,7 +351,6 @@ fn bench_activations(c: &mut Criterion) {
         // Tanh
         group.bench_with_input(BenchmarkId::new("tanh", size), &size, |bencher, _| {
             bencher.iter(|| {
-                out_buf.fill(0.0);
                 let _ = lele::kernels::math::tanh_kernel(black_box(&input), &mut out_buf);
             });
         });
@@ -357,7 +358,6 @@ fn bench_activations(c: &mut Criterion) {
         // Sigmoid
         group.bench_with_input(BenchmarkId::new("sigmoid", size), &size, |bencher, _| {
             bencher.iter(|| {
-                out_buf.fill(0.0);
                 let _ = lele::kernels::math::sigmoid(black_box(&input), &mut out_buf);
             });
         });
@@ -365,7 +365,6 @@ fn bench_activations(c: &mut Criterion) {
         // Exp
         group.bench_with_input(BenchmarkId::new("exp", size), &size, |bencher, _| {
             bencher.iter(|| {
-                out_buf.fill(0.0);
                 let _ = lele::kernels::math::exp(black_box(&input), &mut out_buf);
             });
         });
@@ -373,15 +372,20 @@ fn bench_activations(c: &mut Criterion) {
         // ERF (used in GELU)
         group.bench_with_input(BenchmarkId::new("erf", size), &size, |bencher, _| {
             bencher.iter(|| {
-                out_buf.fill(0.0);
                 let _ = lele::kernels::math::erf(black_box(&input), &mut out_buf);
+            });
+        });
+
+        // GELU (erf form)
+        group.bench_with_input(BenchmarkId::new("gelu_erf", size), &size, |bencher, _| {
+            bencher.iter(|| {
+                let _ = lele::kernels::math::gelu_erf(black_box(&input), &mut out_buf);
             });
         });
 
         // ReLU
         group.bench_with_input(BenchmarkId::new("relu", size), &size, |bencher, _| {
             bencher.iter(|| {
-                out_buf.fill(0.0);
                 let _ = lele::kernels::math::relu(black_box(&input), &mut out_buf);
             });
         });
@@ -389,7 +393,6 @@ fn bench_activations(c: &mut Criterion) {
         // SiLU (Swish)
         group.bench_with_input(BenchmarkId::new("silu", size), &size, |bencher, _| {
             bencher.iter(|| {
-                out_buf.fill(0.0);
                 let _ = lele::kernels::math::silu(black_box(&input), &mut out_buf);
             });
         });
@@ -485,13 +488,7 @@ criterion_group!(
     bench_elementwise,
     bench_leaky_relu,
     bench_matmul_fused_add,
+    bench_activations,
 );
 
-#[cfg(target_arch = "aarch64")]
-criterion_group!(neon_benches, bench_activations);
-
-#[cfg(target_arch = "aarch64")]
-criterion_main!(benches, neon_benches);
-
-#[cfg(not(target_arch = "aarch64"))]
 criterion_main!(benches);
