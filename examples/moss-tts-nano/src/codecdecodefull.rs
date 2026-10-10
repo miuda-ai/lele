@@ -50,6 +50,7 @@ pub struct CodecDecodeFull<'a> {
     #[cfg(target_arch = "aarch64")]
     prepared_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::PreparedWeightsArm>>>,
     quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QuantizedWeights>)>>,
+    qweights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize, bool), (std::vec::Vec<f32>, std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,
 }
 
 impl<'a> CodecDecodeFull<'a> {
@@ -60,6 +61,7 @@ impl<'a> CodecDecodeFull<'a> {
             #[cfg(target_arch = "aarch64")]
             prepared_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             quantized_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            qweights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 fn conv1d_relu<'c, 'd>(
@@ -202,6 +204,48 @@ fn mat_mul_integer_arm<'c, 'd>(
     let zp_b = b_zero_point.and_then(|z| z.data.first()).map(|&v| v as u8);
 
     lele::kernels::mat_mul_integer_prepared_arm(a, &pw, zp_a, zp_b, None, None, false, output_buf)
+}
+
+/// Dynamically quantized linear layer (+ ReLU) against an int8 weight packed
+/// once for the integer GEMM.
+#[cfg(not(target_arch = "aarch64"))]
+fn linear_quantized_packed<'c, 'd>(
+    &self,
+    input: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_k: usize,
+    weight_n: usize,
+    weight_signed: bool,
+    weight_scale: lele::tensor::TensorView<'c, f32>,
+    weight_zero: lele::tensor::TensorView<'c, f32>,
+    bias: lele::tensor::TensorView<'c, f32>,
+    relu: bool,
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let w = self.get_qweights(weight_offset, weight_len, weight_k, weight_n, weight_signed, &weight_zero.data, &weight_scale.data);
+    let bias = (!bias.data.is_empty()).then_some(&bias.data[..]);
+    lele::kernels::qlinear_dynamic(input, &w, bias, relu, output_buf)
+}
+
+/// MatMulInteger against a static weight packed once for the integer GEMM.
+#[cfg(not(target_arch = "aarch64"))]
+fn mat_mul_integer_packed<'c, 'd>(
+    &self,
+    a: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_k: usize,
+    weight_n: usize,
+    weight_signed: bool,
+    a_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    b_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let zb = b_zero_point.map_or(&[0.0f32][..], |z| &z.data[..]);
+    let w = self.get_qweights(weight_offset, weight_len, weight_k, weight_n, weight_signed, zb, &[1.0]);
+    let za = a_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0) as i32;
+    lele::kernels::mat_mul_integer_qweights(a, za, &w, output_buf)
 }
 
 // Helper for pre-quantized inputs (used in attention where input is already quantized)
@@ -3919,6 +3963,19 @@ fn embedding_concat_i64<'c, 'd>(
         let qw = std::sync::Arc::new(lele::kernels::prepare_quantized_weights(raw, k, n, &scale.data));
         self.quantized_weights_cache.borrow_mut().insert(key, (scale.data.to_vec(), qw.clone()));
         qw
+    }
+    #[allow(dead_code)]
+    fn get_qweights(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool, zero_point: &[f32], scale: &[f32]) -> std::sync::Arc<lele::kernels::QWeights> {
+        let key = (offset, len, k, n, signed);
+        if let Some((z, s, w)) = self.qweights_cache.borrow().get(&key) {
+            if z.as_slice() == zero_point && s.as_slice() == scale {
+                return w.clone();
+            }
+        }
+        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();
+        let w = std::sync::Arc::new(lele::kernels::QWeights::new(&self.data[offset..offset + len], k, n, signed, &zp, scale));
+        self.qweights_cache.borrow_mut().insert(key, (zero_point.to_vec(), scale.to_vec(), w.clone()));
+        w
     }
     pub fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {
         TensorView::from_bytes_f32(&self.data[offset..offset+len], shape)
