@@ -461,9 +461,6 @@ pub fn gemm<'a>(
     {
         let output_len = m * n;
         utils::ensure_capacity(out_buf, output_len);
-        unsafe {
-            out_buf.set_len(output_len);
-        }
         // With no C to add, the product overwrites the buffer, so it is not filled first.
         let accum = match c {
             Some(_) if beta == 0.0 => Accum::Replace,
@@ -532,9 +529,6 @@ fn gemm_neon_path<'a>(
 ) -> TensorView<'a> {
     let output_len = m * n;
     utils::ensure_capacity(out_buf, output_len);
-    unsafe {
-        out_buf.set_len(output_len);
-    }
 
     // Initialize output with C * beta if needed
     let actual_beta = if let Some(cv) = c {
@@ -604,9 +598,6 @@ fn gemm_transposed_path<'a>(
 ) -> TensorView<'a> {
     let output_len = m * n;
     utils::ensure_capacity(out_buf, output_len);
-    unsafe {
-        out_buf.set_len(output_len);
-    }
 
     let actual_beta = if let Some(cv) = c {
         if beta == 0.0 {

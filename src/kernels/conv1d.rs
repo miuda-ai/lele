@@ -110,9 +110,6 @@ fn conv1d_fused_at<'b, 'a>(
         (input_len + pad_left + pad_right - dilation * (kernel_size - 1) - 1) / stride + 1;
     let total_output_size = batch_size * out_channels * output_len;
     utils::ensure_capacity(out, total_output_size);
-    unsafe {
-        out.set_len(total_output_size);
-    }
     let in_channels_per_group = in_channels / group as usize;
     let out_channels_per_group = out_channels / group as usize;
     let unfolded_rows = in_channels_per_group * kernel_size;
