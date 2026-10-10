@@ -1,62 +1,23 @@
-#![allow(unsafe_op_in_unsafe_fn)]
-use crate::kernels::activations::{sigmoid, tanh};
-use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul};
+//! LSTM and GRU, one direction and batch 1, on `fearless_simd`.
+//!
+//! The input's contribution to the gates does not depend on the state, so it
+//! is one GEMM over every time step up front, with the biases added once.
+//! Each step then adds the recurrent matrix times the previous hidden state
+//! and applies the gates.
+
+use crate::kernels::matmul::{Accum, MatMut, MatRef, matmul_at};
+use crate::kernels::simd::simd_call;
+use crate::kernels::simd_math as vm;
 use crate::tensor::TensorView;
+use fearless_simd::{Level, Simd, f32x16, prelude::*};
+use fearless_simd_macros::simd;
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn lstm_gates_avx2(
-    gates: &[f32],
-    out_c: &mut [f32],
-    out_h: &mut [f32],
-    out_y: &mut [f32],
-    hidden_size: usize,
-    t: usize,
-) {
-    use std::arch::x86_64::*;
-    unsafe {
-        let mut k = 0;
-        while k + 8 <= hidden_size {
-            // Load gate values directly and compute sigmoid/tanh with AVX2 SIMD
-            let i_raw = _mm256_loadu_ps(gates.as_ptr().add(k));
-            let o_raw = _mm256_loadu_ps(gates.as_ptr().add(hidden_size + k));
-            let f_raw = _mm256_loadu_ps(gates.as_ptr().add(2 * hidden_size + k));
-            let c_raw = _mm256_loadu_ps(gates.as_ptr().add(3 * hidden_size + k));
-
-            let i_gate = crate::kernels::avx::math::avx2_sigmoid_ps(i_raw);
-            let o_gate = crate::kernels::avx::math::avx2_sigmoid_ps(o_raw);
-            let f_gate = crate::kernels::avx::math::avx2_sigmoid_ps(f_raw);
-            let c_gate = crate::kernels::avx::math::avx2_tanh_ps(c_raw);
-
-            let prev_c = _mm256_loadu_ps(out_c.as_ptr().add(k));
-            // ct = f_gate * prev_c + i_gate * c_gate
-            let ct = _mm256_fmadd_ps(f_gate, prev_c, _mm256_mul_ps(i_gate, c_gate));
-
-            // ht = o_gate * tanh(ct)
-            let tanh_ct = crate::kernels::avx::math::avx2_tanh_ps(ct);
-            let ht = _mm256_mul_ps(o_gate, tanh_ct);
-
-            _mm256_storeu_ps(out_c.as_mut_ptr().add(k), ct);
-            _mm256_storeu_ps(out_h.as_mut_ptr().add(k), ht);
-            _mm256_storeu_ps(out_y.as_mut_ptr().add(t * hidden_size + k), ht);
-
-            k += 8;
-        }
-        while k < hidden_size {
-            let i_gate = sigmoid(gates[k]);
-            let o_gate = sigmoid(gates[hidden_size + k]);
-            let f_gate = sigmoid(gates[2 * hidden_size + k]);
-            let c_gate = tanh(gates[3 * hidden_size + k]);
-            let ct = f_gate * out_c[k] + i_gate * c_gate;
-            let ht = o_gate * tanh(ct);
-            out_c[k] = ct;
-            out_h[k] = ht;
-            out_y[t * hidden_size + k] = ht;
-            k += 1;
-        }
-    }
-}
-
+/// LSTM forward pass, gates in ONNX order `[i, o, f, c]`.
+///
+/// `input` is `[seq_len, 1, input_size]`, `w` `[1, 4*hidden, input_size]`,
+/// `r` `[1, 4*hidden, hidden]`, `bias` `[1, 8*hidden]` (`Wb` then `Rb`).
+/// Returns `(Y, Y_h, Y_c)`: `[seq_len, 1, 1, hidden]`, `[1, 1, hidden]`,
+/// `[1, 1, hidden]`. Sequence lengths and peepholes are not supported.
 pub fn lstm<'b, 'a>(
     input: &TensorView<'b>,
     w: &TensorView<'b>,
@@ -69,173 +30,57 @@ pub fn lstm<'b, 'a>(
     out_h: &'a mut Vec<f32>,
     out_c: &'a mut Vec<f32>,
 ) -> (TensorView<'a>, TensorView<'a>, TensorView<'a>) {
-    let seq_len = input.shape[0];
-    let batch_size = input.shape[1];
-    let input_size = input.shape[2];
-
-    let num_directions = w.shape[0];
-    let hidden_size = w.shape[1] / 4;
-    if num_directions != 1 {
-        panic!("LSTM: Only num_directions=1 supported");
-    }
-    if batch_size != 1 {
-        panic!("LSTM: Only batch_size=1 supported");
-    }
-    let w_data = &w.data;
-    let r_data = &r.data;
-    let default_bias = vec![0.0; 8 * hidden_size];
-    let bias_data: &[f32] = if let Some(b) = bias {
-        b.data.as_ref()
-    } else {
-        default_bias.as_slice()
-    };
-    let (bias_w_slice, bias_r_slice) = bias_data.split_at(4 * hidden_size);
-
-    out_h.resize(hidden_size, 0.0);
-    if let Some(h) = initial_h {
-        out_h.copy_from_slice(&h.data);
-    } else {
-        out_h.fill(0.0);
-    }
-    out_c.resize(hidden_size, 0.0);
-    if let Some(c) = initial_c {
-        out_c.copy_from_slice(&c.data);
-    } else {
-        out_c.fill(0.0);
-    }
-    out_y.resize(seq_len * hidden_size, 0.0);
-
-    let mut gates = vec![0.0; 4 * hidden_size];
-    let mut w_contribution = vec![0.0; 4 * hidden_size];
-    let mut r_contribution = vec![0.0; 4 * hidden_size];
-
-    for t in 0..seq_len {
-        let input_offset = t * input_size;
-        let x_t = &input.data[input_offset..input_offset + input_size];
-
-        unsafe {
-            // W * x_t
-            // W: [4*H, I] row-major.
-            // x_t: [I]
-            // out: [4*H]
-            let m = 4 * hidden_size;
-            let k = input_size;
-            let a = MatRef::<f32>::from_raw_parts(w_data.as_ptr(), m, k, k as isize, 1);
-            let b = MatRef::<f32>::from_raw_parts(x_t.as_ptr(), k, 1, 1, 1);
-            let c = MatMut::<f32>::from_raw_parts_mut(w_contribution.as_mut_ptr(), m, 1, 1, 1);
-
-            matmul(c, Accum::Replace, a, b, 1.0, Par::Seq);
-
-            // R * h_{t-1}
-            // R: [4*H, H]
-            // out_h: [H]
-            let a = MatRef::<f32>::from_raw_parts(
-                r_data.as_ptr(),
-                m,
-                hidden_size,
-                hidden_size as isize,
-                1,
-            );
-            let b = MatRef::<f32>::from_raw_parts(out_h.as_ptr(), hidden_size, 1, 1, 1);
-            let c = MatMut::<f32>::from_raw_parts_mut(r_contribution.as_mut_ptr(), m, 1, 1, 1);
-
-            matmul(c, Accum::Replace, a, b, 1.0, Par::Seq);
-        }
-
-        for g in 0..(4 * hidden_size) {
-            gates[g] = w_contribution[g] + r_contribution[g] + bias_w_slice[g] + bias_r_slice[g];
-        }
-
-        #[cfg(all(target_arch = "aarch64", nightly_build))]
-        {
-            use crate::kernels::neon::math::{simd_sigmoid, simd_tanh};
-            use std::simd::f32x4;
-
-            let mut k = 0;
-            while k + 4 <= hidden_size {
-                let i_gate_in = f32x4::from_slice(&gates[k..k + 4]);
-                let o_gate_in = f32x4::from_slice(&gates[hidden_size + k..hidden_size + k + 4]);
-                let f_gate_in =
-                    f32x4::from_slice(&gates[2 * hidden_size + k..2 * hidden_size + k + 4]);
-                let c_gate_in =
-                    f32x4::from_slice(&gates[3 * hidden_size + k..3 * hidden_size + k + 4]);
-
-                let i_gate = simd_sigmoid(i_gate_in);
-                let o_gate = simd_sigmoid(o_gate_in);
-                let f_gate = simd_sigmoid(f_gate_in);
-                let c_gate = simd_tanh(c_gate_in);
-
-                let prev_c = f32x4::from_slice(&out_c[k..k + 4]);
-                let ct = f_gate * prev_c + i_gate * c_gate;
-                let ht = o_gate * simd_tanh(ct);
-
-                ct.copy_to_slice(&mut out_c[k..k + 4]);
-                ht.copy_to_slice(&mut out_h[k..k + 4]);
-                ht.copy_to_slice(&mut out_y[t * hidden_size + k..t * hidden_size + k + 4]);
-
-                k += 4;
-            }
-            // Remainder
-            while k < hidden_size {
-                let i_gate = sigmoid(gates[k]);
-                let o_gate = sigmoid(gates[hidden_size + k]);
-                let f_gate = sigmoid(gates[2 * hidden_size + k]);
-                let c_gate = tanh(gates[3 * hidden_size + k]);
-                let ct = f_gate * out_c[k] + i_gate * c_gate;
-                let ht = o_gate * tanh(ct);
-                out_c[k] = ct;
-                out_h[k] = ht;
-                out_y[t * hidden_size + k] = ht;
-                k += 1;
-            }
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            unsafe {
-                lstm_gates_avx2(&gates, out_c, out_h, out_y, hidden_size, t);
-            }
-        }
-
-        #[cfg(any(
-            all(target_arch = "aarch64", not(nightly_build)),
-            not(any(target_arch = "aarch64", target_arch = "x86_64"))
-        ))]
-        for k in 0..hidden_size {
-            let i_gate = sigmoid(gates[k]);
-            let o_gate = sigmoid(gates[hidden_size + k]);
-            let f_gate = sigmoid(gates[2 * hidden_size + k]);
-            let c_gate = tanh(gates[3 * hidden_size + k]);
-            let ct = f_gate * out_c[k] + i_gate * c_gate;
-            let ht = o_gate * tanh(ct);
-            out_c[k] = ct;
-            out_h[k] = ht;
-            out_y[t * hidden_size + k] = ht;
-        }
-    }
-    let output_y_shape = vec![seq_len, 1, 1, hidden_size];
-    let output_y = TensorView::from_slice(out_y, output_y_shape);
-    let output_h_shape = vec![1, 1, hidden_size];
-    let output_h = TensorView::from_slice(out_h, output_h_shape);
-    let output_c_shape = vec![1, 1, hidden_size];
-    let output_c = TensorView::from_slice(out_c, output_c_shape);
-    (output_y, output_h, output_c)
+    lstm_at(Level::new(), input, w, r, bias, initial_h, initial_c, out_y, out_h, out_c);
+    let hs = out_h.len();
+    let seq_len = out_y.len() / hs.max(1);
+    (
+        TensorView::from_slice(out_y, vec![seq_len, 1, 1, hs]),
+        TensorView::from_slice(out_h, vec![1, 1, hs]),
+        TensorView::from_slice(out_c, vec![1, 1, hs]),
+    )
 }
 
-/// GRU (Gated Recurrent Unit) forward pass.
+fn lstm_at(
+    level: Level,
+    input: &TensorView,
+    w: &TensorView,
+    r: &TensorView,
+    bias: Option<&TensorView>,
+    initial_h: Option<&TensorView>,
+    initial_c: Option<&TensorView>,
+    out_y: &mut Vec<f32>,
+    out_h: &mut Vec<f32>,
+    out_c: &mut Vec<f32>,
+) {
+    let (seq_len, input_size) = check_shapes("LSTM", input, w);
+    let hs = w.shape[1] / 4;
+    let g = 4 * hs;
+
+    // xw[t] = W·x_t + Wb + Rb.
+    let mut xw = vec![0.0f32; seq_len * g];
+    mul_transposed(level, &mut xw, &input.data, seq_len, &w.data, g, input_size);
+    if let Some(b) = bias {
+        let (bw, br) = b.data.split_at(g);
+        add_bias(&mut xw, bw, br);
+    }
+
+    init_state(out_h, hs, initial_h);
+    init_state(out_c, hs, initial_c);
+    out_y.resize(seq_len * hs, 0.0);
+    for (gates, y) in xw.chunks_exact_mut(g).zip(out_y.chunks_exact_mut(hs)) {
+        matvec(level, gates, Accum::Add, &r.data, out_h, hs);
+        simd_call!(level, lstm_cell(gates, out_c, out_h));
+        y.copy_from_slice(out_h);
+    }
+}
+
+/// GRU forward pass, gates in ONNX order `[z, r, h]`.
 ///
-/// Inputs:
-///   input:  [seq_len, batch_size, input_size]
-///   w:      [1, 3*hidden_size, input_size]  (Weights for update/reset/candidate gates)
-///   r:      [1, 3*hidden_size, hidden_size] (Recurrent weights)
-///   bias:   optional [1, 6*hidden_size]     (bias_w + bias_r concatenated)
-///   initial_h: optional [1, 1, hidden_size]
-///
-/// linear_before_reset: if true, apply bias_r before reset gate multiplication
-///
-/// Outputs: (Y, H_n)
-///   Y:     [seq_len, 1, 1, hidden_size]
-///   H_n:   [1, 1, hidden_size]
+/// `input` is `[seq_len, 1, input_size]`, `w` `[1, 3*hidden, input_size]`,
+/// `r` `[1, 3*hidden, hidden]`, `bias` `[1, 6*hidden]` (`Wb` then `Rb`).
+/// With `linear_before_reset` the reset gate scales `R_h·h + Rb_h`, otherwise
+/// it scales `h` before `R_h` multiplies it.
+/// Returns `(Y, Y_h)`: `[seq_len, 1, 1, hidden]` and `[1, 1, hidden]`.
 pub fn gru<'b, 'a>(
     input: &TensorView<'b>,
     w: &TensorView<'b>,
@@ -246,181 +91,343 @@ pub fn gru<'b, 'a>(
     out_y: &'a mut Vec<f32>,
     out_h: &'a mut Vec<f32>,
 ) -> (TensorView<'a>, TensorView<'a>) {
-    let seq_len = input.shape[0];
-    let batch_size = input.shape[1];
-    let input_size = input.shape[2];
-
-    let num_directions = w.shape[0];
-    let hidden_size = w.shape[1] / 3;
-    if num_directions != 1 {
-        panic!("GRU: Only num_directions=1 supported");
-    }
-    if batch_size != 1 {
-        panic!("GRU: Only batch_size=1 supported");
-    }
-    let w_data = &w.data;
-    let r_data = &r.data;
-    let default_bias = vec![0.0; 6 * hidden_size];
-    let bias_data: &[f32] = if let Some(b) = bias {
-        b.data.as_ref()
-    } else {
-        default_bias.as_slice()
-    };
-    let (bias_w_slice, bias_r_slice) = bias_data.split_at(3 * hidden_size);
-
-    out_h.resize(hidden_size, 0.0);
-    if let Some(h) = initial_h {
-        out_h.copy_from_slice(&h.data);
-    } else {
-        out_h.fill(0.0);
-    }
-    out_y.resize(seq_len * hidden_size, 0.0);
-
-    let mut gates = vec![0.0f32; 3 * hidden_size];
-    let mut w_contribution = vec![0.0f32; 3 * hidden_size];
-    let mut r_contribution = vec![0.0f32; 3 * hidden_size];
-
-    let m = 3 * hidden_size;
-
-    for t in 0..seq_len {
-        let input_offset = t * input_size;
-        let x_t = &input.data[input_offset..input_offset + input_size];
-
-        unsafe {
-            let a = MatRef::<f32>::from_raw_parts(w_data.as_ptr(), m, input_size, input_size as isize, 1);
-            let b = MatRef::<f32>::from_raw_parts(x_t.as_ptr(), input_size, 1, 1, 1);
-            let c = MatMut::<f32>::from_raw_parts_mut(w_contribution.as_mut_ptr(), m, 1, 1, 1);
-            matmul(c, Accum::Replace, a, b, 1.0, Par::Seq);
-
-            let a = MatRef::<f32>::from_raw_parts(r_data.as_ptr(), m, hidden_size, hidden_size as isize, 1);
-            let b = MatRef::<f32>::from_raw_parts(out_h.as_ptr(), hidden_size, 1, 1, 1);
-            let c = MatMut::<f32>::from_raw_parts_mut(r_contribution.as_mut_ptr(), m, 1, 1, 1);
-            matmul(c, Accum::Replace, a, b, 1.0, Par::Seq);
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                unsafe { gru_gate_fusion_avx2(
-                    &w_contribution, &r_contribution, bias_w_slice, bias_r_slice,
-                    out_h, &mut out_y[t * hidden_size..], hidden_size, linear_before_reset,
-                ); }
-                continue;
-            }
-        }
-
-        for g in 0..m {
-            gates[g] = w_contribution[g] + r_contribution[g] + bias_w_slice[g] + bias_r_slice[g];
-        }
-
-        let (z_wx, r_wx_hx) = gates.split_at(hidden_size);
-        let (r_wx, h_wx) = r_wx_hx.split_at(hidden_size);
-
-        if linear_before_reset {
-            for k in 0..hidden_size {
-                let z_gate = sigmoid(z_wx[k]);
-                let r_gate = sigmoid(r_wx[k]);
-                let wh_x_bwh = w_contribution[2 * hidden_size + k] + bias_w_slice[2 * hidden_size + k];
-                let rh_brh = r_contribution[2 * hidden_size + k] + bias_r_slice[2 * hidden_size + k];
-                let h_pre = wh_x_bwh + r_gate * rh_brh;
-                let h_gate = tanh(h_pre);
-                let ht = (1.0 - z_gate) * h_gate + z_gate * out_h[k];
-                out_h[k] = ht;
-                out_y[t * hidden_size + k] = ht;
-            }
-        } else {
-            for k in 0..hidden_size {
-                let z_gate = sigmoid(z_wx[k]);
-                let r_gate = sigmoid(r_wx[k]);
-                let wh_x_bh = w_contribution[2 * hidden_size + k] + bias_w_slice[2 * hidden_size + k];
-                let r_rh = r_gate * (r_contribution[2 * hidden_size + k] + bias_r_slice[2 * hidden_size + k]);
-                let h_pre = wh_x_bh + r_rh;
-                let h_gate = tanh(h_pre);
-                let ht = (1.0 - z_gate) * h_gate + z_gate * out_h[k];
-                out_h[k] = ht;
-                out_y[t * hidden_size + k] = ht;
-            }
-        }
-    }
-
-    let output_y_shape = vec![seq_len, 1, 1, hidden_size];
-    let output_y = TensorView::from_slice(out_y, output_y_shape);
-    let output_h_shape = vec![1, 1, hidden_size];
-    let output_h = TensorView::from_slice(out_h, output_h_shape);
-    (output_y, output_h)
+    gru_at(Level::new(), input, w, r, bias, initial_h, linear_before_reset, out_y, out_h);
+    let hs = out_h.len();
+    let seq_len = out_y.len() / hs.max(1);
+    (
+        TensorView::from_slice(out_y, vec![seq_len, 1, 1, hs]),
+        TensorView::from_slice(out_h, vec![1, 1, hs]),
+    )
 }
 
-#[cfg(target_arch = "x86_64")]
-unsafe fn gru_gate_fusion_avx2(
-    w_cont: &[f32],
-    r_cont: &[f32],
-    bias_w: &[f32],
-    bias_r: &[f32],
-    h: &mut [f32],
-    y_out: &mut [f32],
-    hidden_size: usize,
-    _linear_before_reset: bool,
+fn gru_at(
+    level: Level,
+    input: &TensorView,
+    w: &TensorView,
+    r: &TensorView,
+    bias: Option<&TensorView>,
+    initial_h: Option<&TensorView>,
+    linear_before_reset: bool,
+    out_y: &mut Vec<f32>,
+    out_h: &mut Vec<f32>,
 ) {
-    use std::arch::x86_64::*;
+    let (seq_len, input_size) = check_shapes("GRU", input, w);
+    let hs = w.shape[1] / 3;
+    let g = 3 * hs;
 
-    let one = _mm256_set1_ps(1.0);
-
-    let mut k = 0usize;
-    while k + 8 <= hidden_size {
-        // z gate: sigmoid(w_cont[k] + r_cont[k] + bias_w[k] + bias_r[k])
-        let wz = _mm256_loadu_ps(w_cont.as_ptr().add(k));
-        let wr = _mm256_loadu_ps(r_cont.as_ptr().add(k));
-        let bwz = _mm256_loadu_ps(bias_w.as_ptr().add(k));
-        let bwr = _mm256_loadu_ps(bias_r.as_ptr().add(k));
-        let z_pre = _mm256_add_ps(_mm256_add_ps(wz, wr), _mm256_add_ps(bwz, bwr));
-        let z_gate = crate::kernels::avx::math::avx2_sigmoid_ps(z_pre);
-
-        // r gate
-        let k2 = k + hidden_size;
-        let wr2 = _mm256_loadu_ps(w_cont.as_ptr().add(k2));
-        let rr2 = _mm256_loadu_ps(r_cont.as_ptr().add(k2));
-        let bwr2 = _mm256_loadu_ps(bias_w.as_ptr().add(k2));
-        let brr2 = _mm256_loadu_ps(bias_r.as_ptr().add(k2));
-        let r_pre = _mm256_add_ps(_mm256_add_ps(wr2, rr2), _mm256_add_ps(bwr2, brr2));
-        let r_gate = crate::kernels::avx::math::avx2_sigmoid_ps(r_pre);
-
-        // h gate
-        let k3 = k + 2 * hidden_size;
-        let wh_x = _mm256_add_ps(
-            _mm256_loadu_ps(w_cont.as_ptr().add(k3)),
-            _mm256_loadu_ps(bias_w.as_ptr().add(k3)),
-        );
-        let r_rh = _mm256_mul_ps(
-            r_gate,
-            _mm256_add_ps(
-                _mm256_loadu_ps(r_cont.as_ptr().add(k3)),
-                _mm256_loadu_ps(bias_r.as_ptr().add(k3)),
-            ),
-        );
-        let h_pre = _mm256_add_ps(wh_x, r_rh);
-        let h_gate = crate::kernels::avx::math::avx2_tanh_ps(h_pre);
-
-        // ht = (1-z)*h_gate + z*h_prev
-        let h_prev = _mm256_loadu_ps(h.as_ptr().add(k));
-        let ht = _mm256_fmadd_ps(_mm256_sub_ps(one, z_gate), h_gate, _mm256_mul_ps(z_gate, h_prev));
-        _mm256_storeu_ps(h.as_mut_ptr().add(k), ht);
-        _mm256_storeu_ps(y_out.as_mut_ptr().add(k), ht);
-
-        k += 8;
+    // xw[t] = W·x_t + Wb, plus Rb for z and r, and for h too unless the
+    // reset gate has to scale it.
+    let mut xw = vec![0.0f32; seq_len * g];
+    mul_transposed(level, &mut xw, &input.data, seq_len, &w.data, g, input_size);
+    let zeros = vec![0.0f32; g];
+    let (bw, br) = bias.map_or((&zeros[..], &zeros[..]), |b| b.data.split_at(g));
+    let (br_zr, br_h) = br.split_at(2 * hs);
+    if linear_before_reset {
+        let br = [br_zr, &zeros[..hs]].concat();
+        add_bias(&mut xw, bw, &br);
+    } else {
+        add_bias(&mut xw, bw, br);
     }
-    while k < hidden_size {
-        let z_pre = w_cont[k] + r_cont[k] + bias_w[k] + bias_r[k];
-        let z_gate = sigmoid(z_pre);
-        let r_pre = w_cont[k + hidden_size] + r_cont[k + hidden_size]
-            + bias_w[k + hidden_size] + bias_r[k + hidden_size];
-        let r_gate = sigmoid(r_pre);
-        let wh_x_bh = w_cont[k + 2 * hidden_size] + bias_w[k + 2 * hidden_size];
-        let r_rh = r_gate * (r_cont[k + 2 * hidden_size] + bias_r[k + 2 * hidden_size]);
-        let h_pre = wh_x_bh + r_rh;
-        let h_gate = tanh(h_pre);
-        let ht = (1.0 - z_gate) * h_gate + z_gate * h[k];
-        h[k] = ht;
-        y_out[k] = ht;
-        k += 1;
+
+    let (r_zr, r_h) = r.data.split_at(2 * hs * hs);
+    init_state(out_h, hs, initial_h);
+    out_y.resize(seq_len * hs, 0.0);
+    let mut scratch = vec![0.0f32; hs];
+    for (gates, y) in xw.chunks_exact_mut(g).zip(out_y.chunks_exact_mut(hs)) {
+        let (zr, xh) = gates.split_at_mut(2 * hs);
+        matvec(level, zr, Accum::Add, r_zr, out_h, hs);
+        if linear_before_reset {
+            matvec(level, &mut scratch, Accum::Replace, r_h, out_h, hs);
+            simd_call!(level, gru_cell_linear(zr, &scratch, br_h, xh, out_h));
+        } else {
+            simd_call!(level, gru_reset(zr, out_h, &mut scratch));
+            matvec(level, xh, Accum::Add, r_h, &scratch, hs);
+            simd_call!(level, gru_update(&zr[..hs], xh, out_h));
+        }
+        y.copy_from_slice(out_h);
+    }
+}
+
+/// Checks what the kernels support; returns `(seq_len, input_size)`.
+fn check_shapes(op: &str, input: &TensorView, w: &TensorView) -> (usize, usize) {
+    assert_eq!(w.shape[0], 1, "{op}: only one direction is supported");
+    assert_eq!(input.shape[1], 1, "{op}: only batch size 1 is supported");
+    (input.shape[0], input.shape[2])
+}
+
+fn init_state(state: &mut Vec<f32>, hs: usize, initial: Option<&TensorView>) {
+    state.resize(hs, 0.0);
+    match initial {
+        Some(v) => state.copy_from_slice(&v.data),
+        None => state.fill(0.0),
+    }
+}
+
+/// Adds `bw + br` to every row of `x`.
+fn add_bias(x: &mut [f32], bw: &[f32], br: &[f32]) {
+    let b: Vec<f32> = bw.iter().zip(br).map(|(w, r)| w + r).collect();
+    for row in x.chunks_exact_mut(b.len()) {
+        for (x, b) in row.iter_mut().zip(&b) {
+            *x += b;
+        }
+    }
+}
+
+/// `out = x·wᵀ` for row-major `x` (`rows x k`), `w` (`n x k`) and `out`.
+fn mul_transposed(level: Level, out: &mut [f32], x: &[f32], rows: usize, w: &[f32], n: usize, k: usize) {
+    assert!(x.len() >= rows * k && w.len() >= n * k && out.len() >= rows * n);
+    // SAFETY: the asserts above keep every view inside its slice.
+    let (a, b, c) = unsafe {
+        (
+            MatRef::from_raw_parts(x.as_ptr(), rows, k, k as isize, 1),
+            MatRef::from_raw_parts(w.as_ptr(), k, n, 1, k as isize),
+            MatMut::from_raw_parts_mut(out.as_mut_ptr(), rows, n, n as isize, 1),
+        )
+    };
+    matmul_at(level, c, Accum::Replace, a, b, 1.0);
+}
+
+/// `y = m·x` or `y += m·x`, for row-major `m` with `y.len()` rows and `cols`
+/// columns.
+fn matvec(level: Level, y: &mut [f32], accum: Accum, m: &[f32], x: &[f32], cols: usize) {
+    let rows = y.len();
+    assert!(m.len() >= rows * cols && x.len() >= cols);
+    // SAFETY: the assert above keeps every view inside its slice.
+    let (a, b, c) = unsafe {
+        (
+            MatRef::from_raw_parts(m.as_ptr(), rows, cols, cols as isize, 1),
+            MatRef::from_raw_parts(x.as_ptr(), cols, 1, 1, 1),
+            MatMut::from_raw_parts_mut(y.as_mut_ptr(), rows, 1, 1, 1),
+        )
+    };
+    matmul_at(level, c, accum, a, b, 1.0);
+}
+
+/// `c = σ(f)·c + σ(i)·tanh(g)`, `h = σ(o)·tanh(c)`, from the pre-activations
+/// `gates = [i, o, f, g]`, each `c.len()` long.
+#[simd]
+fn lstm_cell<S: Simd>(simd: S, gates: &[f32], c: &mut [f32], h: &mut [f32]) {
+    let n = c.len();
+    let (i, rest) = gates.split_at(n);
+    let (o, rest) = rest.split_at(n);
+    let (f, g) = rest.split_at(n);
+    for k in (0..n).step_by(16) {
+        let e = n.min(k + 16);
+        let input = vm::sigmoid(load(simd, &i[k..e])) * vm::tanh(load(simd, &g[k..e]));
+        let ct = vm::sigmoid(load(simd, &f[k..e])).mul_add(load(simd, &c[k..e]), input);
+        let ht = vm::sigmoid(load(simd, &o[k..e])) * vm::tanh(ct);
+        store(ct, &mut c[k..e]);
+        store(ht, &mut h[k..e]);
+    }
+}
+
+/// The GRU gates without `linear_before_reset`: `z = σ(z)` in place and
+/// `rh = σ(r)·h`, from `zr = [z, r]`.
+#[simd]
+fn gru_reset<S: Simd>(simd: S, zr: &mut [f32], h: &[f32], rh: &mut [f32]) {
+    let n = h.len();
+    let (z, r) = zr.split_at_mut(n);
+    for k in (0..n).step_by(16) {
+        let e = n.min(k + 16);
+        store(vm::sigmoid(load(simd, &z[k..e])), &mut z[k..e]);
+        store(vm::sigmoid(load(simd, &r[k..e])) * load(simd, &h[k..e]), &mut rh[k..e]);
+    }
+}
+
+/// `h = (1 - z)·tanh(x) + z·h`, as `tanh(x) + z·(h - tanh(x))`, where `z` is
+/// already through its sigmoid.
+#[simd]
+fn gru_update<S: Simd>(simd: S, z: &[f32], x: &[f32], h: &mut [f32]) {
+    let n = h.len();
+    for k in (0..n).step_by(16) {
+        let e = n.min(k + 16);
+        let cand = vm::tanh(load(simd, &x[k..e]));
+        let ht = load(simd, &z[k..e]).mul_add(load(simd, &h[k..e]) - cand, cand);
+        store(ht, &mut h[k..e]);
+    }
+}
+
+/// One GRU step with `linear_before_reset`, from the pre-activations
+/// `zr = [z, r]`, `rh = R_h·h` and `x = W_h·x_t + Wb_h`:
+/// `h = (1 - σ(z))·tanh(x + σ(r)·(rh + rb)) + σ(z)·h`.
+#[simd]
+fn gru_cell_linear<S: Simd>(simd: S, zr: &[f32], rh: &[f32], rb: &[f32], x: &[f32], h: &mut [f32]) {
+    let n = h.len();
+    let (z, r) = zr.split_at(n);
+    for k in (0..n).step_by(16) {
+        let e = n.min(k + 16);
+        let reset = vm::sigmoid(load(simd, &r[k..e]));
+        let pre = reset.mul_add(load(simd, &rh[k..e]) + load(simd, &rb[k..e]), load(simd, &x[k..e]));
+        let cand = vm::tanh(pre);
+        let z = vm::sigmoid(load(simd, &z[k..e]));
+        store(z.mul_add(load(simd, &h[k..e]) - cand, cand), &mut h[k..e]);
+    }
+}
+
+/// Up to 16 elements of `x`, the missing lanes 0.
+#[inline(always)]
+fn load<S: Simd>(simd: S, x: &[f32]) -> f32x16<S> {
+    match x.first_chunk::<16>() {
+        Some(a) => f32x16::load_array_ref(simd, a),
+        None => {
+            let mut padded = [0.0f32; 16];
+            padded[..x.len()].copy_from_slice(x);
+            f32x16::load_array_ref(simd, &padded)
+        }
+    }
+}
+
+/// The first `out.len()` (at most 16) lanes of `v`.
+#[inline(always)]
+fn store<S: Simd>(v: f32x16<S>, out: &mut [f32]) {
+    match out.first_chunk_mut::<16>() {
+        Some(a) => v.store_array(a),
+        None => {
+            let mut padded = [0.0f32; 16];
+            v.store_array(&mut padded);
+            let n = out.len();
+            out.copy_from_slice(&padded[..n]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernels::test_util::{Rng, levels};
+
+    fn sigmoid(x: f64) -> f64 {
+        1.0 / (1.0 + (-x).exp())
+    }
+
+    /// `m·x` for row-major `m` with `x.len()` columns, in f64.
+    fn mv(m: &[f32], x: &[f64]) -> Vec<f64> {
+        m.chunks_exact(x.len())
+            .map(|row| row.iter().zip(x).map(|(&a, &b)| a as f64 * b).sum())
+            .collect()
+    }
+
+    fn lstm_ref(x: &[f32], w: &[f32], r: &[f32], b: &[f32], h0: &[f32], c0: &[f32]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let hs = h0.len();
+        let is = w.len() / (4 * hs);
+        let mut h: Vec<f64> = h0.iter().map(|&v| v as f64).collect();
+        let mut c: Vec<f64> = c0.iter().map(|&v| v as f64).collect();
+        let mut y = Vec::new();
+        for xt in x.chunks_exact(is) {
+            let xt: Vec<f64> = xt.iter().map(|&v| v as f64).collect();
+            let (wx, rh) = (mv(w, &xt), mv(r, &h));
+            let pre = |gate: usize, k: usize| {
+                let j = gate * hs + k;
+                wx[j] + rh[j] + b[j] as f64 + b[4 * hs + j] as f64
+            };
+            for k in 0..hs {
+                let (i, o, f, g) = (sigmoid(pre(0, k)), sigmoid(pre(1, k)), sigmoid(pre(2, k)), pre(3, k).tanh());
+                c[k] = f * c[k] + i * g;
+                h[k] = o * c[k].tanh();
+            }
+            y.extend_from_slice(&h);
+        }
+        (y, h, c)
+    }
+
+    fn gru_ref(x: &[f32], w: &[f32], r: &[f32], b: &[f32], h0: &[f32], linear: bool) -> Vec<f64> {
+        let hs = h0.len();
+        let is = w.len() / (3 * hs);
+        let (r_zr, r_h) = r.split_at(2 * hs * hs);
+        let mut h: Vec<f64> = h0.iter().map(|&v| v as f64).collect();
+        let mut y = Vec::new();
+        for xt in x.chunks_exact(is) {
+            let xt: Vec<f64> = xt.iter().map(|&v| v as f64).collect();
+            let (wx, rh) = (mv(w, &xt), mv(r_zr, &h));
+            let bw = |j: usize| b[j] as f64;
+            let br = |j: usize| b[3 * hs + j] as f64;
+            let z: Vec<f64> = (0..hs).map(|k| sigmoid(wx[k] + rh[k] + bw(k) + br(k))).collect();
+            let rg: Vec<f64> = (0..hs).map(|k| sigmoid(wx[hs + k] + rh[hs + k] + bw(hs + k) + br(hs + k))).collect();
+            let rec = if linear {
+                let rh = mv(r_h, &h);
+                (0..hs).map(|k| rg[k] * (rh[k] + br(2 * hs + k))).collect::<Vec<_>>()
+            } else {
+                let scaled: Vec<f64> = (0..hs).map(|k| rg[k] * h[k]).collect();
+                let rh = mv(r_h, &scaled);
+                (0..hs).map(|k| rh[k] + br(2 * hs + k)).collect()
+            };
+            for k in 0..hs {
+                let cand = (wx[2 * hs + k] + bw(2 * hs + k) + rec[k]).tanh();
+                h[k] = (1.0 - z[k]) * cand + z[k] * h[k];
+            }
+            y.extend_from_slice(&h);
+        }
+        y
+    }
+
+    fn assert_close(got: &[f32], want: &[f64], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+            assert!((g as f64 - w).abs() < 2e-5, "{what}[{i}]: {g} vs {w}");
+        }
+    }
+
+    /// Hidden sizes below, at and around the vector width.
+    const CASES: &[(usize, usize, usize)] = &[(1, 3, 1), (4, 5, 7), (3, 16, 16), (5, 9, 33), (2, 40, 20)];
+
+    #[test]
+    fn test_lstm_matches_reference_at_every_level() {
+        let mut rng = Rng::new(1);
+        for &(seq, is, hs) in CASES {
+            let x = rng.vec(seq * is, -1.0, 1.0);
+            let w = rng.vec(4 * hs * is, -0.5, 0.5);
+            let r = rng.vec(4 * hs * hs, -0.5, 0.5);
+            let b = rng.vec(8 * hs, -0.5, 0.5);
+            let h0 = rng.vec(hs, -1.0, 1.0);
+            let c0 = rng.vec(hs, -1.0, 1.0);
+            let (y_ref, h_ref, c_ref) = lstm_ref(&x, &w, &r, &b, &h0, &c0);
+            let views = (
+                TensorView::from_slice(&x, vec![seq, 1, is]),
+                TensorView::from_slice(&w, vec![1, 4 * hs, is]),
+                TensorView::from_slice(&r, vec![1, 4 * hs, hs]),
+                TensorView::from_slice(&b, vec![1, 8 * hs]),
+                TensorView::from_slice(&h0, vec![1, 1, hs]),
+                TensorView::from_slice(&c0, vec![1, 1, hs]),
+            );
+            for level in levels() {
+                let (mut y, mut h, mut c) = (Vec::new(), Vec::new(), Vec::new());
+                let (xv, wv, rv, bv, hv, cv) = &views;
+                lstm_at(level, xv, wv, rv, Some(bv), Some(hv), Some(cv), &mut y, &mut h, &mut c);
+                let what = format!("{level:?} seq={seq} hidden={hs}");
+                assert_close(&y, &y_ref, &format!("{what} Y"));
+                assert_close(&h, &h_ref, &format!("{what} Y_h"));
+                assert_close(&c, &c_ref, &format!("{what} Y_c"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_gru_matches_reference_at_every_level() {
+        let mut rng = Rng::new(2);
+        for &(seq, is, hs) in CASES {
+            let x = rng.vec(seq * is, -1.0, 1.0);
+            let w = rng.vec(3 * hs * is, -0.5, 0.5);
+            let r = rng.vec(3 * hs * hs, -0.5, 0.5);
+            let b = rng.vec(6 * hs, -0.5, 0.5);
+            let h0 = rng.vec(hs, -1.0, 1.0);
+            let views = (
+                TensorView::from_slice(&x, vec![seq, 1, is]),
+                TensorView::from_slice(&w, vec![1, 3 * hs, is]),
+                TensorView::from_slice(&r, vec![1, 3 * hs, hs]),
+                TensorView::from_slice(&b, vec![1, 6 * hs]),
+                TensorView::from_slice(&h0, vec![1, 1, hs]),
+            );
+            for linear in [false, true] {
+                let y_ref = gru_ref(&x, &w, &r, &b, &h0, linear);
+                for level in levels() {
+                    let (mut y, mut h) = (Vec::new(), Vec::new());
+                    let (xv, wv, rv, bv, hv) = &views;
+                    gru_at(level, xv, wv, rv, Some(bv), Some(hv), linear, &mut y, &mut h);
+                    let what = format!("{level:?} seq={seq} hidden={hs} linear_before_reset={linear}");
+                    assert_close(&y, &y_ref, &format!("{what} Y"));
+                    assert_close(&h, &y_ref[(seq - 1) * hs..], &format!("{what} Y_h"));
+                }
+            }
+        }
     }
 }

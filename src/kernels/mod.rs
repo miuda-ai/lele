@@ -14,8 +14,6 @@ pub mod math;
 pub mod matmul;
 pub(crate) mod matmul_dot;
 pub(crate) mod matmul_nn;
-#[cfg(target_arch = "aarch64")]
-pub mod neon;
 pub mod norm;
 pub mod pooling;
 pub mod qgemm;
