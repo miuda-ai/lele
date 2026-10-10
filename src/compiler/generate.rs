@@ -217,7 +217,7 @@ pub(crate) fn infer_variable_types(
                         }
                     }
                 }
-                "Exp" | "Log" | "Sqrt" | "Sin" | "Cos" | "Sigmoid" | "Tanh" | "Softmax" => {
+                "Exp" | "Log" | "Sqrt" | "Sin" | "Cos" | "Sigmoid" | "Tanh" | "Softmax" | "LogSoftmax" => {
                     for out in &node.output {
                         if !out.is_empty() {
                             let name = sanitize_name(out);
@@ -765,13 +765,15 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
             compiler,
             &var_types,
         )?;
-        // Return — use detach_or_own for f32 (zero-copy from workspace/weights),
-        // to_owned for i64 (local buffers need copying)
+        // Return — detach_or_own (zero-copy) for f32 views of the workspace or the weights,
+        // which outlive the chunk; to_owned for everything else, i64 and views of buffers
+        // local to the chunk included, which are freed when it returns.
+        let body = String::from_utf8_lossy(&f).into_owned();
         let ret_vals: Vec<String> = chunk_outputs
             .iter()
             .map(|s| {
                 let ty = var_types.get(s).map(|t| t.as_str()).unwrap_or("f32");
-                if ty == "f32" {
+                if ty == "f32" && outlives_chunk(&body, s, 0) {
                     format!("unsafe {{ {}.detach_or_own() }}", s)
                 } else {
                     format!("{}.to_owned()", s)
@@ -826,6 +828,45 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
         chunk_idx += 1;
     }
     Ok(var_types)
+}
+
+/// Whether chunk output `var` may leave the chunk as a borrowed view, decided from the
+/// chunk's generated `body`: its data must be in the workspace or the weights, not in a
+/// buffer local to the chunk (an output buffer `buf_*`, a cast's `temp_cast_buf_*`), which
+/// is freed when the chunk returns.
+///
+/// A variable written into `ws.buf_*` qualifies, as does a weight or a chunk argument; a
+/// view (`reshape`, `unsqueeze`, `squeeze`, `.clone()`) qualifies if what it views does.
+/// Every definition counts (there is one per target under `cfg`). Anything else is
+/// returned as a copy.
+fn outlives_chunk(body: &str, var: &str, depth: usize) -> bool {
+    if depth > 64 {
+        return false;
+    }
+    let prefix = format!("let {var} = ");
+    let defs: Vec<&str> = body
+        .lines()
+        .map(str::trim_start)
+        .filter_map(|l| l.strip_prefix(prefix.as_str()))
+        .collect();
+    if defs.is_empty() {
+        return true;
+    }
+    defs.iter().all(|rhs| {
+        let rhs = rhs.split(';').next().unwrap_or("");
+        if rhs.contains("&mut ws.buf_") || rhs.starts_with("self.weight_") {
+            return true;
+        }
+        let viewed = ["reshape", "unsqueeze", "squeeze"]
+            .iter()
+            .find_map(|f| rhs.strip_prefix(&format!("lele::kernels::{f}(&")))
+            .or_else(|| rhs.strip_suffix(".clone()"))
+            .map(|s| s.split([',', ')']).next().unwrap_or("").trim());
+        match viewed {
+            Some(source) if !source.is_empty() => outlives_chunk(body, source, depth + 1),
+            _ => false,
+        }
+    })
 }
 
 pub(crate) fn generate_nodes(
@@ -897,6 +938,7 @@ pub(crate) fn generate_nodes(
                         match data_type {
                             7 => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape),
                             6 => format!("self.weight_i32_i64({}, {}, &{:?})", offset, len, shape),
+                            9 => format!("self.weight_bool_i64({}, {}, &{:?})", offset, len, shape),
                             _ => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape), // fallback
                         }
                     } else {
@@ -1034,6 +1076,39 @@ mod tests {
     use crate::compiler::Compiler;
     use crate::model::onnx_proto::NodeProto;
     use std::collections::HashMap;
+
+    /// SenseVoice's attention mask came out of a cast into a chunk-local buffer and was
+    /// returned as a borrowed view of it: every later chunk read freed memory.
+    #[test]
+    fn test_only_views_of_the_workspace_or_weights_leave_a_chunk_borrowed() {
+        let body = "\
+        let mut temp_cast_buf_m = Vec::<f32>::new();
+        let m = lele::kernels::utils::cast_to_f32(&less, &mut temp_cast_buf_m);
+        let m2 = m.clone(); // Cast f32->f32 is no-op
+        let m3 = lele::kernels::unsqueeze(&m2, &[1]);
+        let x = lele::kernels::add(&a, &b, &mut ws.buf_3);
+        let x2 = lele::kernels::reshape(&x, &[-1, 512]);
+        let w = self.weight_f32(0, 4, &[]);
+        let y = lele::kernels::relu(&x, &mut buf_y);
+        #[cfg(target_arch = \"aarch64\")]
+        let z = lele::kernels::add(&a, &b, &mut ws.buf_4);
+        #[cfg(not(target_arch = \"aarch64\"))]
+        let z = lele::kernels::add(&a, &b, &mut buf_z);
+";
+        for (var, safe) in [
+            ("m", false),
+            ("m2", false),
+            ("m3", false),
+            ("x", true),
+            ("x2", true),
+            ("w", true),
+            ("y", false),
+            ("z", false),
+            ("chunk_argument", true),
+        ] {
+            assert_eq!(outlives_chunk(body, var, 0), safe, "{var}");
+        }
+    }
 
     #[test]
     fn test_custom_op_override() {

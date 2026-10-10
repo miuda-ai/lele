@@ -171,9 +171,6 @@ fn concat_impl<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
 
     let out_numel = out_shape.iter().product::<usize>();
     utils::ensure_capacity(out, out_numel);
-    unsafe {
-        out.set_len(out_numel);
-    }
     if out_numel == 0 {
         return TensorView::from_slice(out, out_shape);
     }
@@ -417,9 +414,6 @@ pub fn pad<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     }
     let total = new_shape.iter().product::<usize>();
     utils::ensure_capacity(out, total);
-    unsafe {
-        out.set_len(total);
-    }
     // For constant mode: use provided constant_value or default to 0 (per ONNX spec)
     let fill_val: T = if let Some(cv) = constant_value {
         if !cv.data.is_empty() {
@@ -611,9 +605,6 @@ where
     }
     let out_numel = out_shape.iter().product::<usize>();
     utils::ensure_capacity(out, out_numel);
-    unsafe {
-        out.set_len(out_numel);
-    }
     let outer_dim: usize = data.shape[..axis].iter().product();
     let axis_dim = data.shape[axis];
     let inner_dim: usize = data.shape[axis + 1..].iter().product();
@@ -689,9 +680,6 @@ fn transpose_inner<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
     }
     let out_numel = input.data.len();
     utils::ensure_capacity(out, out_numel);
-    unsafe {
-        out.set_len(out_numel);
-    }
 
     // Fast path: perm [0,2,1,3] for 4D tensors — copy contiguous blocks
     // [B, A, C, D] -> [B, C, A, D] — inner dim D is contiguous
@@ -1088,6 +1076,23 @@ pub fn to_i64_vec<T: crate::kernels::utils::AsI64 + Copy + std::fmt::Debug>(
     }
     out
 }
+
+/// The compiler emits all-zero sizes for a Split with no `split` input or
+/// attribute, which ONNX defines as equal parts, the last one smaller when
+/// the axis does not divide evenly.
+fn resolve_split_sizes(splits: &[i64], dim: usize) -> std::borrow::Cow<'_, [i64]> {
+    if splits.is_empty() || splits.iter().any(|&s| s != 0) {
+        return std::borrow::Cow::Borrowed(splits);
+    }
+    let n = splits.len();
+    let part = dim.div_ceil(n);
+    std::borrow::Cow::Owned(
+        (0..n)
+            .map(|i| part.min(dim.saturating_sub(i * part)) as i64)
+            .collect(),
+    )
+}
+
 pub fn split<'a, T: Clone + Copy + std::fmt::Debug>(
     input: &TensorView<'_, T>,
     axis: i64,
@@ -1101,6 +1106,7 @@ pub fn split<'a, T: Clone + Copy + std::fmt::Debug>(
         axis as usize
     };
     assert!(axis < ndim, "Split: axis out of bounds (axis={}, ndim={}, shape={:?})", axis, ndim, &*input.shape);
+    let splits = &*resolve_split_sizes(splits, input.shape[axis]);
     let num_splits = splits.len();
     assert_eq!(
         outputs.len(),
@@ -1167,6 +1173,7 @@ pub fn split_owned<T: Clone + Copy + std::fmt::Debug>(
         axis as usize
     };
     assert!(axis < ndim, "Split: axis out of bounds (axis={}, ndim={}, shape={:?})", axis, ndim, &*input.shape);
+    let splits = &*resolve_split_sizes(splits, input.shape[axis]);
 
     let num_splits = splits.len();
     let total: i64 = splits.iter().sum();
@@ -1243,9 +1250,6 @@ where
     if condition.shape == x.shape && x.shape == y.shape {
         let numel = cond_data.len();
         utils::ensure_capacity(out, numel);
-        unsafe {
-            out.set_len(numel);
-        }
         let o = out.as_mut_slice();
         for i in 0..numel {
             unsafe {
@@ -1265,9 +1269,6 @@ where
     let out_numel: usize = out_shape.iter().product();
     let dims = out_shape.len();
     utils::ensure_capacity(out, out_numel);
-    unsafe {
-        out.set_len(out_numel);
-    }
     let o = out.as_mut_slice();
 
     // Fast path: both x and y are scalars — just fill based on condition

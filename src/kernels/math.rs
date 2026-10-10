@@ -1,6 +1,147 @@
+use crate::kernels::binary::{self, Op};
+use crate::kernels::simd::simd_call;
+use crate::kernels::simd_math as vm;
 use crate::kernels::utils;
 use crate::tensor::TensorView;
+use fearless_simd::{Level, Simd};
+use fearless_simd_macros::simd;
 use std::borrow::Cow;
+
+/// Runs the elementwise kernel `kernel` over `input`.
+///
+/// An input shorter than a vector goes through a zero-padded copy rather than
+/// a scalar loop, so that every element sees the same arithmetic whatever the
+/// length: a fused kernel has to match the chain it replaces bit for bit at
+/// every size.
+fn unary<'a>(
+    input: &TensorView<'_>,
+    out: &'a mut Vec<f32>,
+    kernel: impl Fn(Level, &[f32], &mut [f32]),
+) -> TensorView<'a> {
+    const LANES: usize = 16;
+    let n = input.data.len();
+    utils::ensure_capacity(out, n);
+    if n >= LANES {
+        kernel(Level::new(), &input.data, out);
+    } else {
+        let (mut padded, mut padded_out) = ([0.0f32; LANES], [0.0f32; LANES]);
+        padded[..n].copy_from_slice(&input.data);
+        kernel(Level::new(), &padded, &mut padded_out);
+        out.copy_from_slice(&padded_out[..n]);
+    }
+    TensorView {
+        data: Cow::Borrowed(out),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
+}
+
+// These stream memory but spend a long polynomial on every element, so AVX-512
+// might pay off for them; until measured on a CPU that has it they run at
+// AVX2, like the norms (see `simd_call!`).
+
+fn sigmoid_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, sigmoid_simd(src, out))
+}
+
+#[simd]
+fn sigmoid_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::sigmoid)
+}
+
+fn silu_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, silu_simd(src, out))
+}
+
+#[simd]
+fn silu_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::silu)
+}
+
+fn tanh_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, tanh_simd(src, out))
+}
+
+#[simd]
+fn tanh_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::tanh)
+}
+
+fn erf_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, erf_simd(src, out))
+}
+
+#[simd]
+fn erf_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::erf)
+}
+
+fn gelu_erf_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, gelu_erf_simd(src, out))
+}
+
+#[simd]
+fn gelu_erf_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::gelu_erf)
+}
+
+fn gelu_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, gelu_simd(src, out))
+}
+
+#[simd]
+fn gelu_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::gelu)
+}
+
+fn fast_gelu_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, fast_gelu_simd(src, out))
+}
+
+#[simd]
+fn fast_gelu_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::fast_gelu)
+}
+
+fn exp_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, exp_simd(src, out))
+}
+
+#[simd]
+fn exp_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::exp_saturating)
+}
+
+// Pure streaming kernels with almost no arithmetic: these are the ones that
+// lose to a 512-bit access split across cache lines, so the cap matters most.
+
+fn relu_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, relu_simd(src, out))
+}
+
+#[simd]
+fn relu_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::relu)
+}
+
+fn leaky_relu_into(level: Level, src: &[f32], out: &mut [f32], alpha: f32) {
+    simd_call!(level, max = Avx2, leaky_relu_simd(src, out, alpha))
+}
+
+#[simd]
+fn leaky_relu_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32], alpha: f32) {
+    use fearless_simd::prelude::*;
+    let alpha = fearless_simd::f32x16::splat(simd, alpha);
+    vm::map!(simd, src, out, vm::leaky_relu, alpha)
+}
+
+fn sqrt_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, sqrt_simd(src, out))
+}
+
+#[simd]
+fn sqrt_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::sqrt)
+}
 
 pub trait ElementOps: Copy + PartialOrd + PartialEq + std::fmt::Debug + Sized + 'static {
     fn constant_min() -> Self;
@@ -84,9 +225,6 @@ where
     });
     let numel = out_shape.iter().product::<usize>();
     utils::ensure_capacity(output_buf, numel);
-    unsafe {
-        output_buf.set_len(numel);
-    }
     let dims = out_shape.len();
     let o_slice = output_buf.as_mut_slice();
 
@@ -230,8 +368,18 @@ where
         let a_prev = if a.shape.len() >= 2 { a.shape[a.shape.len() - 2] } else { 1 };
         let b_last = b.shape[b.shape.len() - 1];
         let b_prev = if b.shape.len() >= 2 { b.shape[b.shape.len() - 2] } else { 1 };
-        // a is [1,N] (a_prev==1, a_last==cols), b is [M,1] (b_prev==rows, b_last==1)
-        if a_prev == 1 && a_last == cols && b_prev == rows && b_last == 1 && cols > 1 && rows > 1 {
+        // a is [1,N] (a_prev==1, a_last==cols), b is [M,1] (b_prev==rows, b_last==1).
+        // Only when they have no leading dimensions: the loops below index a by
+        // column and b by row alone.
+        if a_prev == 1
+            && a_last == cols
+            && b_prev == rows
+            && b_last == 1
+            && cols > 1
+            && rows > 1
+            && a.data.len() == cols
+            && b.data.len() == rows
+        {
             let a_slice = &a.data;
             let b_slice = &b.data;
             for l in 0..leading {
@@ -252,7 +400,15 @@ where
             };
         }
         // a is [M,1] (a_prev==rows, a_last==1), b is [1,N] (b_prev==1, b_last==cols)
-        if a_prev == rows && a_last == 1 && b_prev == 1 && b_last == cols && cols > 1 && rows > 1 {
+        if a_prev == rows
+            && a_last == 1
+            && b_prev == 1
+            && b_last == cols
+            && cols > 1
+            && rows > 1
+            && a.data.len() == rows
+            && b.data.len() == cols
+        {
             let a_slice = &a.data;
             let b_slice = &b.data;
             for l in 0..leading {
@@ -336,9 +492,6 @@ where
     });
     let numel = out_shape.iter().product::<usize>();
     utils::ensure_capacity(output_buf, numel);
-    unsafe {
-        output_buf.set_len(numel);
-    }
     let dims = out_shape.len();
     if a.data.len() == 1 {
         let val_a = a.data[0];
@@ -414,34 +567,6 @@ where
     }
 }
 
-// Specialized f32 add for aarch64 with NEON optimization.
-// Delegates to crate::kernels::neon::math::add_f32.
-#[cfg(target_arch = "aarch64")]
-pub fn add_f32<'b, 'a>(
-    a: &TensorView<'b, f32>,
-    b: &TensorView<'b, f32>,
-    out: &'a mut Vec<f32>,
-) -> TensorView<'a, f32> {
-    if a.data.len() == b.data.len() && a.shape == b.shape {
-        let len = a.data.len();
-        utils::ensure_capacity(out, len);
-        unsafe {
-            crate::kernels::neon::math::add_f32(
-                a.data.as_ptr(),
-                b.data.as_ptr(),
-                out.as_mut_ptr(),
-                len,
-            );
-        }
-        return TensorView {
-            data: Cow::Borrowed(out),
-            shape: std::borrow::Cow::Owned(a.shape.to_vec()),
-        };
-    }
-    // Fallback for broadcast — delegate to generic broadcast impl
-    add_inner(a, b, out)
-}
-
 pub fn add_timed<
     'b,
     'a,
@@ -489,55 +614,15 @@ fn add_inner<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Deb
     b: &TensorView<'b, T>,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
+    if let Some(shape) = binary::try_f32(Op::Add, a, b, out) {
+        return TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(shape),
+        };
+    }
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
         utils::ensure_capacity(out, len);
-        // Try SIMD fast path for f32 — each platform uses its own module.
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-                let a_ptr = a.data.as_ptr() as *const f32;
-                let b_ptr = b.data.as_ptr() as *const f32;
-                let o_ptr = out.as_mut_ptr() as *mut f32;
-                unsafe {
-                    crate::kernels::avx::math::add_f32(a_ptr, b_ptr, o_ptr, len);
-                }
-                return TensorView {
-                    data: Cow::Borrowed(out),
-                    shape: std::borrow::Cow::Owned(a.shape.to_vec()),
-                };
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-                let a_ptr = a.data.as_ptr() as *const f32;
-                let b_ptr = b.data.as_ptr() as *const f32;
-                let o_ptr = out.as_mut_ptr() as *mut f32;
-                unsafe {
-                    crate::kernels::neon::math::add_f32(a_ptr, b_ptr, o_ptr, len);
-                }
-                return TensorView {
-                    data: Cow::Borrowed(out),
-                    shape: std::borrow::Cow::Owned(a.shape.to_vec()),
-                };
-            }
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-                let a_ptr = a.data.as_ptr() as *const f32;
-                let b_ptr = b.data.as_ptr() as *const f32;
-                let o_ptr = out.as_mut_ptr() as *mut f32;
-                unsafe {
-                    crate::kernels::wasm::math::add_f32(a_ptr, b_ptr, o_ptr, len);
-                }
-                return TensorView {
-                    data: Cow::Borrowed(out),
-                    shape: std::borrow::Cow::Owned(a.shape.to_vec()),
-                };
-            }
-        }
         let a_slice = &a.data;
         let b_slice = &b.data;
         let o_slice = out.as_mut_slice();
@@ -551,216 +636,6 @@ fn add_inner<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Deb
             data: Cow::Borrowed(out),
             shape: std::borrow::Cow::Owned(a.shape.to_vec()),
         };
-    }
-    // x86_64 AVX2 scalar broadcast for f32 add
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-            if a.data.len() == 1 || b.data.len() == 1 {
-                let (scalar_val, tensor, out_shape) = if a.data.len() == 1 {
-                    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap();
-                    (unsafe { *(a.data.as_ptr() as *const f32) }, b, out_shape)
-                } else {
-                    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap();
-                    (unsafe { *(b.data.as_ptr() as *const f32) }, a, out_shape)
-                };
-                let len = tensor.data.len();
-                let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
-                utils::ensure_capacity(out_f32, len);
-                unsafe {
-                    crate::kernels::avx::math::add_scalar_f32(
-                        tensor.data.as_ptr() as *const f32,
-                        scalar_val,
-                        out_f32.as_mut_ptr(),
-                        len,
-                    );
-                }
-                return TensorView {
-                    data: Cow::Borrowed(out),
-                    shape: Cow::Owned(out_shape),
-                };
-            }
-        }
-    }
-    // WASM SIMD fast paths for common broadcast patterns (f32 only).
-    #[cfg(target_arch = "wasm32")]
-    {
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-            // Scalar broadcast: a[i] + scalar or scalar + a[i]
-            if a.data.len() == 1 || b.data.len() == 1 {
-                let (scalar_val, tensor) = if a.data.len() == 1 {
-                    (unsafe { *(a.data.as_ptr() as *const f32) }, b)
-                } else {
-                    (unsafe { *(b.data.as_ptr() as *const f32) }, a)
-                };
-                let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap();
-                let len = tensor.data.len();
-                let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
-                utils::ensure_capacity(out_f32, len);
-                unsafe {
-                    out_f32.set_len(len);
-                }
-                unsafe {
-                    crate::kernels::wasm::math::add_scalar_f32(
-                        tensor.data.as_ptr() as *const f32,
-                        scalar_val,
-                        out_f32.as_mut_ptr(),
-                        len,
-                    );
-                }
-                return TensorView {
-                    data: Cow::Borrowed(out),
-                    shape: Cow::Owned(out_shape),
-                };
-            }
-            // Channel broadcast: [1,C,H,W] + [1,C,1,1] or [1,C,H,W] + [C]
-            let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap();
-            if out_shape.len() == 4 && out_shape[0] == 1 {
-                let c = out_shape[1];
-                let hw = out_shape[2] * out_shape[3];
-                let numel = out_shape.iter().product::<usize>();
-                let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
-                utils::ensure_capacity(out_f32, numel);
-                unsafe {
-                    out_f32.set_len(numel);
-                }
-                // Case A: a is full [1,C,H,W], b is [C]
-                if a.data.len() == numel && b.data.len() == c {
-                    unsafe {
-                        crate::kernels::wasm::math::add_channel_broadcast_f32(
-                            a.data.as_ptr() as *const f32,
-                            b.data.as_ptr() as *const f32,
-                            out_f32.as_mut_ptr(),
-                            c,
-                            hw,
-                        );
-                    }
-                    return TensorView {
-                        data: Cow::Borrowed(out),
-                        shape: Cow::Owned(out_shape),
-                    };
-                }
-                // Case B: b is full [1,C,H,W], a is [C]
-                if b.data.len() == numel && a.data.len() == c {
-                    unsafe {
-                        crate::kernels::wasm::math::add_channel_broadcast_f32(
-                            b.data.as_ptr() as *const f32,
-                            a.data.as_ptr() as *const f32,
-                            out_f32.as_mut_ptr(),
-                            c,
-                            hw,
-                        );
-                    }
-                    return TensorView {
-                        data: Cow::Borrowed(out),
-                        shape: Cow::Owned(out_shape),
-                    };
-                }
-            }
-        }
-    }
-    // Tile-broadcast fast path for f32 on aarch64: one operand is a contiguous tile
-    // that repeats to fill the output (e.g. [1,8,H,W] + [1,1,H,W] attention mask).
-    #[cfg(target_arch = "aarch64")]
-    {
-        use core::arch::aarch64::*;
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-            let out_shape = utils::broadcast_shapes(&a.shape, &b.shape);
-            if let Some(ref os) = out_shape {
-                let numel: usize = os.iter().product();
-                let a_len = a.data.len();
-                let b_len = b.data.len();
-                let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
-
-                // Per-channel broadcast: [N,C,H,W] + [N,C,1,1] or [1,C,1,1] or [C]
-                if os.len() == 4 {
-                    let c = os[1];
-                    let hw = os[2] * os[3];
-                    let n = os[0];
-                    // Case A: a is full [N,C,H,W], b is [N,C,1,1] or [1,C,1,1] or [C,1,1] etc.
-                    if a_len == numel && (b_len == n * c || b_len == c) {
-                        utils::ensure_capacity(out_f32, numel);
-                        unsafe { out_f32.set_len(numel); }
-                        let a_ptr = a.data.as_ptr() as *const f32;
-                        let b_ptr = b.data.as_ptr() as *const f32;
-                        let o_ptr = out_f32.as_mut_ptr();
-                        unsafe {
-                            for nc in 0..n * c {
-                                let bias_val = *b_ptr.add(nc % b_len);
-                                let off = nc * hw;
-                                let bv = vdupq_n_f32(bias_val);
-                                let mut i = 0;
-                                while i + 4 <= hw {
-                                    vst1q_f32(o_ptr.add(off + i), vaddq_f32(vld1q_f32(a_ptr.add(off + i)), bv));
-                                    i += 4;
-                                }
-                                while i < hw {
-                                    *o_ptr.add(off + i) = *a_ptr.add(off + i) + bias_val;
-                                    i += 1;
-                                }
-                            }
-                        }
-                        return TensorView { data: Cow::Borrowed(out), shape: Cow::Owned(os.clone()) };
-                    }
-                    // Case B: b is full [N,C,H,W], a is [N,C,1,1] or [1,C,1,1] or [C,1,1] etc.
-                    if b_len == numel && (a_len == n * c || a_len == c) {
-                        utils::ensure_capacity(out_f32, numel);
-                        unsafe { out_f32.set_len(numel); }
-                        let a_ptr = a.data.as_ptr() as *const f32;
-                        let b_ptr = b.data.as_ptr() as *const f32;
-                        let o_ptr = out_f32.as_mut_ptr();
-                        unsafe {
-                            for nc in 0..n * c {
-                                let bias_val = *a_ptr.add(nc % a_len);
-                                let off = nc * hw;
-                                let bv = vdupq_n_f32(bias_val);
-                                let mut i = 0;
-                                while i + 4 <= hw {
-                                    vst1q_f32(o_ptr.add(off + i), vaddq_f32(vld1q_f32(b_ptr.add(off + i)), bv));
-                                    i += 4;
-                                }
-                                while i < hw {
-                                    *o_ptr.add(off + i) = *b_ptr.add(off + i) + bias_val;
-                                    i += 1;
-                                }
-                            }
-                        }
-                        return TensorView { data: Cow::Borrowed(out), shape: Cow::Owned(os.clone()) };
-                    }
-                }
-
-                if a_len == numel && b_len < numel && b_len > 1 && numel % b_len == 0 {
-                    utils::ensure_capacity(out_f32, numel);
-                    unsafe { out_f32.set_len(numel); }
-                    let n_tiles = numel / b_len;
-                    let a_ptr = a.data.as_ptr() as *const f32;
-                    let b_ptr = b.data.as_ptr() as *const f32;
-                    let o_ptr = out_f32.as_mut_ptr();
-                    unsafe {
-                        for t in 0..n_tiles {
-                            let off = t * b_len;
-                            crate::kernels::neon::math::add_f32(a_ptr.add(off), b_ptr, o_ptr.add(off), b_len);
-                        }
-                    }
-                    return TensorView { data: Cow::Borrowed(out), shape: Cow::Owned(os.clone()) };
-                }
-                if b_len == numel && a_len < numel && a_len > 1 && numel % a_len == 0 {
-                    utils::ensure_capacity(out_f32, numel);
-                    unsafe { out_f32.set_len(numel); }
-                    let n_tiles = numel / a_len;
-                    let a_ptr = a.data.as_ptr() as *const f32;
-                    let b_ptr = b.data.as_ptr() as *const f32;
-                    let o_ptr = out_f32.as_mut_ptr();
-                    unsafe {
-                        for t in 0..n_tiles {
-                            let off = t * a_len;
-                            crate::kernels::neon::math::add_f32(a_ptr, b_ptr.add(off), o_ptr.add(off), a_len);
-                        }
-                    }
-                    return TensorView { data: Cow::Borrowed(out), shape: Cow::Owned(os.clone()) };
-                }
-            }
-        }
     }
     broadcast_binary_op(a, b, out, |x, y| x + y)
 }
@@ -789,55 +664,15 @@ fn mul_inner<'b, 'a, T: Clone + Copy + std::ops::Mul<Output = T> + std::fmt::Deb
     b: &TensorView<'b, T>,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
+    if let Some(shape) = binary::try_f32(Op::Mul, a, b, out) {
+        return TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(shape),
+        };
+    }
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
         utils::ensure_capacity(out, len);
-        // Try SIMD fast path for f32 — each platform uses its own module.
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-                let a_ptr = a.data.as_ptr() as *const f32;
-                let b_ptr = b.data.as_ptr() as *const f32;
-                let o_ptr = out.as_mut_ptr() as *mut f32;
-                unsafe {
-                    crate::kernels::avx::math::mul_f32(a_ptr, b_ptr, o_ptr, len);
-                }
-                return TensorView {
-                    data: Cow::Borrowed(out),
-                    shape: std::borrow::Cow::Owned(a.shape.to_vec()),
-                };
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-                let a_ptr = a.data.as_ptr() as *const f32;
-                let b_ptr = b.data.as_ptr() as *const f32;
-                let o_ptr = out.as_mut_ptr() as *mut f32;
-                unsafe {
-                    crate::kernels::neon::math::mul_f32(a_ptr, b_ptr, o_ptr, len);
-                }
-                return TensorView {
-                    data: Cow::Borrowed(out),
-                    shape: std::borrow::Cow::Owned(a.shape.to_vec()),
-                };
-            }
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-                let a_ptr = a.data.as_ptr() as *const f32;
-                let b_ptr = b.data.as_ptr() as *const f32;
-                let o_ptr = out.as_mut_ptr() as *mut f32;
-                unsafe {
-                    crate::kernels::wasm::math::mul_f32(a_ptr, b_ptr, o_ptr, len);
-                }
-                return TensorView {
-                    data: Cow::Borrowed(out),
-                    shape: std::borrow::Cow::Owned(a.shape.to_vec()),
-                };
-            }
-        }
         let a_slice = &a.data;
         let b_slice = &b.data;
         let o_slice = out.as_mut_slice();
@@ -852,211 +687,6 @@ fn mul_inner<'b, 'a, T: Clone + Copy + std::ops::Mul<Output = T> + std::fmt::Deb
             shape: std::borrow::Cow::Owned(a.shape.to_vec()),
         };
     }
-    // x86_64 AVX2 scalar broadcast for f32 (handles scalar * tensor and tensor * scalar)
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-            if a.data.len() == 1 || b.data.len() == 1 {
-                let (scalar_val, tensor, out_shape) = if a.data.len() == 1 {
-                    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap();
-                    (unsafe { *(a.data.as_ptr() as *const f32) }, b, out_shape)
-                } else {
-                    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap();
-                    (unsafe { *(b.data.as_ptr() as *const f32) }, a, out_shape)
-                };
-                let len = tensor.data.len();
-                let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
-                utils::ensure_capacity(out_f32, len);
-                unsafe {
-                    crate::kernels::avx::math::mul_scalar_f32(
-                        tensor.data.as_ptr() as *const f32,
-                        scalar_val,
-                        out_f32.as_mut_ptr(),
-                        len,
-                    );
-                }
-                return TensorView {
-                    data: Cow::Borrowed(out),
-                    shape: Cow::Owned(out_shape),
-                };
-            }
-        }
-    }
-    // NEON scalar broadcast for f32 (handles scalar * tensor and tensor * scalar)
-    #[cfg(target_arch = "aarch64")]
-    {
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-            if a.data.len() == 1 || b.data.len() == 1 {
-                let (scalar_val, tensor, out_shape) = if a.data.len() == 1 {
-                    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap();
-                    (unsafe { *(a.data.as_ptr() as *const f32) }, b, out_shape)
-                } else {
-                    let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap();
-                    (unsafe { *(b.data.as_ptr() as *const f32) }, a, out_shape)
-                };
-                let len = tensor.data.len();
-                let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
-                utils::ensure_capacity(out_f32, len);
-                unsafe {
-                    crate::kernels::neon::math::mul_scalar_f32(
-                        tensor.data.as_ptr() as *const f32,
-                        scalar_val,
-                        out_f32.as_mut_ptr(),
-                        len,
-                    );
-                }
-                return TensorView {
-                    data: Cow::Borrowed(out),
-                    shape: Cow::Owned(out_shape),
-                };
-            }
-        }
-    }
-    // Per-channel broadcast mul for f32 on aarch64: [N,C,H,W] * [N,C,1,1] or [C]
-    #[cfg(target_arch = "aarch64")]
-    {
-        use core::arch::aarch64::*;
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-            let out_shape = utils::broadcast_shapes(&a.shape, &b.shape);
-            if let Some(ref os) = out_shape {
-                let numel: usize = os.iter().product();
-                let a_len = a.data.len();
-                let b_len = b.data.len();
-                let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
-
-                if os.len() == 4 {
-                    let c = os[1];
-                    let hw = os[2] * os[3];
-                    let n = os[0];
-                    if a_len == numel && (b_len == n * c || b_len == c) {
-                        utils::ensure_capacity(out_f32, numel);
-                        unsafe { out_f32.set_len(numel); }
-                        let a_ptr = a.data.as_ptr() as *const f32;
-                        let b_ptr = b.data.as_ptr() as *const f32;
-                        let o_ptr = out_f32.as_mut_ptr();
-                        unsafe {
-                            for nc in 0..n * c {
-                                let scale = *b_ptr.add(nc % b_len);
-                                let off = nc * hw;
-                                let sv = vdupq_n_f32(scale);
-                                let mut i = 0;
-                                while i + 4 <= hw {
-                                    vst1q_f32(o_ptr.add(off + i), vmulq_f32(vld1q_f32(a_ptr.add(off + i)), sv));
-                                    i += 4;
-                                }
-                                while i < hw {
-                                    *o_ptr.add(off + i) = *a_ptr.add(off + i) * scale;
-                                    i += 1;
-                                }
-                            }
-                        }
-                        return TensorView { data: Cow::Borrowed(out), shape: Cow::Owned(os.clone()) };
-                    }
-                    if b_len == numel && (a_len == n * c || a_len == c) {
-                        utils::ensure_capacity(out_f32, numel);
-                        unsafe { out_f32.set_len(numel); }
-                        let a_ptr = a.data.as_ptr() as *const f32;
-                        let b_ptr = b.data.as_ptr() as *const f32;
-                        let o_ptr = out_f32.as_mut_ptr();
-                        unsafe {
-                            for nc in 0..n * c {
-                                let scale = *a_ptr.add(nc % a_len);
-                                let off = nc * hw;
-                                let sv = vdupq_n_f32(scale);
-                                let mut i = 0;
-                                while i + 4 <= hw {
-                                    vst1q_f32(o_ptr.add(off + i), vmulq_f32(vld1q_f32(b_ptr.add(off + i)), sv));
-                                    i += 4;
-                                }
-                                while i < hw {
-                                    *o_ptr.add(off + i) = *b_ptr.add(off + i) * scale;
-                                    i += 1;
-                                }
-                            }
-                        }
-                        return TensorView { data: Cow::Borrowed(out), shape: Cow::Owned(os.clone()) };
-                    }
-                }
-            }
-        }
-    }
-    // WASM SIMD fast paths for common broadcast patterns in mul (f32 only).
-    #[cfg(target_arch = "wasm32")]
-    {
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-            // Scalar broadcast: tensor[i] * scalar
-            if a.data.len() == 1 || b.data.len() == 1 {
-                let (scalar_val, tensor) = if a.data.len() == 1 {
-                    (unsafe { *(a.data.as_ptr() as *const f32) }, b)
-                } else {
-                    (unsafe { *(b.data.as_ptr() as *const f32) }, a)
-                };
-                let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap();
-                let len = tensor.data.len();
-                let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
-                utils::ensure_capacity(out_f32, len);
-                unsafe {
-                    out_f32.set_len(len);
-                }
-                unsafe {
-                    crate::kernels::wasm::math::mul_scalar_f32(
-                        tensor.data.as_ptr() as *const f32,
-                        scalar_val,
-                        out_f32.as_mut_ptr(),
-                        len,
-                    );
-                }
-                return TensorView {
-                    data: Cow::Borrowed(out),
-                    shape: Cow::Owned(out_shape),
-                };
-            }
-            // Channel broadcast: [1,C,H,W] * [1,C,1,1] or [1,C,H,W] * [C]
-            let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap();
-            if out_shape.len() == 4 && out_shape[0] == 1 {
-                let c = out_shape[1];
-                let hw = out_shape[2] * out_shape[3];
-                let numel = out_shape.iter().product::<usize>();
-                let out_f32 = unsafe { &mut *(out as *mut Vec<T> as *mut Vec<f32>) };
-                utils::ensure_capacity(out_f32, numel);
-                unsafe {
-                    out_f32.set_len(numel);
-                }
-                // Case A: a is full [1,C,H,W], b is [C]
-                if a.data.len() == numel && b.data.len() == c {
-                    unsafe {
-                        crate::kernels::wasm::math::mul_channel_broadcast_f32(
-                            a.data.as_ptr() as *const f32,
-                            b.data.as_ptr() as *const f32,
-                            out_f32.as_mut_ptr(),
-                            c,
-                            hw,
-                        );
-                    }
-                    return TensorView {
-                        data: Cow::Borrowed(out),
-                        shape: Cow::Owned(out_shape),
-                    };
-                }
-                // Case B: b is full [1,C,H,W], a is [C]
-                if b.data.len() == numel && a.data.len() == c {
-                    unsafe {
-                        crate::kernels::wasm::math::mul_channel_broadcast_f32(
-                            b.data.as_ptr() as *const f32,
-                            a.data.as_ptr() as *const f32,
-                            out_f32.as_mut_ptr(),
-                            c,
-                            hw,
-                        );
-                    }
-                    return TensorView {
-                        data: Cow::Borrowed(out),
-                        shape: Cow::Owned(out_shape),
-                    };
-                }
-            }
-        }
-    }
     broadcast_binary_op(a, b, out, |x, y| x * y)
 }
 
@@ -1065,39 +695,15 @@ pub fn sub<'b, 'a, T: Clone + Copy + std::ops::Sub<Output = T> + std::fmt::Debug
     b: &TensorView<'b, T>,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
+    if let Some(shape) = binary::try_f32(Op::Sub, a, b, out) {
+        return TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(shape),
+        };
+    }
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
         utils::ensure_capacity(out, len);
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-                let a_ptr = a.data.as_ptr() as *const f32;
-                let b_ptr = b.data.as_ptr() as *const f32;
-                let o_ptr = out.as_mut_ptr() as *mut f32;
-                unsafe {
-                    crate::kernels::avx::math::sub_f32(a_ptr, b_ptr, o_ptr, len);
-                }
-                return TensorView {
-                    data: Cow::Borrowed(out),
-                    shape: std::borrow::Cow::Owned(a.shape.to_vec()),
-                };
-            }
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-                let a_ptr = a.data.as_ptr() as *const f32;
-                let b_ptr = b.data.as_ptr() as *const f32;
-                let o_ptr = out.as_mut_ptr() as *mut f32;
-                unsafe {
-                    crate::kernels::wasm::math::sub_f32(a_ptr, b_ptr, o_ptr, len);
-                }
-                return TensorView {
-                    data: Cow::Borrowed(out),
-                    shape: std::borrow::Cow::Owned(a.shape.to_vec()),
-                };
-            }
-        }
         let a_slice = &a.data;
         let b_slice = &b.data;
         let o_slice = out.as_mut_slice();
@@ -1136,197 +742,21 @@ pub fn reciprocal<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> Tens
 /// the multiplies reassociated, which costs a fraction of an ulp. Fusing a
 /// graph must not change results, so the compiler emits this instead.
 pub fn gelu_erf<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        unsafe {
-            crate::kernels::avx::math::gelu_erf_kernel(
-                input.data.as_ptr(),
-                out.as_mut_ptr(),
-                numel,
-            );
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::kernels::neon::math::gelu_erf(input, out)
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        unsafe {
-            crate::kernels::wasm::math::gelu_erf(input.data.as_ptr(), out.as_mut_ptr(), numel);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
-    #[cfg(not(any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "wasm32"
-    )))]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        // True division and libm erf — the same operations the generic Div and
-        // Erf kernels run on this arch — so fusion does not move any bits.
-        for i in 0..numel {
-            let x = input.data[i];
-            out[i] = x * (0.5 * (1.0 + libm::erff(x / std::f32::consts::SQRT_2)));
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
+    unary(input, out, gelu_erf_into)
 }
 
 pub fn gelu<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::kernels::neon::math::gelu(input, out)
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        unsafe {
-            crate::kernels::avx::math::gelu_kernel(input.data.as_ptr(), out.as_mut_ptr(), numel);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        crate::kernels::wasm::math::gelu_kernel(input, out)
-    }
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        target_arch = "x86_64",
-        target_arch = "wasm32"
-    )))]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        let inv_sqrt2 = 0.7071067811865475f32; // 1/sqrt(2)
-        for i in 0..numel {
-            let x = input.data[i];
-            let erf_val = libm::erff(x * inv_sqrt2);
-            out[i] = x * 0.5 * (1.0 + erf_val);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
+    unary(input, out, gelu_into)
 }
 
 /// Fast GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 /// This is faster than standard GELU and commonly used in GPT-2/BERT.
 pub fn fast_gelu<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::kernels::neon::math::fast_gelu(input, out)
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        unsafe {
-            crate::kernels::avx::math::fast_gelu_kernel(
-                input.data.as_ptr(),
-                out.as_mut_ptr(),
-                numel,
-            );
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        crate::kernels::wasm::math::fast_gelu_kernel(input, out)
-    }
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        target_arch = "x86_64",
-        target_arch = "wasm32"
-    )))]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        let sqrt_2_over_pi = 0.7978845608028654f32;
-        let coeff = 0.044715f32;
-        for i in 0..numel {
-            let x = input.data[i];
-            let inner = sqrt_2_over_pi * (x + coeff * x * x * x);
-            let tanh_val = inner.tanh();
-            out[i] = 0.5 * x * (1.0 + tanh_val);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
+    unary(input, out, fast_gelu_into)
 }
 
 pub fn erf<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let _r = crate::kernels::neon::math::erf(input, out);
-        _r
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        unsafe {
-            crate::kernels::avx::math::erf_kernel(input.data.as_ptr(), out.as_mut_ptr(), numel);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        unsafe {
-            crate::kernels::wasm::math::erf(input.data.as_ptr(), out.as_mut_ptr(), numel);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        target_arch = "x86_64",
-        target_arch = "wasm32"
-    )))]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        for i in 0..numel {
-            out[i] = libm::erff(input.data[i]);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
+    unary(input, out, erf_into)
 }
 
 pub fn softplus<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
@@ -1349,9 +779,6 @@ pub fn hard_sigmoid<'b, 'a>(
 ) -> TensorView<'a> {
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let i_slice = &input.data;
     let o_slice = out.as_mut_slice();
     #[cfg(target_arch = "aarch64")]
@@ -1385,51 +812,7 @@ pub fn hard_sigmoid<'b, 'a>(
     }
 }
 pub fn tanh_kernel<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let _r = crate::kernels::neon::math::tanh(input, out);
-        _r
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        unsafe {
-            crate::kernels::avx::math::tanh_kernel(input.data.as_ptr(), out.as_mut_ptr(), numel);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        unsafe {
-            crate::kernels::wasm::math::tanh(input.data.as_ptr(), out.as_mut_ptr(), numel);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        target_arch = "x86_64",
-        target_arch = "wasm32"
-    )))]
-    {
-        let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
-        for i in 0..numel {
-            out[i] = input.data[i].tanh();
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
+    unary(input, out, tanh_into)
 }
 
 pub fn div<'b, 'a, T: Clone + Copy + std::ops::Div<Output = T> + std::fmt::Debug + 'static>(
@@ -1437,39 +820,15 @@ pub fn div<'b, 'a, T: Clone + Copy + std::ops::Div<Output = T> + std::fmt::Debug
     b: &TensorView<'b, T>,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
+    if let Some(shape) = binary::try_f32(Op::Div, a, b, out) {
+        return TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(shape),
+        };
+    }
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
         utils::ensure_capacity(out, len);
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-                let a_ptr = a.data.as_ptr() as *const f32;
-                let b_ptr = b.data.as_ptr() as *const f32;
-                let o_ptr = out.as_mut_ptr() as *mut f32;
-                unsafe {
-                    crate::kernels::avx::math::div_f32(a_ptr, b_ptr, o_ptr, len);
-                }
-                return TensorView {
-                    data: Cow::Borrowed(out),
-                    shape: std::borrow::Cow::Owned(a.shape.to_vec()),
-                };
-            }
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-                let a_ptr = a.data.as_ptr() as *const f32;
-                let b_ptr = b.data.as_ptr() as *const f32;
-                let o_ptr = out.as_mut_ptr() as *mut f32;
-                unsafe {
-                    crate::kernels::wasm::math::div_f32(a_ptr, b_ptr, o_ptr, len);
-                }
-                return TensorView {
-                    data: Cow::Borrowed(out),
-                    shape: std::borrow::Cow::Owned(a.shape.to_vec()),
-                };
-            }
-        }
         let a_slice = &a.data;
         let b_slice = &b.data;
         let o_slice = out.as_mut_slice();
@@ -1496,9 +855,6 @@ pub fn mod_f32<'b, 'a, T: ElementOps>(
 ) -> TensorView<'a> {
     let len = a.data.len();
     utils::ensure_capacity(out, len);
-    unsafe {
-        out.set_len(len);
-    }
     let b_scalar = b.data.len() == 1;
     let o_slice = out.as_mut_slice();
     let b_slice = &b.data;
@@ -1575,9 +931,6 @@ fn equal_i64_impl<'a, T: PartialEq + Copy>(
     });
     let numel = out_shape.iter().product::<usize>();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     if a_data.len() == 1 && b_data.len() == 1 {
         out[0] = if a_data[0] == b_data[0] { 1 } else { 0 };
     } else if a_data.len() == 1 {
@@ -1619,58 +972,7 @@ pub fn sigmoid<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorV
     _res
 }
 fn sigmoid_impl<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::kernels::neon::math::sigmoid(input, out)
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let len = input.data.len();
-        utils::ensure_capacity(out, len);
-        let i_slice = &input.data;
-        let o_slice = out.as_mut_slice();
-        unsafe {
-            crate::kernels::avx::math::sigmoid_kernel(i_slice.as_ptr(), o_slice.as_mut_ptr(), len);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: std::borrow::Cow::Owned(input.shape.to_vec()),
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let len = input.data.len();
-        utils::ensure_capacity(out, len);
-        unsafe {
-            crate::kernels::wasm::math::sigmoid(input.data.as_ptr(), out.as_mut_ptr(), len);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: std::borrow::Cow::Owned(input.shape.to_vec()),
-        }
-    }
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        target_arch = "x86_64",
-        target_arch = "wasm32"
-    )))]
-    {
-        let len = input.data.len();
-        utils::ensure_capacity(out, len);
-        let i_slice = &input.data;
-        let o_slice = out.as_mut_slice();
-        for i in 0..len {
-            unsafe {
-                use crate::activations;
-
-                *o_slice.get_unchecked_mut(i) = activations::sigmoid(*i_slice.get_unchecked(i));
-            }
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: std::borrow::Cow::Owned(input.shape.to_vec()),
-        }
-    }
+    unary(input, out, sigmoid_into)
 }
 
 /// SiLU activation: x * sigmoid(x), combined in a single pass
@@ -1691,96 +993,11 @@ pub fn silu<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView
 }
 /// SiLU activation: x * sigmoid(x), combined in a single pass
 fn silu_inner<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::kernels::neon::math::swish(input, out)
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let len = input.data.len();
-        utils::ensure_capacity(out, len);
-        unsafe {
-            crate::kernels::wasm::math::silu(input.data.as_ptr(), out.as_mut_ptr(), len);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let len = input.data.len();
-        utils::ensure_capacity(out, len);
-        unsafe {
-            crate::kernels::avx::math::silu_kernel(input.data.as_ptr(), out.as_mut_ptr(), len);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        target_arch = "wasm32",
-        target_arch = "x86_64"
-    )))]
-    {
-        let len = input.data.len();
-        utils::ensure_capacity(out, len);
-        for i in 0..len {
-            let x = input.data[i];
-            out[i] = x / (1.0 + (-x).exp());
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
+    unary(input, out, silu_into)
 }
 
 pub fn relu<'a, 'b>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::kernels::neon::math::relu(input, out)
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let len = input.data.len();
-        utils::ensure_capacity(out, len);
-        let i_slice = &input.data;
-        let o_slice = out.as_mut_slice();
-        unsafe {
-            crate::kernels::avx::math::relu_kernel(i_slice.as_ptr(), o_slice.as_mut_ptr(), len);
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        crate::kernels::wasm::math::relu_kernel(input, out)
-    }
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        target_arch = "x86_64",
-        target_arch = "wasm32"
-    )))]
-    {
-        let len = input.data.len();
-        utils::ensure_capacity(out, len);
-        let i_slice = &input.data;
-        let o_slice = out.as_mut_slice();
-        for i in 0..len {
-            unsafe {
-                *o_slice.get_unchecked_mut(i) = i_slice.get_unchecked(i).max(0.0);
-            }
-        }
-        TensorView {
-            data: Cow::Borrowed(out),
-            shape: Cow::Owned(input.shape.to_vec()),
-        }
-    }
+    unary(input, out, relu_into)
 }
 
 pub fn leaky_relu<'a, 'b>(
@@ -1788,65 +1005,11 @@ pub fn leaky_relu<'a, 'b>(
     alpha: f32,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let len = input.data.len();
-    utils::ensure_capacity(out, len);
-    let i_slice = &input.data;
-    let o_slice = out.as_mut_slice();
-    #[cfg(target_arch = "aarch64")]
-    {
-        use core::arch::aarch64::*;
-        let valpha = unsafe { vdupq_n_f32(alpha) };
-        let vzero = unsafe { vdupq_n_f32(0.0) };
-        let mut i = 0;
-        unsafe {
-            while i + 4 <= len {
-                let xv = vld1q_f32(i_slice.as_ptr().add(i));
-                let mask = vcgeq_f32(xv, vzero);
-                let neg = vmulq_f32(xv, valpha);
-                let result = vbslq_f32(mask, xv, neg);
-                vst1q_f32(o_slice.as_mut_ptr().add(i), result);
-                i += 4;
-            }
-        }
-        for j in i..len {
-            let x = i_slice[j];
-            o_slice[j] = if x >= 0.0 { x } else { alpha * x };
-        }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        for i in 0..len {
-            let x = i_slice[i];
-            unsafe {
-                *o_slice.get_unchecked_mut(i) = if x >= 0.0 { x } else { alpha * x };
-            }
-        }
-    }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: Cow::Owned(input.shape.to_vec()),
-    }
+    unary(input, out, |level, src, out| leaky_relu_into(level, src, out, alpha))
 }
 
 pub fn sqrt<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let len = input.data.len();
-    utils::ensure_capacity(out, len);
-    let in_slice = &input.data;
-    let out_slice = out.as_mut_slice();
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        crate::kernels::avx::math::sqrt_kernel(in_slice.as_ptr(), out_slice.as_mut_ptr(), len);
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    for i in 0..len {
-        unsafe {
-            *out_slice.get_unchecked_mut(i) = in_slice.get_unchecked(i).sqrt();
-        }
-    }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: std::borrow::Cow::Owned(input.shape.to_vec()),
-    }
+    unary(input, out, sqrt_into)
 }
 
 pub fn round<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
@@ -1906,7 +1069,6 @@ pub fn pow<'b, 'a, T: ElementOps>(
         let exp_val = b.data.first().unwrap().as_f32();
         let len = a.data.len();
         utils::ensure_capacity(out, len);
-        unsafe { out.set_len(len); }
         let a_slice = &a.data;
         let o_slice = out.as_mut_slice();
         if exp_val == 3.0 {
@@ -1942,9 +1104,6 @@ pub fn pow<'b, 'a, T: ElementOps>(
         utils::ensure_capacity(out, len);
         let a_slice = &a.data;
         let b_slice = &b.data;
-        unsafe {
-            out.set_len(len);
-        }
         let o_slice = out.as_mut_slice();
         for i in 0..len {
             unsafe {
@@ -2012,7 +1171,6 @@ pub fn reduce_mean<'b, 'a>(
         }
         let scale = 1.0f32 / inner as f32;
         utils::ensure_capacity(out, outer);
-        unsafe { out.set_len(outer) };
         for (o, dst) in out.iter_mut().enumerate() {
             let run = &input.data[o * inner..(o + 1) * inner];
             // Eight independent accumulators: f32 addition is not associative,
@@ -2375,9 +1533,6 @@ pub fn reduce_l2<'b, 'a>(
     {
         let n = input.data.len() / 2;
         utils::ensure_capacity(out, n);
-        unsafe {
-            out.set_len(n);
-        }
         let mut out_shape = Vec::new();
         for i in 0..dims {
             if i != dims - 1 {
@@ -2507,9 +1662,6 @@ pub fn max<'b, 'a>(
 ) -> TensorView<'a> {
     let len = a.data.len().max(b.data.len());
     utils::ensure_capacity(out, len);
-    unsafe {
-        out.set_len(len);
-    }
     let out_slice = out.as_mut_slice();
     if a.shape == b.shape {
         for i in 0..len {
@@ -2578,9 +1730,6 @@ pub fn clip<'b, 'a, T: ElementOps, U: ElementOps, V: ElementOps>(
         .unwrap_or(T::constant_max());
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     for i in 0..numel {
         let val = input.data[i].clamp_val(min_val, max_val);
         out[i] = V::from_f32(val.as_f32());
@@ -2626,9 +1775,6 @@ pub fn range<'a>(
         0
     };
     utils::ensure_capacity(out, n);
-    unsafe {
-        out.set_len(n);
-    }
     let out_slice = out.as_mut_slice();
     for i in 0..n {
         out_slice[i] = start_val + (i as f32) * delta_val;
@@ -2653,9 +1799,6 @@ pub fn range_i64<'a>(
         0
     };
     utils::ensure_capacity(out, n);
-    unsafe {
-        out.set_len(n);
-    }
     let out_slice = out.as_mut_slice();
     for i in 0..n {
         out_slice[i] = start_val + (i as i64) * delta_val;
@@ -2665,9 +1808,6 @@ pub fn range_i64<'a>(
 pub fn sin<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
         out_slice[i] = input.data[i].sin();
@@ -2677,9 +1817,6 @@ pub fn sin<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
 pub fn cos<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
         out_slice[i] = input.data[i].cos();
@@ -2687,33 +1824,11 @@ pub fn cos<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
     TensorView::from_slice(out, input.shape.to_vec())
 }
 pub fn exp<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        unsafe {
-            crate::kernels::avx::math::exp_kernel(input.data.as_ptr(), out.as_mut_ptr(), numel);
-        }
-        return TensorView::from_slice(out, input.shape.to_vec());
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let out_slice = out.as_mut_slice();
-        for i in 0..numel {
-            out_slice[i] = input.data[i].exp();
-        }
-        TensorView::from_slice(out, input.shape.to_vec())
-    }
+    unary(input, out, exp_into)
 }
 pub fn log<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
         out_slice[i] = input.data[i].ln();
@@ -2723,9 +1838,6 @@ pub fn log<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
 pub fn neg<'b, 'a, T: ElementOps>(input: &TensorView<'b, T>, out: &'a mut Vec<T>) -> TensorView<'a, T> {
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
         out_slice[i] = T::from_f32(-input.data[i].as_f32());
@@ -2821,9 +1933,6 @@ where
     };
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let o_slice = out.as_mut_slice();
     let i_slice = &input.data;
     let ax_dim = input.shape[ax];
@@ -2882,9 +1991,6 @@ pub fn einsum_bs_d_bsd<'b, 'a>(
     let bs_len = a.data.len();
     let numel = bs_len * d_len;
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let o_slice = out.as_mut_slice();
     let mut idx = 0;
     for i in 0..bs_len {
@@ -2943,9 +2049,6 @@ pub fn expand<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     }
     let numel: usize = out_shape.iter().product();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let input_strides = utils::compute_strides(input_shape);
     let mut virtual_strides = vec![0; ndim_out];
     for i in 0..ndim_out {
@@ -2999,9 +2102,6 @@ pub fn tile<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         .collect();
     let numel = out_shape.iter().product();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let out_slice = out.as_mut_slice();
     let mut coords = vec![0; ndim];
     for i in 0..numel {
@@ -3197,6 +2297,33 @@ mod tests {
         assert_eq!(res.data, vec![11.0, 21.0, 31.0, 12.0, 22.0, 32.0]);
     }
     #[test]
+    fn test_add_sub_mul_div_match_broadcast_reference() {
+        use crate::kernels::test_util::{
+            assert_same_bits, binary_inputs, binary_shapes, broadcast_reference, BINARY_OPS,
+        };
+        for (a_shape, b_shape) in &binary_shapes() {
+            let (a, b) = binary_inputs(a_shape, b_shape);
+            let (ta, tb) = (
+                TensorView::from_slice(&a, a_shape.clone()),
+                TensorView::from_slice(&b, b_shape.clone()),
+            );
+            for (name, op) in BINARY_OPS {
+                let (want_shape, want) = broadcast_reference(&a, a_shape, &b, b_shape, op);
+                let mut out = Vec::new();
+                let got = match name {
+                    "add" => add(&ta, &tb, &mut out),
+                    "sub" => sub(&ta, &tb, &mut out),
+                    "mul" => mul(&ta, &tb, &mut out),
+                    _ => div(&ta, &tb, &mut out),
+                };
+                let what = format!("{name} {a_shape:?} {b_shape:?}");
+                assert_eq!(got.shape.to_vec(), want_shape, "{what}: shape");
+                assert_same_bits(&got.data, &want, &what);
+            }
+        }
+    }
+
+    #[test]
     fn test_min_max() {
         let data = vec![1.0, -5.0, 10.0, 3.0];
         let t = TensorView::from_slice(&data, vec![4]);
@@ -3280,6 +2407,209 @@ mod tests {
         assert_eq!(res.shape, vec![2, 4]);
         for (a, b) in res.data.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-6, "got {} expected {}", a, b);
+        }
+    }
+
+    fn apply(
+        f: impl for<'a, 'b> Fn(&TensorView<'b>, &'a mut Vec<f32>) -> TensorView<'a>,
+        x: &[f32],
+    ) -> Vec<f32> {
+        let input = TensorView::from_slice(x, vec![x.len()]);
+        let mut out = Vec::new();
+        f(&input, &mut out).data.into_owned()
+    }
+
+    fn sigmoid_ref(x: f64) -> f64 {
+        1.0 / (1.0 + (-x).exp())
+    }
+
+    fn silu_ref(x: f64) -> f64 {
+        x * sigmoid_ref(x)
+    }
+
+    /// Each activation against its f64 definition, at every awkward length
+    /// (so main loops, vector tails and short rows all run) and from an
+    /// unaligned start.
+    fn check_activation(
+        name: &str,
+        f: impl for<'a, 'b> Fn(&TensorView<'b>, &'a mut Vec<f32>) -> TensorView<'a> + Copy,
+        want: fn(f64) -> f64,
+        tol: f64,
+    ) {
+        check_activation_in(name, f, want, tol, -12.0, 12.0)
+    }
+
+    fn check_activation_in(
+        name: &str,
+        f: impl for<'a, 'b> Fn(&TensorView<'b>, &'a mut Vec<f32>) -> TensorView<'a> + Copy,
+        want: fn(f64) -> f64,
+        tol: f64,
+        lo: f32,
+        hi: f32,
+    ) {
+        use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_close};
+        let mut rng = Rng::new(11);
+        for &n in AWKWARD_LENS {
+            let x = rng.vec(n + 1, lo, hi);
+            for x in [&x[..n], &x[1..]] {
+                let want: Vec<f64> = x.iter().map(|&v| want(v as f64)).collect();
+                assert_close(&apply(f, x), &want, tol, &format!("{name} n={}", x.len()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_sigmoid_matches_reference_at_every_length() {
+        check_activation("sigmoid", sigmoid, sigmoid_ref, 1e-6);
+    }
+
+    #[test]
+    fn test_tanh_matches_reference_at_every_length() {
+        check_activation("tanh", tanh_kernel, f64::tanh, 1e-6);
+    }
+
+    #[test]
+    fn test_silu_matches_reference_at_every_length() {
+        check_activation("silu", silu, silu_ref, 1e-6);
+    }
+
+    #[test]
+    fn test_erf_matches_reference_at_every_length() {
+        check_activation("erf", erf, libm::erf, 1e-6);
+    }
+
+    #[test]
+    fn test_gelu_erf_matches_reference_at_every_length() {
+        check_activation(
+            "gelu_erf",
+            gelu_erf,
+            |x| 0.5 * x * (1.0 + libm::erf(x * std::f64::consts::FRAC_1_SQRT_2)),
+            2e-6,
+        );
+    }
+
+    #[test]
+    fn test_activation_kernels_match_reference_at_every_level() {
+        use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_close, levels};
+        type Kernel = fn(Level, &[f32], &mut [f32]);
+        let kernels: [(&str, Kernel, fn(f64) -> f64, f64); 7] = [
+            ("gelu", gelu_into, |x| 0.5 * x * (1.0 + libm::erf(x * std::f64::consts::FRAC_1_SQRT_2)), 2e-6),
+            ("fast_gelu", fast_gelu_into, |x| {
+                let inner = (2.0 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x);
+                0.5 * x * (1.0 + inner.tanh())
+            }, 2e-6),
+            ("sigmoid", sigmoid_into, sigmoid_ref, 1e-6),
+            ("tanh", tanh_into, f64::tanh, 1e-6),
+            ("silu", silu_into, silu_ref, 1e-6),
+            ("erf", erf_into, libm::erf, 1e-6),
+            ("gelu_erf", gelu_erf_into, |x| 0.5 * x * (1.0 + libm::erf(x * std::f64::consts::FRAC_1_SQRT_2)), 2e-6),
+        ];
+        for level in levels() {
+            let mut rng = Rng::new(12);
+            for &n in AWKWARD_LENS.iter().filter(|&&n| n >= 16) {
+                let x = rng.vec(n, -12.0, 12.0);
+                for (name, kernel, want, tol) in kernels {
+                    let mut out = vec![0.0; n];
+                    kernel(level, &x, &mut out);
+                    let want: Vec<f64> = x.iter().map(|&v| want(v as f64)).collect();
+                    assert_close(&out, &want, tol, &format!("{name} {level:?} n={n}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_gelu_matches_reference_at_every_length() {
+        check_activation(
+            "gelu",
+            gelu,
+            |x| 0.5 * x * (1.0 + libm::erf(x * std::f64::consts::FRAC_1_SQRT_2)),
+            2e-6,
+        );
+    }
+
+    #[test]
+    fn test_fast_gelu_matches_reference_at_every_length() {
+        check_activation_in(
+            "fast_gelu",
+            fast_gelu,
+            |x| {
+                let inner = (2.0 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x);
+                0.5 * x * (1.0 + inner.tanh())
+            },
+            2e-6,
+            -6.0,
+            6.0,
+        );
+    }
+
+    #[test]
+    fn test_exp_is_accurate_and_saturates() {
+        use crate::kernels::test_util::{AWKWARD_LENS, Rng};
+        let mut rng = Rng::new(13);
+        for &n in AWKWARD_LENS {
+            let x = rng.vec(n, -80.0, 80.0);
+            for (&x, &got) in x.iter().zip(&apply(exp, &x)) {
+                let want = (x as f64).exp();
+                let err = ((got as f64 - want) / want).abs();
+                assert!(err < 2e-6, "exp({x}) = {got}, want {want}, relative error {err:.2e}");
+            }
+        }
+        let got = apply(exp, &[100.0, 1000.0, -200.0, -1000.0, 0.0]);
+        assert!(got[0] == f32::INFINITY && got[1] == f32::INFINITY, "overflow: {got:?}");
+        assert!(got[2] < 1e-30 && got[3] < 1e-30 && got[2] >= 0.0, "underflow: {got:?}");
+        assert_eq!(got[4], 1.0);
+    }
+
+    #[test]
+    fn test_sqrt_is_exact_at_every_length() {
+        use crate::kernels::test_util::{AWKWARD_LENS, Rng};
+        let mut rng = Rng::new(14);
+        for &n in AWKWARD_LENS {
+            let x = rng.vec(n, 0.0, 100.0);
+            for (&x, &got) in x.iter().zip(&apply(sqrt, &x)) {
+                assert_eq!(got, x.sqrt(), "sqrt({x}) n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_leaky_relu_matches_reference_at_every_length() {
+        use crate::kernels::test_util::{AWKWARD_LENS, Rng};
+        let mut rng = Rng::new(15);
+        for &n in AWKWARD_LENS {
+            let x = rng.vec(n + 1, -12.0, 12.0);
+            for x in [&x[..n], &x[1..]] {
+                let got = apply(|i, o| leaky_relu(i, 0.1, o), x);
+                for (&x, &got) in x.iter().zip(&got) {
+                    assert_eq!(got, if x >= 0.0 { x } else { 0.1 * x }, "leaky_relu({x}) n={n}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_relu_matches_reference_at_every_length() {
+        check_activation("relu", relu, |x| x.max(0.0), 0.0);
+    }
+
+    #[test]
+    fn test_activations_saturate_without_overflow() {
+        // Far past where exp overflows or underflows in f32.
+        let x = [-1000.0, -100.0, -88.0, -20.0, 20.0, 88.0, 100.0, 1000.0, 0.0, -0.5, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        for (name, got, want) in [
+            ("sigmoid", apply(sigmoid, &x), x.map(|v| sigmoid_ref(v as f64))),
+            ("tanh", apply(tanh_kernel, &x), x.map(|v| (v as f64).tanh())),
+            ("silu", apply(silu, &x), x.map(|v| silu_ref(v as f64))),
+            ("fast_gelu", apply(fast_gelu, &x), x.map(|v| {
+                let v = v as f64;
+                0.5 * v * (1.0 + ((2.0 / std::f64::consts::PI).sqrt() * (v + 0.044715 * v * v * v)).tanh())
+            })),
+        ] {
+            for ((&g, &w), &v) in got.iter().zip(&want).zip(&x) {
+                assert!(g.is_finite(), "{name}({v}) = {g}");
+                assert!((g as f64 - w).abs() <= 1e-6 * w.abs().max(1.0), "{name}({v}) = {g}, want {w}");
+            }
         }
     }
 
