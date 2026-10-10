@@ -36,7 +36,7 @@ pub use conv2d::{
     conv2d_fused, conv2d_silu, fused_scale_bias, fused_scale_bias_silu, gather_elements,
     max_pool2d, print_conv_stats, reset_conv_stats, resize_nearest, topk,
 };
-pub use gemm::{gemm, matmul, matmul_fused_add, Int8Weight, quantize_f32_to_i8};
+pub use gemm::{gemm, matmul, matmul_fused_add};
 pub use manipulation::*;
 pub use manipulation::{split, where_op};
 pub use math::*;
