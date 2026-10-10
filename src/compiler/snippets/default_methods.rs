@@ -140,6 +140,48 @@ fn mat_mul_integer_arm<'c, 'd>(
     lele::kernels::mat_mul_integer_prepared_arm(a, &pw, zp_a, zp_b, None, None, false, output_buf)
 }
 
+/// Dynamically quantized linear layer (+ ReLU) against an int8 weight packed
+/// once for the integer GEMM.
+#[cfg(not(target_arch = "aarch64"))]
+fn linear_quantized_packed<'c, 'd>(
+    &self,
+    input: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_k: usize,
+    weight_n: usize,
+    weight_signed: bool,
+    weight_scale: lele::tensor::TensorView<'c, f32>,
+    weight_zero: lele::tensor::TensorView<'c, f32>,
+    bias: lele::tensor::TensorView<'c, f32>,
+    relu: bool,
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let w = self.get_qweights(weight_offset, weight_len, weight_k, weight_n, weight_signed, &weight_zero.data, &weight_scale.data);
+    let bias = (!bias.data.is_empty()).then_some(&bias.data[..]);
+    lele::kernels::qlinear_dynamic(input, &w, bias, relu, output_buf)
+}
+
+/// MatMulInteger against a static weight packed once for the integer GEMM.
+#[cfg(not(target_arch = "aarch64"))]
+fn mat_mul_integer_packed<'c, 'd>(
+    &self,
+    a: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_k: usize,
+    weight_n: usize,
+    weight_signed: bool,
+    a_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    b_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let zb = b_zero_point.map_or(&[0.0f32][..], |z| &z.data[..]);
+    let w = self.get_qweights(weight_offset, weight_len, weight_k, weight_n, weight_signed, zb, &[1.0]);
+    let za = a_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0) as i32;
+    lele::kernels::mat_mul_integer_qweights(a, za, &w, output_buf)
+}
+
 // Helper for pre-quantized inputs (used in attention where input is already quantized)
 #[inline]
 fn linear_quantized_prequant<'c, 'd>(

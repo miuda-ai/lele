@@ -19,6 +19,7 @@ pub(crate) mod matmul_nn;
 pub mod neon;
 pub mod norm;
 pub mod pooling;
+pub mod qgemm;
 pub mod qmatmul_i8;
 pub mod quantization;
 pub mod rnn;
@@ -44,6 +45,7 @@ pub use math::{cos, cumsum, einsum_bs_d_bsd, exp, expand, greater_or_equal, hard
 pub use norm::*;
 pub use pooling::*;
 pub use pooling::{average_pool2d, global_average_pool};
+pub use qgemm::{QWeights, mat_mul_integer_qweights, qlinear_dynamic, qlinear_static};
 pub use qmatmul_i8::{QuantizedWeights, prepare_quantized_weights, qmatmul_i8};
 pub use quantization::*;
 pub use rnn::*;

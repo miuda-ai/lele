@@ -75,8 +75,8 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                     )?;
                     writeln!(
                         w,
-                        "{}let {} = lele::kernels::mat_mul_integer(&{}, &{}, {}, {}, {});",
-                        tab, outputs[0], inputs[0], inputs[1], a_zp, b_zp, buf_expr
+                        "{}let {} = self.mat_mul_integer_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {});",
+                        tab, outputs[0], inputs[0], *o, *l, k, n, *dt == 3, a_zp, b_zp, buf_expr
                     )?;
                 } else {
                     writeln!(
