@@ -1,106 +1,13 @@
 use crate::kernels::utils;
-#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul as strided_matmul};
 use crate::tensor::TensorView;
 use std::borrow::Cow;
-
-// Apple Accelerate framework bindings for AMX-accelerated GEMM
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-mod accelerate {
-    // CBLAS enums
-    pub const CBLAS_ROW_MAJOR: i32 = 101;
-    pub const CBLAS_NO_TRANS: i32 = 111;
-    pub const CBLAS_TRANS: i32 = 112;
-
-    unsafe extern "C" {
-        pub fn cblas_sgemm(
-            order: i32,
-            trans_a: i32,
-            trans_b: i32,
-            m: i32,
-            n: i32,
-            k: i32,
-            alpha: f32,
-            a: *const f32,
-            lda: i32,
-            b: *const f32,
-            ldb: i32,
-            beta: f32,
-            c: *mut f32,
-            ldc: i32,
-        );
-    }
-
-    unsafe extern "C" {
-        fn setenv(name: *const i8, value: *const i8, overwrite: i32) -> i32;
-    }
-
-    /// Ensure Accelerate uses single thread (avoid thread-spawning overhead for small matrices)
-    pub fn init() {
-        use std::sync::Once;
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            unsafe {
-                setenv(
-                    c"VECLIB_MAXIMUM_THREADS".as_ptr(),
-                    c"1".as_ptr(),
-                    1, // force overwrite
-                );
-            }
-        });
-    }
-}
-
-/// Public cblas_sgemm wrapper (used by quantization module)
-/// C = alpha * A * B + beta * C
-/// A: [M, K] row-major, B: [K, N] row-major, C: [M, N] row-major
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-pub unsafe fn accelerate_sgemm(
-    m: i32,
-    n: i32,
-    k: i32,
-    alpha: f32,
-    a: *const f32,
-    lda: i32,
-    b: *const f32,
-    ldb: i32,
-    beta: f32,
-    c: *mut f32,
-    ldc: i32,
-) {
-    unsafe {
-        accelerate::cblas_sgemm(
-            accelerate::CBLAS_ROW_MAJOR,
-            accelerate::CBLAS_NO_TRANS,
-            accelerate::CBLAS_NO_TRANS,
-            m,
-            n,
-            k,
-            alpha,
-            a,
-            lda,
-            b,
-            ldb,
-            beta,
-            c,
-            ldc,
-        );
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-pub fn accelerate_init() {
-    accelerate::init();
-}
 
 pub fn matmul<'a>(
     a: &TensorView<'_>,
     b: &TensorView<'_>,
     out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    accelerate::init();
-
     let a_dims = a.shape.len();
     let b_dims = b.shape.len();
     assert!(a_dims >= 2);
@@ -141,30 +48,6 @@ pub fn matmul<'a>(
         let b_offset = if batch_b == 1 { 0 } else { b_i * stride_b };
         let out_offset = b_i * stride_out;
 
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-        unsafe {
-            accelerate::cblas_sgemm(
-                accelerate::CBLAS_ROW_MAJOR,
-                accelerate::CBLAS_NO_TRANS,
-                accelerate::CBLAS_NO_TRANS,
-                m as i32,
-                n as i32,
-                k as i32,
-                1.0,
-                a.data.as_ptr().add(a_offset),
-                k as i32,
-                b.data.as_ptr().add(b_offset),
-                n as i32,
-                0.0,
-                out_slice.as_mut_ptr().add(out_offset),
-                n as i32,
-            );
-        }
-
-        #[cfg(not(any(
-            target_arch = "wasm32",
-            all(target_arch = "aarch64", target_os = "macos")
-        )))]
         unsafe {
             let a_mat =
                 MatRef::<f32>::from_raw_parts(a.data.as_ptr().add(a_offset), m, k, k as isize, 1);
@@ -177,23 +60,6 @@ pub fn matmul<'a>(
                 n as isize,
                 1,
             );
-            strided_matmul(out_mat, Accum::Replace, a_mat, b_mat, 1.0, Par::Seq);
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        unsafe {
-            let a_mat =
-                MatRef::<f32>::from_raw_parts(a.data.as_ptr().add(a_offset), m, k, k as isize, 1);
-            let b_mat =
-                MatRef::<f32>::from_raw_parts(b.data.as_ptr().add(b_offset), k, n, n as isize, 1);
-            let out_mat = MatMut::<f32>::from_raw_parts_mut(
-                out_slice.as_mut_ptr().add(out_offset),
-                m,
-                n,
-                n as isize,
-                1,
-            );
-
             strided_matmul(out_mat, Accum::Replace, a_mat, b_mat, 1.0, Par::Seq);
         }
     }
@@ -208,9 +74,6 @@ pub fn matmul_fused_add<'a>(
     bias: &TensorView<'_>,
     out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    accelerate::init();
-
     let a_dims = a.shape.len();
     let b_dims = b.shape.len();
     let batch_a: usize = a.shape[..a_dims - 2].iter().product::<usize>().max(1);
@@ -248,30 +111,6 @@ pub fn matmul_fused_add<'a>(
             }
 
             // GEMM: C = 1.0 * A * B + 1.0 * C (where C is pre-filled with bias)
-            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-            unsafe {
-                accelerate::cblas_sgemm(
-                    accelerate::CBLAS_ROW_MAJOR,
-                    accelerate::CBLAS_NO_TRANS,
-                    accelerate::CBLAS_NO_TRANS,
-                    m as i32,
-                    n as i32,
-                    k as i32,
-                    1.0,
-                    a.data.as_ptr().add(a_offset),
-                    k as i32,
-                    b.data.as_ptr().add(b_offset),
-                    n as i32,
-                    1.0,
-                    out_slice.as_mut_ptr().add(out_offset),
-                    n as i32,
-                );
-            }
-
-            #[cfg(not(any(
-                target_arch = "wasm32",
-                all(target_arch = "aarch64", target_os = "macos")
-            )))]
             unsafe {
                 let a_mat = MatRef::<f32>::from_raw_parts(
                     a.data.as_ptr().add(a_offset),
@@ -295,42 +134,6 @@ pub fn matmul_fused_add<'a>(
                     1,
                 );
                 strided_matmul(out_mat, Accum::Add, a_mat, b_mat, 1.0, Par::Seq);
-            }
-
-            #[cfg(target_arch = "wasm32")]
-            unsafe {
-                use crate::kernels::matmul::{
-                    Accum as WAccum, MatMut as WMatMut, MatRef as WMatRef, Par as WPar,
-                };
-                let a_mat = WMatRef::<f32>::from_raw_parts(
-                    a.data.as_ptr().add(a_offset),
-                    m,
-                    k,
-                    k as isize,
-                    1,
-                );
-                let b_mat = WMatRef::<f32>::from_raw_parts(
-                    b.data.as_ptr().add(b_offset),
-                    k,
-                    n,
-                    n as isize,
-                    1,
-                );
-                let out_mat = WMatMut::<f32>::from_raw_parts_mut(
-                    out_slice.as_mut_ptr().add(out_offset),
-                    m,
-                    n,
-                    n as isize,
-                    1,
-                );
-                crate::kernels::matmul::matmul(
-                    out_mat,
-                    WAccum::Add,
-                    a_mat,
-                    b_mat,
-                    1.0,
-                    WPar::Seq,
-                );
             }
         }
     } else {
@@ -423,9 +226,6 @@ pub fn gemm<'a>(
     trans_b: bool,
     out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    accelerate::init();
-
     let m = if trans_a {
         a.shape[a.shape.len() - 1]
     } else {
@@ -448,213 +248,51 @@ pub fn gemm<'a>(
     };
     assert_eq!(k, k2, "Gemm K dim mismatch");
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-        if !trans_a && !trans_b {
-            return gemm_neon_path(a, b, c, alpha, beta, m, k, n, out_buf);
-        } else {
-            return gemm_transposed_path(a, b, c, alpha, beta, m, k, n, trans_a, trans_b, out_buf);
-        }
-    }
-
-    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-    {
-        let output_len = m * n;
-        utils::ensure_capacity(out_buf, output_len);
-        // With no C to add, the product overwrites the buffer, so it is not filled first.
-        let accum = match c {
-            Some(_) if beta == 0.0 => Accum::Replace,
-            None => Accum::Replace,
-            Some(cv) => {
-                if cv.data.len() == output_len {
-                    for i in 0..output_len {
-                        out_buf[i] = cv.data[i] * beta;
-                    }
-                } else if cv.data.len() == n {
-                    for i in 0..m {
-                        for j in 0..n {
-                            out_buf[i * n + j] = cv.data[j] * beta;
-                        }
-                    }
-                } else if cv.data.len() == m {
-                    for i in 0..m {
-                        for j in 0..n {
-                            out_buf[i * n + j] = cv.data[i] * beta;
-                        }
-                    }
-                } else if cv.data.len() == 1 {
-                    let v = cv.data[0] * beta;
-                    out_buf.fill(v);
-                } else {
-                    for i in 0..output_len {
-                        out_buf[i] = cv.data[i % cv.data.len()] * beta;
-                    }
-                }
-                Accum::Add
-            }
-        };
-
-        let rsa = if trans_a { 1 } else { k as isize };
-        let csa = if trans_a { m as isize } else { 1 };
-        let rsb = if trans_b { 1 } else { n as isize };
-        let csb = if trans_b { k as isize } else { 1 };
-        unsafe {
-            let a_mat = MatRef::<f32>::from_raw_parts(a.data.as_ptr(), m, k, rsa, csa);
-            let b_mat = MatRef::<f32>::from_raw_parts(b.data.as_ptr(), k, n, rsb, csb);
-            let out_mat =
-                MatMut::<f32>::from_raw_parts_mut(out_buf.as_mut_ptr(), m, n, n as isize, 1);
-
-            strided_matmul(out_mat, accum, a_mat, b_mat, alpha, Par::Seq);
-        }
-
-        TensorView {
-            data: Cow::Borrowed(out_buf),
-            shape: Cow::Owned(vec![m, n]),
-        }
-    }
-}
-
-/// High-performance GEMM path for non-transposed matrices via Apple Accelerate AMX
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-fn gemm_neon_path<'a>(
-    a: &TensorView<'_>,
-    b: &TensorView<'_>,
-    c: Option<&TensorView<'_>>,
-    alpha: f32,
-    beta: f32,
-    m: usize,
-    k: usize,
-    n: usize,
-    out_buf: &'a mut Vec<f32>,
-) -> TensorView<'a> {
     let output_len = m * n;
     utils::ensure_capacity(out_buf, output_len);
-
-    // Initialize output with C * beta if needed
-    let actual_beta = if let Some(cv) = c {
-        if beta == 0.0 {
-            out_buf.fill(0.0);
-            0.0
-        } else {
+    // With no C to add, the product overwrites the buffer, so it is not filled first.
+    let accum = match c {
+        Some(_) if beta == 0.0 => Accum::Replace,
+        None => Accum::Replace,
+        Some(cv) => {
             if cv.data.len() == output_len {
-                out_buf.copy_from_slice(&cv.data[..output_len]);
+                for i in 0..output_len {
+                    out_buf[i] = cv.data[i] * beta;
+                }
             } else if cv.data.len() == n {
                 for i in 0..m {
-                    out_buf[i * n..i * n + n].copy_from_slice(&cv.data[..n]);
+                    for j in 0..n {
+                        out_buf[i * n + j] = cv.data[j] * beta;
+                    }
                 }
-            } else if cv.data.len() == 1 {
-                out_buf.fill(cv.data[0]);
-            } else {
-                for i in 0..output_len {
-                    out_buf[i] = cv.data[i % cv.data.len()];
-                }
-            }
-            beta
-        }
-    } else {
-        out_buf.fill(0.0);
-        0.0
-    };
-
-    unsafe {
-        accelerate::cblas_sgemm(
-            accelerate::CBLAS_ROW_MAJOR,
-            accelerate::CBLAS_NO_TRANS,
-            accelerate::CBLAS_NO_TRANS,
-            m as i32,
-            n as i32,
-            k as i32,
-            alpha,
-            a.data.as_ptr(),
-            k as i32,
-            b.data.as_ptr(),
-            n as i32,
-            actual_beta,
-            out_buf.as_mut_ptr(),
-            n as i32,
-        );
-    }
-
-    TensorView {
-        data: Cow::Borrowed(out_buf),
-        shape: Cow::Owned(vec![m, n]),
-    }
-}
-
-/// GEMM path for transposed matrices via Apple Accelerate AMX
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-fn gemm_transposed_path<'a>(
-    a: &TensorView<'_>,
-    b: &TensorView<'_>,
-    c: Option<&TensorView<'_>>,
-    alpha: f32,
-    beta: f32,
-    m: usize,
-    k: usize,
-    n: usize,
-    trans_a: bool,
-    trans_b: bool,
-    out_buf: &'a mut Vec<f32>,
-) -> TensorView<'a> {
-    let output_len = m * n;
-    utils::ensure_capacity(out_buf, output_len);
-
-    let actual_beta = if let Some(cv) = c {
-        if beta == 0.0 {
-            out_buf.fill(0.0);
-            0.0
-        } else {
-            if cv.data.len() == output_len {
-                out_buf.copy_from_slice(&cv.data[..output_len]);
-            } else if cv.data.len() == n {
+            } else if cv.data.len() == m {
                 for i in 0..m {
-                    out_buf[i * n..i * n + n].copy_from_slice(&cv.data[..n]);
+                    for j in 0..n {
+                        out_buf[i * n + j] = cv.data[i] * beta;
+                    }
                 }
             } else if cv.data.len() == 1 {
-                out_buf.fill(cv.data[0]);
+                let v = cv.data[0] * beta;
+                out_buf.fill(v);
             } else {
                 for i in 0..output_len {
-                    out_buf[i] = cv.data[i % cv.data.len()];
+                    out_buf[i] = cv.data[i % cv.data.len()] * beta;
                 }
             }
-            beta
+            Accum::Add
         }
-    } else {
-        out_buf.fill(0.0);
-        0.0
     };
 
-    let cblas_trans_a = if trans_a {
-        accelerate::CBLAS_TRANS
-    } else {
-        accelerate::CBLAS_NO_TRANS
-    };
-    let cblas_trans_b = if trans_b {
-        accelerate::CBLAS_TRANS
-    } else {
-        accelerate::CBLAS_NO_TRANS
-    };
-    // lda: leading dimension of A in row-major order
-    let lda = if trans_a { m } else { k };
-    let ldb = if trans_b { k } else { n };
-
+    let rsa = if trans_a { 1 } else { k as isize };
+    let csa = if trans_a { m as isize } else { 1 };
+    let rsb = if trans_b { 1 } else { n as isize };
+    let csb = if trans_b { k as isize } else { 1 };
     unsafe {
-        accelerate::cblas_sgemm(
-            accelerate::CBLAS_ROW_MAJOR,
-            cblas_trans_a,
-            cblas_trans_b,
-            m as i32,
-            n as i32,
-            k as i32,
-            alpha,
-            a.data.as_ptr(),
-            lda as i32,
-            b.data.as_ptr(),
-            ldb as i32,
-            actual_beta,
-            out_buf.as_mut_ptr(),
-            n as i32,
-        );
+        let a_mat = MatRef::<f32>::from_raw_parts(a.data.as_ptr(), m, k, rsa, csa);
+        let b_mat = MatRef::<f32>::from_raw_parts(b.data.as_ptr(), k, n, rsb, csb);
+        let out_mat = MatMut::<f32>::from_raw_parts_mut(out_buf.as_mut_ptr(), m, n, n as isize, 1);
+
+        strided_matmul(out_mat, accum, a_mat, b_mat, alpha, Par::Seq);
     }
 
     TensorView {

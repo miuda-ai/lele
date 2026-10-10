@@ -204,26 +204,6 @@ fn conv1d_fused_at<'b, 'a>(
             let a_offset = b * out_channels * output_len;
             let in_offset = b * in_channels * input_len;
 
-            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-            unsafe {
-                // Use Apple Accelerate AMX for pointwise conv
-                crate::kernels::gemm::accelerate_init();
-                crate::kernels::gemm::accelerate_sgemm(
-                    out_channels as i32,
-                    output_len as i32,
-                    in_channels as i32,
-                    1.0,
-                    weights.data.as_ptr(),
-                    in_channels as i32,
-                    input.data.as_ptr().add(in_offset),
-                    output_len as i32,
-                    0.0,
-                    out_slice.as_mut_ptr().add(a_offset),
-                    output_len as i32,
-                );
-            }
-
-            #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
             unsafe {
                 let a = MatRef::<f32>::from_raw_parts(
                     weights.data.as_ptr(),

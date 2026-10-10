@@ -112,6 +112,9 @@ fn row_major(nrows: usize, ncols: usize, rs: isize, cs: isize) -> Option<usize> 
 }
 
 /// `C = alpha * A * B` (`Accum::Replace`) or `C += alpha * A * B` (`Accum::Add`).
+///
+/// On macOS (aarch64) this goes to Accelerate whenever A and B are each
+/// row- or column-major and C is row-major.
 pub fn matmul(
     dst: MatMut<f32>,
     accum: Accum,
@@ -120,7 +123,52 @@ pub fn matmul(
     alpha: f32,
     _par: Par,
 ) {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if matmul_accelerate(&dst, &accum, &a, &b, alpha) {
+        return;
+    }
     matmul_at(Level::new(), dst, accum, a, b, alpha)
+}
+
+/// The product through Accelerate, if its layouts are ones `cblas_sgemm`
+/// takes; returns whether it ran.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn matmul_accelerate(dst: &MatMut<f32>, accum: &Accum, a: &MatRef<f32>, b: &MatRef<f32>, alpha: f32) -> bool {
+    let (m, k, n) = (a.nrows, a.ncols, b.ncols);
+    assert_eq!(b.nrows, k, "matmul: inner dimensions differ");
+    assert_eq!((dst.nrows, dst.ncols), (m, n), "matmul: output shape");
+    let strides = [a.rs, a.cs, b.rs, b.cs, dst.rs, dst.cs];
+    if m == 0 || n == 0 || k == 0 || strides.iter().any(|&s| s < 0) {
+        return false;
+    }
+    // Row-major, or column-major and so transposed for BLAS.
+    let layout = |nrows, ncols, rs, cs| {
+        row_major(nrows, ncols, rs, cs)
+            .map(|ld| (false, ld))
+            .or_else(|| row_major(ncols, nrows, cs, rs).map(|ld| (true, ld)))
+    };
+    let (Some((ta, lda)), Some((tb, ldb)), Some(ldc)) = (
+        layout(m, k, a.rs, a.cs),
+        layout(k, n, b.rs, b.cs),
+        row_major(m, n, dst.rs, dst.cs),
+    ) else {
+        return false;
+    };
+    let beta = if matches!(accum, Accum::Add) { 1.0 } else { 0.0 };
+    // SAFETY: `from_raw_parts` promised every element the strides address is
+    // valid, and these are the same matrices with the same strides.
+    unsafe {
+        crate::kernels::accelerate::sgemm(
+            (ta, tb),
+            (m, n, k),
+            alpha,
+            (a.ptr, lda),
+            (b.ptr, ldb),
+            beta,
+            (dst.ptr, ldc),
+        );
+    }
+    true
 }
 
 pub(crate) fn matmul_at(
@@ -309,6 +357,53 @@ mod tests {
                             .collect();
                         assert_close(&got, &want, 1e-4, &format!("{level:?} {m}x{n}x{k} t={ta}{tb}{tc} alpha {alpha} add {add}"));
                     }
+                }
+            }
+        }
+    }
+
+    /// The public entry, which on macOS hands every layout `cblas_sgemm`
+    /// takes (row- or column-major A and B, padded rows, row-major C) to
+    /// Accelerate and the rest to the kernels here.
+    #[test]
+    fn test_public_matmul_matches_reference_for_every_layout() {
+        let mut rng = Rng::new(4);
+        for &(m, n, k) in &[(1, 1, 1), (7, 17, 5), (33, 200, 70), (4, 9, 100)] {
+            // (A transposed, B transposed, C column-major, padding after each row of A and B)
+            for (ta, tb, tc, pad) in [
+                (false, false, false, 0),
+                (true, false, false, 0),
+                (false, true, false, 0),
+                (true, true, false, 3),
+                (false, false, true, 0),
+                (false, false, false, 5),
+            ] {
+                for (alpha, add) in [(1.0, false), (-1.5, true)] {
+                    let (lda, ldb) = (if ta { m } else { k } + pad, if tb { k } else { n } + pad);
+                    let a = rng.vec(if ta { k * lda } else { m * lda }, -1.0, 1.0);
+                    let b = rng.vec(if tb { n * ldb } else { k * ldb }, -1.0, 1.0);
+                    let c0 = rng.vec(m * n, -1.0, 1.0);
+                    let sa = if ta { (1, lda as isize) } else { (lda as isize, 1) };
+                    let sb = if tb { (1, ldb as isize) } else { (ldb as isize, 1) };
+                    let sc = if tc { (1, m as isize) } else { (n as isize, 1) };
+                    let want = reference((m, n, k), &a, sa, &b, sb, &c0, sc, alpha, add);
+                    let mut c = c0.clone();
+                    unsafe {
+                        matmul(
+                            MatMut::from_raw_parts_mut(c.as_mut_ptr(), m, n, sc.0, sc.1),
+                            if add { Accum::Add } else { Accum::Replace },
+                            MatRef::from_raw_parts(a.as_ptr(), m, k, sa.0, sa.1),
+                            MatRef::from_raw_parts(b.as_ptr(), k, n, sb.0, sb.1),
+                            alpha,
+                            Par::Seq,
+                        );
+                    }
+                    let got: Vec<f32> = (0..m)
+                        .flat_map(|i| (0..n).map(move |j| (i, j)))
+                        .map(|(i, j)| c[(i as isize * sc.0 + j as isize * sc.1) as usize])
+                        .collect();
+                    let what = format!("{m}x{n}x{k} t={ta}{tb}{tc} pad {pad} alpha {alpha} add {add}");
+                    assert_close(&got, &want, 1e-4, &what);
                 }
             }
         }

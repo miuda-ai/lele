@@ -1,3 +1,5 @@
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub(crate) mod accelerate;
 pub mod activations;
 pub(crate) mod bias_act;
 pub(crate) mod binary;

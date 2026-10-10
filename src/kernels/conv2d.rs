@@ -2,90 +2,12 @@
 use crate::kernels::bias_act::bias_act_inplace;
 use crate::kernels::timing;
 use crate::kernels::utils;
-#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul as strided_matmul};
 use crate::kernels::window2d::{self, Window};
 use crate::kernels::simd::simd_call;
 use crate::tensor::TensorView;
 use fearless_simd::{Level, Simd, f32x16};
 use fearless_simd_macros::simd;
-
-// Apple Accelerate framework bindings for AMX-accelerated GEMM on macOS aarch64
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-mod accelerate {
-    pub const CBLAS_ROW_MAJOR: i32 = 101;
-    pub const CBLAS_NO_TRANS: i32 = 111;
-    pub const CBLAS_TRANS: i32 = 112;
-
-    unsafe extern "C" {
-        pub fn cblas_sgemm(
-            order: i32,
-            trans_a: i32,
-            trans_b: i32,
-            m: i32,
-            n: i32,
-            k: i32,
-            alpha: f32,
-            a: *const f32,
-            lda: i32,
-            b: *const f32,
-            ldb: i32,
-            beta: f32,
-            c: *mut f32,
-            ldc: i32,
-        );
-    }
-}
-
-/// Thin wrapper: C = A * B (row-major, no-transpose, no bias accumulation)
-/// A: [M, K], B: [K, N], C: [M, N]
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-#[inline(always)]
-unsafe fn accel_sgemm(m: usize, n: usize, k: usize, a: *const f32, b: *const f32, c: *mut f32) {
-    unsafe {
-        accelerate::cblas_sgemm(
-            accelerate::CBLAS_ROW_MAJOR,
-            accelerate::CBLAS_NO_TRANS,
-            accelerate::CBLAS_NO_TRANS,
-            m as i32,
-            n as i32,
-            k as i32,
-            1.0_f32,
-            a,
-            k as i32,
-            b,
-            n as i32,
-            0.0_f32,
-            c,
-            n as i32,
-        );
-    }
-}
-
-/// C = A^T * B (row-major, A transposed).
-/// A stored as [k, m] row-major, B as [k, n], C as [m, n].
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-#[inline(always)]
-unsafe fn accel_sgemm_ta(m: usize, n: usize, k: usize, a: *const f32, b: *const f32, c: *mut f32) {
-    unsafe {
-        accelerate::cblas_sgemm(
-            accelerate::CBLAS_ROW_MAJOR,
-            accelerate::CBLAS_TRANS,
-            accelerate::CBLAS_NO_TRANS,
-            m as i32,
-            n as i32,
-            k as i32,
-            1.0_f32,
-            a,
-            m as i32, // lda = number of cols in A as stored in memory (A stored as [k, m])
-            b,
-            n as i32,
-            0.0_f32,
-            c,
-            n as i32,
-        );
-    }
-}
 
 /// 2D Convolution using im2col + GEMM approach.
 /// Input shape: [N, C_in, H, W]
@@ -323,35 +245,23 @@ fn conv2d_activation<'b, 'a>(
                 let w_ptr = weight_data.as_ptr();
                 let in_ptr = input_data.as_ptr().add(in_offset);
                 let out_ptr = out.as_mut_ptr().add(o_offset);
-
-                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-                accel_sgemm(out_channels, spatial, in_channels, w_ptr, in_ptr, out_ptr);
-
-                #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-                {
-                    let w_mat = MatRef::<f32>::from_raw_parts(
-                        w_ptr,
-                        out_channels,
-                        in_channels,
-                        in_channels as isize,
-                        1,
-                    );
-                    let in_mat = MatRef::<f32>::from_raw_parts(
-                        in_ptr,
-                        in_channels,
-                        spatial,
-                        spatial as isize,
-                        1,
-                    );
-                    let out_mat = MatMut::<f32>::from_raw_parts_mut(
-                        out_ptr,
-                        out_channels,
-                        spatial,
-                        spatial as isize,
-                        1,
-                    );
-                    strided_matmul(out_mat, Accum::Replace, w_mat, in_mat, 1.0, Par::Seq);
-                }
+                let w_mat = MatRef::<f32>::from_raw_parts(
+                    w_ptr,
+                    out_channels,
+                    in_channels,
+                    in_channels as isize,
+                    1,
+                );
+                let in_mat =
+                    MatRef::<f32>::from_raw_parts(in_ptr, in_channels, spatial, spatial as isize, 1);
+                let out_mat = MatMut::<f32>::from_raw_parts_mut(
+                    out_ptr,
+                    out_channels,
+                    spatial,
+                    spatial as isize,
+                    1,
+                );
+                strided_matmul(out_mat, Accum::Replace, w_mat, in_mat, 1.0, Par::Seq);
             }
 
             // Apply bias and optional activation
@@ -450,45 +360,31 @@ fn conv2d_activation<'b, 'a>(
                     let w_ptr = weight_data.as_ptr().add(w_offset);
                     let col_ptr = col_buf.as_ptr();
                     let out_ptr = out.as_mut_ptr().add(o_offset);
-
-                    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-                    accel_sgemm(
+                    // Weight: [out_channels_per_group, col_rows] row-major
+                    let w_mat = MatRef::<f32>::from_raw_parts(
+                        w_ptr,
+                        out_channels_per_group,
+                        col_rows,
+                        col_rows as isize,
+                        1,
+                    );
+                    // Col: [col_rows, col_cols] row-major
+                    let col_mat = MatRef::<f32>::from_raw_parts(
+                        col_ptr,
+                        col_rows,
+                        col_cols,
+                        col_cols as isize,
+                        1,
+                    );
+                    // Out: [out_channels_per_group, col_cols] row-major
+                    let out_mat = MatMut::<f32>::from_raw_parts_mut(
+                        out_ptr,
                         out_channels_per_group,
                         col_cols,
-                        col_rows,
-                        w_ptr,
-                        col_ptr,
-                        out_ptr,
+                        col_cols as isize,
+                        1,
                     );
-
-                    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-                    {
-                        // Weight: [out_channels_per_group, col_rows] row-major
-                        let w_mat = MatRef::<f32>::from_raw_parts(
-                            w_ptr,
-                            out_channels_per_group,
-                            col_rows,
-                            col_rows as isize,
-                            1,
-                        );
-                        // Col: [col_rows, col_cols] row-major
-                        let col_mat = MatRef::<f32>::from_raw_parts(
-                            col_ptr,
-                            col_rows,
-                            col_cols,
-                            col_cols as isize,
-                            1,
-                        );
-                        // Out: [out_channels_per_group, col_cols] row-major
-                        let out_mat = MatMut::<f32>::from_raw_parts_mut(
-                            out_ptr,
-                            out_channels_per_group,
-                            col_cols,
-                            col_cols as isize,
-                            1,
-                        );
-                        strided_matmul(out_mat, Accum::Replace, w_mat, col_mat, 1.0, Par::Seq);
-                    }
+                    strided_matmul(out_mat, Accum::Replace, w_mat, col_mat, 1.0, Par::Seq);
                 }
 
                 // Apply bias and optional activation
@@ -1262,11 +1158,6 @@ fn conv_transpose_gemm(
                 let x = &input[(n * s.in_channels + g * icg) * hw..][..icg * hw];
                 let w = &weights[g * icg * col_rows..][..icg * col_rows];
                 // `w` is `[icg, col_rows]`, so `col = w^T * x`.
-                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-                unsafe {
-                    accel_sgemm_ta(col_rows, hw, icg, w.as_ptr(), x.as_ptr(), col.as_mut_ptr());
-                }
-                #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
                 unsafe {
                     let w_t = MatRef::<f32>::from_raw_parts(w.as_ptr(), col_rows, icg, 1, col_rows as isize);
                     let x = MatRef::<f32>::from_raw_parts(x.as_ptr(), icg, hw, hw as isize, 1);
