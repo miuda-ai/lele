@@ -86,6 +86,8 @@ pub struct DecodeStep<'a> {
     #[cfg(target_arch = "aarch64")]
     prepared_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::PreparedWeightsArm>>>,
     quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QuantizedWeights>)>>,
+    qweights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize, bool), (std::vec::Vec<f32>, std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,
+    conv_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, bool), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::ConvWeights>)>>,
 }
 
 impl<'a> DecodeStep<'a> {
@@ -96,6 +98,8 @@ impl<'a> DecodeStep<'a> {
             #[cfg(target_arch = "aarch64")]
             prepared_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             quantized_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            qweights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            conv_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 fn conv1d_relu<'c, 'd>(
@@ -161,6 +165,13 @@ fn linear_quantized_relu<'c, 'd>(
     )
 }
 
+/// Zero point of a weight for the ARM kernels, which take u8 codes: `get_prepared_weight`
+/// shifts i8 weights by 128, so their zero point moves with them.
+#[cfg(target_arch = "aarch64")]
+fn arm_zero_point(z: f32, signed: bool) -> u8 {
+    if signed { (z as i32 + 128) as u8 } else { z as u8 }
+}
+
 #[cfg(target_arch = "aarch64")]
 fn linear_quantized_arm<'c, 'd>(
     &self,
@@ -169,13 +180,14 @@ fn linear_quantized_arm<'c, 'd>(
     weight_len: usize,
     weight_k: usize,
     weight_n: usize,
+    weight_signed: bool,
     weight_scale: lele::tensor::TensorView<'c, f32>,
     weight_zero: lele::tensor::TensorView<'c, f32>,
     bias: lele::tensor::TensorView<'c, f32>,
     output_buf: &'d mut Vec<f32>,
 ) -> lele::tensor::TensorView<'d, f32> {
-    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n);
-    let zp_b = weight_zero.data.first().map(|&v| v as u8);
+    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n, weight_signed);
+    let zp_b = Some(Self::arm_zero_point(weight_zero.data.first().copied().unwrap_or(0.0), weight_signed));
 
     lele::kernels::fused_dq_gemm_prepared_arm(
         input,
@@ -199,13 +211,14 @@ fn linear_quantized_relu_arm<'c, 'd>(
     weight_len: usize,
     weight_k: usize,
     weight_n: usize,
+    weight_signed: bool,
     weight_scale: lele::tensor::TensorView<'c, f32>,
     weight_zero: lele::tensor::TensorView<'c, f32>,
     bias: lele::tensor::TensorView<'c, f32>,
     output_buf: &'d mut Vec<f32>,
 ) -> lele::tensor::TensorView<'d, f32> {
-    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n);
-    let zp_b = weight_zero.data.first().map(|&v| v as u8);
+    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n, weight_signed);
+    let zp_b = Some(Self::arm_zero_point(weight_zero.data.first().copied().unwrap_or(0.0), weight_signed));
 
     lele::kernels::fused_dq_gemm_prepared_arm(
         input,
@@ -229,15 +242,81 @@ fn mat_mul_integer_arm<'c, 'd>(
     weight_len: usize,
     weight_k: usize,
     weight_n: usize,
+    weight_signed: bool,
     a_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
     b_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
     output_buf: &'d mut Vec<f32>,
 ) -> lele::tensor::TensorView<'d, f32> {
-    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n);
+    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n, weight_signed);
     let zp_a = a_zero_point.and_then(|z| z.data.first().cloned());
-    let zp_b = b_zero_point.and_then(|z| z.data.first()).map(|&v| v as u8);
+    let zb = b_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0);
+    let zp_b = Some(Self::arm_zero_point(zb, weight_signed));
 
     lele::kernels::mat_mul_integer_prepared_arm(a, &pw, zp_a, zp_b, None, None, false, output_buf)
+}
+
+/// Dynamically quantized linear layer (+ ReLU) against an int8 weight packed
+/// once for the integer GEMM.
+#[cfg(not(target_arch = "aarch64"))]
+fn linear_quantized_packed<'c, 'd>(
+    &self,
+    input: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_k: usize,
+    weight_n: usize,
+    weight_signed: bool,
+    weight_scale: lele::tensor::TensorView<'c, f32>,
+    weight_zero: lele::tensor::TensorView<'c, f32>,
+    bias: lele::tensor::TensorView<'c, f32>,
+    relu: bool,
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let w = self.get_qweights(weight_offset, weight_len, weight_k, weight_n, weight_signed, &weight_zero.data, &weight_scale.data);
+    let bias = (!bias.data.is_empty()).then_some(&bias.data[..]);
+    lele::kernels::qlinear_dynamic(input, &w, bias, relu, output_buf)
+}
+
+/// MatMulInteger against a static weight packed once for the integer GEMM.
+#[cfg(not(target_arch = "aarch64"))]
+fn mat_mul_integer_packed<'c, 'd>(
+    &self,
+    a: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_k: usize,
+    weight_n: usize,
+    weight_signed: bool,
+    a_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    b_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let zb = b_zero_point.map_or(&[0.0f32][..], |z| &z.data[..]);
+    let w = self.get_qweights(weight_offset, weight_len, weight_k, weight_n, weight_signed, zb, &[1.0]);
+    let za = a_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0) as i32;
+    lele::kernels::mat_mul_integer_qweights(a, za, &w, output_buf)
+}
+
+/// ConvInteger against a static weight prepared once.
+fn conv_integer_packed<'c, 'd>(
+    &self,
+    x: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_shape: [usize; 4],
+    weight_signed: bool,
+    group: i64,
+    x_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    w_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    dilations: &[i64],
+    pads: &[i64],
+    strides: &[i64],
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let zw = w_zero_point.filter(|z| !z.data.is_empty()).map_or(&[0.0f32][..], |z| &z.data[..]);
+    let w = self.get_conv_weights(weight_offset, weight_len, weight_shape, group as usize, weight_signed, zw);
+    let zx = x_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0) as i32;
+    lele::kernels::conv_integer_packed(x, &w, zx, dilations, pads, strides, output_buf)
 }
 
 // Helper for pre-quantized inputs (used in attention where input is already quantized)
@@ -1391,7 +1470,7 @@ fn embedding_concat_i64<'c, 'd>(
         let _rotary_emb_3_Shape_1_output_0 = lele::kernels::shape(&_rotary_emb_3_Tile_1_output_0);
         let mut buf__rotary_emb_3_Slice_1_output_0 = Vec::<i64>::new();
         let _rotary_emb_3_Slice_1_output_0 = lele::kernels::slice(&_rotary_emb_3_Shape_1_output_0, &[0], &[2], &[0], &[], &mut buf__rotary_emb_3_Slice_1_output_0);
-        (unsafe { _Add_30_output_0.detach_or_own() }, _Cast_43_output_0.to_owned(), _Cast_48_output_0.to_owned(), _Cast_50_output_0.to_owned(), _Cast_54_output_0.to_owned(), _Cast_56_output_0.to_owned(), _Cast_60_output_0.to_owned(), _Cast_62_output_0.to_owned(), unsafe { _Concat_16_output_0.detach_or_own() }, unsafe { _Concat_17_output_0.detach_or_own() }, unsafe { _Concat_27_output_0.detach_or_own() }, unsafe { _Concat_28_output_0.detach_or_own() }, unsafe { _Reshape_28_output_0.detach_or_own() }, unsafe { _Reshape_29_output_0.detach_or_own() }, unsafe { _Reshape_30_output_0.detach_or_own() }, unsafe { _Split_3_output_0.detach_or_own() }, unsafe { _Split_3_output_1.detach_or_own() }, unsafe { _Split_3_output_2.detach_or_own() }, unsafe { _ln_1_3_LayerNormalization_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Cast_1_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Reshape_output_0.detach_or_own() }, _rotary_emb_3_Slice_1_output_0.to_owned(), unsafe { _rotary_emb_3_Tile_1_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Tile_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Unsqueeze_1_output_0.detach_or_own() })
+        (unsafe { _Add_30_output_0.detach_or_own() }, _Cast_43_output_0.to_owned(), _Cast_48_output_0.to_owned(), _Cast_50_output_0.to_owned(), _Cast_54_output_0.to_owned(), _Cast_56_output_0.to_owned(), _Cast_60_output_0.to_owned(), _Cast_62_output_0.to_owned(), unsafe { _Concat_16_output_0.detach_or_own() }, unsafe { _Concat_17_output_0.detach_or_own() }, unsafe { _Concat_27_output_0.detach_or_own() }, unsafe { _Concat_28_output_0.detach_or_own() }, _Reshape_28_output_0.to_owned(), _Reshape_29_output_0.to_owned(), _Reshape_30_output_0.to_owned(), _Split_3_output_0.to_owned(), _Split_3_output_1.to_owned(), _Split_3_output_2.to_owned(), unsafe { _ln_1_3_LayerNormalization_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Cast_1_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Reshape_output_0.detach_or_own() }, _rotary_emb_3_Slice_1_output_0.to_owned(), unsafe { _rotary_emb_3_Tile_1_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Tile_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Unsqueeze_1_output_0.detach_or_own() })
     }
 
 
@@ -2321,7 +2400,7 @@ fn embedding_concat_i64<'c, 'd>(
         let _Shape_113_output_0 = lele::kernels::shape(&_Split_8_output_0);
         let mut buf__Gather_98_output_0 = Vec::<i64>::new();
         let _Gather_98_output_0 = lele::kernels::gather(&_Shape_113_output_0, &self.weight_i64(440813632, 8, &[]), 0, &mut buf__Gather_98_output_0);
-        (unsafe { _Add_55_output_0.detach_or_own() }, _Cast_43_output_0.to_owned(), _Cast_74_output_0.to_owned(), _Cast_78_output_0.to_owned(), _Cast_80_output_0.to_owned(), _Cast_84_output_0.to_owned(), _Cast_86_output_0.to_owned(), _Cast_90_output_0.to_owned(), unsafe { _Concat_71_output_0.detach_or_own() }, unsafe { _Concat_72_output_0.detach_or_own() }, unsafe { _Concat_82_output_0.detach_or_own() }, unsafe { _Concat_83_output_0.detach_or_own() }, _Gather_97_output_0.to_owned(), _Gather_98_output_0.to_owned(), unsafe { _Split_8_output_0.detach_or_own() }, unsafe { _Split_8_output_1.detach_or_own() }, unsafe { _Split_8_output_2.detach_or_own() }, unsafe { _ln_1_8_LayerNormalization_output_0.detach_or_own() })
+        (unsafe { _Add_55_output_0.detach_or_own() }, _Cast_43_output_0.to_owned(), _Cast_74_output_0.to_owned(), _Cast_78_output_0.to_owned(), _Cast_80_output_0.to_owned(), _Cast_84_output_0.to_owned(), _Cast_86_output_0.to_owned(), _Cast_90_output_0.to_owned(), unsafe { _Concat_71_output_0.detach_or_own() }, unsafe { _Concat_72_output_0.detach_or_own() }, unsafe { _Concat_82_output_0.detach_or_own() }, unsafe { _Concat_83_output_0.detach_or_own() }, _Gather_97_output_0.to_owned(), _Gather_98_output_0.to_owned(), _Split_8_output_0.to_owned(), _Split_8_output_1.to_owned(), _Split_8_output_2.to_owned(), unsafe { _ln_1_8_LayerNormalization_output_0.detach_or_own() })
     }
 
 
@@ -2787,7 +2866,7 @@ fn embedding_concat_i64<'c, 'd>(
         let _rotary_emb_10_Unsqueeze_3_output_0 = lele::kernels::unsqueeze(&_rotary_emb_10_Reshape_1_output_0, &[2]);
         let _rotary_emb_10_Cast_2_output_0 = _rotary_emb_10_Unsqueeze_3_output_0.clone(); // Cast f32->f32 is no-op
         let _Mul_66_output_0 = lele::kernels::mul(&_Reshape_91_output_0, &_rotary_emb_10_Cast_1_output_0, &mut ws.buf_4);
-        (unsafe { _Add_65_output_0.detach_or_own() }, _Cast_102_output_0.to_owned(), _Cast_104_output_0.to_owned(), _Cast_43_output_0.to_owned(), _Cast_90_output_0.to_owned(), _Cast_92_output_0.to_owned(), _Cast_96_output_0.to_owned(), _Cast_98_output_0.to_owned(), unsafe { _Concat_104_output_0.detach_or_own() }, unsafe { _Concat_105_output_0.detach_or_own() }, unsafe { _Concat_93_output_0.detach_or_own() }, unsafe { _Concat_94_output_0.detach_or_own() }, unsafe { _Mul_66_output_0.detach_or_own() }, unsafe { _Reshape_91_output_0.detach_or_own() }, unsafe { _Reshape_92_output_0.detach_or_own() }, unsafe { _Reshape_93_output_0.detach_or_own() }, unsafe { _Split_10_output_0.detach_or_own() }, unsafe { _Split_10_output_1.detach_or_own() }, unsafe { _Split_10_output_2.detach_or_own() }, unsafe { _ln_1_10_LayerNormalization_output_0.detach_or_own() }, unsafe { _rotary_emb_10_Cast_1_output_0.detach_or_own() }, unsafe { _rotary_emb_10_Cast_2_output_0.detach_or_own() }, unsafe { _rotary_emb_10_Reshape_1_output_0.detach_or_own() }, unsafe { _rotary_emb_10_Reshape_output_0.detach_or_own() }, unsafe { _rotary_emb_10_Tile_1_output_0.detach_or_own() }, unsafe { _rotary_emb_10_Tile_output_0.detach_or_own() }, unsafe { _rotary_emb_10_Unsqueeze_1_output_0.detach_or_own() }, unsafe { _rotary_emb_10_Unsqueeze_3_output_0.detach_or_own() })
+        (unsafe { _Add_65_output_0.detach_or_own() }, _Cast_102_output_0.to_owned(), _Cast_104_output_0.to_owned(), _Cast_43_output_0.to_owned(), _Cast_90_output_0.to_owned(), _Cast_92_output_0.to_owned(), _Cast_96_output_0.to_owned(), _Cast_98_output_0.to_owned(), unsafe { _Concat_104_output_0.detach_or_own() }, unsafe { _Concat_105_output_0.detach_or_own() }, unsafe { _Concat_93_output_0.detach_or_own() }, unsafe { _Concat_94_output_0.detach_or_own() }, unsafe { _Mul_66_output_0.detach_or_own() }, _Reshape_91_output_0.to_owned(), _Reshape_92_output_0.to_owned(), _Reshape_93_output_0.to_owned(), _Split_10_output_0.to_owned(), _Split_10_output_1.to_owned(), _Split_10_output_2.to_owned(), unsafe { _ln_1_10_LayerNormalization_output_0.detach_or_own() }, unsafe { _rotary_emb_10_Cast_1_output_0.detach_or_own() }, unsafe { _rotary_emb_10_Cast_2_output_0.detach_or_own() }, unsafe { _rotary_emb_10_Reshape_1_output_0.detach_or_own() }, unsafe { _rotary_emb_10_Reshape_output_0.detach_or_own() }, unsafe { _rotary_emb_10_Tile_1_output_0.detach_or_own() }, unsafe { _rotary_emb_10_Tile_output_0.detach_or_own() }, unsafe { _rotary_emb_10_Unsqueeze_1_output_0.detach_or_own() }, unsafe { _rotary_emb_10_Unsqueeze_3_output_0.detach_or_own() })
     }
 
 
@@ -3133,7 +3212,7 @@ fn embedding_concat_i64<'c, 'd>(
 
 
     #[cfg(target_arch = "aarch64")]
-    fn get_prepared_weight(&self, offset: usize, len: usize, k: usize, n: usize) -> std::sync::Arc<lele::kernels::PreparedWeightsArm> {
+    fn get_prepared_weight(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool) -> std::sync::Arc<lele::kernels::PreparedWeightsArm> {
         let key = (offset, len);
         {
             let cache = self.prepared_weights_cache.borrow();
@@ -3142,6 +3221,9 @@ fn embedding_concat_i64<'c, 'd>(
             }
         }
         let raw_bytes = &self.data[offset..offset+len];
+        // The ARM kernels take u8 codes: i8 ones are shifted by 128 (their zero point too, see `arm_zero_point`), which leaves `b - zero_point` unchanged.
+        let shifted: Vec<u8>;
+        let raw_bytes = if signed { shifted = raw_bytes.iter().map(|b| b ^ 0x80).collect(); &shifted[..] } else { raw_bytes };
         let pw = std::sync::Arc::new(lele::kernels::prepare_weights_arm(raw_bytes, k, n));
         self.prepared_weights_cache.borrow_mut().insert(key, pw.clone());
         pw
@@ -3161,6 +3243,32 @@ fn embedding_concat_i64<'c, 'd>(
         let qw = std::sync::Arc::new(lele::kernels::prepare_quantized_weights(raw, k, n, &scale.data));
         self.quantized_weights_cache.borrow_mut().insert(key, (scale.data.to_vec(), qw.clone()));
         qw
+    }
+    #[allow(dead_code)]
+    fn get_qweights(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool, zero_point: &[f32], scale: &[f32]) -> std::sync::Arc<lele::kernels::QWeights> {
+        let key = (offset, len, k, n, signed);
+        if let Some((z, s, w)) = self.qweights_cache.borrow().get(&key) {
+            if z.as_slice() == zero_point && s.as_slice() == scale {
+                return w.clone();
+            }
+        }
+        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();
+        let w = std::sync::Arc::new(lele::kernels::QWeights::new(&self.data[offset..offset + len], k, n, signed, &zp, scale));
+        self.qweights_cache.borrow_mut().insert(key, (zero_point.to_vec(), scale.to_vec(), w.clone()));
+        w
+    }
+    #[allow(dead_code)]
+    fn get_conv_weights(&self, offset: usize, len: usize, shape: [usize; 4], groups: usize, signed: bool, zero_point: &[f32]) -> std::sync::Arc<lele::kernels::ConvWeights> {
+        let key = (offset, len, groups, signed);
+        if let Some((z, w)) = self.conv_weights_cache.borrow().get(&key) {
+            if z.as_slice() == zero_point {
+                return w.clone();
+            }
+        }
+        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();
+        let w = std::sync::Arc::new(lele::kernels::ConvWeights::new(&self.data[offset..offset + len], &shape, groups, signed, &zp));
+        self.conv_weights_cache.borrow_mut().insert(key, (zero_point.to_vec(), w.clone()));
+        w
     }
     pub fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {
         TensorView::from_bytes_f32(&self.data[offset..offset+len], shape)
