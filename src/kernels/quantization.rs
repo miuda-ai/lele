@@ -1,4 +1,7 @@
+use crate::kernels::simd::simd_call;
 use crate::tensor::TensorView;
+use fearless_simd::{Level, Simd, f32x8};
+use fearless_simd_macros::simd;
 
 // Re-export ARM prepared weights
 #[cfg(target_arch = "aarch64")]
@@ -516,6 +519,9 @@ pub fn prepare_weights_arm_from_i8(b_i8_bytes: &[u8], k: usize, n: usize) -> Pre
     prepare_weights_arm(b_i8_bytes, k, n)
 }
 
+/// ONNX `DynamicQuantizeLinear`: `x` quantized to `u8` over its own range (widened to
+/// include zero), with the scale and zero point it picked. The codes are the same ones the
+/// fused path ([`crate::kernels::qgemm::qlinear_dynamic`]) multiplies with.
 pub fn dynamic_quantize_linear<'a, 'b>(
     x: &TensorView<'b, f32>,
     out_y_storage: &'a mut Vec<f32>,
@@ -526,164 +532,64 @@ pub fn dynamic_quantize_linear<'a, 'b>(
     TensorView<'a, f32>,
     TensorView<'a, f32>,
 ) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::kernels::neon::quantization::dynamic_quantize_linear(
-            x,
-            out_y_storage,
-            out_scale,
-            out_zp,
-        )
+    let (scale, zero_point) = crate::kernels::qgemm::dynamic_quant_params(&x.data);
+    out_scale.clear();
+    out_scale.push(scale);
+    out_zp.clear();
+    out_zp.push(zero_point as f32);
+    let p = PerTensor { scale, zero_point: zero_point as f32, qmin: 0.0, qmax: 255.0, round_trip: false };
+    quantize_per_tensor(Level::new(), &p, &x.data, out_y_storage);
+    (
+        TensorView::from_slice(out_y_storage, x.shape.to_vec()),
+        TensorView::from_slice(out_scale, vec![1]),
+        TensorView::from_slice(out_zp, vec![1]),
+    )
+}
+
+/// `QuantizeLinear` with one scale and zero point for the whole tensor
+/// (`clamp(round_ties_even(x / scale) + zero_point, qmin, qmax)`), or with `round_trip` the
+/// `DequantizeLinear` after it as well (`(q - zero_point) * scale`).
+#[derive(Clone, Copy)]
+pub(crate) struct PerTensor {
+    pub scale: f32,
+    pub zero_point: f32,
+    pub qmin: f32,
+    pub qmax: f32,
+    pub round_trip: bool,
+}
+
+impl PerTensor {
+    #[inline(always)]
+    fn apply(&self, x: f32) -> f32 {
+        let q = ((x / self.scale).round_ties_even() + self.zero_point).clamp(self.qmin, self.qmax);
+        if self.round_trip { (q - self.zero_point) * self.scale } else { q }
     }
-    #[cfg(target_arch = "x86_64")]
-    {
-        unsafe {
-            crate::kernels::avx::quantization::dynamic_quantize_linear_avx2(
-                x,
-                out_y_storage,
-                out_scale,
-                out_zp,
-            )
-        }
+}
+
+/// Writes `p` applied to each element of `src` to `out` (resized to fit). The vectors do
+/// the scalar definition's operations in its order (an exact division, not a reciprocal),
+/// so every element matches it.
+pub(crate) fn quantize_per_tensor(level: Level, p: &PerTensor, src: &[f32], out: &mut Vec<f32>) {
+    // Every element is written, so the buffer is not filled first: workspace buffers
+    // alternate between tensor sizes, and zeroing them was 4-5% of Smart Turn.
+    crate::kernels::utils::ensure_capacity(out, src.len());
+    simd_call!(level, quantize_per_tensor_simd(p, src, out))
+}
+
+#[simd]
+fn quantize_per_tensor_simd<S: Simd>(simd: S, p: &PerTensor, src: &[f32], dst: &mut [f32]) {
+    use fearless_simd::prelude::*;
+    let (scale, zp) = (f32x8::splat(simd, p.scale), f32x8::splat(simd, p.zero_point));
+    let (lo, hi) = (f32x8::splat(simd, p.qmin), f32x8::splat(simd, p.qmax));
+    let (src_chunks, src_rest) = src.as_chunks::<8>();
+    let (dst_chunks, dst_rest) = dst.as_chunks_mut::<8>();
+    for (x, y) in src_chunks.iter().zip(dst_chunks) {
+        let q = ((f32x8::from_slice(simd, x) / scale).round_ties_even() + zp).max(lo).min(hi);
+        let r = if p.round_trip { (q - zp) * scale } else { q };
+        r.store_slice(y);
     }
-    #[cfg(target_arch = "wasm32")]
-    {
-        use std::arch::wasm32::*;
-        let len = x.data.len();
-        let ptr = x.data.as_ptr();
-
-        // Phase 1: SIMD min/max scan
-        let mut min_v = f32x4_splat(f32::MAX);
-        let mut max_v = f32x4_splat(f32::MIN);
-        let mut i = 0usize;
-        unsafe {
-            while i + 16 <= len {
-                let v0 = v128_load(ptr.add(i) as *const v128);
-                let v1 = v128_load(ptr.add(i + 4) as *const v128);
-                let v2 = v128_load(ptr.add(i + 8) as *const v128);
-                let v3 = v128_load(ptr.add(i + 12) as *const v128);
-                min_v = f32x4_min(min_v, f32x4_min(v0, f32x4_min(v1, f32x4_min(v2, v3))));
-                max_v = f32x4_max(max_v, f32x4_max(v0, f32x4_max(v1, f32x4_max(v2, v3))));
-                i += 16;
-            }
-            while i + 4 <= len {
-                let v = v128_load(ptr.add(i) as *const v128);
-                min_v = f32x4_min(min_v, v);
-                max_v = f32x4_max(max_v, v);
-                i += 4;
-            }
-        }
-        // Horizontal reduce
-        let mut min_val = f32x4_extract_lane::<0>(min_v)
-            .min(f32x4_extract_lane::<1>(min_v))
-            .min(f32x4_extract_lane::<2>(min_v))
-            .min(f32x4_extract_lane::<3>(min_v));
-        let mut max_val = f32x4_extract_lane::<0>(max_v)
-            .max(f32x4_extract_lane::<1>(max_v))
-            .max(f32x4_extract_lane::<2>(max_v))
-            .max(f32x4_extract_lane::<3>(max_v));
-        // Handle remainder
-        for j in i..len {
-            let v = x.data[j];
-            if v < min_val {
-                min_val = v;
-            }
-            if v > max_val {
-                max_val = v;
-            }
-        }
-
-        let adjusted_max = max_val.max(0.0);
-        let adjusted_min = min_val.min(0.0);
-        let range = (adjusted_max - adjusted_min).max(1e-5);
-        let scale = range / 255.0;
-        let zp = (-adjusted_min / scale).round().clamp(0.0, 255.0);
-        let inv_scale = 1.0 / scale;
-
-        out_scale.clear();
-        out_scale.push(scale);
-        out_zp.clear();
-        out_zp.push(zp);
-
-        // Phase 2: SIMD vectorized quantization
-        out_y_storage.clear();
-        out_y_storage.resize(len, 0.0);
-        let dst = out_y_storage.as_mut_ptr();
-        let inv_scale_v = f32x4_splat(inv_scale);
-        let zp_v = f32x4_splat(zp);
-        let zero_v = f32x4_splat(0.0);
-        let max255_v = f32x4_splat(255.0);
-        let half_v = f32x4_splat(0.5);
-        let mut i = 0usize;
-        unsafe {
-            while i + 4 <= len {
-                let v = v128_load(ptr.add(i) as *const v128);
-                // round via floor(x + 0.5) to match .round() semantics
-                let q = f32x4_floor(f32x4_add(
-                    f32x4_add(f32x4_mul(v, inv_scale_v), zp_v),
-                    half_v,
-                ));
-                let q = f32x4_max(f32x4_min(q, max255_v), zero_v);
-                v128_store(dst.add(i) as *mut v128, q);
-                i += 4;
-            }
-        }
-        for j in i..len {
-            out_y_storage[j] = (x.data[j] * inv_scale + zp).round().clamp(0.0, 255.0);
-        }
-
-        return (
-            TensorView::from_slice(out_y_storage, x.shape.to_vec()),
-            TensorView::from_slice(out_scale, vec![1]),
-            TensorView::from_slice(out_zp, vec![1]),
-        );
-    }
-
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        target_arch = "x86_64",
-        target_arch = "wasm32"
-    )))]
-    {
-        let len = x.data.len();
-
-        let mut min_val = f32::MAX;
-        let mut max_val = f32::MIN;
-        for &v in x.data.iter() {
-            if v < min_val {
-                min_val = v;
-            }
-            if v > max_val {
-                max_val = v;
-            }
-        }
-
-        let adjusted_max = max_val.max(0.0);
-        let adjusted_min = min_val.min(0.0);
-        let range = (adjusted_max - adjusted_min).max(1e-5);
-        let scale = range / 255.0;
-        let zp = (-adjusted_min / scale).round().clamp(0.0, 255.0);
-        let inv_scale = 1.0 / scale;
-
-        out_scale.clear();
-        out_scale.push(scale);
-
-        out_zp.clear();
-        out_zp.push(zp);
-
-        // Calculate and write directly to output
-        out_y_storage.clear();
-        out_y_storage.reserve(len);
-        for i in 0..len {
-            let q = (x.data[i] * inv_scale + zp).round().clamp(0.0, 255.0);
-            out_y_storage.push(q);
-        }
-
-        (
-            TensorView::from_slice(out_y_storage, x.shape.to_vec()),
-            TensorView::from_slice(out_scale, vec![1]),
-            TensorView::from_slice(out_zp, vec![1]),
-        )
+    for (x, y) in src_rest.iter().zip(dst_rest) {
+        *y = p.apply(*x);
     }
 }
 
@@ -839,16 +745,35 @@ pub fn quantize_linear<'a>(
     qmax: f32,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
-    qdq_apply(
-        x,
-        y_scale,
-        y_zero_point,
-        axis,
-        block_size,
-        out,
-        |v, s, z| ((v / s).round_ties_even() + z).clamp(qmin, qmax),
-    );
+    if let Some(p) = per_tensor(x, y_scale, y_zero_point, axis, block_size, qmin, qmax, false) {
+        quantize_per_tensor(Level::new(), &p, &x.data, out);
+    } else {
+        qdq_apply(x, y_scale, y_zero_point, axis, block_size, out, |v, s, z| {
+            ((v / s).round_ties_even() + z).clamp(qmin, qmax)
+        });
+    }
     TensorView::from_slice(out.as_slice(), x.shape.to_vec())
+}
+
+/// The parameters as one [`PerTensor`], when they are per tensor.
+fn per_tensor(
+    x: &TensorView<'_, f32>,
+    scale: &TensorView<'_, f32>,
+    zero_point: Option<&TensorView<'_, f32>>,
+    axis: i64,
+    block_size: usize,
+    qmin: f32,
+    qmax: f32,
+    round_trip: bool,
+) -> Option<PerTensor> {
+    let layout = qparam_layout(&x.shape, scale.data.len(), scale.shape.len(), axis, block_size);
+    matches!(layout, QParamLayout::PerTensor).then(|| PerTensor {
+        scale: scale.data.first().copied().unwrap_or(1.0),
+        zero_point: zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0),
+        qmin,
+        qmax,
+        round_trip,
+    })
 }
 
 /// ONNX `DequantizeLinear`: `y = (x - zero_point) * scale`.
@@ -875,10 +800,10 @@ pub fn dequantize_linear<'a>(
 /// bit-identical result while halving the memory traffic and removing the
 /// intermediate buffer.
 ///
-/// A per-tensor scale — what activation quantization almost always uses — takes
-/// a division-free SIMD path; see
-/// [`fake_quantize_per_tensor_avx2`](crate::kernels::avx::quantization::fake_quantize_per_tensor_avx2)
-/// for why, and for the one way its result can differ.
+/// A per-tensor scale (what activation quantization almost always uses) takes the SIMD
+/// path. It divides exactly rather than multiplying by a reciprocal: that was measured
+/// once and bought only 3-7% of a memory-bound kernel, while landing within half an ulp of
+/// every rounding tie.
 pub fn fake_quantize_linear<'a>(
     x: &TensorView<'_, f32>,
     scale: &TensorView<'_, f32>,
@@ -889,37 +814,8 @@ pub fn fake_quantize_linear<'a>(
     qmax: f32,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
-    #[cfg(target_arch = "x86_64")]
-    if matches!(
-        qparam_layout(
-            &x.shape,
-            scale.data.len(),
-            scale.shape.len(),
-            axis,
-            block_size
-        ),
-        QParamLayout::PerTensor
-    ) && is_x86_feature_detected!("avx2")
-        && is_x86_feature_detected!("fma")
-    {
-        let s = scale.data.first().copied().unwrap_or(1.0);
-        let z = zero_point
-            .and_then(|z| z.data.first().copied())
-            .unwrap_or(0.0);
-        let len = x.data.len();
-        crate::kernels::utils::ensure_capacity(out, len);
-        unsafe {
-            out.set_len(len);
-            crate::kernels::avx::quantization::fake_quantize_per_tensor_avx2(
-                x.data.as_ptr(),
-                out.as_mut_ptr(),
-                len,
-                s,
-                z,
-                qmin,
-                qmax,
-            );
-        }
+    if let Some(p) = per_tensor(x, scale, zero_point, axis, block_size, qmin, qmax, true) {
+        quantize_per_tensor(Level::new(), &p, &x.data, out);
         return TensorView::from_slice(out.as_slice(), x.shape.to_vec());
     }
 
@@ -942,5 +838,52 @@ pub fn quant_range(onnx_dtype: i32) -> Option<(f32, f32)> {
         21 => Some((0.0, 15.0)),                            // UINT4
         22 => Some((-8.0, 7.0)),                            // INT4
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernels::test_util::{AWKWARD_LENS, Rng, levels};
+
+    #[test]
+    fn test_per_tensor_quantize_matches_its_definition_at_every_level() {
+        let mut rng = Rng::new(17);
+        for level in levels() {
+            for &len in AWKWARD_LENS {
+                for (scale, zero_point, qmin, qmax) in [(0.02, 128.0, 0.0, 255.0), (0.05, 0.0, -128.0, 127.0), (0.3, -3.0, -8.0, 7.0)] {
+                    // Values on the grid, at its rounding ties, and past both ends.
+                    let mut x = rng.vec(len, -40.0, 40.0);
+                    for (i, v) in x.iter_mut().enumerate().step_by(3) {
+                        *v = scale * ((i % 300) as f32 * 0.5 - 75.0);
+                    }
+                    for round_trip in [false, true] {
+                        let p = PerTensor { scale, zero_point, qmin, qmax, round_trip };
+                        let mut got = Vec::new();
+                        quantize_per_tensor(level, &p, &x, &mut got);
+                        for (i, (&g, &v)) in got.iter().zip(&x).enumerate() {
+                            let q = ((v / scale).round_ties_even() + zero_point).clamp(qmin, qmax);
+                            let want = if round_trip { (q - zero_point) * scale } else { q };
+                            // `==`, not bits: a clamp may keep either zero's sign.
+                            assert!(g == want, "{level:?} len {len} round_trip {round_trip} at {i}: {v} -> {g}, want {want}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_dynamic_quantize_linear_follows_onnx() {
+        let x: Vec<f32> = (0..37).map(|i| i as f32 * 0.37 - 4.1).collect();
+        let (mut y, mut s, mut z) = (Vec::new(), Vec::new(), Vec::new());
+        let (q, scale, zp) = dynamic_quantize_linear(&TensorView::from_slice(&x, vec![37]), &mut y, &mut s, &mut z);
+        let (min, max) = (-4.1f32, 36.0 * 0.37 - 4.1);
+        let want_scale = (max - min) / 255.0;
+        let want_zp = (-min / want_scale).round_ties_even().clamp(0.0, 255.0);
+        assert_eq!((scale.data[0], zp.data[0]), (want_scale, want_zp));
+        for (&g, &v) in q.data.iter().zip(&x) {
+            assert_eq!(g, ((v / want_scale).round_ties_even() + want_zp).clamp(0.0, 255.0));
+        }
     }
 }

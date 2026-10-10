@@ -387,8 +387,8 @@ pub(crate) fn quantize_rows_at(
     dst: &mut Vec<i32>,
 ) {
     assert!(src.len() >= m * k);
-    dst.clear();
-    dst.resize(m * k.div_ceil(2), 0);
+    // Every pair is written, so the buffer is not filled first.
+    crate::kernels::utils::ensure_capacity(dst, m * k.div_ceil(2));
     simd_call!(level, quantize_rows_simd(src, m, k, scale, zero_point, center, dst))
 }
 
@@ -445,7 +445,7 @@ pub(crate) fn dynamic_quant_params_at(level: Level, x: &[f32]) -> (f32, i32) {
     let (min, max) = simd_call!(level, min_max_simd(x));
     let (min, max) = (min.min(0.0), max.max(0.0));
     let scale = (max - min).max(1e-5) / 255.0;
-    let zero_point = (-min / scale).round().clamp(0.0, 255.0) as i32;
+    let zero_point = (-min / scale).round_ties_even().clamp(0.0, 255.0) as i32;
     (scale, zero_point)
 }
 
@@ -506,8 +506,7 @@ pub fn mat_mul_integer_f32<'a>(
     let batch_a: usize = a.shape[..ad - 2].iter().product();
     let batch_b: usize = b.shape[..bd - 2].iter().product();
     let batch = batch_a.max(batch_b);
-    out.clear();
-    out.resize(batch * m * n, 0.0);
+    crate::kernels::utils::ensure_capacity(out, batch * m * n);
     let scale = scale.unwrap_or(&[1.0]);
     let e = Epilogue { scale: 1.0, bias, relu };
     A_ROWS.with_borrow_mut(|rows| {
@@ -550,8 +549,8 @@ fn quantized_matmul<'a>(
     let k = x.shape.last().copied().unwrap_or(1);
     assert_eq!(k, w.k, "depth of {:?} against a {}x{} weight", x.shape, w.k, w.n);
     let m: usize = x.shape[..x.shape.len().saturating_sub(1)].iter().product();
-    out.clear();
-    out.resize(m * w.n, 0.0);
+    // C is written whole, so the buffer is not filled first.
+    crate::kernels::utils::ensure_capacity(out, m * w.n);
     A_ROWS.with_borrow_mut(|a| {
         quantize_rows(&x.data, m, k, scale, zero_point, center, a);
         qgemm(a, m, w.pairs, w, &Epilogue { scale, bias, relu }, out);
@@ -746,7 +745,7 @@ mod tests {
             let x: Vec<f32> = (0..37).map(|i| i as f32 * 0.25 - 2.0).collect();
             let (s, z) = dynamic_quant_params_at(level, &x);
             assert_eq!(s, 9.0 / 255.0);
-            assert_eq!(z, (2.0f32 / s).round() as i32);
+            assert_eq!(z, (2.0f32 / s).round_ties_even() as i32);
             // All positive: the range is widened down to zero.
             let (s, z) = dynamic_quant_params_at(level, &[1.0, 2.0, 3.0]);
             assert_eq!((s, z), (3.0 / 255.0, 0));
