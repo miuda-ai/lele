@@ -5,8 +5,10 @@ use crate::kernels::utils;
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul as strided_matmul};
 use crate::kernels::window2d::{self, Window};
+use crate::kernels::simd::simd_call;
 use crate::tensor::TensorView;
-use fearless_simd::Level;
+use fearless_simd::{Level, Simd, f32x16};
+use fearless_simd_macros::simd;
 
 // Apple Accelerate framework bindings for AMX-accelerated GEMM on macOS aarch64
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -1041,11 +1043,7 @@ pub fn conv_transpose<'b, 'a>(
     } else {
         None
     };
-    let r = if input.shape.len() == 3 {
-        conv_transpose_1d(input, weights, bias, dilations, group, pads, strides, out)
-    } else {
-        conv_transpose_inner(input, weights, bias, dilations, group, pads, strides, out)
-    };
+    let r = conv_transpose_at(Level::new(), input, weights, bias, dilations, group, pads, strides, out);
     if crate::kernels::timing::TIMING_ENABLED {
         crate::kernels::timing::CONV_TRANS_NS.fetch_add(
             _t0.unwrap().elapsed().as_nanos() as u64,
@@ -1054,7 +1052,27 @@ pub fn conv_transpose<'b, 'a>(
     }
     r
 }
+
+fn conv_transpose_at<'b, 'a>(
+    level: Level,
+    input: &TensorView<'b>,
+    weights: &TensorView<'b>,
+    bias: Option<&TensorView<'b>>,
+    dilations: &[i64],
+    group: i64,
+    pads: &[i64],
+    strides: &[i64],
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    if input.shape.len() == 3 {
+        conv_transpose_1d(level, input, weights, bias, dilations, group, pads, strides, out)
+    } else {
+        conv_transpose_inner(level, input, weights, bias, dilations, group, pads, strides, out)
+    }
+}
+
 fn conv_transpose_1d<'b, 'a>(
+    level: Level,
     input: &TensorView<'b>,
     weights: &TensorView<'b>,
     bias: Option<&TensorView<'b>>,
@@ -1077,7 +1095,6 @@ fn conv_transpose_1d<'b, 'a>(
     let kernel = w_shape[2] as usize;
     let group = group as usize;
     let out_channels = out_channels_per_group * group;
-    let in_channels_per_group = in_channels / group;
 
     let stride = strides.get(0).copied().unwrap_or(1) as usize;
     let dilation = dilations.get(0).copied().unwrap_or(1) as usize;
@@ -1096,54 +1113,259 @@ fn conv_transpose_1d<'b, 'a>(
     let l_out = l_out as usize;
 
     let out_size = batch_size * out_channels * l_out;
-    if out.len() != out_size {
-        out.resize(out_size, 0.0);
+    utils::ensure_capacity(out, out_size);
+    unsafe {
+        out.set_len(out_size);
     }
-    out[..out_size].fill(0.0);
 
-    // Weight layout: [C_in, C_out_per_group, K] (C-order)
-    let w_stride_oc = kernel;
-
-    for n in 0..batch_size {
-        for g in 0..group {
-            for ic_local in 0..in_channels_per_group {
-                let ic_global = g * in_channels_per_group + ic_local;
-                let in_base = n * in_channels * l_in + ic_global * l_in;
-
-                for oc_local in 0..out_channels_per_group {
-                    let oc_global = g * out_channels_per_group + oc_local;
-                    let out_base = n * out_channels * l_out + oc_global * l_out;
-                    let w_base = ic_global * out_channels_per_group * kernel + oc_local * w_stride_oc;
-
-                    for l in 0..l_in {
-                        let in_val = input.data[in_base + l];
-                        for k in 0..kernel {
-                            let v = l * stride + k * dilation;
-                            if v >= pad_begin && v < l_out + pad_begin {
-                                let v_valid = v - pad_begin;
-                                out[out_base + v_valid] += weights.data[w_base + k] * in_val;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(b) = bias {
-            for oc in 0..out_channels {
-                let bv = b.data[oc];
-                let ch_off = n * out_channels * l_out + oc * l_out;
-                for i in 0..l_out {
-                    out[ch_off + i] += bv;
-                }
-            }
-        }
+    // A 1D transposed convolution is a 2D one of height 1.
+    let shape = Transposed {
+        batch: batch_size,
+        in_channels,
+        out_channels,
+        groups: group,
+        in_h: 1,
+        in_w: l_in,
+        kernel_h: 1,
+        kernel_w: kernel,
+        stride_h: 1,
+        stride_w: stride,
+        dilation_h: 1,
+        dilation_w: dilation,
+        pad_top: 0,
+        pad_left: pad_begin,
+        out_h: 1,
+        out_w: l_out,
+    };
+    let bias = bias.map(|b| &b.data[..]);
+    if in_channels == group && out_channels == group {
+        conv_transpose_depthwise_1d(level, &shape, &input.data, &weights.data, bias, out);
+    } else {
+        conv_transpose_gemm(level, &shape, &input.data, &weights.data, bias, out);
     }
 
     TensorView::from_slice(out, vec![batch_size, out_channels, l_out])
 }
 
+/// A 1D transposed convolution with one input and one output channel per
+/// group. Output `j * stride + r` is phase `r`, entry `j`; tap `k` adds
+/// `weights[c, k] * input[c, l]` to entry `l + q` of phase `r`, where
+/// `k * dilation - pad_left = q * stride + r`. So each tap is a multiply-add
+/// of the whole input row into one phase, with no scattered writes; the
+/// phases are interleaved into the output at the end.
+fn conv_transpose_depthwise_1d(
+    level: Level,
+    s: &Transposed,
+    input: &[f32],
+    weights: &[f32],
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) {
+    let (stride, len, out_len, kernel) = (s.stride_w, s.in_w, s.out_w, s.kernel_w);
+    let phase_len = out_len.div_ceil(stride);
+    thread_local! {
+        static PHASES: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    PHASES.with_borrow_mut(|phases| {
+        phases.resize(stride * phase_len, 0.0);
+        let rows = input.chunks_exact(len).zip(out.chunks_exact_mut(out_len));
+        for (c, (x, y)) in rows.enumerate() {
+            let ch = c % s.out_channels;
+            phases.fill(bias.map_or(0.0, |b| b[ch]));
+            for (k, &w) in weights[ch * kernel..][..kernel].iter().enumerate() {
+                let shift = (k * s.dilation_w) as isize - s.pad_left as isize;
+                let (q, r) = (shift.div_euclid(stride as isize), shift.rem_euclid(stride as isize) as usize);
+                // Phase `r` holds the outputs `r, r + stride, ...` below `out_len`.
+                let entries = out_len.saturating_sub(r).div_ceil(stride) as isize;
+                let (lo, hi) = ((-q).max(0), (entries - q).min(len as isize));
+                if lo >= hi {
+                    continue;
+                }
+                let (lo, hi) = (lo as usize, hi as usize);
+                let dst = &mut phases[r * phase_len + (lo as isize + q) as usize..][..hi - lo];
+                simd_call!(level, mul_add_into(dst, &x[lo..hi], w));
+            }
+            if stride == 2 {
+                let (even, odd) = phases.split_at(phase_len);
+                simd_call!(level, interleave_into(y, even, odd));
+            } else {
+                for (j, v) in y.iter_mut().enumerate() {
+                    *v = phases[j % stride * phase_len + j / stride];
+                }
+            }
+        }
+    });
+}
+
+/// `dst[i] += w * src[i]`.
+#[simd]
+fn mul_add_into<S: Simd>(simd: S, dst: &mut [f32], src: &[f32], w: f32) {
+    use fearless_simd::prelude::*;
+    let wv = f32x16::splat(simd, w);
+    let (d16, d_rest) = dst.as_chunks_mut::<16>();
+    let (s16, s_rest) = src.as_chunks::<16>();
+    for (d, s) in d16.iter_mut().zip(s16) {
+        wv.mul_add(f32x16::from_slice(simd, s), f32x16::from_slice(simd, d)).store_slice(d);
+    }
+    for (d, &s) in d_rest.iter_mut().zip(s_rest) {
+        *d += w * s;
+    }
+}
+
+/// `out[2 * j] = even[j]` and `out[2 * j + 1] = odd[j]`.
+#[simd]
+fn interleave_into<S: Simd>(simd: S, out: &mut [f32], even: &[f32], odd: &[f32]) {
+    use fearless_simd::prelude::*;
+    let (o32, _) = out.as_chunks_mut::<32>();
+    let pairs = o32.len();
+    for ((o, e), d) in o32.iter_mut().zip(even.as_chunks::<16>().0).zip(odd.as_chunks::<16>().0) {
+        let (a, b) = simd.interleave_f32x16(f32x16::from_slice(simd, e), f32x16::from_slice(simd, d));
+        let (lo, hi) = o.split_at_mut(16);
+        a.store_slice(lo);
+        b.store_slice(hi);
+    }
+    for (j, v) in out.iter_mut().enumerate().skip(32 * pairs) {
+        *v = if j % 2 == 0 { even[j / 2] } else { odd[j / 2] };
+    }
+}
+
+/// Shape of a transposed convolution: input `(ih, iw)` of channel `ic` adds
+/// `input * weights[ic, oc, kh, kw]` to output
+/// `(ih * stride_h + kh * dilation_h - pad_top, iw * stride_w + kw * dilation_w - pad_left)`
+/// of each channel `oc` of its group, when that lies inside the output.
+struct Transposed {
+    batch: usize,
+    in_channels: usize,
+    out_channels: usize,
+    groups: usize,
+    in_h: usize,
+    in_w: usize,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    dilation_h: usize,
+    dilation_w: usize,
+    pad_top: usize,
+    pad_left: usize,
+    out_h: usize,
+    out_w: usize,
+}
+
+/// Transposed convolution as a GEMM and a scatter, per batch and group:
+/// `col[(oc, kh, kw), (ih, iw)] = sum_ic weights[ic, (oc, kh, kw)] * input[ic, (ih, iw)]`,
+/// then every row of `col` is added onto the output positions its tap reaches.
+/// `weights` is `[in_channels, out_channels / groups, kernel_h, kernel_w]`.
+fn conv_transpose_gemm(
+    level: Level,
+    s: &Transposed,
+    input: &[f32],
+    weights: &[f32],
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) {
+    let (icg, ocg) = (s.in_channels / s.groups, s.out_channels / s.groups);
+    let taps = s.kernel_h * s.kernel_w;
+    let col_rows = ocg * taps;
+    let (hw, out_hw) = (s.in_h * s.in_w, s.out_h * s.out_w);
+
+    // Each output starts at its channel's bias and gathers every tap that reaches it.
+    for (c, plane) in out.chunks_exact_mut(out_hw).enumerate() {
+        plane.fill(bias.map_or(0.0, |b| b[c % s.out_channels]));
+    }
+
+    thread_local! {
+        static CT_COL_BUF: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    CT_COL_BUF.with_borrow_mut(|col| {
+        col.resize(col_rows * hw, 0.0);
+        for n in 0..s.batch {
+            for g in 0..s.groups {
+                let x = &input[(n * s.in_channels + g * icg) * hw..][..icg * hw];
+                let w = &weights[g * icg * col_rows..][..icg * col_rows];
+                // `w` is `[icg, col_rows]`, so `col = w^T * x`.
+                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                unsafe {
+                    accel_sgemm_ta(col_rows, hw, icg, w.as_ptr(), x.as_ptr(), col.as_mut_ptr());
+                }
+                #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+                unsafe {
+                    let w_t = MatRef::<f32>::from_raw_parts(w.as_ptr(), col_rows, icg, 1, col_rows as isize);
+                    let x = MatRef::<f32>::from_raw_parts(x.as_ptr(), icg, hw, hw as isize, 1);
+                    let c = MatMut::<f32>::from_raw_parts_mut(col.as_mut_ptr(), col_rows, hw, hw as isize, 1);
+                    strided_matmul(c, Accum::Replace, w_t, x, 1.0, Par::Seq);
+                }
+                let y = &mut out[(n * s.out_channels + g * ocg) * out_hw..][..ocg * out_hw];
+                col2im(level, s, col, y);
+            }
+        }
+    });
+}
+
+/// `dst[2 * i] += src[i]`; `dst` needs at least `2 * src.len() - 1` entries.
+/// Stride 2 is the usual upsampler, and the scalar loop does one element at a
+/// time.
+#[simd]
+fn add_every_other<S: Simd>(simd: S, dst: &mut [f32], src: &[f32]) {
+    use fearless_simd::prelude::*;
+    // Whole vectors where the odd entries between them exist too; they are
+    // stored back unchanged.
+    let vectors = (src.len() / 16).min(dst.len() / 32);
+    for (s, d) in src.as_chunks::<16>().0.iter().zip(dst.as_chunks_mut::<32>().0).take(vectors) {
+        let (a, b) = d.split_at_mut(16);
+        let (even, odd) = simd.deinterleave_f32x16(f32x16::from_slice(simd, a), f32x16::from_slice(simd, b));
+        let (a2, b2) = simd.interleave_f32x16(even + f32x16::from_slice(simd, s), odd);
+        a2.store_slice(a);
+        b2.store_slice(b);
+    }
+    for i in vectors * 16..src.len() {
+        dst[2 * i] += src[i];
+    }
+}
+
+/// Adds row `(oc, kh, kw)` of `col` onto the outputs of channel `oc` that tap
+/// `(kh, kw)` reaches.
+fn col2im(level: Level, s: &Transposed, col: &[f32], out: &mut [f32]) {
+    let taps = s.kernel_h * s.kernel_w;
+    let (hw, out_hw) = (s.in_h * s.in_w, s.out_h * s.out_w);
+    for (r, src) in col.chunks_exact(hw).enumerate() {
+        let (oc, kh, kw) = (r / taps, r % taps / s.kernel_w, r % s.kernel_w);
+        let plane = &mut out[oc * out_hw..][..out_hw];
+        let rows = tap_range(s.in_h, s.stride_h, kh * s.dilation_h, s.pad_top, s.out_h);
+        let cols = tap_range(s.in_w, s.stride_w, kw * s.dilation_w, s.pad_left, s.out_w);
+        if cols.is_empty() {
+            continue;
+        }
+        for ih in rows {
+            let oh = ih * s.stride_h + kh * s.dilation_h - s.pad_top;
+            let ow = cols.start * s.stride_w + kw * s.dilation_w - s.pad_left;
+            let src = &src[ih * s.in_w..][cols.clone()];
+            let dst = &mut plane[oh * s.out_w + ow..];
+            if s.stride_w == 1 {
+                for (d, &v) in dst.iter_mut().zip(src) {
+                    *d += v;
+                }
+            } else if s.stride_w == 2 {
+                simd_call!(level, add_every_other(dst, src));
+            } else {
+                for (d, &v) in dst.iter_mut().step_by(s.stride_w).zip(src) {
+                    *d += v;
+                }
+            }
+        }
+    }
+}
+
+/// The inputs `i` whose output `i * stride + shift - pad` lies in `0..out_len`.
+fn tap_range(in_len: usize, stride: usize, shift: usize, pad: usize, out_len: usize) -> std::ops::Range<usize> {
+    // i * stride + shift >= pad and i * stride + shift < out_len + pad.
+    let start = pad.saturating_sub(shift).div_ceil(stride);
+    let end = (out_len + pad).saturating_sub(shift).div_ceil(stride).min(in_len);
+    start.min(end)..end
+}
+
 fn conv_transpose_inner<'b, 'a>(
+    level: Level,
     input: &TensorView<'b>,
     weights: &TensorView<'b>,
     bias: Option<&TensorView<'b>>,
@@ -1201,110 +1423,30 @@ fn conv_transpose_inner<'b, 'a>(
     let out_h = out_h as usize;
     let out_w = out_w as usize;
     let out_size = batch_size * out_channels * out_h * out_w;
-    if out.len() != out_size {
-        out.resize(out_size, 0.0);
-    }
-    // Always zero the entire output buffer before accumulation,
-    // since resize only fills NEW elements (old data may remain).
-    out[..out_size].fill(0.0);
-
-    // Groups are not supported for simplicity in this implementation
-    assert!(group == 1, "ConvTranspose: group > 1 not supported yet");
-
-    // GEMM + col2im:
-    // col[oc*kh*kw, ih*iw] = W^T[oc*kh*kw, ic] * input[ic, ih*iw]
-    // then scatter col into output according to stride/dilation/padding.
-    let hw = in_h * in_w;
-    let col_rows = out_channels * kernel_h * kernel_w;
-
-    thread_local! {
-        static CT_COL_BUF: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
-    }
-    let col_len = col_rows * hw;
-    CT_COL_BUF.with(|buf_cell| {
-        let mut col_ref = buf_cell.borrow_mut();
-        if col_ref.len() < col_len {
-            col_ref.resize(col_len, 0.0);
-        }
-        let col = &mut col_ref[..col_len];
-
-    for n in 0..batch_size {
-        let batch_offset = n * out_channels * out_h * out_w;
-        let input_ptr = unsafe { input.data.as_ptr().add(n * in_channels * hw) };
-
-        // GEMM: col[col_rows x hw] = W^T[col_rows x in_channels] * input[in_channels x hw]
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-        unsafe {
-            accel_sgemm_ta(
-                col_rows,
-                hw,
-                in_channels,
-                weights.data.as_ptr(),
-                input_ptr,
-                col.as_mut_ptr(),
-            );
-        }
-        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-        {
-            for r in 0..col_rows {
-                let oc = r / (kernel_h * kernel_w);
-                let k_idx = r % (kernel_h * kernel_w);
-                let kh = k_idx / kernel_w;
-                let kw = k_idx % kernel_w;
-                for ih in 0..in_h {
-                    for iw in 0..in_w {
-                        let mut sum = 0.0f32;
-                        for ic in 0..in_channels {
-                            let w_val = weights.data
-                                [ic * col_rows + oc * kernel_h * kernel_w + kh * kernel_w + kw];
-                            let in_val =
-                                input.data[n * in_channels * hw + ic * hw + ih * in_w + iw];
-                            sum += w_val * in_val;
-                        }
-                        col[r * hw + ih * in_w + iw] = sum;
-                    }
-                }
-            }
-        }
-
-        for oc in 0..out_channels {
-            let oc_out_base = batch_offset + oc * out_h * out_w;
-            for kh in 0..kernel_h {
-                let oh_shift = kh * dilation_h;
-                for kw in 0..kernel_w {
-                    let ow_shift = kw * dilation_w;
-                    let r = oc * kernel_h * kernel_w + kh * kernel_w + kw;
-                    let col_row_base = r * hw;
-                    for ih in 0..in_h {
-                        let oh = ih * stride_h + oh_shift;
-                        if oh >= pad_top && oh < out_h + pad_top {
-                            let oh_valid = oh - pad_top;
-                            for iw in 0..in_w {
-                                let ow = iw * stride_w + ow_shift;
-                                if ow >= pad_left && ow < out_w + pad_left {
-                                    let ow_valid = ow - pad_left;
-                                    out[oc_out_base + oh_valid * out_w + ow_valid] +=
-                                        col[col_row_base + ih * in_w + iw];
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(b) = bias {
-            for oc in 0..out_channels {
-                let ch_offset = batch_offset + oc * out_h * out_w;
-                let bv = b.data[oc];
-                for i in 0..out_h * out_w {
-                    out[ch_offset + i] += bv;
-                }
-            }
-        }
+    utils::ensure_capacity(out, out_size);
+    unsafe {
+        out.set_len(out_size);
     }
 
-    }); // end CT_COL_BUF.with
+    let shape = Transposed {
+        batch: batch_size,
+        in_channels,
+        out_channels,
+        groups: group as usize,
+        in_h,
+        in_w,
+        kernel_h,
+        kernel_w,
+        stride_h,
+        stride_w,
+        dilation_h,
+        dilation_w,
+        pad_top,
+        pad_left,
+        out_h,
+        out_w,
+    };
+    conv_transpose_gemm(level, &shape, &input.data, &weights.data, bias.map(|b| &b.data[..]), out);
 
     TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w])
 }
@@ -1312,7 +1454,7 @@ fn conv_transpose_inner<'b, 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::test_util::{assert_close, levels, Rng};
+    use crate::kernels::test_util::{assert_close, levels, Rng, AWKWARD_LENS};
 
     /// `[channels, h, w]`, `[kh, kw]`, strides, dilations and pads `[top, left, bottom, right]`.
     type WindowCase = ([usize; 3], [usize; 2], [usize; 2], [usize; 2], [usize; 4]);
@@ -1417,6 +1559,119 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_conv_transpose_matches_reference() {
+        // (in [c, h, w], out channels, groups, kernel [kh, kw], strides, dilations,
+        // pads [top, left, bottom, right]); h = 0 makes it 1D, of length w.
+        let cases: &[([usize; 3], usize, usize, [usize; 2], [usize; 2], [usize; 2], [usize; 4])] = &[
+            ([4, 5, 7], 6, 1, [2, 2], [2, 2], [1, 1], [0, 0, 0, 0]),
+            ([4, 4, 6], 4, 2, [3, 3], [2, 2], [1, 1], [1, 1, 1, 1]),
+            ([3, 3, 9], 2, 1, [3, 2], [1, 3], [2, 1], [0, 1, 2, 0]),
+            ([6, 4, 5], 6, 6, [3, 3], [1, 1], [1, 1], [1, 1, 1, 1]),
+            ([4, 0, 9], 3, 1, [1, 4], [1, 2], [1, 1], [0, 1, 0, 2]),
+            ([5, 0, 20], 5, 5, [1, 12], [1, 2], [1, 1], [0, 0, 0, 0]),
+            ([3, 0, 70], 3, 3, [1, 12], [1, 2], [1, 1], [0, 3, 0, 5]),
+            ([4, 0, 11], 4, 4, [1, 5], [1, 3], [1, 2], [0, 2, 0, 3]),
+            ([2, 0, 9], 2, 2, [1, 3], [1, 1], [1, 1], [0, 1, 0, 1]),
+            ([3, 0, 5], 2, 1, [1, 7], [1, 3], [1, 2], [0, 3, 0, 1]),
+            ([6, 0, 4], 1, 1, [1, 12], [1, 3], [1, 1], [0, 0, 0, 0]),
+        ];
+        let mut rng = Rng::new(13);
+        for &([c, h, w], oc, groups, [kh, kw], [sh, sw], [dh, dw], [pt, pl, pb, pr]) in cases {
+            let one_d = h == 0;
+            let h = h.max(1);
+            let (icg, ocg) = (c / groups, oc / groups);
+            let out_h = (h - 1) * sh + dh * (kh - 1) + 1 - pt - pb;
+            let out_w = (w - 1) * sw + dw * (kw - 1) + 1 - pl - pr;
+            let batch = 2;
+            let x = rng.vec(batch * c * h * w, -1.0, 1.0);
+            let wt = rng.vec(c * ocg * kh * kw, -1.0, 1.0);
+            let b = rng.vec(oc, -1.0, 1.0);
+            let mut want = vec![0.0f64; batch * oc * out_h * out_w];
+            for n in 0..batch {
+                for o in 0..oc {
+                    want[(n * oc + o) * out_h * out_w..][..out_h * out_w].fill(b[o] as f64);
+                }
+                for ic in 0..c {
+                    let g = ic / icg;
+                    for o in 0..ocg {
+                        let oc_global = g * ocg + o;
+                        for (ih, iw, ki, kj) in input_taps(h, w, kh, kw) {
+                            let oh = (ih * sh + ki * dh) as isize - pt as isize;
+                            let ow = (iw * sw + kj * dw) as isize - pl as isize;
+                            if !(0..out_h as isize).contains(&oh) || !(0..out_w as isize).contains(&ow) {
+                                continue;
+                            }
+                            let xv = x[((n * c + ic) * h + ih) * w + iw] as f64;
+                            let wv = wt[((ic * ocg + o) * kh + ki) * kw + kj] as f64;
+                            want[((n * oc + oc_global) * out_h + oh as usize) * out_w + ow as usize] += xv * wv;
+                        }
+                    }
+                }
+            }
+            let (in_shape, w_shape, strides, dilations, pads) = if one_d {
+                (vec![batch, c, w], vec![c, ocg, kw], vec![sw as i64], vec![dw as i64], vec![pl as i64, pr as i64])
+            } else {
+                (
+                    vec![batch, c, h, w],
+                    vec![c, ocg, kh, kw],
+                    vec![sh as i64, sw as i64],
+                    vec![dh as i64, dw as i64],
+                    vec![pt as i64, pl as i64, pb as i64, pr as i64],
+                )
+            };
+            let input = TensorView::from_slice(&x, in_shape);
+            let weights = TensorView::from_slice(&wt, w_shape);
+            let bias = TensorView::from_slice(&b, vec![oc]);
+            let want_shape = if one_d { vec![batch, oc, out_w] } else { vec![batch, oc, out_h, out_w] };
+            for level in levels() {
+                // A dirty buffer: every output must be written.
+                let mut out = vec![f32::NAN; 3];
+                let got = conv_transpose_at(
+                    level,
+                    &input,
+                    &weights,
+                    Some(&bias),
+                    &dilations,
+                    groups as i64,
+                    &pads,
+                    &strides,
+                    &mut out,
+                );
+                assert_eq!(got.shape.as_ref(), &want_shape[..]);
+                let what = format!("{level:?} {:?}", (c, h, w, oc, groups, kh, kw, sw));
+                assert_close(&got.data, &want, 1e-5, &what);
+            }
+        }
+    }
+
+    #[test]
+    fn test_add_every_other_at_every_level_and_length() {
+        let mut rng = Rng::new(14);
+        for level in levels() {
+            for &len in AWKWARD_LENS {
+                let src = rng.vec(len, -1.0, 1.0);
+                // Both the shortest `dst` and one with a whole extra vector.
+                for extra in [0, 33] {
+                    let dst = rng.vec(2 * len - 1 + extra, -1.0, 1.0);
+                    let mut got = dst.clone();
+                    simd_call!(level, add_every_other(&mut got, &src));
+                    let want: Vec<f64> = (0..dst.len())
+                        .map(|i| dst[i] as f64 + if i % 2 == 0 && i / 2 < len { src[i / 2] as f64 } else { 0.0 })
+                        .collect();
+                    assert_close(&got, &want, 1e-6, &format!("{level:?} len {len} extra {extra}"));
+                }
+            }
+        }
+    }
+
+    /// Every `(ih, iw, ki, kj)`.
+    fn input_taps(h: usize, w: usize, kh: usize, kw: usize) -> impl Iterator<Item = (usize, usize, usize, usize)> {
+        (0..h).flat_map(move |ih| {
+            (0..w).flat_map(move |iw| (0..kh).flat_map(move |ki| (0..kw).map(move |kj| (ih, iw, ki, kj))))
+        })
     }
 
     #[test]
