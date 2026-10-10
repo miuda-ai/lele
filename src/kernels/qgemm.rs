@@ -18,7 +18,12 @@
 //! `vpmaddwd`, 12 `vpaddd` and 8 loads, and the loop is bound by issuing them. (The
 //! `vpmaddubsw` route does 32 products per instruction but saturates at `i16`, so it is
 //! exact only for 7-bit weights.)
+//!
+//! Where VNNI is guaranteed (`fearless_simd`'s AVX-512 level), weights are packed for
+//! [`crate::kernels::qgemm_vnni`] instead, which is about four times faster; [`QWeights`]
+//! picks the layout when it packs, and [`run_at`] the matching kernel.
 
+use crate::kernels::qgemm_vnni::{self, QuadWeights};
 use crate::kernels::simd::simd_call;
 use crate::tensor::TensorView;
 use fearless_simd::{Level, Simd, f32x8, i16x16, i32x8};
@@ -34,6 +39,37 @@ const NR: usize = 16;
 /// through memory.
 const KC: usize = 1024;
 
+/// Zeroed `i32`s that start on a 64-byte boundary (a cache line, and one 512-bit vector):
+/// in a panel that does not, every load of B straddles two lines, which measured up to
+/// 40% slower on an Ice Lake Xeon.
+pub(crate) struct AlignedI32 {
+    buf: Vec<i32>,
+    start: usize,
+    len: usize,
+}
+
+impl AlignedI32 {
+    pub(crate) fn zeroed(len: usize) -> Self {
+        let buf = vec![0; len + 15];
+        let start = buf.as_ptr().align_offset(64);
+        assert!(start < 16);
+        Self { buf, start, len }
+    }
+}
+
+impl std::ops::Deref for AlignedI32 {
+    type Target = [i32];
+    fn deref(&self) -> &[i32] {
+        &self.buf[self.start..][..self.len]
+    }
+}
+
+impl std::ops::DerefMut for AlignedI32 {
+    fn deref_mut(&mut self) -> &mut [i32] {
+        &mut self.buf[self.start..][..self.len]
+    }
+}
+
 /// Two centered codes in one `i32`: the even depth in the low half, the odd one in the
 /// high half, as the lanes of a 16-bit vector bitcast from it are laid out.
 #[inline]
@@ -41,51 +77,108 @@ fn pack_pair(lo: i32, hi: i32) -> i32 {
     (lo as i16 as u16 as i32) | (hi << 16)
 }
 
-/// A `k x n` weight of 8-bit codes, centered and packed for [`qgemm`].
+/// A `k x n` weight of 8-bit codes, packed for the integer GEMM of the machine it runs on.
 pub struct QWeights {
     k: usize,
     n: usize,
-    /// Pairs of depths: `k`, rounded up to even, halved.
-    pairs: usize,
-    /// Panels of `NR` columns, each `pairs` rows of `NR` packed pairs; zero past `k` and `n`.
-    data: Vec<i32>,
-    /// The scale of each column, zero past `n` to a whole panel.
+    packed: Packed,
+    /// The scale of each column, zero past `n` to a whole panel of either layout.
     scale: Vec<f32>,
+}
+
+/// How B is packed, which decides how A is quantized for it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Layout {
+    /// Centered 16-bit pairs, for `vpmaddwd` and its equivalents ([`qgemm_at`]).
+    Pairs,
+    /// `i8` quads for VNNI's `vpdpbusd` ([`crate::kernels::qgemm_vnni`]). (Chosen only on
+    /// x86; elsewhere only the tests pack them, emulating the instruction.)
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    Quads,
+}
+
+impl Layout {
+    /// The layout that runs fastest at `level`: quads where VNNI is guaranteed.
+    pub(crate) fn for_level(level: Level) -> Self {
+        match level {
+            #[cfg(target_arch = "x86_64")]
+            Level::Avx512(_) => Layout::Quads,
+            _ => Layout::Pairs,
+        }
+    }
+}
+
+enum Packed {
+    /// Panels of `NR` columns, each `pairs` rows of `NR` packed pairs (`b - zb`); zero past
+    /// `k` and `n`.
+    Pairs { pairs: usize, data: AlignedI32 },
+    Quads(QuadWeights),
 }
 
 impl QWeights {
     /// Packs row-major `k x n` codes, `i8` if `signed` and `u8` otherwise, with one zero
     /// point and one scale for all columns or one of each per column.
     pub fn new(codes: &[u8], k: usize, n: usize, signed: bool, zero_point: &[i32], scale: &[f32]) -> Self {
-        assert_eq!(codes.len(), k * n);
-        Self::pack(k, n, |i| if signed { codes[i] as i8 as i32 } else { codes[i] as i32 }, zero_point, scale)
+        Self::with_layout(Layout::for_level(Level::new()), codes, k, n, signed, zero_point, scale)
     }
 
-    /// As [`QWeights::new`], from codes held in `f32` (as lele keeps integer tensors).
+    pub(crate) fn with_layout(
+        layout: Layout,
+        codes: &[u8],
+        k: usize,
+        n: usize,
+        signed: bool,
+        zero_point: &[i32],
+        scale: &[f32],
+    ) -> Self {
+        assert_eq!(codes.len(), k * n);
+        let code = |i: usize| if signed { codes[i] as i8 as i32 } else { codes[i] as i32 };
+        Self::pack(layout, k, n, code, if signed { 0 } else { 128 }, zero_point, scale)
+    }
+
+    /// As [`QWeights::new`], from codes held in `f32` (as lele keeps integer tensors); they
+    /// are taken as `i8` if any is negative and `u8` otherwise.
     pub fn from_f32_codes(codes: &[f32], k: usize, n: usize, zero_point: &[i32], scale: &[f32]) -> Self {
         assert_eq!(codes.len(), k * n);
-        Self::pack(k, n, |i| codes[i] as i32, zero_point, scale)
+        let shift = if codes.iter().any(|&c| c < 0.0) { 0 } else { 128 };
+        let layout = Layout::for_level(Level::new());
+        Self::pack(layout, k, n, |i| codes[i] as i32, shift, zero_point, scale)
     }
 
-    /// `code(i)` is element `i` of the row-major codes.
-    fn pack(k: usize, n: usize, code: impl Fn(usize) -> i32, zero_point: &[i32], scale: &[f32]) -> Self {
+    /// `code(i)` is element `i` of the row-major codes; `shift` brings them into `i8` (0
+    /// for `i8` codes, 128 for `u8`), which the quads need.
+    fn pack(
+        layout: Layout,
+        k: usize,
+        n: usize,
+        code: impl Fn(usize) -> i32,
+        shift: i32,
+        zero_point: &[i32],
+        scale: &[f32],
+    ) -> Self {
         assert!(zero_point.len() == 1 || zero_point.len() == n);
         assert!(scale.len() == 1 || scale.len() == n);
-        let pairs = k.div_ceil(2);
-        let panels = n.div_ceil(NR);
         let zp = |j: usize| zero_point[if zero_point.len() == 1 { 0 } else { j }];
-        let code = |kk: usize, j: usize| if kk < k { code(kk * n + j) - zp(j) } else { 0 };
-        let mut data = vec![0; panels * pairs * NR];
-        for p in 0..pairs {
-            for j in 0..n {
-                data[((j / NR) * pairs + p) * NR + j % NR] = pack_pair(code(2 * p, j), code(2 * p + 1, j));
+        let packed = match layout {
+            Layout::Pairs => {
+                let pairs = k.div_ceil(2);
+                let centered = |kk: usize, j: usize| if kk < k { code(kk * n + j) - zp(j) } else { 0 };
+                let mut data = AlignedI32::zeroed(n.div_ceil(NR) * pairs * NR);
+                for p in 0..pairs {
+                    for j in 0..n {
+                        let pair = pack_pair(centered(2 * p, j), centered(2 * p + 1, j));
+                        data[((j / NR) * pairs + p) * NR + j % NR] = pair;
+                    }
+                }
+                Packed::Pairs { pairs, data }
             }
-        }
-        let mut col_scale = vec![0.0; panels * NR];
+            Layout::Quads => Packed::Quads(qgemm_vnni::pack(k, n, code, shift, zp)),
+        };
+        let mut col_scale = vec![0.0; n.div_ceil(qgemm_vnni::NR) * qgemm_vnni::NR];
         for (j, s) in col_scale[..n].iter_mut().enumerate() {
             *s = scale[if scale.len() == 1 { 0 } else { j }];
         }
-        Self { k, n, pairs, data, scale: col_scale }
+        Self { k, n, packed, scale: col_scale }
     }
 
     pub fn k(&self) -> usize {
@@ -96,15 +189,26 @@ impl QWeights {
         self.n
     }
 
-    /// Pairs of depths per row of A.
-    pub fn pairs(&self) -> usize {
-        self.pairs
+    #[cfg(test)]
+    pub(crate) fn layout(&self) -> Layout {
+        match self.packed {
+            Packed::Pairs { .. } => Layout::Pairs,
+            Packed::Quads(_) => Layout::Quads,
+        }
+    }
+
+    /// Pairs of depths per row of A, and the panels, for the pairs layout.
+    fn pairs(&self) -> (usize, &[i32]) {
+        match &self.packed {
+            Packed::Pairs { pairs, data } => (*pairs, data),
+            Packed::Quads(_) => panic!("weights packed for VNNI used as pairs"),
+        }
     }
 }
 
 /// What happens to the integer sums on the way out:
 /// `C[i][j] = relu?(sum * (scale * column scale of B) + bias[j])`.
-pub struct Epilogue<'a> {
+pub(crate) struct Epilogue<'a> {
     /// The scale of A.
     pub scale: f32,
     /// `n` values to add, if any.
@@ -112,18 +216,15 @@ pub struct Epilogue<'a> {
     pub relu: bool,
 }
 
-/// `C = epilogue(A * B)`. A is `m` rows of `w.pairs()` packed pairs, `lda` apart, as
-/// [`quantize_rows`] writes them; C is `m x n`, row-major.
-pub fn qgemm(a: &[i32], m: usize, lda: usize, w: &QWeights, e: &Epilogue, c: &mut [f32]) {
-    qgemm_at(Level::new(), a, m, lda, w, e, c)
-}
-
+/// `C = epilogue(A * B)` for B in the pairs layout. A is `m` rows of `w.pairs()` packed
+/// pairs, `lda` apart, as [`quantize_rows_at`] writes them; C is `m x n`, row-major.
 pub(crate) fn qgemm_at(level: Level, a: &[i32], m: usize, lda: usize, w: &QWeights, e: &Epilogue, c: &mut [f32]) {
-    assert!(lda >= w.pairs && a.len() >= m.saturating_sub(1) * lda + w.pairs);
+    let (pairs, _) = w.pairs();
+    assert!(lda >= pairs && a.len() >= m.saturating_sub(1) * lda + pairs);
     assert!(c.len() >= m * w.n);
     assert!(e.bias.is_none_or(|b| b.len() >= w.n));
     SUMS.with_borrow_mut(|sums| {
-        let sums = if w.pairs > KC {
+        let sums = if pairs > KC {
             sums.resize(m * w.n.div_ceil(NR) * NR, 0);
             &mut sums[..]
         } else {
@@ -149,16 +250,17 @@ fn qgemm_simd<S: Simd>(
     c: &mut [f32],
     sums: &mut [i32],
 ) {
-    let depth = w.pairs.div_ceil(w.pairs.div_ceil(KC).max(1));
+    let (pairs, data) = w.pairs();
+    let depth = pairs.div_ceil(pairs.div_ceil(KC).max(1));
     let panels = w.n.div_ceil(NR);
     let lds = panels * NR;
     let mut pc = 0;
     loop {
-        let kc = depth.min(w.pairs - pc);
-        let last = pc + kc == w.pairs;
+        let kc = depth.min(pairs - pc);
+        let last = pc + kc == pairs;
         for jp in 0..panels {
             let j = jp * NR;
-            let b = &w.data[(jp * w.pairs + pc) * NR..][..kc * NR];
+            let b = &data[(jp * pairs + pc) * NR..][..kc * NR];
             let t = Tile {
                 kc,
                 lda,
@@ -365,17 +467,13 @@ fn madd<S: Simd>(simd: S, a: i16x16<S>, b: i16x16<S>) -> i32x8<S> {
     }
 }
 
-/// Writes `m` rows of `k` activations, row-major in `src`, as rows of A for [`qgemm`]:
+/// Writes `m` rows of `k` activations, row-major in `src`, as rows of A for [`qgemm_at`]:
 /// each value quantized as `ONNX QuantizeLinear` does to `u8`
 /// (`clamp(round_ties_even(x / scale) + zero_point, 0, 255)`), less `center` (the zero
 /// point of the codes), two depths to a pair. `dst` gets `m * k.div_ceil(2)` pairs; an odd
 /// last depth is paired with zero.
 ///
 /// Activations that are codes already take `scale` 1 and `zero_point` 0.
-pub fn quantize_rows(src: &[f32], m: usize, k: usize, scale: f32, zero_point: i32, center: i32, dst: &mut Vec<i32>) {
-    quantize_rows_at(Level::new(), src, m, k, scale, zero_point, center, dst)
-}
-
 pub(crate) fn quantize_rows_at(
     level: Level,
     src: &[f32],
@@ -509,32 +607,56 @@ pub fn mat_mul_integer_f32<'a>(
     crate::kernels::utils::ensure_capacity(out, batch * m * n);
     let scale = scale.unwrap_or(&[1.0]);
     let e = Epilogue { scale: 1.0, bias, relu };
-    A_ROWS.with_borrow_mut(|rows| {
-        if batch_b == 1 {
-            // One B for every batch of A: all their rows in one product.
-            let w = QWeights::from_f32_codes(&b.data[..k * n], k, n, b_zero_point, scale);
-            quantize_rows(&a.data, batch_a * m, k, 1.0, 0, a_zero_point, rows);
-            qgemm(rows, batch_a * m, w.pairs, &w, &e, out);
-            return;
-        }
+    let level = Level::new();
+    if batch_b == 1 {
+        // One B for every batch of A: all their rows in one product.
+        let w = QWeights::from_f32_codes(&b.data[..k * n], k, n, b_zero_point, scale);
+        run_at(level, &w, &a.data, batch_a * m, 1.0, 0, a_zero_point, &e, out);
+    } else {
         for i in 0..batch {
             let w = QWeights::from_f32_codes(&b.data[i * k * n..][..k * n], k, n, b_zero_point, scale);
-            let ai = if batch_a == 1 { 0 } else { i };
-            quantize_rows(&a.data[ai * m * k..][..m * k], m, k, 1.0, 0, a_zero_point, rows);
-            qgemm(rows, m, w.pairs, &w, &e, &mut out[i * m * n..][..m * n]);
+            let a = &a.data[if batch_a == 1 { 0 } else { i * m * k }..][..m * k];
+            run_at(level, &w, a, m, 1.0, 0, a_zero_point, &e, &mut out[i * m * n..][..m * n]);
         }
-    });
+    }
     let mut shape = if batch_a >= batch_b { a.shape[..ad - 2].to_vec() } else { b.shape[..bd - 2].to_vec() };
     shape.extend([m, n]);
     TensorView::from_slice(out, shape)
 }
 
 thread_local! {
-    /// Rows of A, quantized.
+    /// Rows of A, quantized, and (for the quads) their sums.
     static A_ROWS: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static ROW_SUMS: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Quantizes `x` with `scale`, `zero_point` and `center` (as [`quantize_rows`]) and
+/// `C = epilogue(A * w)` for the `m x k` activations `src`, quantized with `scale` and
+/// `zero_point` and taken less `center` (as [`quantize_rows_at`] does), in whichever layout
+/// `w` is packed.
+pub(crate) fn run_at(
+    level: Level,
+    w: &QWeights,
+    src: &[f32],
+    m: usize,
+    scale: f32,
+    zero_point: i32,
+    center: i32,
+    e: &Epilogue,
+    c: &mut [f32],
+) {
+    A_ROWS.with_borrow_mut(|a| match &w.packed {
+        Packed::Pairs { pairs, .. } => {
+            quantize_rows_at(level, src, m, w.k, scale, zero_point, center, a);
+            qgemm_at(level, a, m, *pairs, w, e, c);
+        }
+        Packed::Quads(q) => ROW_SUMS.with_borrow_mut(|sums| {
+            qgemm_vnni::quantize_rows(level, src, m, w.k, scale, zero_point, a, sums);
+            qgemm_vnni::qgemm(level, a, sums, m, q.quads, center, q, w.n, &w.scale, e, c);
+        }),
+    })
+}
+
+/// Quantizes `x` with `scale`, `zero_point` and `center` (as [`quantize_rows_at`]) and
 /// multiplies it by `w`, with `scale` the scale of the result's A.
 fn quantized_matmul<'a>(
     x: &TensorView<'_, f32>,
@@ -551,10 +673,7 @@ fn quantized_matmul<'a>(
     let m: usize = x.shape[..x.shape.len().saturating_sub(1)].iter().product();
     // C is written whole, so the buffer is not filled first.
     crate::kernels::utils::ensure_capacity(out, m * w.n);
-    A_ROWS.with_borrow_mut(|a| {
-        quantize_rows(&x.data, m, k, scale, zero_point, center, a);
-        qgemm(a, m, w.pairs, w, &Epilogue { scale, bias, relu }, out);
-    });
+    run_at(Level::new(), w, &x.data, m, scale, zero_point, center, &Epilogue { scale, bias, relu }, out);
     let mut shape = x.shape.to_vec();
     match shape.last_mut() {
         Some(last) => *last = w.n,
@@ -610,28 +729,34 @@ mod tests {
             // Several depth blocks.
             (7, 2100, 20), (2, 4500, 33),
         ];
-        for level in levels() {
+        // Both layouts at every level: the quads emulate VNNI off the AVX-512 level.
+        for (level, layout) in levels().into_iter().flat_map(|l| [(l, Layout::Pairs), (l, Layout::Quads)]) {
             for &(m, k, n) in &sizes {
                 for case in 0..4 {
                     let signed = case % 2 == 0;
                     let per_col = case >= 2;
                     let raw = codes(&mut rng, k * n);
+                    // Case 0 is QDQ's symmetric i8 (zero point 0: the quads skip their row term).
                     let zp: Vec<i32> = (0..if per_col { n } else { 1 })
-                        .map(|_| if signed { rng.f32(-20.0, 20.0) as i32 } else { rng.f32(0.0, 256.0) as i32 })
+                        .map(|_| match case {
+                            0 => 0,
+                            _ if signed => rng.f32(-20.0, 20.0) as i32,
+                            _ => rng.f32(0.0, 256.0) as i32,
+                        })
                         .collect();
                     let ws: Vec<f32> = (0..if per_col { n } else { 1 }).map(|_| rng.f32(0.001, 0.1)).collect();
-                    let w = QWeights::new(&raw, k, n, signed, &zp, &ws);
+                    let w = QWeights::with_layout(layout, &raw, k, n, signed, &zp, &ws);
+                    assert_eq!(w.layout(), layout);
                     let x = rng.vec(m * k, -3.0, 3.0);
                     let (sa, za) = (rng.f32(0.01, 0.05), rng.f32(0.0, 256.0) as i32);
-                    let mut a = Vec::new();
-                    quantize_rows_at(level, &x, m, k, sa, za, za, &mut a);
                     let bias = rng.vec(n, -1.0, 1.0);
                     let relu = case == 1;
                     let e = Epilogue { scale: sa, bias: (case != 3).then_some(&bias[..]), relu };
                     let mut c = vec![f32::NAN; m * n];
-                    qgemm_at(level, &a, m, w.pairs(), &w, &e, &mut c);
+                    run_at(level, &w, &x, m, sa, za, za, &e, &mut c);
 
-                    let ac = unpack_rows(&a, m, k);
+                    let ac: Vec<i32> =
+                        x.iter().map(|&v| ((v / sa).round_ties_even() as i32 + za).clamp(0, 255) - za).collect();
                     let mut want = vec![0.0f32; m * n];
                     for i in 0..m {
                         for j in 0..n {
@@ -651,7 +776,7 @@ mod tests {
                             want[i * n + j] = v;
                         }
                     }
-                    assert_same_bits(&c, &want, &format!("{level:?} {m}x{k}x{n} case {case}"));
+                    assert_same_bits(&c, &want, &format!("{level:?} {layout:?} {m}x{k}x{n} case {case}"));
                 }
             }
         }

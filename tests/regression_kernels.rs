@@ -1472,52 +1472,6 @@ fn test_quantized_weights_take_the_integer_path_when_the_cpu_allows() {
     assert!(qw.is_integer(), "an integer kernel should run everywhere but on aarch64");
 }
 
-/// Exact check of the packed kernel against integer arithmetic, skipped on
-/// machines that cannot run it.
-#[test]
-#[cfg(target_arch = "x86_64")]
-fn test_vnni_qgemm_matches_integer_reference() {
-    use lele::kernels::avx512::qgemm::{has_vnni, pack_i8_weights, qgemm_u8s8_f32};
-    if !has_vnni() {
-        return;
-    }
-    // K is not a multiple of 4 and N is not a multiple of 64, so both the
-    // packing padding and the masked store are exercised.
-    let (m, k, n) = (11usize, 37usize, 70usize);
-    let a: Vec<u8> = (0..m * k.next_multiple_of(4))
-        .map(|i| (i * 37 % 256) as u8)
-        .collect();
-    let b: Vec<i8> = (0..k * n)
-        .map(|i| ((i * 53 % 255) as i32 - 127) as i8)
-        .collect();
-    let w_scale: Vec<f32> = (0..n).map(|j| 0.001 + (j % 7) as f32 * 1e-4).collect();
-    let bias: Vec<f32> = (0..n).map(|j| (j % 11) as f32 * 0.01).collect();
-    let (a_scale, a_zp) = (0.0037f32, 131i32);
-    let lda = k.next_multiple_of(4);
-
-    let pw = pack_i8_weights(&b, k, n);
-    let mut out = vec![0f32; m * n];
-    unsafe {
-        qgemm_u8s8_f32(
-            a.as_ptr(), m, lda, &pw, a_zp, a_scale,
-            w_scale.as_ptr(), w_scale.len(), Some(bias.as_ptr()),
-            out.as_mut_ptr(), n,
-        );
-    }
-
-    for i in 0..m {
-        for j in 0..n {
-            let dot: i32 = (0..k).map(|kk| a[i * lda + kk] as i32 * b[kk * n + j] as i32).sum();
-            let col: i32 = (0..k).map(|kk| b[kk * n + j] as i32).sum();
-            let want = a_scale * w_scale[j] * (dot - a_zp * col) as f32 + bias[j];
-            let got = out[i * n + j];
-            assert!(
-                (got - want).abs() <= 1e-5 * want.abs().max(1.0),
-                "vnni qgemm differs at ({i},{j}): got {got}, want {want}"
-            );
-        }
-    }
-}
 
 #[test]
 #[cfg(target_arch = "x86_64")]

@@ -1,8 +1,6 @@
 pub mod activations;
 #[cfg(target_arch = "x86_64")]
 pub mod avx;
-#[cfg(target_arch = "x86_64")]
-pub mod avx512;
 pub(crate) mod bias_act;
 pub(crate) mod binary;
 pub mod conv1d;
@@ -20,6 +18,7 @@ pub mod neon;
 pub mod norm;
 pub mod pooling;
 pub mod qgemm;
+pub(crate) mod qgemm_vnni;
 pub mod qmatmul_i8;
 pub mod quantization;
 pub mod rnn;
