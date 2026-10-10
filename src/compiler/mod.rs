@@ -1429,14 +1429,17 @@ impl Compiler {
         writeln!(&mut code, "\npub struct {}<'a> {{", struct_name)?;
         writeln!(&mut code, "    data: &'a [u8],")?;
         writeln!(&mut code, "    _phantom: std::marker::PhantomData<&'a ()>,")?;
-        writeln!(&mut code, "    #[cfg(target_arch = \"aarch64\")]")?;
         writeln!(
             &mut code,
-            "    prepared_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::PreparedWeightsArm>>>,"
+            "    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,"
         )?;
         writeln!(
             &mut code,
-            "    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QuantizedWeights>)>>,"
+            "    qweights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize, bool), (std::vec::Vec<f32>, std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,"
+        )?;
+        writeln!(
+            &mut code,
+            "    conv_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, bool), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::ConvWeights>)>>,"
         )?;
         writeln!(&mut code, "}}")?;
         writeln!(&mut code, "\nimpl<'a> {}<'a> {{", struct_name)?;
@@ -1444,14 +1447,17 @@ impl Compiler {
         writeln!(&mut code, "        Self {{")?;
         writeln!(&mut code, "            data,")?;
         writeln!(&mut code, "            _phantom: std::marker::PhantomData,")?;
-        writeln!(&mut code, "            #[cfg(target_arch = \"aarch64\")]")?;
-        writeln!(
-            &mut code,
-            "            prepared_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
-        )?;
         writeln!(
             &mut code,
             "            quantized_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
+        )?;
+        writeln!(
+            &mut code,
+            "            qweights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
+        )?;
+        writeln!(
+            &mut code,
+            "            conv_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
         )?;
         writeln!(&mut code, "        }}")?;
         writeln!(&mut code, "    }}")?;
@@ -1463,46 +1469,12 @@ impl Compiler {
             writeln!(&mut code, "{}", func)?;
         }
 
-        // ARM prepared weights helper
-        writeln!(&mut code, "    #[cfg(target_arch = \"aarch64\")]")?;
-        writeln!(
-            &mut code,
-            "    fn get_prepared_weight(&self, offset: usize, len: usize, k: usize, n: usize) -> std::sync::Arc<lele::kernels::PreparedWeightsArm> {{"
-        )?;
-        writeln!(&mut code, "        let key = (offset, len);")?;
-        writeln!(&mut code, "        {{")?;
-        writeln!(
-            &mut code,
-            "            let cache = self.prepared_weights_cache.borrow();"
-        )?;
-        writeln!(
-            &mut code,
-            "            if let Some(pw) = cache.get(&key) {{"
-        )?;
-        writeln!(&mut code, "                return pw.clone();")?;
-        writeln!(&mut code, "            }}")?;
-        writeln!(&mut code, "        }}")?;
-        writeln!(
-            &mut code,
-            "        let raw_bytes = &self.data[offset..offset+len];"
-        )?;
-        writeln!(
-            &mut code,
-            "        let pw = std::sync::Arc::new(lele::kernels::prepare_weights_arm(raw_bytes, k, n));"
-        )?;
-        writeln!(
-            &mut code,
-            "        self.prepared_weights_cache.borrow_mut().insert(key, pw.clone());"
-        )?;
-        writeln!(&mut code, "        pw")?;
-        writeln!(&mut code, "    }}")?;
-
         // Int8 weights for QLinearMatMulI8. Preparing is architecture
         // dependent and costs a full pass over the weight, so it happens once
         // per tensor and the result is cached for the life of the model.
         writeln!(
             &mut code,
-            "    fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &lele::tensor::TensorView<f32>) -> std::sync::Arc<lele::kernels::QuantizedWeights> {{"
+            "    fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &lele::tensor::TensorView<f32>) -> std::sync::Arc<lele::kernels::QWeights> {{"
         )?;
         writeln!(
             &mut code,
@@ -1539,6 +1511,68 @@ impl Compiler {
             "        self.quantized_weights_cache.borrow_mut().insert(key, (scale.data.to_vec(), qw.clone()));"
         )?;
         writeln!(&mut code, "        qw")?;
+        writeln!(&mut code, "    }}")?;
+
+        // 8-bit weights packed for the integer GEMM, with their zero points
+        // subtracted, so the cached entry must match those and the scales.
+        writeln!(
+            &mut code,
+            "    #[allow(dead_code)]\n    fn get_qweights(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool, zero_point: &[f32], scale: &[f32]) -> std::sync::Arc<lele::kernels::QWeights> {{"
+        )?;
+        writeln!(&mut code, "        let key = (offset, len, k, n, signed);")?;
+        writeln!(
+            &mut code,
+            "        if let Some((z, s, w)) = self.qweights_cache.borrow().get(&key) {{"
+        )?;
+        writeln!(
+            &mut code,
+            "            if z.as_slice() == zero_point && s.as_slice() == scale {{"
+        )?;
+        writeln!(&mut code, "                return w.clone();")?;
+        writeln!(&mut code, "            }}")?;
+        writeln!(&mut code, "        }}")?;
+        writeln!(
+            &mut code,
+            "        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();"
+        )?;
+        writeln!(
+            &mut code,
+            "        let w = std::sync::Arc::new(lele::kernels::QWeights::new(&self.data[offset..offset + len], k, n, signed, &zp, scale));"
+        )?;
+        writeln!(
+            &mut code,
+            "        self.qweights_cache.borrow_mut().insert(key, (zero_point.to_vec(), scale.to_vec(), w.clone()));"
+        )?;
+        writeln!(&mut code, "        w")?;
+        writeln!(&mut code, "    }}")?;
+
+        // ConvInteger weights, prepared with their zero points, which the entry must match.
+        writeln!(
+            &mut code,
+            "    #[allow(dead_code)]\n    fn get_conv_weights(&self, offset: usize, len: usize, shape: [usize; 4], groups: usize, signed: bool, zero_point: &[f32]) -> std::sync::Arc<lele::kernels::ConvWeights> {{"
+        )?;
+        writeln!(&mut code, "        let key = (offset, len, groups, signed);")?;
+        writeln!(
+            &mut code,
+            "        if let Some((z, w)) = self.conv_weights_cache.borrow().get(&key) {{"
+        )?;
+        writeln!(&mut code, "            if z.as_slice() == zero_point {{")?;
+        writeln!(&mut code, "                return w.clone();")?;
+        writeln!(&mut code, "            }}")?;
+        writeln!(&mut code, "        }}")?;
+        writeln!(
+            &mut code,
+            "        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();"
+        )?;
+        writeln!(
+            &mut code,
+            "        let w = std::sync::Arc::new(lele::kernels::ConvWeights::new(&self.data[offset..offset + len], &shape, groups, signed, &zp));"
+        )?;
+        writeln!(
+            &mut code,
+            "        self.conv_weights_cache.borrow_mut().insert(key, (zero_point.to_vec(), w.clone()));"
+        )?;
+        writeln!(&mut code, "        w")?;
         writeln!(&mut code, "    }}")?;
 
         // Helpers for weights

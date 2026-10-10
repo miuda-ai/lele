@@ -62,9 +62,9 @@ impl PrefillWorkspace {
 pub struct Prefill<'a> {
     data: &'a [u8],
     _phantom: std::marker::PhantomData<&'a ()>,
-    #[cfg(target_arch = "aarch64")]
-    prepared_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::PreparedWeightsArm>>>,
-    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QuantizedWeights>)>>,
+    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,
+    qweights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize, bool), (std::vec::Vec<f32>, std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,
+    conv_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, bool), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::ConvWeights>)>>,
 }
 
 impl<'a> Prefill<'a> {
@@ -72,9 +72,9 @@ impl<'a> Prefill<'a> {
         Self {
             data,
             _phantom: std::marker::PhantomData,
-            #[cfg(target_arch = "aarch64")]
-            prepared_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             quantized_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            qweights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            conv_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 fn conv1d_relu<'c, 'd>(
@@ -140,83 +140,66 @@ fn linear_quantized_relu<'c, 'd>(
     )
 }
 
-#[cfg(target_arch = "aarch64")]
-fn linear_quantized_arm<'c, 'd>(
+/// Dynamically quantized linear layer (+ ReLU) against an int8 weight packed
+/// once for the integer GEMM.
+fn linear_quantized_packed<'c, 'd>(
     &self,
     input: &lele::tensor::TensorView<'c, f32>,
     weight_offset: usize,
     weight_len: usize,
     weight_k: usize,
     weight_n: usize,
+    weight_signed: bool,
     weight_scale: lele::tensor::TensorView<'c, f32>,
     weight_zero: lele::tensor::TensorView<'c, f32>,
     bias: lele::tensor::TensorView<'c, f32>,
+    relu: bool,
     output_buf: &'d mut Vec<f32>,
 ) -> lele::tensor::TensorView<'d, f32> {
-    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n);
-    let zp_b = weight_zero.data.first().map(|&v| v as u8);
-
-    lele::kernels::fused_dq_gemm_prepared_arm(
-        input,
-        &pw,
-        zp_b,
-        &weight_scale,
-        Some(&bias),
-        false,
-        output_buf,
-    )
+    let w = self.get_qweights(weight_offset, weight_len, weight_k, weight_n, weight_signed, &weight_zero.data, &weight_scale.data);
+    let bias = (!bias.data.is_empty()).then_some(&bias.data[..]);
+    lele::kernels::qlinear_dynamic(input, &w, bias, relu, output_buf)
 }
 
-/// ARM-optimized quantized linear + ReLU with pre-packed weights.
-/// Uses fused DynQuant+GEMM: eliminates f32 intermediate buffer, per-call u8
-/// allocation, and separate f32→u8 conversion pass.
-#[cfg(target_arch = "aarch64")]
-fn linear_quantized_relu_arm<'c, 'd>(
-    &self,
-    input: &lele::tensor::TensorView<'c, f32>,
-    weight_offset: usize,
-    weight_len: usize,
-    weight_k: usize,
-    weight_n: usize,
-    weight_scale: lele::tensor::TensorView<'c, f32>,
-    weight_zero: lele::tensor::TensorView<'c, f32>,
-    bias: lele::tensor::TensorView<'c, f32>,
-    output_buf: &'d mut Vec<f32>,
-) -> lele::tensor::TensorView<'d, f32> {
-    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n);
-    let zp_b = weight_zero.data.first().map(|&v| v as u8);
-
-    lele::kernels::fused_dq_gemm_prepared_arm(
-        input,
-        &pw,
-        zp_b,
-        &weight_scale,
-        Some(&bias),
-        true,
-        output_buf,
-    )
-}
-
-/// ARM-optimized MatMulInteger with pre-packed weight cache.
-/// Used for unfused MatMulInteger nodes where B is a static model weight.
-/// Eliminates: per-call B packing, B u8→f32→u8 roundtrip, heap alloc.
-#[cfg(target_arch = "aarch64")]
-fn mat_mul_integer_arm<'c, 'd>(
+/// MatMulInteger against a static weight packed once for the integer GEMM.
+fn mat_mul_integer_packed<'c, 'd>(
     &self,
     a: &lele::tensor::TensorView<'c, f32>,
     weight_offset: usize,
     weight_len: usize,
     weight_k: usize,
     weight_n: usize,
+    weight_signed: bool,
     a_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
     b_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
     output_buf: &'d mut Vec<f32>,
 ) -> lele::tensor::TensorView<'d, f32> {
-    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n);
-    let zp_a = a_zero_point.and_then(|z| z.data.first().cloned());
-    let zp_b = b_zero_point.and_then(|z| z.data.first()).map(|&v| v as u8);
+    let zb = b_zero_point.map_or(&[0.0f32][..], |z| &z.data[..]);
+    let w = self.get_qweights(weight_offset, weight_len, weight_k, weight_n, weight_signed, zb, &[1.0]);
+    let za = a_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0) as i32;
+    lele::kernels::mat_mul_integer_qweights(a, za, &w, output_buf)
+}
 
-    lele::kernels::mat_mul_integer_prepared_arm(a, &pw, zp_a, zp_b, None, None, false, output_buf)
+/// ConvInteger against a static weight prepared once.
+fn conv_integer_packed<'c, 'd>(
+    &self,
+    x: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_shape: [usize; 4],
+    weight_signed: bool,
+    group: i64,
+    x_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    w_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    dilations: &[i64],
+    pads: &[i64],
+    strides: &[i64],
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let zw = w_zero_point.filter(|z| !z.data.is_empty()).map_or(&[0.0f32][..], |z| &z.data[..]);
+    let w = self.get_conv_weights(weight_offset, weight_len, weight_shape, group as usize, weight_signed, zw);
+    let zx = x_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0) as i32;
+    lele::kernels::conv_integer_packed(x, &w, zx, dilations, pads, strides, output_buf)
 }
 
 // Helper for pre-quantized inputs (used in attention where input is already quantized)
@@ -910,7 +893,7 @@ fn embedding_concat_i64<'c, 'd>(
         let _Gather_28_output_0 = lele::kernels::gather(&_Shape_29_output_0, &self.weight_i64(440813600, 8, &[]), 0, &mut buf__Gather_28_output_0);
         let mut buf__Shape_30_output_0 = Vec::<i64>::new();
         let _Shape_30_output_0 = lele::kernels::shape(&_Split_1_output_0);
-        (unsafe { _Add_17_output_0.detach_or_own() }, _Cast_18_output_0.to_owned(), _Gather_25_output_0.to_owned(), _Gather_28_output_0.to_owned(), unsafe { _Mul_22_output_0.detach_or_own() }, _Range_1_output_0.to_owned(), unsafe { _Reshape_2_output_0.detach_or_own() }, _Shape_30_output_0.to_owned(), _Slice_output_0.to_owned(), unsafe { _Split_1_output_0.detach_or_own() }, unsafe { _Split_1_output_1.detach_or_own() }, unsafe { _Split_1_output_2.detach_or_own() }, unsafe { _Split_output_2.detach_or_own() }, _Unsqueeze_29_output_0.to_owned(), _Where_16_output_0.to_owned(), unsafe { _ln_1_1_LayerNormalization_output_0.detach_or_own() }, attention_mask.to_owned(), unsafe { core_model_transformer_h_10_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_10_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_11_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_11_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_1_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_2_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_2_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_3_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_3_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_4_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_4_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_5_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_5_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_6_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_6_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_7_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_7_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_8_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_8_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_9_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_9_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_ln_f_weight.detach_or_own() })
+        (unsafe { _Add_17_output_0.detach_or_own() }, _Cast_18_output_0.to_owned(), _Gather_25_output_0.to_owned(), _Gather_28_output_0.to_owned(), unsafe { _Mul_22_output_0.detach_or_own() }, _Range_1_output_0.to_owned(), _Reshape_2_output_0.to_owned(), _Shape_30_output_0.to_owned(), _Slice_output_0.to_owned(), _Split_1_output_0.to_owned(), _Split_1_output_1.to_owned(), _Split_1_output_2.to_owned(), _Split_output_2.to_owned(), _Unsqueeze_29_output_0.to_owned(), _Where_16_output_0.to_owned(), unsafe { _ln_1_1_LayerNormalization_output_0.detach_or_own() }, attention_mask.to_owned(), unsafe { core_model_transformer_h_10_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_10_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_11_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_11_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_1_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_2_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_2_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_3_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_3_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_4_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_4_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_5_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_5_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_6_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_6_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_7_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_7_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_8_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_8_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_h_9_ln_1_weight.detach_or_own() }, unsafe { core_model_transformer_h_9_ln_2_weight.detach_or_own() }, unsafe { core_model_transformer_ln_f_weight.detach_or_own() })
     }
 
 
@@ -1373,7 +1356,7 @@ fn embedding_concat_i64<'c, 'd>(
         let _rotary_emb_3_Cast_2_output_0 = _rotary_emb_3_Unsqueeze_3_output_0.clone(); // Cast f32->f32 is no-op
         let _Mul_35_output_0 = lele::kernels::mul(&_Reshape_18_output_0, &_rotary_emb_3_Cast_1_output_0, &mut ws.buf_19);
         let _Slice_17_output_0 = lele::kernels::slice(&_Reshape_18_output_0, &[1], &[9223372036854775807], &[3], &[2], &mut ws.buf_40);
-        (unsafe { _Add_22_output_0.detach_or_own() }, unsafe { _Add_27_output_0.detach_or_own() }, _Cast_18_output_0.to_owned(), _Gather_25_output_0.to_owned(), _Gather_52_output_0.to_owned(), unsafe { _Mul_34_output_0.detach_or_own() }, unsafe { _Mul_35_output_0.detach_or_own() }, unsafe { _Reshape_14_output_0.detach_or_own() }, unsafe { _Reshape_18_output_0.detach_or_own() }, unsafe { _Reshape_19_output_0.detach_or_own() }, unsafe { _Reshape_20_output_0.detach_or_own() }, unsafe { _Reshape_8_output_0.detach_or_own() }, unsafe { _Slice_17_output_0.detach_or_own() }, _Slice_output_0.to_owned(), unsafe { _Split_1_output_2.detach_or_own() }, unsafe { _Split_2_output_2.detach_or_own() }, unsafe { _Split_3_output_0.detach_or_own() }, unsafe { _Split_3_output_1.detach_or_own() }, unsafe { _Split_3_output_2.detach_or_own() }, _Unsqueeze_29_output_0.to_owned(), _Where_16_output_0.to_owned(), unsafe { _rotary_emb_3_Cast_1_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Cast_2_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Reshape_1_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Reshape_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Tile_1_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Tile_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Unsqueeze_1_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Unsqueeze_3_output_0.detach_or_own() })
+        (unsafe { _Add_22_output_0.detach_or_own() }, unsafe { _Add_27_output_0.detach_or_own() }, _Cast_18_output_0.to_owned(), _Gather_25_output_0.to_owned(), _Gather_52_output_0.to_owned(), unsafe { _Mul_34_output_0.detach_or_own() }, unsafe { _Mul_35_output_0.detach_or_own() }, _Reshape_14_output_0.to_owned(), _Reshape_18_output_0.to_owned(), _Reshape_19_output_0.to_owned(), _Reshape_20_output_0.to_owned(), unsafe { _Reshape_8_output_0.detach_or_own() }, unsafe { _Slice_17_output_0.detach_or_own() }, _Slice_output_0.to_owned(), unsafe { _Split_1_output_2.detach_or_own() }, _Split_2_output_2.to_owned(), _Split_3_output_0.to_owned(), _Split_3_output_1.to_owned(), _Split_3_output_2.to_owned(), _Unsqueeze_29_output_0.to_owned(), _Where_16_output_0.to_owned(), unsafe { _rotary_emb_3_Cast_1_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Cast_2_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Reshape_1_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Reshape_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Tile_1_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Tile_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Unsqueeze_1_output_0.detach_or_own() }, unsafe { _rotary_emb_3_Unsqueeze_3_output_0.detach_or_own() })
     }
 
 
@@ -1836,7 +1819,7 @@ fn embedding_concat_i64<'c, 'd>(
         let _mlp_fc_in_5_Add_output_0 = self.linear(&_ln_2_5_LayerNormalization_output_0, &self.weight_f32(252069888, 9437184, &[768, 3072]), &self.weight_f32(50522112, 12288, &[3072]), &mut ws.buf_15);
         let _mlp_act_5_Mul_output_0 = lele::kernels::mul(&_mlp_fc_in_5_Add_output_0, &self.weight_f32(440814160, 4, &[]), &mut ws.buf_20);
         let _mlp_act_5_Pow_output_0 = lele::kernels::pow(&_mlp_fc_in_5_Add_output_0, &self.weight_f32(440814176, 4, &[]), &mut ws.buf_13);
-        (unsafe { _Add_32_output_0.detach_or_own() }, unsafe { _Add_37_output_0.detach_or_own() }, unsafe { _Add_42_output_0.detach_or_own() }, unsafe { _Add_44_output_0.detach_or_own() }, _Cast_18_output_0.to_owned(), _Gather_25_output_0.to_owned(), unsafe { _Reshape_20_output_0.detach_or_own() }, unsafe { _Reshape_26_output_0.detach_or_own() }, unsafe { _Reshape_32_output_0.detach_or_own() }, _Slice_output_0.to_owned(), unsafe { _Split_4_output_2.detach_or_own() }, unsafe { _Split_5_output_2.detach_or_own() }, _Unsqueeze_29_output_0.to_owned(), _Where_16_output_0.to_owned(), unsafe { _mlp_act_5_Mul_output_0.detach_or_own() }, unsafe { _mlp_act_5_Pow_output_0.detach_or_own() }, unsafe { _mlp_fc_in_5_Add_output_0.detach_or_own() })
+        (unsafe { _Add_32_output_0.detach_or_own() }, unsafe { _Add_37_output_0.detach_or_own() }, unsafe { _Add_42_output_0.detach_or_own() }, unsafe { _Add_44_output_0.detach_or_own() }, _Cast_18_output_0.to_owned(), _Gather_25_output_0.to_owned(), unsafe { _Reshape_20_output_0.detach_or_own() }, _Reshape_26_output_0.to_owned(), _Reshape_32_output_0.to_owned(), _Slice_output_0.to_owned(), _Split_4_output_2.to_owned(), _Split_5_output_2.to_owned(), _Unsqueeze_29_output_0.to_owned(), _Where_16_output_0.to_owned(), unsafe { _mlp_act_5_Mul_output_0.detach_or_own() }, unsafe { _mlp_act_5_Pow_output_0.detach_or_own() }, unsafe { _mlp_fc_in_5_Add_output_0.detach_or_own() })
     }
 
 
@@ -2309,7 +2292,7 @@ fn embedding_concat_i64<'c, 'd>(
         let mut buf__rotary_emb_8_Concat_output_0 = Vec::<i64>::new();
         let _rotary_emb_8_Concat_output_0 = lele::kernels::concat(&[&_rotary_emb_8_Slice_output_0, &self.weight_i64(440813648, 8, &[1])], 0, &mut buf__rotary_emb_8_Concat_output_0);
         let _rotary_emb_8_Reshape_output_0 = lele::kernels::reshape(&_rotary_emb_8_Tile_output_0, &_rotary_emb_8_Concat_output_0.data[..]);
-        (unsafe { _Add_47_output_0.detach_or_own() }, unsafe { _Add_52_output_0.detach_or_own() }, _Cast_18_output_0.to_owned(), _Gather_25_output_0.to_owned(), _Gather_97_output_0.to_owned(), unsafe { _Mul_64_output_0.detach_or_own() }, unsafe { _Reshape_38_output_0.detach_or_own() }, unsafe { _Reshape_44_output_0.detach_or_own() }, unsafe { _Reshape_48_output_0.detach_or_own() }, unsafe { _Reshape_49_output_0.detach_or_own() }, unsafe { _Reshape_50_output_0.detach_or_own() }, _Slice_output_0.to_owned(), unsafe { _Split_6_output_2.detach_or_own() }, unsafe { _Split_7_output_2.detach_or_own() }, unsafe { _Split_8_output_0.detach_or_own() }, unsafe { _Split_8_output_1.detach_or_own() }, unsafe { _Split_8_output_2.detach_or_own() }, _Unsqueeze_29_output_0.to_owned(), _Where_16_output_0.to_owned(), unsafe { _rotary_emb_8_Einsum_output_0.detach_or_own() }, unsafe { _rotary_emb_8_Reshape_output_0.detach_or_own() }, unsafe { _rotary_emb_8_Tile_output_0.detach_or_own() })
+        (unsafe { _Add_47_output_0.detach_or_own() }, unsafe { _Add_52_output_0.detach_or_own() }, _Cast_18_output_0.to_owned(), _Gather_25_output_0.to_owned(), _Gather_97_output_0.to_owned(), unsafe { _Mul_64_output_0.detach_or_own() }, _Reshape_38_output_0.to_owned(), _Reshape_44_output_0.to_owned(), _Reshape_48_output_0.to_owned(), _Reshape_49_output_0.to_owned(), _Reshape_50_output_0.to_owned(), _Slice_output_0.to_owned(), _Split_6_output_2.to_owned(), _Split_7_output_2.to_owned(), _Split_8_output_0.to_owned(), _Split_8_output_1.to_owned(), _Split_8_output_2.to_owned(), _Unsqueeze_29_output_0.to_owned(), _Where_16_output_0.to_owned(), unsafe { _rotary_emb_8_Einsum_output_0.detach_or_own() }, unsafe { _rotary_emb_8_Reshape_output_0.detach_or_own() }, unsafe { _rotary_emb_8_Tile_output_0.detach_or_own() })
     }
 
 
@@ -2765,7 +2748,7 @@ fn embedding_concat_i64<'c, 'd>(
         let _Cast_65_output_0 = lele::kernels::utils::cast_to_i64(&_Not_27_output_0, &mut temp_cast_buf__Cast_65_output_0);
         let _Where_27_output_0 = lele::kernels::where_op(&_Cast_65_output_0, &self.weight_f32(440814128, 4, &[]), &_Mul_81_output_0, &mut ws.buf_40);
         let _Softmax_10_output_0 = lele::kernels::softmax(&_Where_27_output_0, 3, &mut ws.buf_16);
-        (unsafe { _Add_57_output_0.detach_or_own() }, unsafe { _Add_62_output_0.detach_or_own() }, unsafe { _Add_67_output_0.detach_or_own() }, _Cast_18_output_0.to_owned(), _Gather_25_output_0.to_owned(), unsafe { _Mul_76_output_0.detach_or_own() }, unsafe { _Reshape_50_output_0.detach_or_own() }, unsafe { _Reshape_56_output_0.detach_or_own() }, unsafe { _Reshape_62_output_0.detach_or_own() }, _Slice_output_0.to_owned(), unsafe { _Softmax_10_output_0.detach_or_own() }, unsafe { _Split_10_output_2.detach_or_own() }, unsafe { _Split_9_output_2.detach_or_own() }, unsafe { _Transpose_42_output_0.detach_or_own() }, _Unsqueeze_29_output_0.to_owned(), _Where_16_output_0.to_owned())
+        (unsafe { _Add_57_output_0.detach_or_own() }, unsafe { _Add_62_output_0.detach_or_own() }, unsafe { _Add_67_output_0.detach_or_own() }, _Cast_18_output_0.to_owned(), _Gather_25_output_0.to_owned(), unsafe { _Mul_76_output_0.detach_or_own() }, unsafe { _Reshape_50_output_0.detach_or_own() }, _Reshape_56_output_0.to_owned(), _Reshape_62_output_0.to_owned(), _Slice_output_0.to_owned(), unsafe { _Softmax_10_output_0.detach_or_own() }, _Split_10_output_2.to_owned(), _Split_9_output_2.to_owned(), unsafe { _Transpose_42_output_0.detach_or_own() }, _Unsqueeze_29_output_0.to_owned(), _Where_16_output_0.to_owned())
     }
 
 
@@ -3026,25 +3009,11 @@ fn embedding_concat_i64<'c, 'd>(
         let present_value_10 = _Reshape_62_output_0.clone(); // Cast f32->f32 is no-op
         let present_key_11 = _Add_72_output_0.clone(); // Cast f32->f32 is no-op
         let present_value_11 = _Reshape_68_output_0.clone(); // Cast f32->f32 is no-op
-        (unsafe { _Add_17_output_0.detach_or_own() }, unsafe { _Add_22_output_0.detach_or_own() }, unsafe { _Add_27_output_0.detach_or_own() }, unsafe { _Add_32_output_0.detach_or_own() }, unsafe { _Add_37_output_0.detach_or_own() }, unsafe { _Add_42_output_0.detach_or_own() }, unsafe { _Add_47_output_0.detach_or_own() }, unsafe { _Add_52_output_0.detach_or_own() }, unsafe { _Add_57_output_0.detach_or_own() }, unsafe { _Add_62_output_0.detach_or_own() }, unsafe { _Add_67_output_0.detach_or_own() }, unsafe { _Add_72_output_0.detach_or_own() }, unsafe { _Mul_89_output_0.detach_or_own() }, unsafe { _Reshape_14_output_0.detach_or_own() }, unsafe { _Reshape_20_output_0.detach_or_own() }, unsafe { _Reshape_26_output_0.detach_or_own() }, unsafe { _Reshape_2_output_0.detach_or_own() }, unsafe { _Reshape_32_output_0.detach_or_own() }, unsafe { _Reshape_38_output_0.detach_or_own() }, unsafe { _Reshape_44_output_0.detach_or_own() }, unsafe { _Reshape_50_output_0.detach_or_own() }, unsafe { _Reshape_56_output_0.detach_or_own() }, unsafe { _Reshape_62_output_0.detach_or_own() }, unsafe { _Reshape_68_output_0.detach_or_own() }, unsafe { _Reshape_8_output_0.detach_or_own() }, unsafe { _Split_11_output_2.detach_or_own() }, unsafe { global_hidden.detach_or_own() }, unsafe { present_key_0.detach_or_own() }, unsafe { present_key_1.detach_or_own() }, unsafe { present_key_10.detach_or_own() }, unsafe { present_key_11.detach_or_own() }, unsafe { present_key_2.detach_or_own() }, unsafe { present_key_3.detach_or_own() }, unsafe { present_key_4.detach_or_own() }, unsafe { present_key_5.detach_or_own() }, unsafe { present_key_6.detach_or_own() }, unsafe { present_key_7.detach_or_own() }, unsafe { present_key_8.detach_or_own() }, unsafe { present_key_9.detach_or_own() }, unsafe { present_value_0.detach_or_own() }, unsafe { present_value_1.detach_or_own() }, unsafe { present_value_10.detach_or_own() }, unsafe { present_value_11.detach_or_own() }, unsafe { present_value_2.detach_or_own() }, unsafe { present_value_3.detach_or_own() }, unsafe { present_value_4.detach_or_own() }, unsafe { present_value_5.detach_or_own() }, unsafe { present_value_6.detach_or_own() }, unsafe { present_value_7.detach_or_own() }, unsafe { present_value_8.detach_or_own() }, unsafe { present_value_9.detach_or_own() })
+        (unsafe { _Add_17_output_0.detach_or_own() }, unsafe { _Add_22_output_0.detach_or_own() }, unsafe { _Add_27_output_0.detach_or_own() }, unsafe { _Add_32_output_0.detach_or_own() }, unsafe { _Add_37_output_0.detach_or_own() }, unsafe { _Add_42_output_0.detach_or_own() }, unsafe { _Add_47_output_0.detach_or_own() }, unsafe { _Add_52_output_0.detach_or_own() }, unsafe { _Add_57_output_0.detach_or_own() }, unsafe { _Add_62_output_0.detach_or_own() }, unsafe { _Add_67_output_0.detach_or_own() }, unsafe { _Add_72_output_0.detach_or_own() }, unsafe { _Mul_89_output_0.detach_or_own() }, unsafe { _Reshape_14_output_0.detach_or_own() }, unsafe { _Reshape_20_output_0.detach_or_own() }, unsafe { _Reshape_26_output_0.detach_or_own() }, unsafe { _Reshape_2_output_0.detach_or_own() }, unsafe { _Reshape_32_output_0.detach_or_own() }, unsafe { _Reshape_38_output_0.detach_or_own() }, unsafe { _Reshape_44_output_0.detach_or_own() }, unsafe { _Reshape_50_output_0.detach_or_own() }, unsafe { _Reshape_56_output_0.detach_or_own() }, unsafe { _Reshape_62_output_0.detach_or_own() }, _Reshape_68_output_0.to_owned(), unsafe { _Reshape_8_output_0.detach_or_own() }, _Split_11_output_2.to_owned(), unsafe { global_hidden.detach_or_own() }, unsafe { present_key_0.detach_or_own() }, unsafe { present_key_1.detach_or_own() }, unsafe { present_key_10.detach_or_own() }, unsafe { present_key_11.detach_or_own() }, unsafe { present_key_2.detach_or_own() }, unsafe { present_key_3.detach_or_own() }, unsafe { present_key_4.detach_or_own() }, unsafe { present_key_5.detach_or_own() }, unsafe { present_key_6.detach_or_own() }, unsafe { present_key_7.detach_or_own() }, unsafe { present_key_8.detach_or_own() }, unsafe { present_key_9.detach_or_own() }, unsafe { present_value_0.detach_or_own() }, unsafe { present_value_1.detach_or_own() }, unsafe { present_value_10.detach_or_own() }, present_value_11.to_owned(), unsafe { present_value_2.detach_or_own() }, unsafe { present_value_3.detach_or_own() }, unsafe { present_value_4.detach_or_own() }, unsafe { present_value_5.detach_or_own() }, unsafe { present_value_6.detach_or_own() }, unsafe { present_value_7.detach_or_own() }, unsafe { present_value_8.detach_or_own() }, unsafe { present_value_9.detach_or_own() })
     }
 
 
-    #[cfg(target_arch = "aarch64")]
-    fn get_prepared_weight(&self, offset: usize, len: usize, k: usize, n: usize) -> std::sync::Arc<lele::kernels::PreparedWeightsArm> {
-        let key = (offset, len);
-        {
-            let cache = self.prepared_weights_cache.borrow();
-            if let Some(pw) = cache.get(&key) {
-                return pw.clone();
-            }
-        }
-        let raw_bytes = &self.data[offset..offset+len];
-        let pw = std::sync::Arc::new(lele::kernels::prepare_weights_arm(raw_bytes, k, n));
-        self.prepared_weights_cache.borrow_mut().insert(key, pw.clone());
-        pw
-    }
-    fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &lele::tensor::TensorView<f32>) -> std::sync::Arc<lele::kernels::QuantizedWeights> {
+    fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &lele::tensor::TensorView<f32>) -> std::sync::Arc<lele::kernels::QWeights> {
         // Distinct initializers can share identical bytes, and one initializer can sit behind several DequantizeLinear nodes carrying different scales, so the key must include the shape and the cached entry must match the exact scale.
         let key = (offset, len, k, n);
         {
@@ -3059,6 +3028,32 @@ fn embedding_concat_i64<'c, 'd>(
         let qw = std::sync::Arc::new(lele::kernels::prepare_quantized_weights(raw, k, n, &scale.data));
         self.quantized_weights_cache.borrow_mut().insert(key, (scale.data.to_vec(), qw.clone()));
         qw
+    }
+    #[allow(dead_code)]
+    fn get_qweights(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool, zero_point: &[f32], scale: &[f32]) -> std::sync::Arc<lele::kernels::QWeights> {
+        let key = (offset, len, k, n, signed);
+        if let Some((z, s, w)) = self.qweights_cache.borrow().get(&key) {
+            if z.as_slice() == zero_point && s.as_slice() == scale {
+                return w.clone();
+            }
+        }
+        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();
+        let w = std::sync::Arc::new(lele::kernels::QWeights::new(&self.data[offset..offset + len], k, n, signed, &zp, scale));
+        self.qweights_cache.borrow_mut().insert(key, (zero_point.to_vec(), scale.to_vec(), w.clone()));
+        w
+    }
+    #[allow(dead_code)]
+    fn get_conv_weights(&self, offset: usize, len: usize, shape: [usize; 4], groups: usize, signed: bool, zero_point: &[f32]) -> std::sync::Arc<lele::kernels::ConvWeights> {
+        let key = (offset, len, groups, signed);
+        if let Some((z, w)) = self.conv_weights_cache.borrow().get(&key) {
+            if z.as_slice() == zero_point {
+                return w.clone();
+            }
+        }
+        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();
+        let w = std::sync::Arc::new(lele::kernels::ConvWeights::new(&self.data[offset..offset + len], &shape, groups, signed, &zp));
+        self.conv_weights_cache.borrow_mut().insert(key, (zero_point.to_vec(), w.clone()));
+        w
     }
     pub fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {
         TensorView::from_bytes_f32(&self.data[offset..offset+len], shape)

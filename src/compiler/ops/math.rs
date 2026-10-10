@@ -52,7 +52,7 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             } else {
                 "None".to_string()
             };
-            // Check if B is a static weight — use cached ARM path
+            // A static B is packed once for the integer GEMM.
             let b_weight_name = super::super::sanitize_name(&ctx.node.input[1]);
             if let Some((o, l, sh, dt)) = ctx.known_weights.get(&b_weight_name) {
                 if (*dt == 2 || *dt == 3) && sh.len() == 2 {
@@ -60,23 +60,8 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                     let n = sh[1];
                     writeln!(
                         w,
-                        "{}#[cfg(target_arch = \"aarch64\")]",
-                        tab
-                    )?;
-                    writeln!(
-                        w,
-                        "{}let {} = self.mat_mul_integer_arm(&{}, {}, {}, {}, {}, {}, {}, {});",
-                        tab, outputs[0], inputs[0], *o, *l, k, n, a_zp, b_zp, buf_expr
-                    )?;
-                    writeln!(
-                        w,
-                        "{}#[cfg(not(target_arch = \"aarch64\"))]",
-                        tab
-                    )?;
-                    writeln!(
-                        w,
-                        "{}let {} = lele::kernels::mat_mul_integer(&{}, &{}, {}, {}, {});",
-                        tab, outputs[0], inputs[0], inputs[1], a_zp, b_zp, buf_expr
+                        "{}let {} = self.mat_mul_integer_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {});",
+                        tab, outputs[0], inputs[0], *o, *l, k, n, *dt == 3, a_zp, b_zp, buf_expr
                     )?;
                 } else {
                     writeln!(
