@@ -17,7 +17,7 @@
 //! addresses of A spill instead.
 
 use crate::kernels::simd::simd_call;
-use fearless_simd::{Level, Simd, f32x8};
+use fearless_simd::{Level, Simd, f32x4, f32x8};
 use fearless_simd_macros::simd;
 
 /// Rows of C per register tile.
@@ -89,9 +89,16 @@ fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: &[f32], c: &mut [f32],
             let nc = (PANELS * NR).min(d.n - jc);
             let panels = nc.div_ceil(NR);
             // Panels that cannot be loaded in place are packed up front: all of a
-            // transposed B, and the narrow last panel. The rest load in place.
-            let first_prepacked = if d.b_cols { 0 } else { nc / NR };
-            pack_b(b, d.ldb, d.b_cols, pc, kc, jc, nc, first_prepacked, bpack);
+            // transposed B, and a last panel narrower than the vectors its tiles load
+            // (they load one vector up to 8 columns, two above). The rest load in place.
+            let first_prepacked = if d.b_cols {
+                0
+            } else if nc % NR == 0 || nc % NR == 8 {
+                panels
+            } else {
+                nc / NR
+            };
+            pack_b(simd, b, d.ldb, d.b_cols, pc, kc, jc, nc, first_prepacked, bpack);
             let mut ir = 0;
             while ir < d.m {
                 let rows = MR.min(d.m - ir);
@@ -144,7 +151,9 @@ fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: &[f32], c: &mut [f32],
 ///
 /// With `b_cols`, `b` holds the transpose of B (column `j` of B is the contiguous row
 /// `j` of `b`), and the rows of a panel are read side by side and written in order.
-fn pack_b(
+#[inline(always)]
+fn pack_b<S: Simd>(
+    simd: S,
     b: &[f32],
     ldb: usize,
     b_cols: bool,
@@ -155,6 +164,7 @@ fn pack_b(
     first: usize,
     out: &mut [f32],
 ) {
+    use fearless_simd::prelude::*;
     for jp in first..nc.div_ceil(NR) {
         let panel = &mut out[jp * kc * NR..][..kc * NR];
         let j = jc + jp * NR;
@@ -165,10 +175,24 @@ fn pack_b(
                 row[width..].fill(0.0);
             }
         } else if width == NR {
-            let src: [&[f32]; NR] = core::array::from_fn(|jj| &b[(j + jj) * ldb + pc..][..kc]);
-            for (p, dst) in panel.as_chunks_mut::<NR>().0.iter_mut().enumerate() {
-                for jj in 0..NR {
-                    dst[jj] = src[jj][p];
+            // 4x4 blocks: four depths of four columns, transposed in registers.
+            let quads = kc / 4;
+            for jq in 0..NR / 4 {
+                let src: [&[f32]; 4] = core::array::from_fn(|i| &b[(j + 4 * jq + i) * ldb + pc..][..kc]);
+                for q in 0..quads {
+                    let [r0, r1, r2, r3] = src.map(|s| f32x4::from_slice(simd, &s[4 * q..][..4]));
+                    let (a0, a1) = simd.interleave_f32x4(r0, r2);
+                    let (b0, b1) = simd.interleave_f32x4(r1, r3);
+                    let (c0, c1) = simd.interleave_f32x4(a0, b0);
+                    let (c2, c3) = simd.interleave_f32x4(a1, b1);
+                    for (t, col) in [c0, c1, c2, c3].iter().enumerate() {
+                        col.store_slice(&mut panel[(4 * q + t) * NR + 4 * jq..][..4]);
+                    }
+                }
+                for p in 4 * quads..kc {
+                    for i in 0..4 {
+                        panel[p * NR + 4 * jq + i] = src[i][p];
+                    }
                 }
             }
         } else {
@@ -215,7 +239,7 @@ macro_rules! tile_fn {
             let mut acc = [[zero; V]; R];
             macro_rules! step {
                 ($p:expr, $row:expr) => {{
-                    let row: &[f32; NR] = $row;
+                    let row: &[f32; 8 * V] = $row;
                     let bv: [f32x8<S>; V] = core::array::from_fn(|v| f32x8::from_slice(simd, &row[v * 8..][..8]));
                     for r in 0..R {
                         let av = f32x8::splat(simd, a_rows[r][$p]);
@@ -240,7 +264,7 @@ macro_rules! tile_fn {
                         }
                     }
                     for row in rest {
-                        step!(kc - 1, row);
+                        step!(kc - 1, row.first_chunk().unwrap());
                     }
                     for r in 0..R {
                         acc[r][0] = acc[r][0] + acc2[r][0];
@@ -249,19 +273,20 @@ macro_rules! tile_fn {
                 PACKED_PANEL => {
                     let rows = &src.as_chunks::<NR>().0[..kc];
                     for (p, row) in rows.iter().enumerate() {
-                        step!(p, row);
+                        step!(p, row.first_chunk().unwrap());
                     }
                 }
+                // In place, only the `V` vectors used are read (and copied).
                 IN_PLACE => {
                     for (p, row) in src.chunks(t.lds).take(kc).enumerate() {
-                        step!(p, row.first_chunk::<NR>().unwrap());
+                        step!(p, row.first_chunk().unwrap());
                     }
                 }
                 _ => {
                     let out = &mut dst.as_chunks_mut::<NR>().0[..kc];
                     for (p, (row, out)) in src.chunks(t.lds).zip(out).enumerate() {
-                        let row = row.first_chunk::<NR>().unwrap();
-                        *out = *row;
+                        let row: &[f32; 8 * V] = row.first_chunk().unwrap();
+                        *out.first_chunk_mut().unwrap() = *row;
                         step!(p, row);
                     }
                 }
@@ -324,78 +349,97 @@ fn store_tile<S: Simd, const R: usize, const V: usize>(
 /// Rows of C handled by `gemm_small_m`.
 pub(crate) const SMALL_M: usize = 4;
 
-/// `gemm_nn` for at most `SMALL_M` rows of C. B is used once per row of A at most, so
-/// nothing is copied: tiles of C walk down the columns of B in place.
+/// `gemm_nn` for at most `SMALL_M` rows of C. There is too little arithmetic per element
+/// of B for it to be anything but a stream of B, so B is read in order, `P` rows at a
+/// time, each pass adding them into C (which stays in L1). (Tiles of C walking down the
+/// columns of B, as `gemm_nn` does, are 5-40% slower here: B arrives in short pieces
+/// from rows far apart.) From 5 rows on, `gemm_nn` is faster.
 pub(crate) fn gemm_small_m(level: Level, d: &Dims, a: &[f32], b: &[f32], c: &mut [f32]) {
     simd_call!(level, gemm_small_m_simd(d, a, b, c))
 }
 
 #[simd]
 fn gemm_small_m_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: &[f32], c: &mut [f32]) {
-    macro_rules! run {
-        ($r:literal, $wide:literal) => {{
-            // Wide tiles while they fit, then one vector at a time, then single columns.
-            let mut j = 0;
-            while j + 8 * $wide <= d.n {
-                row_tile::<S, $r, $wide>(simd, d, a, b, c, j);
-                j += 8 * $wide;
-            }
-            while j + 8 <= d.n {
-                row_tile::<S, $r, 1>(simd, d, a, b, c, j);
-                j += 8;
-            }
-            for j in j..d.n {
-                for r in 0..$r {
-                    let sum: f32 = (0..d.k).map(|p| a[r * d.lda + p] * b[p * d.ldb + j]).sum();
-                    let out = &mut c[r * d.ldc + j];
-                    *out = d.alpha * sum + if d.add { *out } else { 0.0 };
-                }
-            }
-        }};
-    }
+    // `R * P` broadcasts of A per pass; past 16 they are reloaded, which costs less than
+    // passing over C more often.
     match d.m {
-        1 => run!(1, 8),
-        2 => run!(2, 6),
-        3 => run!(3, 4),
-        _ => run!(4, 3),
+        1 => stream_rows::<S, 1, 8>(simd, d, a, b, c),
+        2 => stream_rows::<S, 2, 6>(simd, d, a, b, c),
+        3 => stream_rows::<S, 3, 4>(simd, d, a, b, c),
+        _ => stream_rows::<S, 4, 4>(simd, d, a, b, c),
     }
 }
 
-/// `R` rows of C, columns `j..j + 8 * V`, over the whole depth.
+/// `R` rows of C, `P` rows of B per pass.
 #[inline(always)]
-fn row_tile<S: Simd, const R: usize, const V: usize>(
+fn stream_rows<S: Simd, const R: usize, const P: usize>(
     simd: S,
     d: &Dims,
     a: &[f32],
     b: &[f32],
     c: &mut [f32],
-    j: usize,
 ) {
-    use fearless_simd::prelude::*;
-    let a_rows: [&[f32]; R] = core::array::from_fn(|r| &a[r * d.lda..][..d.k]);
-    let zero = f32x8::splat(simd, 0.0);
-    let mut acc = [[zero; V]; R];
-    for (p, brow) in b[j..].chunks(d.ldb).take(d.k).enumerate() {
-        let brow = &brow[..8 * V];
-        let bv: [f32x8<S>; V] = core::array::from_fn(|v| f32x8::from_slice(simd, &brow[v * 8..][..8]));
-        for r in 0..R {
-            let av = f32x8::splat(simd, a_rows[r][p]);
-            for v in 0..V {
-                acc[r][v] = av.mul_add(bv[v], acc[r][v]);
-            }
-        }
+    let mut first = !d.add;
+    let mut p = 0;
+    while p + P <= d.k {
+        stream_pass::<S, R, P>(simd, d, a, b, c, p, first);
+        first = false;
+        p += P;
     }
-    let alpha = f32x8::splat(simd, d.alpha);
-    for r in 0..R {
-        let row = &mut c[r * d.ldc + j..][..8 * V];
-        for v in 0..V {
-            let dst = &mut row[v * 8..][..8];
-            let val = acc[r][v] * alpha;
-            if d.add {
-                (val + f32x8::from_slice(simd, dst)).store_slice(dst);
-            } else {
-                val.store_slice(dst);
-            }
+    while p < d.k {
+        stream_pass::<S, R, 1>(simd, d, a, b, c, p, first);
+        first = false;
+        p += 1;
+    }
+    if first {
+        for r in 0..R {
+            c[r * d.ldc..][..d.n].fill(0.0);
         }
     }
 }
+
+/// Adds rows `p..p + P` of B, times their elements of A, into `R` rows of C (or
+/// overwrites C with them if `first`).
+#[inline(always)]
+fn stream_pass<S: Simd, const R: usize, const P: usize>(
+    simd: S,
+    d: &Dims,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    p: usize,
+    first: bool,
+) {
+    use fearless_simd::prelude::*;
+    let n = d.n;
+    let vecs = n / 8;
+    let s: [[f32; P]; R] = core::array::from_fn(|r| core::array::from_fn(|i| d.alpha * a[r * d.lda + p + i]));
+    let sv = s.map(|row| row.map(|x| f32x8::splat(simd, x)));
+    let br: [&[f32]; P] = core::array::from_fn(|i| &b[(p + i) * d.ldb..][..n]);
+    let mut c_rows = c.chunks_mut(d.ldc);
+    let cr: [&mut [f32]; R] = core::array::from_fn(|_| &mut c_rows.next().unwrap()[..n]);
+    // All cut to the same number of vectors, so indexing them needs no checks.
+    let bv: [&[[f32; 8]]; P] = br.map(|row| &row.as_chunks::<8>().0[..vecs]);
+    let cv = cr.map(|row| &mut row.as_chunks_mut::<8>().0[..vecs]);
+    for j in 0..vecs {
+        let mut acc: [f32x8<S>; R] =
+            core::array::from_fn(|r| if first { f32x8::splat(simd, 0.0) } else { f32x8::from_slice(simd, &cv[r][j]) });
+        for i in 0..P {
+            let b = f32x8::from_slice(simd, &bv[i][j]);
+            for r in 0..R {
+                acc[r] = sv[r][i].mul_add(b, acc[r]);
+            }
+        }
+        for r in 0..R {
+            acc[r].store_slice(&mut cv[r][j]);
+        }
+    }
+    for j in 8 * vecs..n {
+        for r in 0..R {
+            let sum: f32 = (0..P).map(|i| s[r][i] * br[i][j]).sum();
+            let out = &mut c[r * d.ldc + j];
+            *out = if first { sum } else { *out + sum };
+        }
+    }
+}
+
