@@ -80,6 +80,35 @@ fn store_last_vector<S: Simd>(v: f32x16<S>, out_row: &mut [f32]) {
     v.store_array(out_row.last_chunk_mut::<LANES>().expect("row at least a vector wide"));
 }
 
+/// `v` with the lanes `last_vector` shares with the last full vector zeroed,
+/// leaving the `tail_len` it adds to a sum.
+#[inline(always)]
+fn tail_lanes<S: Simd>(simd: S, v: f32x16<S>, tail_len: usize) -> f32x16<S> {
+    let lane = f32x16::load_array_ref(simd, &LANE_INDEX);
+    let new = lane.simd_ge(f32x16::splat(simd, (LANES - tail_len) as f32));
+    new.select(v, f32x16::splat(simd, 0.0))
+}
+
+/// Largest element of a row at least `LANES` wide.
+#[inline(always)]
+fn row_max<S: Simd>(simd: S, row: &[f32]) -> f32 {
+    let (x, x_tail) = row.as_chunks::<LANES>();
+    let (x2, x1) = x.as_chunks::<2>();
+    let mut max0 = f32x16::splat(simd, f32::NEG_INFINITY);
+    let mut max1 = max0;
+    for [a, b] in x2 {
+        max0 = max0.max(f32x16::load_array_ref(simd, a));
+        max1 = max1.max(f32x16::load_array_ref(simd, b));
+    }
+    for a in x1 {
+        max0 = max0.max(f32x16::load_array_ref(simd, a));
+    }
+    if !x_tail.is_empty() {
+        max0 = max0.max(last_vector(simd, row));
+    }
+    max0.max(max1).reduce_max()
+}
+
 /// Rows at least `LANES` wide.
 #[simd]
 fn softmax_rows_simd<S: Simd>(simd: S, rows: usize, n: usize, src: &[f32], out: &mut [f32]) {
@@ -92,20 +121,7 @@ fn softmax_rows_simd<S: Simd>(simd: S, rows: usize, n: usize, src: &[f32], out: 
         let (x, x_tail) = row.as_chunks::<LANES>();
         let (x2, x1) = x.as_chunks::<2>();
         let load = |x| f32x16::load_array_ref(simd, x);
-
-        let mut max0 = f32x16::splat(simd, f32::NEG_INFINITY);
-        let mut max1 = max0;
-        for [a, b] in x2 {
-            max0 = max0.max(load(a));
-            max1 = max1.max(load(b));
-        }
-        for a in x1 {
-            max0 = max0.max(load(a));
-        }
-        if !x_tail.is_empty() {
-            max0 = max0.max(last_vector(simd, row));
-        }
-        let max_v = f32x16::splat(simd, max0.max(max1).reduce_max());
+        let max_v = f32x16::splat(simd, row_max(simd, row));
 
         // exp(x - max) goes to `out` and is scaled in place afterwards: the
         // row is still in cache, and the sum is needed before any output is final.
@@ -130,9 +146,7 @@ fn softmax_rows_simd<S: Simd>(simd: S, rows: usize, n: usize, src: &[f32], out: 
         // last `x_tail.len()` lanes are new to the sum.
         let tail_e = (!x_tail.is_empty()).then(|| exp(last_vector(simd, row) - max_v));
         if let Some(e) = tail_e {
-            let lane = f32x16::load_array_ref(simd, &LANE_INDEX);
-            let new = lane.simd_ge(f32x16::splat(simd, (LANES - x_tail.len()) as f32));
-            sum0 += new.select(e, f32x16::splat(simd, 0.0));
+            sum0 += tail_lanes(simd, e, x_tail.len());
         }
         let inv_sum = 1.0 / (sum0 + sum1).reduce_sum();
 
@@ -157,9 +171,13 @@ fn softmax_rows_simd<S: Simd>(simd: S, rows: usize, n: usize, src: &[f32], out: 
 const LANE_INDEX: [f32; LANES] =
     [0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15.];
 
-/// `x - max - ln(sum(exp(x - max)))` along `axis`. Scalar on purpose: CTC heads
-/// apply it once to a few hundred logits, and the exact `exp`/`ln` keep the
-/// log-probabilities faithful far into the tail, where beam search reads them.
+/// `x - max - ln(sum(exp(x - max)))` along `axis`.
+///
+/// Outputs are `(x - max) - ln(sum)`, never an exponential, so logits far
+/// below the max keep their exact distance from it instead of underflowing
+/// through `exp`; that tail is where a CTC beam search reads them. Taking
+/// `x - max` first keeps it exact for logits near the max, where adding `ln(sum)`
+/// to a large `max` would round away most of a small result.
 pub fn log_softmax<'b, 'a>(
     input: &TensorView<'b>,
     axis: i32,
@@ -174,22 +192,74 @@ pub fn log_softmax<'b, 'a>(
     let inner_size: usize = input.shape[axis + 1..].iter().product();
     let axis_size = input.shape[axis];
     let outer_size: usize = input.shape[..axis].iter().product();
-    let data = &input.data;
-    for o in 0..outer_size {
-        for i in 0..inner_size {
-            let base = o * axis_size * inner_size + i;
-            let at = |k: usize| base + k * inner_size;
-            let max_val = (0..axis_size).fold(f32::NEG_INFINITY, |m, k| m.max(data[at(k)]));
-            let sum: f32 = (0..axis_size).map(|k| (data[at(k)] - max_val).exp()).sum();
-            let shift = max_val + sum.ln();
-            for k in 0..axis_size {
-                out_slice[at(k)] = data[at(k)] - shift;
-            }
-        }
+    if inner_size == 1 {
+        log_softmax_rows(Level::new(), outer_size, &input.data, out_slice, axis_size);
+    } else {
+        log_softmax_strided(outer_size, axis_size, inner_size, &input.data, out_slice);
     }
     TensorView {
         data: Cow::Borrowed(out_slice),
         shape: std::borrow::Cow::Owned(input.shape.to_vec()),
+    }
+}
+
+/// Log-softmax of the first `rows` `n`-wide rows of `src` into `out`.
+fn log_softmax_rows(level: Level, rows: usize, src: &[f32], out: &mut [f32], n: usize) {
+    if n < LANES {
+        return log_softmax_strided(rows, n, 1, src, out);
+    }
+    simd_call!(level, max = Avx2, log_softmax_rows_simd(rows, n, src, out))
+}
+
+/// Log-softmax over the middle axis of `[outer, axis_size, inner]`, in scalar
+/// code: for an axis other than the last, and for rows narrower than a vector.
+fn log_softmax_strided(outer: usize, axis_size: usize, inner: usize, src: &[f32], out: &mut [f32]) {
+    for o in 0..outer {
+        for i in 0..inner {
+            let base = o * axis_size * inner + i;
+            let at = |k: usize| base + k * inner;
+            let max_val = (0..axis_size).fold(f32::NEG_INFINITY, |m, k| m.max(src[at(k)]));
+            let sum: f32 = (0..axis_size).map(|k| (src[at(k)] - max_val).exp()).sum();
+            let log_sum = sum.ln();
+            for k in 0..axis_size {
+                out[at(k)] = (src[at(k)] - max_val) - log_sum;
+            }
+        }
+    }
+}
+
+/// Rows at least `LANES` wide.
+#[simd]
+fn log_softmax_rows_simd<S: Simd>(simd: S, rows: usize, n: usize, src: &[f32], out: &mut [f32]) {
+    let rows_out = out[..rows * n].chunks_exact_mut(n);
+    for (row, out_row) in src[..rows * n].chunks_exact(n).zip(rows_out) {
+        let (x, x_tail) = row.as_chunks::<LANES>();
+        let (x2, x1) = x.as_chunks::<2>();
+        let max = row_max(simd, row);
+        let max_v = f32x16::splat(simd, max);
+
+        let mut sum0 = f32x16::splat(simd, 0.0);
+        let mut sum1 = sum0;
+        for [a, b] in x2 {
+            sum0 += exp(f32x16::load_array_ref(simd, a) - max_v);
+            sum1 += exp(f32x16::load_array_ref(simd, b) - max_v);
+        }
+        for a in x1 {
+            sum0 += exp(f32x16::load_array_ref(simd, a) - max_v);
+        }
+        if !x_tail.is_empty() {
+            let e = exp(last_vector(simd, row) - max_v);
+            sum0 += tail_lanes(simd, e, x_tail.len());
+        }
+        let log_sum_v = f32x16::splat(simd, (sum0 + sum1).reduce_sum().ln());
+
+        let (o, _) = out_row.as_chunks_mut::<LANES>();
+        for (a, oa) in x.iter().zip(o) {
+            (f32x16::load_array_ref(simd, a) - max_v - log_sum_v).store_array(oa);
+        }
+        if !x_tail.is_empty() {
+            store_last_vector(last_vector(simd, row) - max_v - log_sum_v, out_row);
+        }
     }
 }
 
@@ -753,6 +823,46 @@ mod tests {
             x[0] = 50.0;
             let got = softmax_of(&x, n);
             assert_close(&got, &softmax_ref(&x, n), 1e-6, &format!("n={n}"));
+        }
+    }
+
+    fn log_softmax_ref(x: &[f32], n: usize) -> Vec<f64> {
+        x.chunks_exact(n)
+            .flat_map(|row| {
+                let max = row.iter().fold(f64::MIN, |m, &v| m.max(v as f64));
+                let sum: f64 = row.iter().map(|&v| (v as f64 - max).exp()).sum();
+                row.iter().map(move |&v| v as f64 - max - sum.ln())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_log_softmax_matches_reference_at_every_length_and_level() {
+        for level in levels() {
+            for (lo, hi) in [(-5.0, 5.0), (-80.0, 80.0)] {
+                let mut rng = Rng::new(9);
+                for &n in AWKWARD_LENS {
+                    let x = rng.vec(ROWS * n, lo, hi);
+                    let mut out = vec![0.0; x.len()];
+                    log_softmax_rows(level, ROWS, &x, &mut out, n);
+                    let what = format!("{level:?} x in [{lo}, {hi}) n={n}");
+                    assert_close(&out, &log_softmax_ref(&x, n), 1e-6, &what);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_log_softmax_keeps_far_below_max_logits_exact() {
+        // Everything but the first logit sits past exp's underflow point.
+        for level in levels() {
+            for &n in AWKWARD_LENS.iter().filter(|&&n| n > 1) {
+                let mut x = vec![-200.0; n];
+                x[0] = 50.0;
+                let mut out = vec![0.0; n];
+                log_softmax_rows(level, 1, &x, &mut out, n);
+                assert_close(&out, &log_softmax_ref(&x, n), 1e-7, &format!("{level:?} n={n}"));
+            }
         }
     }
 
