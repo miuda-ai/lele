@@ -1,108 +1,473 @@
-// Allow unsafe operations in unsafe functions without explicit unsafe blocks
-#![allow(unsafe_op_in_unsafe_fn)]
-
+use crate::kernels::simd::simd_call;
 use crate::kernels::utils;
 use crate::tensor::TensorView;
+use fearless_simd::{Level, Simd, f32x4, f32x8, f64x4, prelude::*};
+use fearless_simd_macros::simd;
 
-#[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::*;
+/// Side of the square blocks a matrix transpose works through, in elements:
+/// a block of the source and one of the destination, 16 KiB each for f32,
+/// stay in L1 together, so each cache line is read or filled completely
+/// before it is evicted. 32 and 128 were up to 20% slower on model shapes.
+const TRANSPOSE_BLOCK: usize = 64;
 
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
+/// Most axes `transpose` plans for on the stack. Heap allocations were most
+/// of the time of the small transposes models are full of, such as the
+/// 2x2 and 3x2 ones in Silero VAD and SenseVoice; higher ranks are moved
+/// element by element.
+const MAX_RANK: usize = 8;
 
-/// Transpose a 4x4 matrix of f32 using NEON intrinsics
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn transpose_4x4_f32_neon(
-    row0: float32x4_t,
-    row1: float32x4_t,
-    row2: float32x4_t,
-    row3: float32x4_t,
-) -> (float32x4_t, float32x4_t, float32x4_t, float32x4_t) {
-    // Step 1: vtrnq transposes adjacent pairs
-    // t0.0 = [r0[0],r1[0],r0[2],r1[2]], t0.1 = [r0[1],r1[1],r0[3],r1[3]]
-    let t0 = vtrnq_f32(row0, row1);
-    // t1.0 = [r2[0],r3[0],r2[2],r3[2]], t1.1 = [r2[1],r3[1],r2[3],r3[3]]
-    let t1 = vtrnq_f32(row2, row3);
-
-    // Step 2: Combine low/high halves to get transposed columns
-    let col0 = vcombine_f32(vget_low_f32(t0.0), vget_low_f32(t1.0));
-    let col1 = vcombine_f32(vget_low_f32(t0.1), vget_low_f32(t1.1));
-    let col2 = vcombine_f32(vget_high_f32(t0.0), vget_high_f32(t1.0));
-    let col3 = vcombine_f32(vget_high_f32(t0.1), vget_high_f32(t1.1));
-
-    (col0, col1, col2, col3)
+/// Up to `MAX_RANK` values, on the stack.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Small<T: Copy> {
+    len: usize,
+    items: [T; MAX_RANK],
 }
 
-/// Transpose an 8×8 block of f32 using AVX2 intrinsics.
-/// Reads from 8 source rows (each row has stride `src_stride`),
-/// writes to 8 destination rows (each row has stride `dst_stride`).
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn transpose_8x8_f32_avx2(
-    src: *const f32,
-    src_stride: usize,
-    dst: *mut f32,
-    dst_stride: usize,
+impl<T: Copy + Default> Small<T> {
+    fn new() -> Self {
+        Self { len: 0, items: [T::default(); MAX_RANK] }
+    }
+
+    fn push(&mut self, value: T) {
+        self.items[self.len] = value;
+        self.len += 1;
+    }
+}
+
+impl<T: Copy + Default> FromIterator<T> for Small<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut small = Self::new();
+        for value in iter {
+            small.push(value);
+        }
+        small
+    }
+}
+
+impl<T: Copy> std::ops::Deref for Small<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.items[..self.len]
+    }
+}
+
+impl<T: Copy> std::ops::DerefMut for Small<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.items[..self.len]
+    }
+}
+
+impl<T: Copy + std::fmt::Debug> std::fmt::Debug for Small<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self[..].fmt(f)
+    }
+}
+
+/// The input shape and permutation of a transpose equivalent to `perm` on
+/// `shape`, with axes of length 1 dropped and every run of input axes that
+/// stays adjacent and in order in the output merged into one axis.
+///
+/// After this, any permutation that moves no data is the identity of rank
+/// 0 or 1, and one that keeps the innermost axis in place copies whole rows.
+fn simplify_transpose(shape: &[usize], perm: &[usize]) -> (Small<usize>, Small<usize>) {
+    // Runs of input axes, as (first, last, output position), in output order;
+    // a run continues when the next axis is the next one of length > 1.
+    let mut runs: Small<(usize, usize, usize)> = Small::new();
+    for &p in perm.iter().filter(|&&p| shape[p] != 1) {
+        match runs.last_mut() {
+            Some(run) if run.1 < p && shape[run.1 + 1..p].iter().all(|&len| len == 1) => run.1 = p,
+            _ => runs.push((p, p, runs.len)),
+        }
+    }
+    runs.sort_unstable_by_key(|run| run.0);
+    let mut new_shape = Small::new();
+    let mut new_perm: Small<usize> = runs.iter().map(|_| 0).collect();
+    for (axis, &(first, last, at)) in runs.iter().enumerate() {
+        new_shape.push(shape[first..=last].iter().product());
+        new_perm[at] = axis;
+    }
+    (new_shape, new_perm)
+}
+
+/// Calls `f(src_offset, dst_offset)` for every index of the axes `dims`,
+/// each given as (length, source stride, destination stride), the last axis
+/// fastest. With no axes, calls it once with zero offsets.
+fn for_each_offset(dims: &[(usize, usize, usize)], mut f: impl FnMut(usize, usize)) {
+    let Some((&(len, src_stride, dst_stride), dims)) = dims.split_last() else {
+        return f(0, 0);
+    };
+    if len == 0 || dims.iter().any(|&(len, _, _)| len == 0) {
+        return;
+    }
+    let mut index: Small<usize> = dims.iter().map(|_| 0).collect();
+    let (mut src, mut dst) = (0, 0);
+    loop {
+        for i in 0..len {
+            f(src + i * src_stride, dst + i * dst_stride);
+        }
+        let mut d = dims.len();
+        loop {
+            if d == 0 {
+                return;
+            }
+            d -= 1;
+            let (len, src_stride, dst_stride) = dims[d];
+            index[d] += 1;
+            if index[d] < len {
+                src += src_stride;
+                dst += dst_stride;
+                break;
+            }
+            src -= (len - 1) * src_stride;
+            dst -= (len - 1) * dst_stride;
+            index[d] = 0;
+        }
+    }
+}
+
+/// `dst[c * dst_ld + r] = src[r * src_ld + c]` for `r < rows`, `c < cols`.
+pub(crate) fn transpose_matrix<T: Copy + 'static>(
+    src: &[T],
+    src_ld: usize,
+    dst: &mut [T],
+    dst_ld: usize,
+    rows: usize,
+    cols: usize,
 ) {
-    // Load 8 rows
-    let r0 = _mm256_loadu_ps(src);
-    let r1 = _mm256_loadu_ps(src.add(src_stride));
-    let r2 = _mm256_loadu_ps(src.add(src_stride * 2));
-    let r3 = _mm256_loadu_ps(src.add(src_stride * 3));
-    let r4 = _mm256_loadu_ps(src.add(src_stride * 4));
-    let r5 = _mm256_loadu_ps(src.add(src_stride * 5));
-    let r6 = _mm256_loadu_ps(src.add(src_stride * 6));
-    let r7 = _mm256_loadu_ps(src.add(src_stride * 7));
+    // Fewer elements than a tile or two, or too thin a side for even 4x4
+    // tiles: not worth detecting and dispatching to a SIMD level.
+    let small = rows * cols <= 64 || rows < 4 || cols < 4;
+    if size_of::<T>() == 4 && align_of::<T>() == 4 && !small {
+        // Only moved, never computed on, so any 4-byte type can go through
+        // the vectors bit for bit.
+        // SAFETY: `T` and `u32` have the same size and alignment, `T: Copy`
+        // has no drop glue, and every bit pattern of `T` is a valid `u32`.
+        let (src, dst) = unsafe {
+            (
+                std::slice::from_raw_parts(src.as_ptr().cast::<u32>(), src.len()),
+                std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u32>(), dst.len()),
+            )
+        };
+        transpose_matrix_u32(Level::new(), src, src_ld, dst, dst_ld, rows, cols);
+    } else {
+        assert_matrix_fits(src.len(), src_ld, dst.len(), dst_ld, rows, cols);
+        // SAFETY: checked just above.
+        unsafe { transpose_scalar(src.as_ptr(), src_ld, dst.as_mut_ptr(), dst_ld, 0..rows, 0..cols) };
+    }
+}
 
-    // Stage 1: interleave 32-bit floats
-    let t0 = _mm256_unpacklo_ps(r0, r1);
-    let t1 = _mm256_unpackhi_ps(r0, r1);
-    let t2 = _mm256_unpacklo_ps(r2, r3);
-    let t3 = _mm256_unpackhi_ps(r2, r3);
-    let t4 = _mm256_unpacklo_ps(r4, r5);
-    let t5 = _mm256_unpackhi_ps(r4, r5);
-    let t6 = _mm256_unpacklo_ps(r6, r7);
-    let t7 = _mm256_unpackhi_ps(r6, r7);
+/// Copies `count` rows of `row` elements, `src_stride` apart in `src` and
+/// `dst_stride` apart in `dst`.
+fn copy_rows<T: Copy>(src: &[T], src_stride: usize, dst: &mut [T], dst_stride: usize, count: usize, row: usize) {
+    if count == 0 || row == 0 {
+        return;
+    }
+    assert!(
+        (count - 1) * src_stride + row <= src.len() && (count - 1) * dst_stride + row <= dst.len(),
+        "transpose: {count} rows of {row} overrun {} -> {} elements",
+        src.len(),
+        dst.len()
+    );
+    // Rows this short spent as long in the call to `memcpy` as in copying,
+    // on Neoverse N1 most (BERT's rows of 26 heads were 6% slower).
+    if size_of::<T>() == 4 && align_of::<T>() == 4 && (4..=MAX_INLINE_ROW).contains(&row) {
+        // SAFETY: as in `transpose_matrix`.
+        let (src, dst) = unsafe {
+            (
+                std::slice::from_raw_parts(src.as_ptr().cast::<f32>(), src.len()),
+                std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<f32>(), dst.len()),
+            )
+        };
+        simd_call!(Level::new(), copy_rows_simd(src, src_stride, dst, dst_stride, count, row));
+    } else {
+        for i in 0..count {
+            dst[i * dst_stride..][..row].copy_from_slice(&src[i * src_stride..][..row]);
+        }
+    }
+}
 
-    // Stage 2: interleave 64-bit groups
-    let s0 = _mm256_shuffle_ps(t0, t2, 0x44);
-    let s1 = _mm256_shuffle_ps(t0, t2, 0xEE);
-    let s2 = _mm256_shuffle_ps(t1, t3, 0x44);
-    let s3 = _mm256_shuffle_ps(t1, t3, 0xEE);
-    let s4 = _mm256_shuffle_ps(t4, t6, 0x44);
-    let s5 = _mm256_shuffle_ps(t4, t6, 0xEE);
-    let s6 = _mm256_shuffle_ps(t5, t7, 0x44);
-    let s7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+/// Longest row `copy_rows` copies with vectors rather than `memcpy`.
+const MAX_INLINE_ROW: usize = 128;
 
-    // Stage 3: swap 128-bit halves
-    _mm256_storeu_ps(dst, _mm256_permute2f128_ps(s0, s4, 0x20));
-    _mm256_storeu_ps(dst.add(dst_stride), _mm256_permute2f128_ps(s1, s5, 0x20));
-    _mm256_storeu_ps(
-        dst.add(dst_stride * 2),
-        _mm256_permute2f128_ps(s2, s6, 0x20),
+/// `copy_rows` for rows of 4 to `MAX_INLINE_ROW` elements, whose extent has
+/// been checked; the last vector of a row overlaps the one before.
+#[simd]
+fn copy_rows_simd<S: Simd>(
+    simd: S,
+    src: &[f32],
+    src_stride: usize,
+    dst: &mut [f32],
+    dst_stride: usize,
+    count: usize,
+    row: usize,
+) {
+    let (src, dst) = (src.as_ptr(), dst.as_mut_ptr());
+    // SAFETY: `copy_rows` checked that every row is inside both slices, and
+    // each access below stays inside its row.
+    unsafe {
+        for i in 0..count {
+            let (s, d) = (src.add(i * src_stride), dst.add(i * dst_stride));
+            if row >= 8 {
+                let mut k = 0;
+                while k + 8 < row {
+                    f32x8::load_array_ref(simd, &*s.add(k).cast()).store_array(&mut *d.add(k).cast());
+                    k += 8;
+                }
+                f32x8::load_array_ref(simd, &*s.add(row - 8).cast()).store_array(&mut *d.add(row - 8).cast());
+            } else {
+                f32x4::load_array_ref(simd, &*s.cast()).store_array(&mut *d.cast());
+                f32x4::load_array_ref(simd, &*s.add(row - 4).cast()).store_array(&mut *d.add(row - 4).cast());
+            }
+        }
+    }
+}
+
+/// Panics unless a `rows x cols` matrix with `src_ld` between rows fits in
+/// `src_len` elements, and its transpose with `dst_ld` in `dst_len`.
+fn assert_matrix_fits(src_len: usize, src_ld: usize, dst_len: usize, dst_ld: usize, rows: usize, cols: usize) {
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    assert!(
+        cols <= src_ld && rows <= dst_ld && (rows - 1) * src_ld + cols <= src_len && (cols - 1) * dst_ld + rows <= dst_len,
+        "transpose: {rows}x{cols} matrix (leading dimensions {src_ld} -> {dst_ld}) overruns {src_len} -> {dst_len} elements"
     );
-    _mm256_storeu_ps(
-        dst.add(dst_stride * 3),
-        _mm256_permute2f128_ps(s3, s7, 0x20),
-    );
-    _mm256_storeu_ps(
-        dst.add(dst_stride * 4),
-        _mm256_permute2f128_ps(s0, s4, 0x31),
-    );
-    _mm256_storeu_ps(
-        dst.add(dst_stride * 5),
-        _mm256_permute2f128_ps(s1, s5, 0x31),
-    );
-    _mm256_storeu_ps(
-        dst.add(dst_stride * 6),
-        _mm256_permute2f128_ps(s2, s6, 0x31),
-    );
-    _mm256_storeu_ps(
-        dst.add(dst_stride * 7),
-        _mm256_permute2f128_ps(s3, s7, 0x31),
-    );
+}
+
+/// `transpose_matrix` for one range of rows and columns, a block at a time.
+///
+/// # Safety
+/// `assert_matrix_fits` must hold for `src` and `dst` and matrices at least
+/// `rows.end x cols.end`.
+unsafe fn transpose_scalar<T: Copy>(
+    src: *const T,
+    src_ld: usize,
+    dst: *mut T,
+    dst_ld: usize,
+    rows: std::ops::Range<usize>,
+    cols: std::ops::Range<usize>,
+) {
+    for r0 in rows.clone().step_by(TRANSPOSE_BLOCK) {
+        let r1 = (r0 + TRANSPOSE_BLOCK).min(rows.end);
+        for c0 in cols.clone().step_by(TRANSPOSE_BLOCK) {
+            let c1 = (c0 + TRANSPOSE_BLOCK).min(cols.end);
+            // The inner loop runs along the longer side: the edges left by
+            // the tiles are strips a few elements across.
+            if r1 - r0 >= c1 - c0 {
+                for c in c0..c1 {
+                    for r in r0..r1 {
+                        unsafe { *dst.add(c * dst_ld + r) = *src.add(r * src_ld + c) };
+                    }
+                }
+            } else {
+                for r in r0..r1 {
+                    for c in c0..c1 {
+                        unsafe { *dst.add(c * dst_ld + r) = *src.add(r * src_ld + c) };
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `transpose_matrix` at `level`.
+fn transpose_matrix_u32(
+    level: Level,
+    src: &[u32],
+    src_ld: usize,
+    dst: &mut [u32],
+    dst_ld: usize,
+    rows: usize,
+    cols: usize,
+) {
+    simd_call!(level, transpose_matrix_simd(src, src_ld, dst, dst_ld, rows, cols))
+}
+
+#[simd]
+fn transpose_matrix_simd<S: Simd>(
+    simd: S,
+    src: &[u32],
+    src_ld: usize,
+    dst: &mut [u32],
+    dst_ld: usize,
+    rows: usize,
+    cols: usize,
+) {
+    assert_matrix_fits(src.len(), src_ld, dst.len(), dst_ld, rows, cols);
+    let (src, dst) = (src.as_ptr(), dst.as_mut_ptr());
+    // SAFETY: checked above, and every tile lies inside rows x cols.
+    unsafe {
+        if rows >= 8 && cols >= 8 {
+            // 8x8 tiles over the bulk, then a strip of tiles along each edge
+            // it leaves, 4x4 ones if they are wide enough, overlapping the
+            // bulk: rewriting elements took less time than single ones.
+            let (rows8, cols8) = (rows / 8 * 8, cols / 8 * 8);
+            transpose_tiles::<S, 8>(simd, src, src_ld, dst, dst_ld, 0..rows8, 0..cols8);
+            match cols - cols8 {
+                0 => {}
+                1..=4 => transpose_tiles::<S, 4>(simd, src, src_ld, dst, dst_ld, 0..rows, cols - 4..cols),
+                _ => transpose_tiles::<S, 8>(simd, src, src_ld, dst, dst_ld, 0..rows, cols - 8..cols),
+            }
+            match rows - rows8 {
+                0 => {}
+                1..=4 => transpose_tiles::<S, 4>(simd, src, src_ld, dst, dst_ld, rows - 4..rows, 0..cols8),
+                _ => transpose_tiles::<S, 8>(simd, src, src_ld, dst, dst_ld, rows - 8..rows, 0..cols8),
+            }
+        } else if rows >= 4 && cols >= 4 {
+            transpose_tiles::<S, 4>(simd, src, src_ld, dst, dst_ld, 0..rows, 0..cols);
+        } else {
+            transpose_scalar(src, src_ld, dst, dst_ld, 0..rows, 0..cols);
+        }
+    }
+}
+
+/// `transpose_matrix` for ranges of at least `N` rows and columns, in
+/// `N`x`N` tiles, a block of them at a time. Where a range is not a
+/// multiple of `N` long, its last tiles overlap the ones before.
+///
+/// # Safety
+/// As for `transpose_scalar`.
+#[inline(always)]
+unsafe fn transpose_tiles<S: Simd, const N: usize>(
+    simd: S,
+    src: *const u32,
+    src_ld: usize,
+    dst: *mut u32,
+    dst_ld: usize,
+    rows: std::ops::Range<usize>,
+    cols: std::ops::Range<usize>,
+) {
+    // A function rather than a closure: closures don't take on the target
+    // features `#[simd]` compiles this with, and the vector code would not
+    // inline into them.
+    #[inline(always)]
+    unsafe fn tile<S: Simd, const N: usize>(
+        simd: S,
+        src: *const u32,
+        src_ld: usize,
+        dst: *mut u32,
+        dst_ld: usize,
+        (r, c): (usize, usize),
+    ) {
+        let (src, dst) = unsafe { (src.add(r * src_ld + c), dst.add(c * dst_ld + r)) };
+        if N == 8 {
+            unsafe { transpose_8x8(simd, src, src_ld, dst, dst_ld) };
+        } else {
+            unsafe { transpose_4x4(simd, src, src_ld, dst, dst_ld) };
+        }
+    }
+    // Within a block, going across a tile row at a time ("rows first") keeps
+    // a tile's worth of each destination row in cache until the next tile
+    // row fills it in; going down a tile column at a time keeps the source
+    // rows instead. Rows a multiple of 1 KiB apart fall into a few L1 sets,
+    // too few for a block's 64, so the side with such a stride is the one
+    // that must not wait in cache. Otherwise, measured on model shapes,
+    // Neoverse N1 was up to 2x faster rows first and Zen 3 up to 2x faster
+    // columns first.
+    let (src_conflicts, dst_conflicts) = (src_ld.is_multiple_of(256), dst_ld.is_multiple_of(256));
+    let rows_first = if src_conflicts != dst_conflicts {
+        src_conflicts
+    } else {
+        cfg!(target_arch = "aarch64")
+    };
+    // The tile at row r, column c, moved back to overlap the one before where
+    // it would run past the end.
+    let at = |r: usize, c: usize| (r.min(rows.end - N), c.min(cols.end - N));
+    for r0 in rows.clone().step_by(TRANSPOSE_BLOCK) {
+        let r1 = (r0 + TRANSPOSE_BLOCK).min(rows.end);
+        for c0 in cols.clone().step_by(TRANSPOSE_BLOCK) {
+            let c1 = (c0 + TRANSPOSE_BLOCK).min(cols.end);
+            if rows_first {
+                for r in (r0..r1).step_by(N) {
+                    for c in (c0..c1).step_by(N) {
+                        unsafe { tile::<S, N>(simd, src, src_ld, dst, dst_ld, at(r, c)) };
+                    }
+                }
+            } else {
+                for c in (c0..c1).step_by(N) {
+                    for r in (r0..r1).step_by(N) {
+                        unsafe { tile::<S, N>(simd, src, src_ld, dst, dst_ld, at(r, c)) };
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `a` and `b` interleaved within each half: the halves of `a.interleave(b)`
+/// for the low halves, then for the high ones. The whole-vector `interleave`
+/// moves data across the 128-bit halves; this compiles to one in-half
+/// unpack per output on AVX2.
+#[inline(always)]
+fn interleave_halves<S: Simd>(a: f32x8<S>, b: f32x8<S>) -> (f32x8<S>, f32x8<S>) {
+    let ((a0, a1), (b0, b1)) = (a.split(), b.split());
+    let ((lo0, hi0), (lo1, hi1)) = (a0.interleave(b0), a1.interleave(b1));
+    (lo0.combine(lo1), hi0.combine(hi1))
+}
+
+/// `interleave_halves` of pairs of elements.
+#[inline(always)]
+fn interleave_pair_halves<S: Simd>(a: f32x8<S>, b: f32x8<S>) -> (f32x8<S>, f32x8<S>) {
+    let (a, b) = (a.bitcast::<f64x4<S>>(), b.bitcast::<f64x4<S>>());
+    let ((a0, a1), (b0, b1)) = (a.split(), b.split());
+    let ((lo0, hi0), (lo1, hi1)) = (a0.interleave(b0), a1.interleave(b1));
+    (lo0.combine(lo1).bitcast(), hi0.combine(hi1).bitcast())
+}
+
+/// Transposes the 8x8 tile at `src` into `dst`: 4x4 transposes within the
+/// halves of each pair of rows, by interleaving elements, then pairs of
+/// them, and swapping the off-diagonal 4x4 blocks last.
+///
+/// The float vectors only move bits, so NaN payloads come through; on AVX2
+/// they ran up to 10% faster than the same steps on integer vectors.
+///
+/// # Safety
+/// 8 rows of 8 elements, `src_ld` and `dst_ld` apart, must be readable at
+/// `src` and writable at `dst`.
+#[inline(always)]
+unsafe fn transpose_8x8<S: Simd>(simd: S, src: *const u32, src_ld: usize, dst: *mut u32, dst_ld: usize) {
+    let (src, dst) = (src.cast::<f32>(), dst.cast::<f32>());
+    // Loops rather than `array::from_fn`, for the reason `transpose_tiles`
+    // gives for not using closures.
+    let mut r = [f32x8::splat(simd, 0.0); 8];
+    for (i, r) in r.iter_mut().enumerate() {
+        *r = f32x8::load_array_ref(simd, unsafe { &*src.add(i * src_ld).cast() });
+    }
+    let (t0, t1) = interleave_halves(r[0], r[1]);
+    let (t2, t3) = interleave_halves(r[2], r[3]);
+    let (t4, t5) = interleave_halves(r[4], r[5]);
+    let (t6, t7) = interleave_halves(r[6], r[7]);
+    // Row i of the tile, in halves: columns 0-3 of rows 0-3 and 4-7 for
+    // i < 4, columns 4-7 of them for i >= 4.
+    let (s0, s1) = interleave_pair_halves(t0, t2);
+    let (s2, s3) = interleave_pair_halves(t1, t3);
+    let (s4, s5) = interleave_pair_halves(t4, t6);
+    let (s6, s7) = interleave_pair_halves(t5, t7);
+    for (i, (top, bottom)) in [(s0, s4), (s1, s5), (s2, s6), (s3, s7)].into_iter().enumerate() {
+        let ((top0, top1), (bottom0, bottom1)) = (top.split(), bottom.split());
+        top0.combine(bottom0).store_array(unsafe { &mut *dst.add(i * dst_ld).cast() });
+        top1.combine(bottom1).store_array(unsafe { &mut *dst.add((i + 4) * dst_ld).cast() });
+    }
+}
+
+/// `transpose_8x8` for 4x4 tiles, in two rounds.
+#[inline(always)]
+unsafe fn transpose_4x4<S: Simd>(simd: S, src: *const u32, src_ld: usize, dst: *mut u32, dst_ld: usize) {
+    let (src, dst) = (src.cast::<f32>(), dst.cast::<f32>());
+    let mut v = [f32x4::splat(simd, 0.0); 4];
+    for (i, v) in v.iter_mut().enumerate() {
+        *v = f32x4::load_array_ref(simd, unsafe { &*src.add(i * src_ld).cast() });
+    }
+    for _ in 0..2 {
+        let mut next = v;
+        for i in 0..2 {
+            (next[2 * i], next[2 * i + 1]) = v[i].interleave(v[i + 2]);
+        }
+        v = next;
+    }
+    for (i, v) in v.into_iter().enumerate() {
+        v.store_array(unsafe { &mut *dst.add(i * dst_ld).cast() });
+    }
 }
 
 pub fn concat<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
@@ -613,18 +978,15 @@ where
 
     for o in 0..outer_dim {
         for idx_i in 0..indices_len {
-            unsafe {
-                let mut idx_val = indices.data[idx_i].as_i64();
-                if idx_val < 0 {
-                    idx_val += axis_dim as i64;
-                }
-                let idx_val = idx_val as usize;
-                let src_offset = o * axis_dim * inner_dim + idx_val * inner_dim;
-                for k in 0..inner_dim {
-                    *out.as_mut_ptr().add(out_idx + k) = data.data[src_offset + k];
-                }
-                out_idx += inner_dim;
+            let mut idx_val = indices.data[idx_i].as_i64();
+            if idx_val < 0 {
+                idx_val += axis_dim as i64;
             }
+            let idx_val = idx_val as usize;
+            let src_offset = o * axis_dim * inner_dim + idx_val * inner_dim;
+            out[out_idx..out_idx + inner_dim]
+                .copy_from_slice(&data.data[src_offset..src_offset + inner_dim]);
+            out_idx += inner_dim;
         }
     }
     TensorView::from_slice(out, out_shape)
@@ -637,435 +999,104 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
     perm: &[i64],
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
-    let result = transpose_inner(input, perm, out);
-    result
-}
-fn transpose_inner<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
-    input: &TensorView<'b, T>,
-    perm: &[i64],
-    out: &'a mut Vec<T>,
-) -> TensorView<'a, T> {
     let ndim = input.dim();
-    let mut perm_vec: Vec<usize> = if perm.is_empty() {
-        (0..ndim).rev().collect()
-    } else {
-        let mut p: Vec<usize> = perm.iter().map(|&x| x as usize).collect();
-        while p.len() < ndim {
-            let next = p.len();
-            p.push(next);
-        }
-        p
+    // Missing trailing axes stay in place; no perm at all reverses the axes.
+    let perm_at = |i: usize| match perm.get(i) {
+        Some(&p) => p as usize,
+        None if perm.is_empty() => ndim - 1 - i,
+        None => i,
     };
-    perm_vec.truncate(ndim);
-
-    let input_shape = input.shape.to_vec();
+    let input_shape = &input.shape;
     let input_data: &[T] = input.data.as_ref();
-
-    let mut out_shape = vec![0; ndim];
-    for (i, &p) in perm_vec.iter().enumerate() {
-        if p >= input_shape.len() {
-            eprintln!(
-                "DEBUG transpose: perm={:?} input_shape={:?} ndim={}",
-                perm_vec, input_shape, ndim
-            );
-            panic!(
-                "transpose: perm[{}]={} but input has {} dims (shape={:?})",
-                i,
-                p,
-                input_shape.len(),
-                input_shape
-            );
-        }
-        out_shape[i] = input_shape[p];
-    }
+    assert!(
+        (0..ndim).all(|i| perm_at(i) < ndim && (0..i).all(|j| perm_at(j) != perm_at(i))),
+        "transpose: perm {perm:?} is not a permutation of the {ndim} axes of shape {input_shape:?}"
+    );
+    let out_shape: Vec<usize> = (0..ndim).map(|i| input_shape[perm_at(i)]).collect();
     let out_numel = input.data.len();
     utils::ensure_capacity(out, out_numel);
-
-    // Fast path: perm [0,2,1,3] for 4D tensors — copy contiguous blocks
-    // [B, A, C, D] -> [B, C, A, D] — inner dim D is contiguous
-    if ndim == 4 && perm_vec == [0, 2, 1, 3] {
-        let (b, a, c, d) = (
-            input_shape[0],
-            input_shape[1],
-            input_shape[2],
-            input_shape[3],
-        );
-        let out_slice = out.as_mut_slice();
-        for bi in 0..b {
-            for ci in 0..c {
-                for ai in 0..a {
-                    let src_off = ((bi * a + ai) * c + ci) * d;
-                    let dst_off = ((bi * c + ci) * a + ai) * d;
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            input_data.as_ptr().add(src_off),
-                            out_slice.as_mut_ptr().add(dst_off),
-                            d,
-                        );
-                    }
-                }
-            }
+    let dst = &mut out[..out_numel];
+    // Two axes longer than 1 that swap places, the rest of length 1, as in
+    // most model transposes: a matrix transpose, without the planning that
+    // was a good part of a small one's time.
+    let mut long = [0; 2];
+    let mut long_count = 0;
+    for p in (0..ndim).map(perm_at).filter(|&p| input_shape[p] != 1) {
+        if long_count < 2 {
+            long[long_count] = p;
         }
+        long_count += 1;
+    }
+    if long_count == 2 && long[0] > long[1] {
+        let (rows, cols) = (input_shape[long[1]], input_shape[long[0]]);
+        transpose_matrix(input_data, cols, dst, rows, rows, cols);
+        return TensorView::from_slice(out, out_shape);
+    }
+    if ndim > MAX_RANK {
+        let perm: Vec<usize> = (0..ndim).map(perm_at).collect();
+        transpose_any_rank(input_data, input_shape, &perm, dst);
         return TensorView::from_slice(out, out_shape);
     }
 
-    // Fast path: perm [0,2,3,1] for 4D tensors
-    // [B, A, C, D] -> [B, C, D, A]
-    if ndim == 4 && perm_vec == [0, 2, 3, 1] {
-        let (b, a, c, d) = (
-            input_shape[0],
-            input_shape[1],
-            input_shape[2],
-            input_shape[3],
-        );
-
-        // Fast NEON path for f32: 4×4 block transpose on (A, C*D) matrix within each batch
-        #[cfg(target_arch = "aarch64")]
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-            let cd = c * d;
-            let in_ptr = input_data.as_ptr() as *const f32;
-            let out_ptr = out.as_mut_ptr() as *mut f32;
-            let a4 = a / 4 * 4;
-            let cd4 = cd / 4 * 4;
-
-            for bi in 0..b {
-                let base_in = bi * a * cd;
-                let base_out = bi * cd * a;
-                unsafe {
-                    // 4×4 block transpose core
-                    for ai in (0..a4).step_by(4) {
-                        for cdi in (0..cd4).step_by(4) {
-                            let r0 = vld1q_f32(in_ptr.add(base_in + ai * cd + cdi));
-                            let r1 = vld1q_f32(in_ptr.add(base_in + (ai + 1) * cd + cdi));
-                            let r2 = vld1q_f32(in_ptr.add(base_in + (ai + 2) * cd + cdi));
-                            let r3 = vld1q_f32(in_ptr.add(base_in + (ai + 3) * cd + cdi));
-                            let (t0, t1, t2, t3) = transpose_4x4_f32_neon(r0, r1, r2, r3);
-                            vst1q_f32(out_ptr.add(base_out + cdi * a + ai), t0);
-                            vst1q_f32(out_ptr.add(base_out + (cdi + 1) * a + ai), t1);
-                            vst1q_f32(out_ptr.add(base_out + (cdi + 2) * a + ai), t2);
-                            vst1q_f32(out_ptr.add(base_out + (cdi + 3) * a + ai), t3);
-                        }
-                        // Remainder columns
-                        for cdi in cd4..cd {
-                            for ai2 in ai..ai + 4 {
-                                *out_ptr.add(base_out + cdi * a + ai2) =
-                                    *in_ptr.add(base_in + ai2 * cd + cdi);
-                            }
-                        }
-                    }
-                    // Remainder rows
-                    for ai in a4..a {
-                        for cdi in 0..cd {
-                            *out_ptr.add(base_out + cdi * a + ai) =
-                                *in_ptr.add(base_in + ai * cd + cdi);
-                        }
-                    }
-                }
-            }
-            return TensorView::from_slice(out, out_shape);
-        }
-
-        // AVX2 path for f32: 8×8 block transpose on (A, C*D) matrix
-        #[cfg(target_arch = "x86_64")]
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-            let cd = c * d;
-            let in_ptr = input_data.as_ptr() as *const f32;
-            let out_ptr = out.as_mut_ptr() as *mut f32;
-            let a8 = a / 8 * 8;
-            let cd8 = cd / 8 * 8;
-
-            for bi in 0..b {
-                let base_in = bi * a * cd;
-                let base_out = bi * cd * a;
-                unsafe {
-                    for ai in (0..a8).step_by(8) {
-                        for cdi in (0..cd8).step_by(8) {
-                            transpose_8x8_f32_avx2(
-                                in_ptr.add(base_in + ai * cd + cdi),
-                                cd,
-                                out_ptr.add(base_out + cdi * a + ai),
-                                a,
-                            );
-                        }
-                        for cdi in cd8..cd {
-                            for ai2 in ai..ai + 8 {
-                                *out_ptr.add(base_out + cdi * a + ai2) =
-                                    *in_ptr.add(base_in + ai2 * cd + cdi);
-                            }
-                        }
-                    }
-                    for ai in a8..a {
-                        for cdi in 0..cd {
-                            *out_ptr.add(base_out + cdi * a + ai) =
-                                *in_ptr.add(base_in + ai * cd + cdi);
-                        }
-                    }
-                }
-            }
-            return TensorView::from_slice(out, out_shape);
-        }
-
-        // Scalar fallback
-        let out_slice = out.as_mut_slice();
-        for bi in 0..b {
-            for ai in 0..a {
-                for ci in 0..c {
-                    for di in 0..d {
-                        let src_off = ((bi * a + ai) * c + ci) * d + di;
-                        let dst_off = ((bi * c + ci) * d + di) * a + ai;
-                        unsafe {
-                            *out_slice.get_unchecked_mut(dst_off) =
-                                *input_data.get_unchecked(src_off);
-                        }
-                    }
-                }
-            }
-        }
+    let perm_full: Small<usize> = (0..ndim).map(perm_at).collect();
+    let (shape, perm) = simplify_transpose(input_shape, &perm_full);
+    let n = shape.len();
+    if n <= 1 {
+        dst.copy_from_slice(input_data);
         return TensorView::from_slice(out, out_shape);
     }
-
-    // Fast path: perm [0,2,1] for 3D tensors — 2D transpose within each batch
-    // [B, R, C] -> [B, C, R]
-    if ndim == 3 && perm_vec == [0, 2, 1] {
-        let (b, r, c) = (input_shape[0], input_shape[1], input_shape[2]);
-
-        // Fast NEON path for f32: 4×4 block transpose within each batch
-        #[cfg(target_arch = "aarch64")]
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-            let in_ptr = input_data.as_ptr() as *const f32;
-            let out_ptr = out.as_mut_ptr() as *mut f32;
-            let r4 = r / 4 * 4;
-            let c4 = c / 4 * 4;
-
-            for bi in 0..b {
-                let base_in = bi * r * c;
-                let base_out = bi * c * r;
-                unsafe {
-                    for ri in (0..r4).step_by(4) {
-                        for ci in (0..c4).step_by(4) {
-                            let r0 = vld1q_f32(in_ptr.add(base_in + ri * c + ci));
-                            let r1 = vld1q_f32(in_ptr.add(base_in + (ri + 1) * c + ci));
-                            let r2 = vld1q_f32(in_ptr.add(base_in + (ri + 2) * c + ci));
-                            let r3 = vld1q_f32(in_ptr.add(base_in + (ri + 3) * c + ci));
-                            let (t0, t1, t2, t3) = transpose_4x4_f32_neon(r0, r1, r2, r3);
-                            vst1q_f32(out_ptr.add(base_out + ci * r + ri), t0);
-                            vst1q_f32(out_ptr.add(base_out + (ci + 1) * r + ri), t1);
-                            vst1q_f32(out_ptr.add(base_out + (ci + 2) * r + ri), t2);
-                            vst1q_f32(out_ptr.add(base_out + (ci + 3) * r + ri), t3);
-                        }
-                        // Remainder columns
-                        for ci in c4..c {
-                            for ri2 in ri..ri + 4 {
-                                *out_ptr.add(base_out + ci * r + ri2) =
-                                    *in_ptr.add(base_in + ri2 * c + ci);
-                            }
-                        }
-                    }
-                    // Remainder rows
-                    for ri in r4..r {
-                        for ci in 0..c {
-                            *out_ptr.add(base_out + ci * r + ri) =
-                                *in_ptr.add(base_in + ri * c + ci);
-                        }
-                    }
-                }
-            }
-            return TensorView::from_slice(out, out_shape);
-        }
-
-        // Fast AVX2 path for f32: 8×8 block transpose within each batch
-        #[cfg(target_arch = "x86_64")]
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-            let in_ptr = input_data.as_ptr() as *const f32;
-            let out_ptr = out.as_mut_ptr() as *mut f32;
-            let r8 = r / 8 * 8;
-            let c8 = c / 8 * 8;
-
-            for bi in 0..b {
-                let base_in = bi * r * c;
-                let base_out = bi * c * r;
-                unsafe {
-                    for ri in (0..r8).step_by(8) {
-                        for ci in (0..c8).step_by(8) {
-                            transpose_8x8_f32_avx2(
-                                in_ptr.add(base_in + ri * c + ci),
-                                c,
-                                out_ptr.add(base_out + ci * r + ri),
-                                r,
-                            );
-                        }
-                        // Remainder columns (< 8)
-                        for ci in c8..c {
-                            for ri2 in ri..ri + 8 {
-                                *out_ptr.add(base_out + ci * r + ri2) =
-                                    *in_ptr.add(base_in + ri2 * c + ci);
-                            }
-                        }
-                    }
-                    // Remainder rows (< 8)
-                    for ri in r8..r {
-                        for ci in 0..c {
-                            *out_ptr.add(base_out + ci * r + ri) =
-                                *in_ptr.add(base_in + ri * c + ci);
-                        }
-                    }
-                }
-            }
-            return TensorView::from_slice(out, out_shape);
-        }
-
-        // Scalar fallback for non-SIMD or non-f32
-        let out_slice = out.as_mut_slice();
-        for bi in 0..b {
-            let base_in = bi * r * c;
-            let base_out = bi * c * r;
-            for ri in 0..r {
-                for ci in 0..c {
-                    unsafe {
-                        *out_slice.get_unchecked_mut(base_out + ci * r + ri) =
-                            *input_data.get_unchecked(base_in + ri * c + ci);
-                    }
-                }
-            }
-        }
-        return TensorView::from_slice(out, out_shape);
+    let in_stride = |axis: usize| shape[axis + 1..].iter().product::<usize>();
+    // Each output axis as (length, input stride, output stride).
+    let mut axes: Small<(usize, usize, usize)> = perm.iter().map(|&p| (shape[p], in_stride(p), 0)).collect();
+    let mut out_stride = 1;
+    for axis in axes.iter_mut().rev() {
+        axis.2 = out_stride;
+        out_stride *= axis.0;
     }
 
-    // Fast path: perm [1, 0] for 2D tensors — simple matrix transpose
-    if ndim == 2 && perm_vec == [1, 0] {
-        let (r, c) = (input_shape[0], input_shape[1]);
-        let out_slice = out.as_mut_slice();
-
-        #[cfg(target_arch = "aarch64")]
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-            // NEON-optimized 4x4 block transpose for f32
-            let r4 = r / 4 * 4;
-            let c4 = c / 4 * 4;
-            let in_ptr = input_data.as_ptr() as *const f32;
-            let out_ptr = out_slice.as_mut_ptr() as *mut f32;
-
-            unsafe {
-                for ri in (0..r4).step_by(4) {
-                    for ci in (0..c4).step_by(4) {
-                        // Load 4x4 block
-                        let row0 = vld1q_f32(in_ptr.add(ri * c + ci));
-                        let row1 = vld1q_f32(in_ptr.add((ri + 1) * c + ci));
-                        let row2 = vld1q_f32(in_ptr.add((ri + 2) * c + ci));
-                        let row3 = vld1q_f32(in_ptr.add((ri + 3) * c + ci));
-
-                        // Transpose 4x4
-                        let (t0, t1, t2, t3) = transpose_4x4_f32_neon(row0, row1, row2, row3);
-
-                        // Store transposed (note: output is [c, r] so stride is r)
-                        vst1q_f32(out_ptr.add(ci * r + ri), t0);
-                        vst1q_f32(out_ptr.add((ci + 1) * r + ri), t1);
-                        vst1q_f32(out_ptr.add((ci + 2) * r + ri), t2);
-                        vst1q_f32(out_ptr.add((ci + 3) * r + ri), t3);
-                    }
-
-                    // Handle remaining columns
-                    for ci in c4..c {
-                        for ri2 in ri..ri + 4 {
-                            *out_slice.get_unchecked_mut(ci * r + ri2) =
-                                *input_data.get_unchecked(ri2 * c + ci);
-                        }
-                    }
-                }
-
-                // Handle remaining rows
-                for ri in r4..r {
-                    for ci in 0..c {
-                        *out_slice.get_unchecked_mut(ci * r + ri) =
-                            *input_data.get_unchecked(ri * c + ci);
-                    }
-                }
-            }
-            return TensorView::from_slice(out, out_shape);
-        }
-
-        // AVX2-optimized 8×8 block transpose for f32
-        #[cfg(target_arch = "x86_64")]
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-            let r8 = r / 8 * 8;
-            let c8 = c / 8 * 8;
-            let in_ptr = input_data.as_ptr() as *const f32;
-            let out_ptr = out_slice.as_mut_ptr() as *mut f32;
-
-            unsafe {
-                for ri in (0..r8).step_by(8) {
-                    for ci in (0..c8).step_by(8) {
-                        transpose_8x8_f32_avx2(
-                            in_ptr.add(ri * c + ci),
-                            c,
-                            out_ptr.add(ci * r + ri),
-                            r,
-                        );
-                    }
-                    // Remainder columns
-                    for ci in c8..c {
-                        for ri2 in ri..ri + 8 {
-                            *out_slice.get_unchecked_mut(ci * r + ri2) =
-                                *input_data.get_unchecked(ri2 * c + ci);
-                        }
-                    }
-                }
-                // Remainder rows
-                for ri in r8..r {
-                    for ci in 0..c {
-                        *out_slice.get_unchecked_mut(ci * r + ri) =
-                            *input_data.get_unchecked(ri * c + ci);
-                    }
-                }
-            }
-            return TensorView::from_slice(out, out_shape);
-        }
-
-        // Non-SIMD fallback (generic)
-        for ri in 0..r {
-            for ci in 0..c {
-                unsafe {
-                    *out_slice.get_unchecked_mut(ci * r + ri) =
-                        *input_data.get_unchecked(ri * c + ci);
-                }
-            }
-        }
-        return TensorView::from_slice(out, out_shape);
-    }
-
-    // Generic fallback
-    let in_strides = utils::compute_strides(&input_shape);
-    let mut virtual_strides = vec![0; ndim];
-    for i in 0..ndim {
-        if perm_vec[i] >= in_strides.len() {
-            panic!(
-                "transpose: perm[{}]={} but input has {} dims (shape={:?})",
-                i,
-                perm_vec[i],
-                in_strides.len(),
-                input_shape
+    if perm[n - 1] == n - 1 {
+        // The innermost axis stays innermost: copy whole rows.
+        let row = shape[n - 1];
+        let (count, src_stride, dst_stride) = axes[n - 2];
+        for_each_offset(&axes[..n - 2], |s, d| {
+            copy_rows(&input_data[s..], src_stride, &mut dst[d..], dst_stride, count, row);
+        });
+    } else {
+        // A matrix transpose for each index of the other axes: its rows run
+        // along the input axis that becomes innermost, its columns along the
+        // input's innermost axis.
+        let rows_axis = perm[n - 1];
+        let cols_at = perm.iter().position(|&p| p == n - 1).expect("perm is a permutation");
+        let outer: Small<_> = (0..n - 1).filter(|&i| i != cols_at).map(|i| axes[i]).collect();
+        for_each_offset(&outer, |s, d| {
+            transpose_matrix(
+                &input_data[s..],
+                in_stride(rows_axis),
+                &mut dst[d..],
+                axes[cols_at].2,
+                shape[rows_axis],
+                shape[n - 1],
             );
-        }
-        virtual_strides[i] = in_strides[perm_vec[i]];
-    }
-    let mut coords = vec![0; ndim];
-    let out_slice = out.as_mut_slice();
-    let mut in_off = 0;
-    for i in 0..out_numel {
-        unsafe {
-            *out_slice.get_unchecked_mut(i) = *input_data.get_unchecked(in_off);
-        }
-        for d in (0..ndim).rev() {
-            coords[d] += 1;
-            if coords[d] < out_shape[d] {
-                in_off += virtual_strides[d];
-                break;
-            } else {
-                in_off -= (coords[d] - 1) * virtual_strides[d];
-                coords[d] = 0;
-            }
-        }
+        });
     }
     TensorView::from_slice(out, out_shape)
+}
+
+/// `transpose` for more than `MAX_RANK` axes, one element at a time.
+fn transpose_any_rank<T: Copy>(src: &[T], shape: &[usize], perm: &[usize], dst: &mut [T]) {
+    let strides = utils::compute_strides(shape);
+    let out_shape: Vec<usize> = perm.iter().map(|&p| shape[p]).collect();
+    let mut index = vec![0; shape.len()];
+    for value in dst.iter_mut() {
+        *value = src[(0..shape.len()).map(|d| index[d] * strides[perm[d]]).sum::<usize>()];
+        for d in (0..shape.len()).rev() {
+            index[d] += 1;
+            if index[d] < out_shape[d] {
+                break;
+            }
+            index[d] = 0;
+        }
+    }
 }
 pub fn to_i64_vec<T: crate::kernels::utils::AsI64 + Copy + std::fmt::Debug>(
     input: &TensorView<T>,
@@ -1431,5 +1462,197 @@ mod tests {
         let res = concat(&[&t1, &t2], 1, &mut out);
         assert_eq!(res.shape, vec![2, 3]);
         assert_eq!(res.data, vec![1.0, 2.0, 5.0, 3.0, 4.0, 6.0]);
+    }
+
+    /// Transpose element by element: output index to input index.
+    fn transpose_reference<T: Copy>(data: &[T], shape: &[usize], perm: &[usize]) -> Vec<T> {
+        let strides = utils::compute_strides(shape);
+        let out_shape: Vec<usize> = perm.iter().map(|&p| shape[p]).collect();
+        let mut index = vec![0; shape.len()];
+        (0..data.len())
+            .map(|mut i| {
+                for d in (0..shape.len()).rev() {
+                    index[d] = i % out_shape[d];
+                    i /= out_shape[d];
+                }
+                data[(0..shape.len()).map(|d| index[d] * strides[perm[d]]).sum::<usize>()]
+            })
+            .collect()
+    }
+
+    fn permutations(n: usize) -> Vec<Vec<usize>> {
+        if n == 0 {
+            return vec![vec![]];
+        }
+        let mut all = Vec::new();
+        for p in permutations(n - 1) {
+            for at in 0..n {
+                let mut q = p.clone();
+                q.insert(at, n - 1);
+                all.push(q);
+            }
+        }
+        all
+    }
+
+    fn check_transpose<T: Copy + PartialEq + std::fmt::Debug + 'static>(
+        shape: &[usize],
+        perm: &[usize],
+        value: impl Fn(usize) -> T,
+    ) {
+        let data: Vec<T> = (0..shape.iter().product()).map(value).collect();
+        let input = TensorView::from_slice(&data, shape.to_vec());
+        let perm_i64: Vec<i64> = perm.iter().map(|&p| p as i64).collect();
+        let mut out = Vec::new();
+        let got = transpose(&input, &perm_i64, &mut out);
+        let want_shape: Vec<usize> = perm.iter().map(|&p| shape[p]).collect();
+        assert_eq!(&*got.shape, &want_shape[..], "shape {shape:?} perm {perm:?}");
+        assert!(
+            got.data == transpose_reference(&data, shape, perm),
+            "shape {shape:?} perm {perm:?}"
+        );
+    }
+
+    #[test]
+    fn test_transpose_matches_reference_for_every_permutation() {
+        // Lengths of 1 (dropped), and around the 4- and 8-wide tiles and the
+        // 64-wide blocks.
+        let lens = [1, 2, 3, 5, 8, 9, 65];
+        for rank in 1..=4 {
+            for perm in permutations(rank) {
+                let mut shape = vec![0; rank];
+                // Every length on every axis would be 7^4 shapes per perm; walk
+                // each length over each axis in turn, the others cycling past it.
+                for i in 0..lens.len() * rank {
+                    for (d, len) in shape.iter_mut().enumerate() {
+                        *len = lens[(i / rank + d * (i % rank + 1)) % lens.len()];
+                    }
+                    if shape.iter().product::<usize>() > 40_000 {
+                        continue;
+                    }
+                    check_transpose(&shape, &perm, |i| i as f32);
+                }
+            }
+        }
+        for perm in permutations(5) {
+            check_transpose(&[2, 3, 1, 4, 5], &perm, |i| i as f32);
+        }
+    }
+
+    #[test]
+    fn test_transpose_of_each_element_size() {
+        for (shape, perm) in [
+            (&[37, 41][..], &[1, 0][..]),
+            (&[3, 17, 9], &[0, 2, 1]),
+            (&[2, 9, 3, 10], &[0, 2, 3, 1]),
+            (&[2, 9, 3, 10], &[2, 0, 1, 3]),
+            (&[4, 3, 5], &[2, 1, 0]),
+        ] {
+            check_transpose(shape, perm, |i| i as u8);
+            check_transpose(shape, perm, |i| i as i32 - 500);
+            check_transpose(shape, perm, |i| i as i64 * 1_000_000_007);
+            check_transpose(shape, perm, |i| i % 3 == 0);
+
+            // NaN payloads, signalling ones included, and negative zero must
+            // come through bit for bit.
+            let bits: Vec<u32> = (0..shape.iter().product::<usize>())
+                .map(|i| match i % 3 {
+                    0 => 0x7f80_0001 + i as u32, // signalling NaN
+                    1 => 0xffc0_0000 | i as u32, // quiet NaN, sign set
+                    _ => 0x8000_0000,            // -0.0
+                })
+                .collect();
+            let floats: Vec<f32> = bits.iter().map(|&b| f32::from_bits(b)).collect();
+            let perm_i64: Vec<i64> = perm.iter().map(|&p| p as i64).collect();
+            let mut out = Vec::new();
+            let got = transpose(&TensorView::from_slice(&floats, shape.to_vec()), &perm_i64, &mut out);
+            let got: Vec<u32> = got.data.iter().map(|v| v.to_bits()).collect();
+            assert!(got == transpose_reference(&bits, shape, perm), "shape {shape:?} perm {perm:?}");
+        }
+    }
+
+    #[test]
+    fn test_transpose_model_shapes() {
+        for (shape, perm) in [
+            (&[1, 2, 400, 400][..], &[0, 1, 3, 2][..]), // YOLO26 head
+            (&[1, 80, 8400], &[0, 2, 1]),                // YOLO26 output
+            (&[1, 97, 4, 128], &[0, 2, 3, 1]),           // SenseVoice attention keys
+            (&[1, 97, 4, 128], &[0, 2, 1, 3]),
+            (&[1, 16, 384, 30], &[1, 0, 2, 3]),          // T-one, only moves an axis of 1
+            (&[10, 1, 8, 48], &[1, 2, 3, 0]),
+            (&[1, 1856, 3, 4, 64], &[2, 0, 3, 1, 4]),    // MOSS-TTS QKV split
+        ] {
+            check_transpose(shape, perm, |i| i as f32);
+        }
+    }
+
+    #[test]
+    fn test_transpose_matrix_at_every_level_and_stride() {
+        for level in crate::kernels::test_util::levels() {
+            // Every remainder by 8 on both sides, for the edge strips, and
+            // sides under 8 and under 4.
+            for rows in [1, 3, 4, 7, 8, 9, 12, 13, 31, 32, 33, 44, 70, 130] {
+                for cols in [1, 2, 5, 8, 11, 12, 14, 16, 17, 40, 65, 129] {
+                    // Padded leading dimensions, as for a matrix inside a larger
+                    // tensor; multiples of 256 on either side, both or neither
+                    // pick each order of walking the tiles.
+                    let pad = |len: usize, wide: bool| if wide { len.next_multiple_of(256) } else { len + 3 };
+                    for (wide_src, wide_dst) in [(false, false), (true, false), (false, true), (true, true)] {
+                        let (src_ld, dst_ld) = (pad(cols, wide_src), pad(rows, wide_dst));
+                        // Spread over all 32 bits, so many are NaN patterns
+                        // once the tiles move them as floats.
+                        let src: Vec<u32> = (0..rows * src_ld).map(|i| (i as u32).wrapping_mul(0x9e37_79b9)).collect();
+                        let mut dst = vec![u32::MAX; cols * dst_ld];
+                        transpose_matrix_u32(level, &src, src_ld, &mut dst, dst_ld, rows, cols);
+                        for c in 0..cols {
+                            for r in 0..dst_ld {
+                                let want = if r < rows { src[r * src_ld + c] } else { u32::MAX };
+                                assert_eq!(
+                                    dst[c * dst_ld + r],
+                                    want,
+                                    "{level:?} {rows}x{cols}, ld {src_ld} -> {dst_ld}, at ({r}, {c})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_simplify_transpose() {
+        let simplified = |shape: &[usize], perm: &[usize]| {
+            let (shape, perm) = simplify_transpose(shape, perm);
+            (shape.to_vec(), perm.to_vec())
+        };
+        // Axes of 1 go, and runs kept in order merge.
+        assert_eq!(simplified(&[1, 16, 384, 30], &[1, 0, 2, 3]), (vec![184_320], vec![0]));
+        assert_eq!(simplified(&[1, 97, 4, 128], &[0, 2, 3, 1]), (vec![97, 512], vec![1, 0]));
+        assert_eq!(simplified(&[10, 1, 8, 48], &[1, 2, 3, 0]), (vec![10, 384], vec![1, 0]));
+        assert_eq!(simplified(&[2, 62, 8, 64], &[2, 0, 1, 3]), (vec![124, 8, 64], vec![1, 0, 2]));
+        assert_eq!(simplified(&[4, 3, 5], &[2, 1, 0]), (vec![4, 3, 5], vec![2, 1, 0]));
+        assert_eq!(simplified(&[1, 1], &[1, 0]), (vec![], vec![]));
+    }
+
+    #[test]
+    fn test_transpose_above_max_rank_and_default_perms() {
+        let shape = [2, 1, 3, 2, 1, 2, 3, 1, 2];
+        let perm = [8, 2, 0, 6, 1, 5, 3, 7, 4];
+        check_transpose(&shape, &perm, |i| i as f32);
+
+        // No perm reverses the axes; a short one leaves the rest in place.
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let input = TensorView::from_slice(&data, vec![2, 3, 4]);
+        let mut out = Vec::new();
+        assert!(transpose(&input, &[], &mut out).data == transpose_reference(&data, &[2, 3, 4], &[2, 1, 0]));
+        assert!(transpose(&input, &[1, 0], &mut out).data == transpose_reference(&data, &[2, 3, 4], &[1, 0, 2]));
+    }
+
+    #[test]
+    #[should_panic(expected = "not a permutation")]
+    fn test_transpose_rejects_repeated_axis() {
+        let data = [0.0f32; 6];
+        transpose(&TensorView::from_slice(&data, vec![2, 3]), &[0, 0], &mut Vec::new());
     }
 }
