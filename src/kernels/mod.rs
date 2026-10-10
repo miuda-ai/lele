@@ -1,6 +1,4 @@
 pub mod activations;
-#[cfg(target_arch = "x86_64")]
-pub mod avx;
 pub(crate) mod bias_act;
 pub(crate) mod binary;
 pub mod conv1d;
@@ -28,6 +26,7 @@ pub(crate) mod simd_math;
 pub(crate) mod test_util;
 pub mod timing;
 pub mod utils;
+pub(crate) mod window2d;
 pub use conv1d::conv1d;
 pub use conv1d::conv1d_fused;
 pub use conv2d::{
