@@ -401,9 +401,9 @@ fn test_matmul_integer_correctness() -> bool {
     all_pass
 }
 
-/// Test conv_integer correctness (verifies conv2d faer_matmul call is NOT skipped on WASM)
+/// Test conv_integer correctness
 fn test_conv_integer_correctness() -> bool {
-    use lele::kernels::conv2d::conv_integer;
+    use lele::kernels::conv_integer;
 
     println!("--- Conv Integer (conv2d) Correctness Tests ---");
     let mut all_pass = true;

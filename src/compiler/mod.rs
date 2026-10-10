@@ -1429,14 +1429,17 @@ impl Compiler {
         writeln!(&mut code, "\npub struct {}<'a> {{", struct_name)?;
         writeln!(&mut code, "    data: &'a [u8],")?;
         writeln!(&mut code, "    _phantom: std::marker::PhantomData<&'a ()>,")?;
-        writeln!(&mut code, "    #[cfg(target_arch = \"aarch64\")]")?;
         writeln!(
             &mut code,
-            "    prepared_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::PreparedWeightsArm>>>,"
+            "    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,"
         )?;
         writeln!(
             &mut code,
-            "    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QuantizedWeights>)>>,"
+            "    qweights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize, bool), (std::vec::Vec<f32>, std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,"
+        )?;
+        writeln!(
+            &mut code,
+            "    conv_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, bool), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::ConvWeights>)>>,"
         )?;
         writeln!(&mut code, "}}")?;
         writeln!(&mut code, "\nimpl<'a> {}<'a> {{", struct_name)?;
@@ -1444,14 +1447,17 @@ impl Compiler {
         writeln!(&mut code, "        Self {{")?;
         writeln!(&mut code, "            data,")?;
         writeln!(&mut code, "            _phantom: std::marker::PhantomData,")?;
-        writeln!(&mut code, "            #[cfg(target_arch = \"aarch64\")]")?;
-        writeln!(
-            &mut code,
-            "            prepared_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
-        )?;
         writeln!(
             &mut code,
             "            quantized_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
+        )?;
+        writeln!(
+            &mut code,
+            "            qweights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
+        )?;
+        writeln!(
+            &mut code,
+            "            conv_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
         )?;
         writeln!(&mut code, "        }}")?;
         writeln!(&mut code, "    }}")?;
@@ -1463,46 +1469,12 @@ impl Compiler {
             writeln!(&mut code, "{}", func)?;
         }
 
-        // ARM prepared weights helper
-        writeln!(&mut code, "    #[cfg(target_arch = \"aarch64\")]")?;
-        writeln!(
-            &mut code,
-            "    fn get_prepared_weight(&self, offset: usize, len: usize, k: usize, n: usize) -> std::sync::Arc<lele::kernels::PreparedWeightsArm> {{"
-        )?;
-        writeln!(&mut code, "        let key = (offset, len);")?;
-        writeln!(&mut code, "        {{")?;
-        writeln!(
-            &mut code,
-            "            let cache = self.prepared_weights_cache.borrow();"
-        )?;
-        writeln!(
-            &mut code,
-            "            if let Some(pw) = cache.get(&key) {{"
-        )?;
-        writeln!(&mut code, "                return pw.clone();")?;
-        writeln!(&mut code, "            }}")?;
-        writeln!(&mut code, "        }}")?;
-        writeln!(
-            &mut code,
-            "        let raw_bytes = &self.data[offset..offset+len];"
-        )?;
-        writeln!(
-            &mut code,
-            "        let pw = std::sync::Arc::new(lele::kernels::prepare_weights_arm(raw_bytes, k, n));"
-        )?;
-        writeln!(
-            &mut code,
-            "        self.prepared_weights_cache.borrow_mut().insert(key, pw.clone());"
-        )?;
-        writeln!(&mut code, "        pw")?;
-        writeln!(&mut code, "    }}")?;
-
         // Int8 weights for QLinearMatMulI8. Preparing is architecture
         // dependent and costs a full pass over the weight, so it happens once
         // per tensor and the result is cached for the life of the model.
         writeln!(
             &mut code,
-            "    fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &lele::tensor::TensorView<f32>) -> std::sync::Arc<lele::kernels::QuantizedWeights> {{"
+            "    fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &lele::tensor::TensorView<f32>) -> std::sync::Arc<lele::kernels::QWeights> {{"
         )?;
         writeln!(
             &mut code,
@@ -1539,6 +1511,68 @@ impl Compiler {
             "        self.quantized_weights_cache.borrow_mut().insert(key, (scale.data.to_vec(), qw.clone()));"
         )?;
         writeln!(&mut code, "        qw")?;
+        writeln!(&mut code, "    }}")?;
+
+        // 8-bit weights packed for the integer GEMM, with their zero points
+        // subtracted, so the cached entry must match those and the scales.
+        writeln!(
+            &mut code,
+            "    #[allow(dead_code)]\n    fn get_qweights(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool, zero_point: &[f32], scale: &[f32]) -> std::sync::Arc<lele::kernels::QWeights> {{"
+        )?;
+        writeln!(&mut code, "        let key = (offset, len, k, n, signed);")?;
+        writeln!(
+            &mut code,
+            "        if let Some((z, s, w)) = self.qweights_cache.borrow().get(&key) {{"
+        )?;
+        writeln!(
+            &mut code,
+            "            if z.as_slice() == zero_point && s.as_slice() == scale {{"
+        )?;
+        writeln!(&mut code, "                return w.clone();")?;
+        writeln!(&mut code, "            }}")?;
+        writeln!(&mut code, "        }}")?;
+        writeln!(
+            &mut code,
+            "        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();"
+        )?;
+        writeln!(
+            &mut code,
+            "        let w = std::sync::Arc::new(lele::kernels::QWeights::new(&self.data[offset..offset + len], k, n, signed, &zp, scale));"
+        )?;
+        writeln!(
+            &mut code,
+            "        self.qweights_cache.borrow_mut().insert(key, (zero_point.to_vec(), scale.to_vec(), w.clone()));"
+        )?;
+        writeln!(&mut code, "        w")?;
+        writeln!(&mut code, "    }}")?;
+
+        // ConvInteger weights, prepared with their zero points, which the entry must match.
+        writeln!(
+            &mut code,
+            "    #[allow(dead_code)]\n    fn get_conv_weights(&self, offset: usize, len: usize, shape: [usize; 4], groups: usize, signed: bool, zero_point: &[f32]) -> std::sync::Arc<lele::kernels::ConvWeights> {{"
+        )?;
+        writeln!(&mut code, "        let key = (offset, len, groups, signed);")?;
+        writeln!(
+            &mut code,
+            "        if let Some((z, w)) = self.conv_weights_cache.borrow().get(&key) {{"
+        )?;
+        writeln!(&mut code, "            if z.as_slice() == zero_point {{")?;
+        writeln!(&mut code, "                return w.clone();")?;
+        writeln!(&mut code, "            }}")?;
+        writeln!(&mut code, "        }}")?;
+        writeln!(
+            &mut code,
+            "        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();"
+        )?;
+        writeln!(
+            &mut code,
+            "        let w = std::sync::Arc::new(lele::kernels::ConvWeights::new(&self.data[offset..offset + len], &shape, groups, signed, &zp));"
+        )?;
+        writeln!(
+            &mut code,
+            "        self.conv_weights_cache.borrow_mut().insert(key, (zero_point.to_vec(), w.clone()));"
+        )?;
+        writeln!(&mut code, "        w")?;
         writeln!(&mut code, "    }}")?;
 
         // Helpers for weights
@@ -2302,5 +2336,88 @@ mod qdq_matmul_fusion_tests {
         let mut g = graph(n);
         Compiler::fuse_qdq_matmul(&mut g);
         assert_eq!(op_types(&g).last(), Some(&"MatMul"));
+    }
+}
+
+#[cfg(test)]
+mod conv_pattern_tests {
+    use super::*;
+    use crate::model::onnx_proto::{AttributeProto, ValueInfoProto};
+
+    /// A depthwise 3x3 Conv with stride `[2, 1]` (as in PP-OCR's recognizer),
+    /// followed by `next` (`Relu`, or `Add` of a bias initializer).
+    fn graph(next: &str) -> GraphProto {
+        let ints = |name: &str, v: &[i64]| AttributeProto {
+            name: name.to_string(),
+            ints: v.to_vec(),
+            ..Default::default()
+        };
+        let mut group = ints("group", &[]);
+        group.i = 4;
+        let conv = NodeProto {
+            op_type: "Conv".to_string(),
+            input: vec!["x".to_string(), "w".to_string()],
+            output: vec!["c".to_string()],
+            attribute: vec![
+                ints("kernel_shape", &[3, 3]),
+                ints("strides", &[2, 1]),
+                ints("dilations", &[1, 2]),
+                ints("pads", &[1, 2, 1, 2]),
+                group,
+            ],
+            ..Default::default()
+        };
+        let mut inputs = vec!["c".to_string()];
+        if next == "Add" {
+            inputs.push("b".to_string());
+        }
+        let after = NodeProto {
+            op_type: next.to_string(),
+            input: inputs,
+            output: vec!["y".to_string()],
+            ..Default::default()
+        };
+        let init = |name: &str, dims: &[i64]| TensorProto {
+            name: name.to_string(),
+            data_type: 1,
+            dims: dims.to_vec(),
+            raw_data: vec![0u8; 4 * dims.iter().product::<i64>() as usize],
+            ..Default::default()
+        };
+        GraphProto {
+            node: vec![conv, after],
+            initializer: vec![init("w", &[4, 1, 3, 3]), init("b", &[1, 4, 1, 1])],
+            input: vec![ValueInfoProto {
+                name: "x".to_string(),
+                ..Default::default()
+            }],
+            output: vec![ValueInfoProto {
+                name: "y".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The fused Conv patterns used to keep only the first stride and
+    /// dilation and repeat it, turning `[2, 1]` into `[2, 2]`.
+    #[test]
+    fn fused_conv_keeps_per_axis_strides_and_dilations() {
+        for next in ["Relu", "Add"] {
+            let result = Compiler::new()
+                .with_name("ConvStrides")
+                .with_default_optimizations()
+                .compile(&graph(next))
+                .expect("compilation should succeed");
+            let call = result
+                .code
+                .lines()
+                .find(|l| l.contains("lele::kernels::conv2d"))
+                .unwrap_or_else(|| panic!("{next}: no conv2d call in\n{}", result.code));
+            assert!(call.contains("&[1, 2], 4, &[1, 2, 1, 2], &[2, 1]"), "{next}: {call}");
+            // Both went through their fused pattern.
+            let fused = if next == "Relu" { "conv2d_fused(" } else { "Some(&self.weight_f32" };
+            assert!(call.contains(fused), "{next}: {call}");
+        }
     }
 }

@@ -67,6 +67,8 @@ fn bench_softmax(c: &mut Criterion) {
         (64, 128),     // Large batch
         (128, 80),     // SenseVoice vocabulary
         (1, 1024),     // Large vocabulary
+        (12, 197),     // ViT attention rows, odd width
+        (64, 64),
     ];
 
     for &(batch, axis_size) in &sizes {
@@ -110,6 +112,7 @@ fn bench_layer_norm(c: &mut Criterion) {
         (16, 256),
         (64, 128),
         (128, 512),
+        (16, 1027),
     ];
 
     for &(outer, norm_size) in &sizes {
@@ -137,6 +140,101 @@ fn bench_layer_norm(c: &mut Criterion) {
                         black_box(&scale),
                         black_box(&bias),
                         -1,
+                        1e-5,
+                        &mut out_buf,
+                    );
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_rms_norm(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rms_norm");
+
+    let sizes = [(1, 512), (4, 512), (16, 256), (64, 128), (128, 512), (16, 1027)];
+
+    for &(outer, norm_size) in &sizes {
+        let input_data: Vec<f32> = (0..outer * norm_size)
+            .map(|i| ((i % 20) as f32 - 10.0) * 0.1)
+            .collect();
+        let weight: Vec<f32> = (0..norm_size).map(|i| 1.0 + ((i % 5) as f32) * 0.1).collect();
+        let mut out_buf = vec![0.0f32; outer * norm_size];
+
+        let input_shape = vec![outer, norm_size];
+        let weight_shape = vec![norm_size];
+        let input = TensorView { data: Cow::Borrowed(&input_data), shape: Cow::Borrowed(&input_shape) };
+        let weight = TensorView { data: Cow::Borrowed(&weight), shape: Cow::Borrowed(&weight_shape) };
+
+        group.throughput(Throughput::Elements((outer * norm_size) as u64));
+        group.bench_with_input(
+            BenchmarkId::new("rms_norm", format!("{}x{}", outer, norm_size)),
+            &(outer, norm_size),
+            |bencher, _| {
+                bencher.iter(|| {
+                    let _ = lele::kernels::norm::rms_norm(
+                        black_box(&input),
+                        black_box(&weight),
+                        -1,
+                        1e-5,
+                        &mut out_buf,
+                    );
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_batch_norm(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch_norm");
+
+    // NCHW shapes from convolutional models, plus an odd spatial size.
+    let shapes: [Vec<usize>; 5] = [
+        vec![1, 64, 56, 56],
+        vec![1, 256, 14, 14],
+        vec![4, 128, 28, 28],
+        vec![1, 512, 7, 7],
+        vec![2, 32, 13, 13],
+    ];
+
+    for shape in &shapes {
+        let numel: usize = shape.iter().product();
+        let ch = shape[1];
+        let input_data: Vec<f32> = (0..numel).map(|i| ((i % 20) as f32 - 10.0) * 0.1).collect();
+        let scale: Vec<f32> = (0..ch).map(|i| 1.0 + ((i % 5) as f32) * 0.1).collect();
+        let bias: Vec<f32> = (0..ch).map(|i| ((i % 5) as f32) * 0.01).collect();
+        let mean: Vec<f32> = (0..ch).map(|i| ((i % 7) as f32) * 0.05).collect();
+        let var: Vec<f32> = (0..ch).map(|i| 0.5 + ((i % 3) as f32) * 0.25).collect();
+        let mut out_buf = vec![0.0f32; numel];
+
+        let param_shape = vec![ch];
+        let input = TensorView { data: Cow::Borrowed(&input_data), shape: Cow::Borrowed(shape) };
+        fn view<'a>(v: &'a [f32], shape: &'a [usize]) -> TensorView<'a> {
+            TensorView { data: Cow::Borrowed(v), shape: Cow::Borrowed(shape) }
+        }
+        let (scale, bias, mean, var) = (
+            view(&scale, &param_shape),
+            view(&bias, &param_shape),
+            view(&mean, &param_shape),
+            view(&var, &param_shape),
+        );
+
+        group.throughput(Throughput::Elements(numel as u64));
+        group.bench_with_input(
+            BenchmarkId::new("batch_norm", format!("{shape:?}")),
+            shape,
+            |bencher, _| {
+                bencher.iter(|| {
+                    let _ = lele::kernels::norm::batch_norm(
+                        black_box(&input),
+                        black_box(&scale),
+                        black_box(&bias),
+                        black_box(&mean),
+                        black_box(&var),
                         1e-5,
                         &mut out_buf,
                     );
@@ -233,11 +331,13 @@ fn bench_elementwise(c: &mut Criterion) {
 // Activation Functions Benchmarks
 // ============================================================================
 
-#[cfg(target_arch = "aarch64")]
 fn bench_activations(c: &mut Criterion) {
     let mut group = c.benchmark_group("activations");
 
-    let sizes = [512, 1024, 2048, 4096];
+    // Element counts logged from running the example models: T-one (silu,
+    // sigmoid: 1920 to 42240) and supertonic3 (tanh: 25600; gelu_erf, erf:
+    // 77824 and 438272). 197 is an odd size that leaves a vector tail.
+    let sizes = [197, 1920, 3840, 7680, 21760, 42240, 77824, 438272];
 
     for &size in &sizes {
         let input_data: Vec<f32> = (0..size).map(|i| ((i % 20) as f32 - 10.0) * 0.1).collect();
@@ -251,7 +351,6 @@ fn bench_activations(c: &mut Criterion) {
         // Tanh
         group.bench_with_input(BenchmarkId::new("tanh", size), &size, |bencher, _| {
             bencher.iter(|| {
-                out_buf.fill(0.0);
                 let _ = lele::kernels::math::tanh_kernel(black_box(&input), &mut out_buf);
             });
         });
@@ -259,7 +358,6 @@ fn bench_activations(c: &mut Criterion) {
         // Sigmoid
         group.bench_with_input(BenchmarkId::new("sigmoid", size), &size, |bencher, _| {
             bencher.iter(|| {
-                out_buf.fill(0.0);
                 let _ = lele::kernels::math::sigmoid(black_box(&input), &mut out_buf);
             });
         });
@@ -267,7 +365,6 @@ fn bench_activations(c: &mut Criterion) {
         // Exp
         group.bench_with_input(BenchmarkId::new("exp", size), &size, |bencher, _| {
             bencher.iter(|| {
-                out_buf.fill(0.0);
                 let _ = lele::kernels::math::exp(black_box(&input), &mut out_buf);
             });
         });
@@ -275,15 +372,32 @@ fn bench_activations(c: &mut Criterion) {
         // ERF (used in GELU)
         group.bench_with_input(BenchmarkId::new("erf", size), &size, |bencher, _| {
             bencher.iter(|| {
-                out_buf.fill(0.0);
                 let _ = lele::kernels::math::erf(black_box(&input), &mut out_buf);
+            });
+        });
+
+        // GELU (erf form)
+        group.bench_with_input(BenchmarkId::new("gelu_erf", size), &size, |bencher, _| {
+            bencher.iter(|| {
+                let _ = lele::kernels::math::gelu_erf(black_box(&input), &mut out_buf);
+            });
+        });
+
+        // GELU (multiply form) and its tanh approximation
+        group.bench_with_input(BenchmarkId::new("gelu", size), &size, |bencher, _| {
+            bencher.iter(|| {
+                let _ = lele::kernels::math::gelu(black_box(&input), &mut out_buf);
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("fast_gelu", size), &size, |bencher, _| {
+            bencher.iter(|| {
+                let _ = lele::kernels::math::fast_gelu(black_box(&input), &mut out_buf);
             });
         });
 
         // ReLU
         group.bench_with_input(BenchmarkId::new("relu", size), &size, |bencher, _| {
             bencher.iter(|| {
-                out_buf.fill(0.0);
                 let _ = lele::kernels::math::relu(black_box(&input), &mut out_buf);
             });
         });
@@ -291,7 +405,6 @@ fn bench_activations(c: &mut Criterion) {
         // SiLU (Swish)
         group.bench_with_input(BenchmarkId::new("silu", size), &size, |bencher, _| {
             bencher.iter(|| {
-                out_buf.fill(0.0);
                 let _ = lele::kernels::math::silu(black_box(&input), &mut out_buf);
             });
         });
@@ -381,17 +494,13 @@ criterion_group!(
     bench_gemm,
     bench_softmax,
     bench_layer_norm,
+    bench_rms_norm,
+    bench_batch_norm,
     bench_transpose,
     bench_elementwise,
     bench_leaky_relu,
     bench_matmul_fused_add,
+    bench_activations,
 );
 
-#[cfg(target_arch = "aarch64")]
-criterion_group!(neon_benches, bench_activations);
-
-#[cfg(target_arch = "aarch64")]
-criterion_main!(benches, neon_benches);
-
-#[cfg(not(target_arch = "aarch64"))]
 criterion_main!(benches);
