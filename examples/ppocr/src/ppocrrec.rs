@@ -31,8 +31,9 @@ impl PpocrRecWorkspace {
 pub struct PpocrRec<'a> {
     data: &'a [u8],
     _phantom: std::marker::PhantomData<&'a ()>,
-    #[cfg(target_arch = "aarch64")]
-    prepared_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::PreparedWeightsArm>>>,
+    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,
+    qweights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize, bool), (std::vec::Vec<f32>, std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,
+    conv_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, bool), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::ConvWeights>)>>,
 }
 
 impl<'a> PpocrRec<'a> {
@@ -40,8 +41,9 @@ impl<'a> PpocrRec<'a> {
         Self {
             data,
             _phantom: std::marker::PhantomData,
-            #[cfg(target_arch = "aarch64")]
-            prepared_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            quantized_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            qweights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            conv_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 fn conv1d_relu<'c, 'd>(
@@ -107,83 +109,66 @@ fn linear_quantized_relu<'c, 'd>(
     )
 }
 
-#[cfg(target_arch = "aarch64")]
-fn linear_quantized_arm<'c, 'd>(
+/// Dynamically quantized linear layer (+ ReLU) against an int8 weight packed
+/// once for the integer GEMM.
+fn linear_quantized_packed<'c, 'd>(
     &self,
     input: &lele::tensor::TensorView<'c, f32>,
     weight_offset: usize,
     weight_len: usize,
     weight_k: usize,
     weight_n: usize,
+    weight_signed: bool,
     weight_scale: lele::tensor::TensorView<'c, f32>,
     weight_zero: lele::tensor::TensorView<'c, f32>,
     bias: lele::tensor::TensorView<'c, f32>,
+    relu: bool,
     output_buf: &'d mut Vec<f32>,
 ) -> lele::tensor::TensorView<'d, f32> {
-    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n);
-    let zp_b = weight_zero.data.first().map(|&v| v as u8);
-
-    lele::kernels::fused_dq_gemm_prepared_arm(
-        input,
-        &pw,
-        zp_b,
-        &weight_scale,
-        Some(&bias),
-        false,
-        output_buf,
-    )
+    let w = self.get_qweights(weight_offset, weight_len, weight_k, weight_n, weight_signed, &weight_zero.data, &weight_scale.data);
+    let bias = (!bias.data.is_empty()).then_some(&bias.data[..]);
+    lele::kernels::qlinear_dynamic(input, &w, bias, relu, output_buf)
 }
 
-/// ARM-optimized quantized linear + ReLU with pre-packed weights.
-/// Uses fused DynQuant+GEMM: eliminates f32 intermediate buffer, per-call u8
-/// allocation, and separate f32→u8 conversion pass.
-#[cfg(target_arch = "aarch64")]
-fn linear_quantized_relu_arm<'c, 'd>(
-    &self,
-    input: &lele::tensor::TensorView<'c, f32>,
-    weight_offset: usize,
-    weight_len: usize,
-    weight_k: usize,
-    weight_n: usize,
-    weight_scale: lele::tensor::TensorView<'c, f32>,
-    weight_zero: lele::tensor::TensorView<'c, f32>,
-    bias: lele::tensor::TensorView<'c, f32>,
-    output_buf: &'d mut Vec<f32>,
-) -> lele::tensor::TensorView<'d, f32> {
-    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n);
-    let zp_b = weight_zero.data.first().map(|&v| v as u8);
-
-    lele::kernels::fused_dq_gemm_prepared_arm(
-        input,
-        &pw,
-        zp_b,
-        &weight_scale,
-        Some(&bias),
-        true,
-        output_buf,
-    )
-}
-
-/// ARM-optimized MatMulInteger with pre-packed weight cache.
-/// Used for unfused MatMulInteger nodes where B is a static model weight.
-/// Eliminates: per-call B packing, B u8→f32→u8 roundtrip, heap alloc.
-#[cfg(target_arch = "aarch64")]
-fn mat_mul_integer_arm<'c, 'd>(
+/// MatMulInteger against a static weight packed once for the integer GEMM.
+fn mat_mul_integer_packed<'c, 'd>(
     &self,
     a: &lele::tensor::TensorView<'c, f32>,
     weight_offset: usize,
     weight_len: usize,
     weight_k: usize,
     weight_n: usize,
+    weight_signed: bool,
     a_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
     b_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
     output_buf: &'d mut Vec<f32>,
 ) -> lele::tensor::TensorView<'d, f32> {
-    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n);
-    let zp_a = a_zero_point.and_then(|z| z.data.first().cloned());
-    let zp_b = b_zero_point.and_then(|z| z.data.first()).map(|&v| v as u8);
+    let zb = b_zero_point.map_or(&[0.0f32][..], |z| &z.data[..]);
+    let w = self.get_qweights(weight_offset, weight_len, weight_k, weight_n, weight_signed, zb, &[1.0]);
+    let za = a_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0) as i32;
+    lele::kernels::mat_mul_integer_qweights(a, za, &w, output_buf)
+}
 
-    lele::kernels::mat_mul_integer_prepared_arm(a, &pw, zp_a, zp_b, None, None, false, output_buf)
+/// ConvInteger against a static weight prepared once.
+fn conv_integer_packed<'c, 'd>(
+    &self,
+    x: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_shape: [usize; 4],
+    weight_signed: bool,
+    group: i64,
+    x_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    w_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    dilations: &[i64],
+    pads: &[i64],
+    strides: &[i64],
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let zw = w_zero_point.filter(|z| !z.data.is_empty()).map_or(&[0.0f32][..], |z| &z.data[..]);
+    let w = self.get_conv_weights(weight_offset, weight_len, weight_shape, group as usize, weight_signed, zw);
+    let zx = x_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0) as i32;
+    lele::kernels::conv_integer_packed(x, &w, zx, dilations, pads, strides, output_buf)
 }
 
 // Helper for pre-quantized inputs (used in attention where input is already quantized)
@@ -213,6 +198,24 @@ fn linear_quantized_prequant<'c, 'd>(
         output_buf,
     )
 }
+/// Static-QDQ matmul: activation already on the quantization grid, weight kept
+/// in int8 so an integer GEMM can run where the hardware supports one.
+fn qmatmul_i8<'c, 'd>(
+    &self,
+    input: &lele::tensor::TensorView<'c, f32>,
+    input_scale: &lele::tensor::TensorView<'c, f32>,
+    input_zero_point: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_k: usize,
+    weight_n: usize,
+    weight_scale: &lele::tensor::TensorView<'c, f32>,
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let qw = self.get_quantized_weight(weight_offset, weight_len, weight_k, weight_n, weight_scale);
+    lele::kernels::qmatmul_i8(input, input_scale, input_zero_point, &qw, output_buf)
+}
+
 fn linear<'c, 'd>(
     &self,
     input: &lele::tensor::TensorView<'c>,
@@ -282,7 +285,7 @@ fn embedding_concat_i64<'c, 'd>(
         let p2o_pd_op_conv2d_0_0 = lele::kernels::conv2d(&x, &self.weight_f32(0, 2592, &[24, 3, 3, 3]), None, &[1, 1], 1, &[1, 1, 1, 1], &[2, 2], &mut ws.buf_0);
         let p2o_pd_op_batch_norm__0_0 = lele::kernels::batch_norm(&p2o_pd_op_conv2d_0_0, &self.weight_f32(2592, 96, &[24]), &self.weight_f32(2688, 96, &[24]), &self.weight_f32(2784, 96, &[24]), &self.weight_f32(2880, 96, &[24]), 1e-5, &mut ws.buf_1);
         let auto_cast_0 = p2o_pd_op_batch_norm__0_0.clone();
-        let p2o_pd_op_gelu_0_0 = lele::kernels::gelu(&auto_cast_0, &mut ws.buf_0);
+        let p2o_pd_op_gelu_0_0 = lele::kernels::gelu_erf(&auto_cast_0, &mut ws.buf_0);
         let p2o_pd_op_conv2d_1_0 = lele::kernels::conv2d(&p2o_pd_op_gelu_0_0, &self.weight_f32(3024, 41472, &[48, 24, 3, 3]), None, &[1, 1], 1, &[1, 1, 1, 1], &[2, 2], &mut ws.buf_6);
         let p2o_pd_op_batch_norm__1_0 = lele::kernels::batch_norm(&p2o_pd_op_conv2d_1_0, &self.weight_f32(44496, 192, &[48]), &self.weight_f32(44688, 192, &[48]), &self.weight_f32(44880, 192, &[48]), &self.weight_f32(45072, 192, &[48]), 1e-5, &mut ws.buf_7);
         let Add_3 = lele::kernels::conv2d(&p2o_pd_op_batch_norm__1_0, &self.weight_f32(45264, 1728, &[48, 1, 3, 3]), Some(&self.weight_f32(46992, 192, &[1, 48, 1, 1])), &[1, 1], 48, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_3);
@@ -300,7 +303,7 @@ fn embedding_concat_i64<'c, 'd>(
         let Add_9 = lele::kernels::conv2d(&p2o_pd_op_multiply_0_0, &self.weight_f32(52032, 18432, &[96, 48, 1, 1]), Some(&self.weight_f32(70464, 384, &[1, 96, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_4);
         let p2o_pd_op_add_3_0 = Add_9.clone();
         let auto_cast_5 = p2o_pd_op_add_3_0.clone();
-        let p2o_pd_op_gelu_1_0 = lele::kernels::gelu(&auto_cast_5, &mut ws.buf_7);
+        let p2o_pd_op_gelu_1_0 = lele::kernels::gelu_erf(&auto_cast_5, &mut ws.buf_7);
         let Add_13 = lele::kernels::conv2d(&p2o_pd_op_gelu_1_0, &self.weight_f32(70848, 18432, &[48, 96, 1, 1]), Some(&self.weight_f32(89280, 192, &[1, 48, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_8);
         let p2o_pd_op_add_4_0 = Add_13.clone();
         let Add_15 = lele::kernels::add(&p2o_pd_op_multiply_0_0, &p2o_pd_op_add_4_0, &mut ws.buf_0);
@@ -310,17 +313,17 @@ fn embedding_concat_i64<'c, 'd>(
         let Add_19 = lele::kernels::conv2d(&p2o_pd_op_add_6_0, &self.weight_f32(91392, 18432, &[96, 48, 1, 1]), Some(&self.weight_f32(109824, 384, &[1, 96, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_1);
         let p2o_pd_op_add_7_0 = Add_19.clone();
         let auto_cast_9 = p2o_pd_op_add_7_0.clone();
-        let p2o_pd_op_gelu_2_0 = lele::kernels::gelu(&auto_cast_9, &mut ws.buf_7);
+        let p2o_pd_op_gelu_2_0 = lele::kernels::gelu_erf(&auto_cast_9, &mut ws.buf_7);
         let Add_23 = lele::kernels::conv2d(&p2o_pd_op_gelu_2_0, &self.weight_f32(110208, 18432, &[48, 96, 1, 1]), Some(&self.weight_f32(128640, 192, &[1, 48, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_8);
         let p2o_pd_op_add_8_0 = Add_23.clone();
         let Add_25 = lele::kernels::add(&p2o_pd_op_add_6_0, &p2o_pd_op_add_8_0, &mut ws.buf_2);
         let p2o_pd_op_add_9_0 = Add_25.clone();
-        let Add_27 = lele::kernels::conv2d(&p2o_pd_op_add_9_0, &self.weight_f32(128832, 1728, &[48, 1, 3, 3]), Some(&self.weight_f32(130560, 192, &[1, 48, 1, 1])), &[1, 1], 48, &[1, 1, 1, 1], &[2, 2], &mut ws.buf_4);
+        let Add_27 = lele::kernels::conv2d(&p2o_pd_op_add_9_0, &self.weight_f32(128832, 1728, &[48, 1, 3, 3]), Some(&self.weight_f32(130560, 192, &[1, 48, 1, 1])), &[1, 1], 48, &[1, 1, 1, 1], &[2, 1], &mut ws.buf_4);
         let p2o_pd_op_add_10_0 = Add_27.clone();
         let Add_29 = lele::kernels::conv2d(&p2o_pd_op_add_10_0, &self.weight_f32(130752, 18432, &[96, 48, 1, 1]), Some(&self.weight_f32(149184, 384, &[1, 96, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_3);
         let p2o_pd_op_add_11_0 = Add_29.clone();
         let auto_cast_13 = p2o_pd_op_add_11_0.clone();
-        let p2o_pd_op_gelu_3_0 = lele::kernels::gelu(&auto_cast_13, &mut ws.buf_6);
+        let p2o_pd_op_gelu_3_0 = lele::kernels::gelu_erf(&auto_cast_13, &mut ws.buf_6);
         let Add_33 = lele::kernels::conv2d(&p2o_pd_op_gelu_3_0, &self.weight_f32(149568, 36864, &[96, 96, 1, 1]), Some(&self.weight_f32(186432, 384, &[1, 96, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_7);
         let p2o_pd_op_add_12_0 = Add_33.clone();
         let Add_35 = lele::kernels::conv2d(&p2o_pd_op_add_12_0, &self.weight_f32(186816, 3456, &[96, 1, 3, 3]), Some(&self.weight_f32(190272, 384, &[1, 96, 1, 1])), &[1, 1], 96, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_2);
@@ -338,7 +341,7 @@ fn embedding_concat_i64<'c, 'd>(
         let Add_41 = lele::kernels::conv2d(&p2o_pd_op_multiply_1_0, &self.weight_f32(209568, 73728, &[192, 96, 1, 1]), Some(&self.weight_f32(283296, 768, &[1, 192, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_4);
         let p2o_pd_op_add_16_0 = Add_41.clone();
         let auto_cast_19 = p2o_pd_op_add_16_0.clone();
-        let p2o_pd_op_gelu_4_0 = lele::kernels::gelu(&auto_cast_19, &mut ws.buf_7);
+        let p2o_pd_op_gelu_4_0 = lele::kernels::gelu_erf(&auto_cast_19, &mut ws.buf_7);
         let Add_45 = lele::kernels::conv2d(&p2o_pd_op_gelu_4_0, &self.weight_f32(284064, 73728, &[96, 192, 1, 1]), Some(&self.weight_f32(357792, 384, &[1, 96, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_8);
         let p2o_pd_op_add_17_0 = Add_45.clone();
         let Add_47 = lele::kernels::add(&p2o_pd_op_multiply_1_0, &p2o_pd_op_add_17_0, &mut ws.buf_1);
@@ -348,17 +351,17 @@ fn embedding_concat_i64<'c, 'd>(
         let Add_51 = lele::kernels::conv2d(&p2o_pd_op_add_19_0, &self.weight_f32(362016, 73728, &[192, 96, 1, 1]), Some(&self.weight_f32(435744, 768, &[1, 192, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_3);
         let p2o_pd_op_add_20_0 = Add_51.clone();
         let auto_cast_23 = p2o_pd_op_add_20_0.clone();
-        let p2o_pd_op_gelu_5_0 = lele::kernels::gelu(&auto_cast_23, &mut ws.buf_7);
+        let p2o_pd_op_gelu_5_0 = lele::kernels::gelu_erf(&auto_cast_23, &mut ws.buf_7);
         let Add_55 = lele::kernels::conv2d(&p2o_pd_op_gelu_5_0, &self.weight_f32(436512, 73728, &[96, 192, 1, 1]), Some(&self.weight_f32(510240, 384, &[1, 96, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_8);
         let p2o_pd_op_add_21_0 = Add_55.clone();
         let Add_57 = lele::kernels::add(&p2o_pd_op_add_19_0, &p2o_pd_op_add_21_0, &mut ws.buf_0);
         let p2o_pd_op_add_22_0 = Add_57.clone();
-        let Add_59 = lele::kernels::conv2d(&p2o_pd_op_add_22_0, &self.weight_f32(510624, 3456, &[96, 1, 3, 3]), Some(&self.weight_f32(514080, 384, &[1, 96, 1, 1])), &[1, 1], 96, &[1, 1, 1, 1], &[2, 2], &mut ws.buf_4);
+        let Add_59 = lele::kernels::conv2d(&p2o_pd_op_add_22_0, &self.weight_f32(510624, 3456, &[96, 1, 3, 3]), Some(&self.weight_f32(514080, 384, &[1, 96, 1, 1])), &[1, 1], 96, &[1, 1, 1, 1], &[2, 1], &mut ws.buf_4);
         let p2o_pd_op_add_23_0 = Add_59.clone();
         let Add_61 = lele::kernels::conv2d(&p2o_pd_op_add_23_0, &self.weight_f32(514464, 73728, &[192, 96, 1, 1]), Some(&self.weight_f32(588192, 768, &[1, 192, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_2);
         let p2o_pd_op_add_24_0 = Add_61.clone();
         let auto_cast_27 = p2o_pd_op_add_24_0.clone();
-        let p2o_pd_op_gelu_6_0 = lele::kernels::gelu(&auto_cast_27, &mut ws.buf_6);
+        let p2o_pd_op_gelu_6_0 = lele::kernels::gelu_erf(&auto_cast_27, &mut ws.buf_6);
         let Add_65 = lele::kernels::conv2d(&p2o_pd_op_gelu_6_0, &self.weight_f32(588960, 122880, &[160, 192, 1, 1]), Some(&self.weight_f32(711840, 640, &[1, 160, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_7);
         let p2o_pd_op_add_25_0 = Add_65.clone();
         let Add_67 = lele::kernels::conv2d(&p2o_pd_op_add_25_0, &self.weight_f32(712480, 5760, &[160, 1, 3, 3]), Some(&self.weight_f32(718240, 640, &[1, 160, 1, 1])), &[1, 1], 160, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_0);
@@ -376,7 +379,7 @@ fn embedding_concat_i64<'c, 'd>(
         let Add_73 = lele::kernels::conv2d(&p2o_pd_op_multiply_2_0, &self.weight_f32(770880, 204800, &[320, 160, 1, 1]), Some(&self.weight_f32(975680, 1280, &[1, 320, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_4);
         let p2o_pd_op_add_29_0 = Add_73.clone();
         let auto_cast_33 = p2o_pd_op_add_29_0.clone();
-        let p2o_pd_op_gelu_7_0 = lele::kernels::gelu(&auto_cast_33, &mut ws.buf_7);
+        let p2o_pd_op_gelu_7_0 = lele::kernels::gelu_erf(&auto_cast_33, &mut ws.buf_7);
         let Add_77 = lele::kernels::conv2d(&p2o_pd_op_gelu_7_0, &self.weight_f32(976960, 204800, &[160, 320, 1, 1]), Some(&self.weight_f32(1181760, 640, &[1, 160, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_8);
         let p2o_pd_op_add_30_0 = Add_77.clone();
         let Add_79 = lele::kernels::add(&p2o_pd_op_multiply_2_0, &p2o_pd_op_add_30_0, &mut ws.buf_0);
@@ -386,7 +389,7 @@ fn embedding_concat_i64<'c, 'd>(
         let Add_83 = lele::kernels::conv2d(&p2o_pd_op_add_32_0, &self.weight_f32(1188800, 204800, &[320, 160, 1, 1]), Some(&self.weight_f32(1393600, 1280, &[1, 320, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_3);
         let p2o_pd_op_add_33_0 = Add_83.clone();
         let auto_cast_37 = p2o_pd_op_add_33_0.clone();
-        let p2o_pd_op_gelu_8_0 = lele::kernels::gelu(&auto_cast_37, &mut ws.buf_7);
+        let p2o_pd_op_gelu_8_0 = lele::kernels::gelu_erf(&auto_cast_37, &mut ws.buf_7);
         let Add_87 = lele::kernels::conv2d(&p2o_pd_op_gelu_8_0, &self.weight_f32(1394880, 204800, &[160, 320, 1, 1]), Some(&self.weight_f32(1599680, 640, &[1, 160, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_8);
         let p2o_pd_op_add_34_0 = Add_87.clone();
         let Add_89 = lele::kernels::add(&p2o_pd_op_add_32_0, &p2o_pd_op_add_34_0, &mut ws.buf_1);
@@ -396,7 +399,7 @@ fn embedding_concat_i64<'c, 'd>(
         let Add_93 = lele::kernels::conv2d(&p2o_pd_op_add_36_0, &self.weight_f32(1606720, 204800, &[320, 160, 1, 1]), Some(&self.weight_f32(1811520, 1280, &[1, 320, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_2);
         let p2o_pd_op_add_37_0 = Add_93.clone();
         let auto_cast_41 = p2o_pd_op_add_37_0.clone();
-        let p2o_pd_op_gelu_9_0 = lele::kernels::gelu(&auto_cast_41, &mut ws.buf_7);
+        let p2o_pd_op_gelu_9_0 = lele::kernels::gelu_erf(&auto_cast_41, &mut ws.buf_7);
         let Add_97 = lele::kernels::conv2d(&p2o_pd_op_gelu_9_0, &self.weight_f32(1812800, 204800, &[160, 320, 1, 1]), Some(&self.weight_f32(2017600, 640, &[1, 160, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_8);
         let p2o_pd_op_add_38_0 = Add_97.clone();
         let Add_99 = lele::kernels::add(&p2o_pd_op_add_36_0, &p2o_pd_op_add_38_0, &mut ws.buf_0);
@@ -427,48 +430,76 @@ fn embedding_concat_i64<'c, 'd>(
     }
 
 
-    #[cfg(target_arch = "aarch64")]
-    fn get_prepared_weight(&self, offset: usize, len: usize, k: usize, n: usize) -> std::sync::Arc<lele::kernels::PreparedWeightsArm> {
-        let key = (offset, len);
+    fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &lele::tensor::TensorView<f32>) -> std::sync::Arc<lele::kernels::QWeights> {
+        // Distinct initializers can share identical bytes, and one initializer can sit behind several DequantizeLinear nodes carrying different scales, so the key must include the shape and the cached entry must match the exact scale.
+        let key = (offset, len, k, n);
         {
-            let cache = self.prepared_weights_cache.borrow();
-            if let Some(pw) = cache.get(&key) {
-                return pw.clone();
+            let cache = self.quantized_weights_cache.borrow();
+            if let Some((cached_scale, qw)) = cache.get(&key) {
+                if cached_scale.len() == scale.data.len() && cached_scale.iter().zip(scale.data.iter()).all(|(a, b)| a.to_bits() == b.to_bits()) {
+                    return qw.clone();
+                }
             }
         }
-        let raw_bytes = &self.data[offset..offset+len];
-        let pw = std::sync::Arc::new(lele::kernels::prepare_weights_arm(raw_bytes, k, n));
-        self.prepared_weights_cache.borrow_mut().insert(key, pw.clone());
-        pw
+        let raw = &self.data[offset..offset+len];
+        let qw = std::sync::Arc::new(lele::kernels::prepare_quantized_weights(raw, k, n, &scale.data));
+        self.quantized_weights_cache.borrow_mut().insert(key, (scale.data.to_vec(), qw.clone()));
+        qw
     }
-    fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {
+    #[allow(dead_code)]
+    fn get_qweights(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool, zero_point: &[f32], scale: &[f32]) -> std::sync::Arc<lele::kernels::QWeights> {
+        let key = (offset, len, k, n, signed);
+        if let Some((z, s, w)) = self.qweights_cache.borrow().get(&key) {
+            if z.as_slice() == zero_point && s.as_slice() == scale {
+                return w.clone();
+            }
+        }
+        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();
+        let w = std::sync::Arc::new(lele::kernels::QWeights::new(&self.data[offset..offset + len], k, n, signed, &zp, scale));
+        self.qweights_cache.borrow_mut().insert(key, (zero_point.to_vec(), scale.to_vec(), w.clone()));
+        w
+    }
+    #[allow(dead_code)]
+    fn get_conv_weights(&self, offset: usize, len: usize, shape: [usize; 4], groups: usize, signed: bool, zero_point: &[f32]) -> std::sync::Arc<lele::kernels::ConvWeights> {
+        let key = (offset, len, groups, signed);
+        if let Some((z, w)) = self.conv_weights_cache.borrow().get(&key) {
+            if z.as_slice() == zero_point {
+                return w.clone();
+            }
+        }
+        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();
+        let w = std::sync::Arc::new(lele::kernels::ConvWeights::new(&self.data[offset..offset + len], &shape, groups, signed, &zp));
+        self.conv_weights_cache.borrow_mut().insert(key, (zero_point.to_vec(), w.clone()));
+        w
+    }
+    pub fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {
         TensorView::from_bytes_f32(&self.data[offset..offset+len], shape)
     }
-    fn weight_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
+    pub fn weight_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
         TensorView::from_bytes_i64(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_i32_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
+    pub fn weight_i32_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
         TensorView::from_bytes_i32_as_i64(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_i32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i32> {
+    pub fn weight_i32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i32> {
         TensorView::from_bytes_i32(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_i64_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
+    pub fn weight_i64_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
         TensorView::from_bytes_i64_as_f32(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_i32_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
+    pub fn weight_i32_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
         TensorView::from_bytes_i32_as_f32(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_u8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
+    pub fn weight_u8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
         TensorView::from_bytes_u8(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_i8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
+    pub fn weight_i8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
         TensorView::from_bytes_i8(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_f16(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
+    pub fn weight_f16(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
         TensorView::from_bytes_f16(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_u8_raw(&self, offset: usize, len: usize) -> &'a [u8] {
+    pub fn weight_u8_raw(&self, offset: usize, len: usize) -> &'a [u8] {
         &self.data[offset..offset+len]
     }
 
