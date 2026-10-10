@@ -833,7 +833,7 @@ pub fn gemm<'a>(
     };
     assert_eq!(k, k2, "Gemm K dim mismatch");
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     {
         if !trans_a && !trans_b {
             return gemm_neon_path(a, b, c, alpha, beta, m, k, n, out_buf);
@@ -842,7 +842,13 @@ pub fn gemm<'a>(
         }
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    // Accelerate's transposed path is macOS-only; elsewhere transposes take the generic path.
+    #[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+    if !trans_a && !trans_b {
+        return gemm_neon_path(a, b, c, alpha, beta, m, k, n, out_buf);
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
     {
         let output_len = m * n;
         utils::ensure_capacity(out_buf, output_len);

@@ -21,7 +21,7 @@
 
 use crate::kernels::simd::simd_call;
 use crate::tensor::TensorView;
-use fearless_simd::{Level, Simd, SimdInto, f32x8, i16x16, i32x8};
+use fearless_simd::{Level, Simd, f32x8, i16x16, i32x8};
 use fearless_simd_macros::simd;
 
 /// Rows of C per register tile.
@@ -313,6 +313,7 @@ fn madd<S: Simd>(simd: S, a: i16x16<S>, b: i16x16<S>) -> i32x8<S> {
         #[cfg(target_arch = "x86_64")]
         Level::Avx512(_) | Level::Avx2(_) => {
             use core::arch::x86_64::{__m256i, _mm256_madd_epi16};
+            use fearless_simd::SimdInto;
             let (a, b): (__m256i, __m256i) = (a.into(), b.into());
             // SAFETY: both levels guarantee AVX2.
             unsafe { _mm256_madd_epi16(a, b) }.simd_into(simd)
@@ -320,6 +321,7 @@ fn madd<S: Simd>(simd: S, a: i16x16<S>, b: i16x16<S>) -> i32x8<S> {
         #[cfg(target_arch = "x86_64")]
         Level::Sse4_2(_) | Level::Sse2(_) => {
             use core::arch::x86_64::{__m128i, _mm_madd_epi16};
+            use fearless_simd::SimdInto;
             let (a0, a1) = simd.split_i16x16(a);
             let (b0, b1) = simd.split_i16x16(b);
             let half = |a: __m128i, b: __m128i| {
@@ -331,6 +333,7 @@ fn madd<S: Simd>(simd: S, a: i16x16<S>, b: i16x16<S>) -> i32x8<S> {
         #[cfg(target_arch = "aarch64")]
         Level::Neon(_) => {
             use core::arch::aarch64::{int16x8_t, int32x4_t, vget_low_s16, vmull_high_s16, vmull_s16, vpaddq_s32};
+            use fearless_simd::SimdInto;
             let (a0, a1) = simd.split_i16x16(a);
             let (b0, b1) = simd.split_i16x16(b);
             let half = |a: int16x8_t, b: int16x8_t| -> int32x4_t {
@@ -345,6 +348,7 @@ fn madd<S: Simd>(simd: S, a: i16x16<S>, b: i16x16<S>) -> i32x8<S> {
         #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
         Level::WasmSimd128(_) => {
             use core::arch::wasm32::i32x4_dot_i16x8;
+            use fearless_simd::SimdInto;
             let (a0, a1) = simd.split_i16x16(a);
             let (b0, b1) = simd.split_i16x16(b);
             let half = |a, b| i32x4_dot_i16x8(a, b).simd_into(simd);

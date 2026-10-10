@@ -4,9 +4,12 @@
 use crate::kernels::utils;
 use crate::tensor::TensorView;
 use core::arch::aarch64::*;
+#[cfg(target_feature = "dotprod")]
 use core::arch::asm;
 use std::borrow::Cow;
 
+/// `acc[i] += a[4i..4i+4] . b[4i..4i+4]`, in u8 products summed to u32.
+#[cfg(target_feature = "dotprod")]
 #[inline(always)]
 unsafe fn vdotq_u32_custom(mut acc: uint32x4_t, a: uint8x16_t, b: uint8x16_t) -> uint32x4_t {
     unsafe {
@@ -19,6 +22,16 @@ unsafe fn vdotq_u32_custom(mut acc: uint32x4_t, a: uint8x16_t, b: uint8x16_t) ->
         );
         acc
     }
+}
+
+/// The same without `udot` (ARMv8.0, e.g. generic aarch64 Linux builds): widening
+/// multiplies, then pairwise adds widened to u32 before they could overflow u16.
+#[cfg(not(target_feature = "dotprod"))]
+#[inline(always)]
+unsafe fn vdotq_u32_custom(acc: uint32x4_t, a: uint8x16_t, b: uint8x16_t) -> uint32x4_t {
+    let lo = vmull_u8(vget_low_u8(a), vget_low_u8(b));
+    let hi = vmull_high_u8(a, b);
+    vaddq_u32(acc, vpaddq_u32(vpaddlq_u16(lo), vpaddlq_u16(hi)))
 }
 
 pub struct PreparedWeightsArm {

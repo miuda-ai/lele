@@ -73,9 +73,9 @@ pub fn mat_mul_integer_with_scale_bias_relu<'a, 'b, 'c>(
 
 /// Fully-fused quantized linear: DynamicQuantizeLinear + MatMulInteger + Scale + Bias [+ ReLU].
 ///
-/// The weight arrives as a tensor here, so outside aarch64 it is packed for
-/// [`crate::kernels::qgemm`] on every call; generated code packs the weights it knows once
-/// instead (`QWeights`).
+/// The weight arrives as a tensor here, so it is packed for [`crate::kernels::qgemm`] on
+/// every call; generated code packs the weights it knows once instead (`QWeights`, or the
+/// ARM prepared weights on aarch64).
 pub fn fused_quantized_linear<'a>(
     input: &TensorView<'_, f32>,
     weight_int8: &TensorView<'_, f32>,
@@ -85,56 +85,21 @@ pub fn fused_quantized_linear<'a>(
     apply_relu: bool,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        use crate::kernels::qgemm::{QWeights, qlinear_dynamic};
-        let dims = weight_int8.shape.len();
-        let (k, n) = (weight_int8.shape[dims - 2], weight_int8.shape[dims - 1]);
-        let mut zero_point: Vec<i32> = weight_zero.data.iter().map(|&z| z as i32).collect();
-        if zero_point.is_empty() {
-            zero_point.push(0);
-        }
-        let w = QWeights::from_f32_codes(&weight_int8.data[..k * n], k, n, &zero_point, &weight_scale.data);
-        let bias = (!bias.data.is_empty()).then_some(&bias.data[..]);
-        qlinear_dynamic(input, &w, bias, apply_relu, out)
+    use crate::kernels::qgemm::{QWeights, qlinear_dynamic};
+    let dims = weight_int8.shape.len();
+    let (k, n) = (weight_int8.shape[dims - 2], weight_int8.shape[dims - 1]);
+    let mut zero_point: Vec<i32> = weight_zero.data.iter().map(|&z| z as i32).collect();
+    if zero_point.is_empty() {
+        zero_point.push(0);
     }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        use std::cell::RefCell;
-        thread_local! {
-            static BUF_Q: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
-            static BUF_S: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
-            static BUF_Z: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
-            static BUF_SM: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
-        }
-
-        let mut buf_q = BUF_Q.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        let mut buf_s = BUF_S.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        let mut buf_z = BUF_Z.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        let mut buf_sm = BUF_SM.with(|c| std::mem::take(&mut *c.borrow_mut()));
-
-        let (q, s, z) = dynamic_quantize_linear(input, &mut buf_q, &mut buf_s, &mut buf_z);
-        let combined_scale = crate::kernels::mul(&s, weight_scale, &mut buf_sm);
-        let result = mat_mul_integer_with_scale_bias_activation(
-            &q,
-            weight_int8,
-            Some(&z),
-            Some(weight_zero),
-            Some(&combined_scale),
-            Some(bias),
-            apply_relu,
-            out,
-        );
-        BUF_Q.with(|c| *c.borrow_mut() = buf_q);
-        BUF_S.with(|c| *c.borrow_mut() = buf_s);
-        BUF_Z.with(|c| *c.borrow_mut() = buf_z);
-        BUF_SM.with(|c| *c.borrow_mut() = buf_sm);
-        result
-    }
+    let w = QWeights::from_f32_codes(&weight_int8.data[..k * n], k, n, &zero_point, &weight_scale.data);
+    let bias = (!bias.data.is_empty()).then_some(&bias.data[..]);
+    qlinear_dynamic(input, &w, bias, apply_relu, out)
 }
 
-// Internal function with activation parameter
+/// `MatMulInteger` with B given at run time, on every target through
+/// [`crate::kernels::qgemm`]: it takes `u8` and `i8` weights alike, which converting to
+/// `u8` for the Neon kernels would not (negative codes would clamp to 0).
 fn mat_mul_integer_with_scale_bias_activation<'a, 'b, 'c>(
     a: &TensorView<'b, f32>,
     b: &TensorView<'c, f32>,
@@ -145,53 +110,21 @@ fn mat_mul_integer_with_scale_bias_activation<'a, 'b, 'c>(
     apply_relu: bool,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let a_zp = a_zero_point.and_then(|z| z.data.first()).map_or(0, |&z| z as i32);
-        let b_zp: Vec<i32> = match b_zero_point {
-            Some(z) if !z.data.is_empty() => z.data.iter().map(|&z| z as i32).collect(),
-            _ => vec![0],
-        };
-        crate::kernels::qgemm::mat_mul_integer_f32(
-            a,
-            b,
-            a_zp,
-            &b_zp,
-            scale.map(|s| &s.data[..]),
-            bias.map(|b| &b.data[..]),
-            apply_relu,
-            out,
-        )
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        let a_u8: Vec<u8> = a.data.iter().map(|&x| x as u8).collect();
-        let b_u8: Vec<u8> = b.data.iter().map(|&x| x as u8).collect();
-
-        let a_u8_view = TensorView::from_slice(&a_u8, a.shape.to_vec());
-        let b_u8_view = TensorView::from_slice(&b_u8, b.shape.to_vec());
-
-        let a_zp_u8 = a_zero_point.map(|z| {
-            let data: Vec<u8> = z.data.iter().map(|&x| x as u8).collect();
-            TensorView::from_owned(data, z.shape.to_vec())
-        });
-        let b_zp_u8 = b_zero_point.map(|z| {
-            let data: Vec<u8> = z.data.iter().map(|&x| x as u8).collect();
-            TensorView::from_owned(data, z.shape.to_vec())
-        });
-
-        crate::kernels::neon::quantization::mat_mul_integer_u8(
-            &a_u8_view,
-            &b_u8_view,
-            a_zp_u8.as_ref(),
-            b_zp_u8.as_ref(),
-            scale,
-            bias,
-            apply_relu,
-            out,
-        )
-    }
+    let a_zp = a_zero_point.and_then(|z| z.data.first()).map_or(0, |&z| z as i32);
+    let b_zp: Vec<i32> = match b_zero_point {
+        Some(z) if !z.data.is_empty() => z.data.iter().map(|&z| z as i32).collect(),
+        _ => vec![0],
+    };
+    crate::kernels::qgemm::mat_mul_integer_f32(
+        a,
+        b,
+        a_zp,
+        &b_zp,
+        scale.map(|s| &s.data[..]),
+        bias.map(|b| &b.data[..]),
+        apply_relu,
+        out,
+    )
 }
 
 #[cfg(target_arch = "aarch64")]

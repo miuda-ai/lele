@@ -237,7 +237,7 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         writeln!(w, "{}#[cfg(target_arch = \"aarch64\")]", tab)?;
                         writeln!(
                             w,
-                            "{}let {} = self.linear_quantized_relu_arm(&{}, {}, {}, {}, {}, {}, {}, {}, {});",
+                            "{}let {} = self.linear_quantized_relu_arm(&{}, {}, {}, {}, {}, {}, {}, {}, {}, {});",
                             tab,
                             output_name,
                             input,
@@ -245,6 +245,7 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                             *l,
                             k,
                             n,
+                            *dt == 3,
                             weight_scale,
                             weight_zero,
                             bias,
@@ -396,7 +397,7 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         writeln!(w, "{}#[cfg(target_arch = \"aarch64\")]", tab)?;
                         writeln!(
                             w,
-                            "{}let {} = self.linear_quantized_arm(&{}, {}, {}, {}, {}, {}, {}, {}, {});",
+                            "{}let {} = self.linear_quantized_arm(&{}, {}, {}, {}, {}, {}, {}, {}, {}, {});",
                             tab,
                             output_name,
                             input,
@@ -404,6 +405,7 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                             *l,
                             k,
                             n,
+                            *dt == 3,
                             weight_scale,
                             weight_zero,
                             bias,

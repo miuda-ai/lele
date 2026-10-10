@@ -1475,7 +1475,7 @@ impl Compiler {
         writeln!(&mut code, "    #[cfg(target_arch = \"aarch64\")]")?;
         writeln!(
             &mut code,
-            "    fn get_prepared_weight(&self, offset: usize, len: usize, k: usize, n: usize) -> std::sync::Arc<lele::kernels::PreparedWeightsArm> {{"
+            "    fn get_prepared_weight(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool) -> std::sync::Arc<lele::kernels::PreparedWeightsArm> {{"
         )?;
         writeln!(&mut code, "        let key = (offset, len);")?;
         writeln!(&mut code, "        {{")?;
@@ -1493,6 +1493,18 @@ impl Compiler {
         writeln!(
             &mut code,
             "        let raw_bytes = &self.data[offset..offset+len];"
+        )?;
+        writeln!(
+            &mut code,
+            "        // The ARM kernels take u8 codes: i8 ones are shifted by 128 (their zero point too, see `arm_zero_point`), which leaves `b - zero_point` unchanged."
+        )?;
+        writeln!(
+            &mut code,
+            "        let shifted: Vec<u8>;"
+        )?;
+        writeln!(
+            &mut code,
+            "        let raw_bytes = if signed {{ shifted = raw_bytes.iter().map(|b| b ^ 0x80).collect(); &shifted[..] }} else {{ raw_bytes }};"
         )?;
         writeln!(
             &mut code,
