@@ -1,24 +1,10 @@
 #![allow(unsafe_op_in_unsafe_fn)]
+use crate::kernels::bias_act::bias_act_inplace;
 use crate::kernels::timing;
 use crate::kernels::utils;
-#[cfg(target_arch = "wasm32")]
-use crate::kernels::wasm_matmul::{Accum, MatMut, MatRef, Par, matmul as faer_matmul};
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul as faer_matmul};
 use crate::tensor::TensorView;
-#[cfg(not(any(
-    target_arch = "wasm32",
-    all(target_arch = "aarch64", target_os = "macos")
-)))]
-use faer::linalg::matmul::matmul as faer_matmul;
-#[cfg(not(any(
-    target_arch = "wasm32",
-    all(target_arch = "aarch64", target_os = "macos")
-)))]
-use faer::mat::{MatMut, MatRef};
-#[cfg(not(any(
-    target_arch = "wasm32",
-    all(target_arch = "aarch64", target_os = "macos")
-)))]
-use faer::{Accum, Par};
 
 // Apple Accelerate framework bindings for AMX-accelerated GEMM on macOS aarch64
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -359,167 +345,12 @@ fn conv2d_activation<'b, 'a>(
                 }
             }
 
-            // Apply bias and optional activation using SIMD when available
-            #[cfg(target_arch = "x86_64")]
-            {
-                if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                    for oc in 0..out_channels {
-                        let bias_val = if let Some(b) = bias { b.data[oc] } else { 0.0 };
-                        let row_start = o_offset + oc * spatial;
-                        let ptr = unsafe { out.as_mut_ptr().add(row_start) };
-                        unsafe {
-                            match act {
-                                Activation::SiLU => {
-                                    if bias_val != 0.0 {
-                                        crate::kernels::avx::math::bias_silu_inplace(
-                                            ptr, spatial, bias_val,
-                                        );
-                                    } else {
-                                        crate::kernels::avx::math::silu_inplace(ptr, spatial);
-                                    }
-                                }
-                                Activation::Relu => {
-                                    if bias_val != 0.0 {
-                                        crate::kernels::avx::math::bias_relu_inplace(
-                                            ptr, spatial, bias_val,
-                                        );
-                                    } else {
-                                        crate::kernels::avx::math::relu_inplace(ptr, spatial);
-                                    }
-                                }
-                                Activation::None => {
-                                    if bias_val != 0.0 {
-                                        crate::kernels::avx::math::bias_add_inplace(
-                                            ptr, spatial, bias_val,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // Scalar fallback
-                    for oc in 0..out_channels {
-                        let bias_val = if let Some(b) = bias { b.data[oc] } else { 0.0 };
-                        let row_start = o_offset + oc * spatial;
-                        if bias_val != 0.0 || act != Activation::None {
-                            for j in 0..spatial {
-                                let val = out[row_start + j] + bias_val;
-                                out[row_start + j] = match act {
-                                    Activation::Relu => {
-                                        if val < 0.0 {
-                                            0.0
-                                        } else {
-                                            val
-                                        }
-                                    }
-                                    Activation::SiLU => val / (1.0 + (-val).exp()),
-                                    Activation::None => val,
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                for oc in 0..out_channels {
-                    let bias_val = if let Some(b) = bias { b.data[oc] } else { 0.0 };
+            // Apply bias and optional activation
+            for oc in 0..out_channels {
+                let bias_val = if let Some(b) = bias { b.data[oc] } else { 0.0 };
+                if bias_val != 0.0 || act != Activation::None {
                     let row_start = o_offset + oc * spatial;
-                    let ptr = unsafe { out.as_mut_ptr().add(row_start) };
-                    unsafe {
-                        match act {
-                            Activation::SiLU => {
-                                if bias_val != 0.0 {
-                                    crate::kernels::wasm::math::bias_silu_inplace(
-                                        ptr, spatial, bias_val,
-                                    );
-                                } else {
-                                    crate::kernels::wasm::math::silu_inplace(ptr, spatial);
-                                }
-                            }
-                            Activation::Relu => {
-                                if bias_val != 0.0 {
-                                    crate::kernels::wasm::math::bias_relu_inplace(
-                                        ptr, spatial, bias_val,
-                                    );
-                                } else {
-                                    crate::kernels::wasm::math::relu_inplace(ptr, spatial);
-                                }
-                            }
-                            Activation::None => {
-                                if bias_val != 0.0 {
-                                    crate::kernels::wasm::math::bias_add_inplace(
-                                        ptr, spatial, bias_val,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                for oc in 0..out_channels {
-                    let bias_val = if let Some(b) = bias { b.data[oc] } else { 0.0 };
-                    let row_start = o_offset + oc * spatial;
-                    let ptr = unsafe { out.as_mut_ptr().add(row_start) };
-                    unsafe {
-                        match act {
-                            Activation::SiLU => {
-                                if bias_val != 0.0 {
-                                    crate::kernels::neon::math::bias_silu_inplace(
-                                        ptr, spatial, bias_val,
-                                    );
-                                } else {
-                                    crate::kernels::neon::math::silu_inplace(ptr, spatial);
-                                }
-                            }
-                            Activation::Relu => {
-                                if bias_val != 0.0 {
-                                    crate::kernels::neon::math::bias_relu_inplace(
-                                        ptr, spatial, bias_val,
-                                    );
-                                } else {
-                                    crate::kernels::neon::math::relu_inplace(ptr, spatial);
-                                }
-                            }
-                            Activation::None => {
-                                if bias_val != 0.0 {
-                                    crate::kernels::neon::math::bias_add_inplace(
-                                        ptr, spatial, bias_val,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            #[cfg(not(any(
-                target_arch = "x86_64",
-                target_arch = "wasm32",
-                target_arch = "aarch64"
-            )))]
-            {
-                for oc in 0..out_channels {
-                    let bias_val = if let Some(b) = bias { b.data[oc] } else { 0.0 };
-                    let row_start = o_offset + oc * spatial;
-                    if bias_val != 0.0 || act != Activation::None {
-                        for j in 0..spatial {
-                            let val = out[row_start + j] + bias_val;
-                            out[row_start + j] = match act {
-                                Activation::Relu => {
-                                    if val < 0.0 {
-                                        0.0
-                                    } else {
-                                        val
-                                    }
-                                }
-                                Activation::SiLU => val / (1.0 + (-val).exp()),
-                                Activation::None => val,
-                            };
-                        }
-                    }
+                    bias_act_inplace(&mut out[row_start..row_start + spatial], bias_val, act);
                 }
             }
         }
@@ -723,187 +554,16 @@ fn conv2d_activation<'b, 'a>(
                     }
                 }
 
-                // Apply bias and optional activation using SIMD when available
-                #[cfg(target_arch = "x86_64")]
-                {
-                    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                        for oc in 0..out_channels_per_group {
-                            let bias_val = if let Some(b) = bias {
-                                b.data[out_ch_start + oc]
-                            } else {
-                                0.0
-                            };
-                            let row_start = o_offset + oc * col_cols;
-                            let ptr = unsafe { out.as_mut_ptr().add(row_start) };
-                            unsafe {
-                                match act {
-                                    Activation::SiLU => {
-                                        if bias_val != 0.0 {
-                                            crate::kernels::avx::math::bias_silu_inplace(
-                                                ptr, col_cols, bias_val,
-                                            );
-                                        } else {
-                                            crate::kernels::avx::math::silu_inplace(ptr, col_cols);
-                                        }
-                                    }
-                                    Activation::Relu => {
-                                        if bias_val != 0.0 {
-                                            crate::kernels::avx::math::bias_relu_inplace(
-                                                ptr, col_cols, bias_val,
-                                            );
-                                        } else {
-                                            crate::kernels::avx::math::relu_inplace(ptr, col_cols);
-                                        }
-                                    }
-                                    Activation::None => {
-                                        if bias_val != 0.0 {
-                                            crate::kernels::avx::math::bias_add_inplace(
-                                                ptr, col_cols, bias_val,
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                // Apply bias and optional activation
+                for oc in 0..out_channels_per_group {
+                    let bias_val = if let Some(b) = bias {
+                        b.data[out_ch_start + oc]
                     } else {
-                        // Scalar fallback
-                        for oc in 0..out_channels_per_group {
-                            let bias_val = if let Some(b) = bias {
-                                b.data[out_ch_start + oc]
-                            } else {
-                                0.0
-                            };
-                            let row_start = o_offset + oc * col_cols;
-                            if bias_val != 0.0 || act != Activation::None {
-                                for j in 0..col_cols {
-                                    let val = out[row_start + j] + bias_val;
-                                    out[row_start + j] = match act {
-                                        Activation::Relu => {
-                                            if val < 0.0 {
-                                                0.0
-                                            } else {
-                                                val
-                                            }
-                                        }
-                                        Activation::SiLU => val / (1.0 + (-val).exp()),
-                                        Activation::None => val,
-                                    };
-                                }
-                            }
-                        }
-                    }
-                }
-                #[cfg(target_arch = "wasm32")]
-                {
-                    for oc in 0..out_channels_per_group {
-                        let bias_val = if let Some(b) = bias {
-                            b.data[out_ch_start + oc]
-                        } else {
-                            0.0
-                        };
+                        0.0
+                    };
+                    if bias_val != 0.0 || act != Activation::None {
                         let row_start = o_offset + oc * col_cols;
-                        let ptr = unsafe { out.as_mut_ptr().add(row_start) };
-                        unsafe {
-                            match act {
-                                Activation::SiLU => {
-                                    if bias_val != 0.0 {
-                                        crate::kernels::wasm::math::bias_silu_inplace(
-                                            ptr, col_cols, bias_val,
-                                        );
-                                    } else {
-                                        crate::kernels::wasm::math::silu_inplace(ptr, col_cols);
-                                    }
-                                }
-                                Activation::Relu => {
-                                    if bias_val != 0.0 {
-                                        crate::kernels::wasm::math::bias_relu_inplace(
-                                            ptr, col_cols, bias_val,
-                                        );
-                                    } else {
-                                        crate::kernels::wasm::math::relu_inplace(ptr, col_cols);
-                                    }
-                                }
-                                Activation::None => {
-                                    if bias_val != 0.0 {
-                                        crate::kernels::wasm::math::bias_add_inplace(
-                                            ptr, col_cols, bias_val,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    for oc in 0..out_channels_per_group {
-                        let bias_val = if let Some(b) = bias {
-                            b.data[out_ch_start + oc]
-                        } else {
-                            0.0
-                        };
-                        let row_start = o_offset + oc * col_cols;
-                        let ptr = unsafe { out.as_mut_ptr().add(row_start) };
-                        unsafe {
-                            match act {
-                                Activation::SiLU => {
-                                    if bias_val != 0.0 {
-                                        crate::kernels::neon::math::bias_silu_inplace(
-                                            ptr, col_cols, bias_val,
-                                        );
-                                    } else {
-                                        crate::kernels::neon::math::silu_inplace(ptr, col_cols);
-                                    }
-                                }
-                                Activation::Relu => {
-                                    if bias_val != 0.0 {
-                                        crate::kernels::neon::math::bias_relu_inplace(
-                                            ptr, col_cols, bias_val,
-                                        );
-                                    } else {
-                                        crate::kernels::neon::math::relu_inplace(ptr, col_cols);
-                                    }
-                                }
-                                Activation::None => {
-                                    if bias_val != 0.0 {
-                                        crate::kernels::neon::math::bias_add_inplace(
-                                            ptr, col_cols, bias_val,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                #[cfg(not(any(
-                    target_arch = "x86_64",
-                    target_arch = "wasm32",
-                    target_arch = "aarch64"
-                )))]
-                {
-                    for oc in 0..out_channels_per_group {
-                        let bias_val = if let Some(b) = bias {
-                            b.data[out_ch_start + oc]
-                        } else {
-                            0.0
-                        };
-                        let row_start = o_offset + oc * col_cols;
-                        if bias_val != 0.0 || act != Activation::None {
-                            for j in 0..col_cols {
-                                let val = out[row_start + j] + bias_val;
-                                out[row_start + j] = match act {
-                                    Activation::Relu => {
-                                        if val < 0.0 {
-                                            0.0
-                                        } else {
-                                            val
-                                        }
-                                    }
-                                    Activation::SiLU => val / (1.0 + (-val).exp()),
-                                    Activation::None => val,
-                                };
-                            }
-                        }
+                        bias_act_inplace(&mut out[row_start..row_start + col_cols], bias_val, act);
                     }
                 }
             }

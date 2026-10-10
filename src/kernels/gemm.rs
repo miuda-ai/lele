@@ -1,22 +1,7 @@
 use crate::kernels::utils;
-#[cfg(target_arch = "wasm32")]
-use crate::kernels::wasm_matmul::{Accum, MatMut, MatRef, Par, matmul as faer_matmul};
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul as faer_matmul};
 use crate::tensor::TensorView;
-#[cfg(not(any(
-    target_arch = "wasm32",
-    all(target_arch = "aarch64", target_os = "macos")
-)))]
-use faer::linalg::matmul::matmul as faer_matmul;
-#[cfg(not(any(
-    target_arch = "wasm32",
-    all(target_arch = "aarch64", target_os = "macos")
-)))]
-use faer::mat::{MatMut, MatRef};
-#[cfg(not(any(
-    target_arch = "wasm32",
-    all(target_arch = "aarch64", target_os = "macos")
-)))]
-use faer::{Accum, Par};
 use std::borrow::Cow;
 
 // Apple Accelerate framework bindings for AMX-accelerated GEMM
@@ -197,8 +182,6 @@ pub fn matmul<'a>(
 
         #[cfg(target_arch = "wasm32")]
         unsafe {
-            use crate::kernels::wasm_matmul::{Accum, MatMut, MatRef, Par};
-
             let a_mat =
                 MatRef::<f32>::from_raw_parts(a.data.as_ptr().add(a_offset), m, k, k as isize, 1);
             let b_mat =
@@ -316,7 +299,7 @@ pub fn matmul_fused_add<'a>(
 
             #[cfg(target_arch = "wasm32")]
             unsafe {
-                use crate::kernels::wasm_matmul::{
+                use crate::kernels::matmul::{
                     Accum as WAccum, MatMut as WMatMut, MatRef as WMatRef, Par as WPar,
                 };
                 let a_mat = WMatRef::<f32>::from_raw_parts(
@@ -340,7 +323,7 @@ pub fn matmul_fused_add<'a>(
                     n as isize,
                     1,
                 );
-                crate::kernels::wasm_matmul::matmul(
+                crate::kernels::matmul::matmul(
                     out_mat,
                     WAccum::Add,
                     a_mat,
