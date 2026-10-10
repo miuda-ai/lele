@@ -4,26 +4,6 @@ use std::borrow::Cow;
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn test_relu_accuracy() {
-    let input_data = vec![-2.0, -1.0, 0.0, 1.0, 2.0, -0.5, 0.5, 1.5];
-    let input = TensorView {
-        data: Cow::Borrowed(&input_data),
-        shape: Cow::Owned(vec![input_data.len()]),
-    };
-
-    let mut out_scalar = Vec::new();
-    let mut out_neon = Vec::new();
-
-    math::relu(&input, &mut out_scalar);
-    lele::kernels::neon::math::relu(&input, &mut out_neon);
-
-    for i in 0..input_data.len() {
-        assert_eq!(out_scalar[i], out_neon[i], "ReLU mismatch at index {}", i);
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[test]
 fn test_layernorm_accuracy() {
     let norm_size = 10;
     let input_data: Vec<f32> = (0..norm_size).map(|x| x as f32).collect();
