@@ -591,7 +591,7 @@ fn test_stft_power_spectrum_known_sinusoid() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_fft_precomputed_vs_scalar() {
+fn test_fft_planned_vs_unplanned() {
     let n = 64;
     let input: Vec<f32> = (0..n).map(|i| (i as f32 * 0.3).sin()).collect();
 
@@ -599,14 +599,11 @@ fn test_fft_precomputed_vs_scalar() {
     let mut scalar_im = vec![0.0f32; n / 2 + 1];
     lele::kernels::fft::rfft_forward_f32(&input, &mut scalar_re, &mut scalar_im);
 
-    let (tw_re, tw_im, bit_rev) = lele::kernels::fft::precompute_twiddles(n);
-    let mut re_buf = vec![0.0f32; n];
-    let mut im_buf = vec![0.0f32; n];
+    let fft = lele::kernels::fft::Rfft::new(n);
+    let mut scratch = vec![0.0f32; fft.scratch_len()];
     let mut pre_re = vec![0.0f32; n / 2 + 1];
     let mut pre_im = vec![0.0f32; n / 2 + 1];
-    lele::kernels::fft::rfft_forward_f32_precomputed(
-        &input, &tw_re, &tw_im, &bit_rev, &mut re_buf, &mut im_buf, &mut pre_re, &mut pre_im,
-    );
+    fft.forward(&input, &mut scratch, &mut pre_re, &mut pre_im);
 
     assert_close(&scalar_re, &pre_re, 1e-5, "fft_re");
     assert_close(&scalar_im, &pre_im, 1e-5, "fft_im");
@@ -617,12 +614,10 @@ fn test_fft_parseval_theorem() {
     let n = 128;
     let input: Vec<f32> = (0..n).map(|i| (i as f32 * 0.1).sin() + (i as f32 * 0.05).cos()).collect();
 
-    let (tw_re, tw_im, bit_rev) = lele::kernels::fft::precompute_twiddles(n);
-    let mut re_buf = vec![0.0; n]; let mut im_buf = vec![0.0; n];
+    let fft = lele::kernels::fft::Rfft::new(n);
+    let mut scratch = vec![0.0; fft.scratch_len()];
     let mut freq_re = vec![0.0; n/2+1]; let mut freq_im = vec![0.0; n/2+1];
-    lele::kernels::fft::rfft_forward_f32_precomputed(
-        &input, &tw_re, &tw_im, &bit_rev, &mut re_buf, &mut im_buf, &mut freq_re, &mut freq_im,
-    );
+    fft.forward(&input, &mut scratch, &mut freq_re, &mut freq_im);
 
     let time_energy: f32 = input.iter().map(|x| x * x).sum();
     let half = n / 2 + 1;
@@ -645,17 +640,17 @@ fn test_fft_linearity() {
     let scale = 2.5f32;
     let ab: Vec<f32> = a.iter().zip(b.iter()).map(|(&x, &y)| x + scale * y).collect();
 
-    let (tw_re, tw_im, bit_rev) = lele::kernels::fft::precompute_twiddles(n);
-    let mut rb = vec![0.0; n]; let mut ib = vec![0.0; n];
+    let fft = lele::kernels::fft::Rfft::new(n);
+    let mut scratch = vec![0.0; fft.scratch_len()];
     let mut fr = vec![0.0; n/2+1]; let mut fi = vec![0.0; n/2+1];
 
-    lele::kernels::fft::rfft_forward_f32_precomputed(&ab, &tw_re, &tw_im, &bit_rev, &mut rb, &mut ib, &mut fr, &mut fi);
+    fft.forward(&ab, &mut scratch, &mut fr, &mut fi);
     let ab_re = fr.clone(); let ab_im = fi.clone();
 
-    lele::kernels::fft::rfft_forward_f32_precomputed(&a, &tw_re, &tw_im, &bit_rev, &mut rb, &mut ib, &mut fr, &mut fi);
+    fft.forward(&a, &mut scratch, &mut fr, &mut fi);
     let a_re = fr.clone(); let a_im = fi.clone();
 
-    lele::kernels::fft::rfft_forward_f32_precomputed(&b, &tw_re, &tw_im, &bit_rev, &mut rb, &mut ib, &mut fr, &mut fi);
+    fft.forward(&b, &mut scratch, &mut fr, &mut fi);
     let b_re = fr.clone(); let b_im = fi.clone();
 
     let half = n / 2 + 1;

@@ -1,18 +1,14 @@
 pub struct RealFft {
-    n: usize,
-    tw_re: Vec<f32>,
-    tw_im: Vec<f32>,
-    bit_rev: Vec<usize>,
+    fft: crate::kernels::fft::Rfft,
 }
 
 impl RealFft {
     pub fn new(length: usize) -> Self {
-        let (tw_re, tw_im, bit_rev) = crate::kernels::fft::precompute_twiddles(length);
-        Self { n: length, tw_re, tw_im, bit_rev }
+        Self { fft: crate::kernels::fft::Rfft::new(length) }
     }
 
     pub fn scratch_len(&self) -> usize {
-        self.n
+        self.fft.len()
     }
 
     pub fn process_with_scratch(
@@ -21,23 +17,20 @@ impl RealFft {
         output: &mut [Complex<f32>],
         _scratch: &mut [Complex<f32>],
     ) {
-        assert_eq!(input.len(), self.n);
-        let half = self.n / 2 + 1;
-        let mut re_buf = vec![0.0f32; self.n];
-        let mut im_buf = vec![0.0f32; self.n];
-        let mut freq_re = vec![0.0f32; half];
-        let mut freq_im = vec![0.0f32; half];
+        let n = self.fft.len();
+        assert_eq!(input.len(), n);
+        let half = n / 2 + 1;
+        let mut buf = vec![0.0f32; self.fft.scratch_len() + 2 * half];
+        let (scratch, freq) = buf.split_at_mut(self.fft.scratch_len());
+        let (freq_re, freq_im) = freq.split_at_mut(half);
 
-        crate::kernels::fft::rfft_forward_f32_precomputed(
-            input, &self.tw_re, &self.tw_im, &self.bit_rev,
-            &mut re_buf, &mut im_buf, &mut freq_re, &mut freq_im,
-        );
+        self.fft.forward(input, scratch, freq_re, freq_im);
 
         for i in 0..half {
             output[i] = Complex { re: freq_re[i], im: freq_im[i] };
         }
-        for i in half..self.n {
-            let j = self.n - i;
+        for i in half..n {
+            let j = n - i;
             output[i] = Complex { re: freq_re[j], im: -freq_im[j] };
         }
     }

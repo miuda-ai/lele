@@ -2165,9 +2165,8 @@ pub fn stft<'b, 'a>(
         w
     };
 
-    let (tw_re, tw_im, bit_rev) = crate::kernels::fft::precompute_twiddles(n_fft);
-    let mut re_buf = vec![0.0f32; n_fft];
-    let mut im_buf = vec![0.0f32; n_fft];
+    let fft = crate::kernels::fft::Rfft::new(n_fft);
+    let mut scratch = vec![0.0f32; fft.scratch_len()];
     let mut frame_data = vec![0.0f32; n_fft];
     let mut freq_re = vec![0.0f32; n_freqs];
     let mut freq_im = vec![0.0f32; n_freqs];
@@ -2182,11 +2181,7 @@ pub fn stft<'b, 'a>(
                 frame_data[i] = 0.0;
             }
         }
-        crate::kernels::fft::rfft_forward_f32_precomputed(
-            &frame_data, &tw_re, &tw_im, &bit_rev,
-            &mut re_buf, &mut im_buf,
-            &mut freq_re, &mut freq_im,
-        );
+        fft.forward(&frame_data, &mut scratch, &mut freq_re, &mut freq_im);
         for freq in 0..n_freqs {
             let out_idx = (frame * n_freqs + freq) * 2;
             out[out_idx] = freq_re[freq];
@@ -2233,9 +2228,8 @@ pub fn stft_power_spectrum<'b, 'a>(
         w
     };
 
-    let (tw_re, tw_im, bit_rev) = crate::kernels::fft::precompute_twiddles(n_fft);
-    let mut re_buf = vec![0.0f32; n_fft];
-    let mut im_buf = vec![0.0f32; n_fft];
+    let fft = crate::kernels::fft::Rfft::new(n_fft);
+    let mut scratch = vec![0.0f32; fft.scratch_len()];
     let mut frame_data = vec![0.0f32; n_fft];
     let mut freq_re = vec![0.0f32; n_freqs];
     let mut freq_im = vec![0.0f32; n_freqs];
@@ -2250,11 +2244,7 @@ pub fn stft_power_spectrum<'b, 'a>(
                 frame_data[i] = 0.0;
             }
         }
-        crate::kernels::fft::rfft_forward_f32_precomputed(
-            &frame_data, &tw_re, &tw_im, &bit_rev,
-            &mut re_buf, &mut im_buf,
-            &mut freq_re, &mut freq_im,
-        );
+        fft.forward(&frame_data, &mut scratch, &mut freq_re, &mut freq_im);
         let base = frame * n_freqs;
         for freq in 0..n_freqs {
             let re = freq_re[freq];
