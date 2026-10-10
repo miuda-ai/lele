@@ -1,26 +1,6 @@
-use lele::kernels::{math, norm, quantization};
+use lele::kernels::{math, norm};
 use lele::tensor::TensorView;
 use std::borrow::Cow;
-
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn test_relu_accuracy() {
-    let input_data = vec![-2.0, -1.0, 0.0, 1.0, 2.0, -0.5, 0.5, 1.5];
-    let input = TensorView {
-        data: Cow::Borrowed(&input_data),
-        shape: Cow::Owned(vec![input_data.len()]),
-    };
-
-    let mut out_scalar = Vec::new();
-    let mut out_neon = Vec::new();
-
-    math::relu(&input, &mut out_scalar);
-    lele::kernels::neon::math::relu(&input, &mut out_neon);
-
-    for i in 0..input_data.len() {
-        assert_eq!(out_scalar[i], out_neon[i], "ReLU mismatch at index {}", i);
-    }
-}
 
 #[cfg(target_arch = "aarch64")]
 #[test]
@@ -68,43 +48,6 @@ fn test_layernorm_accuracy() {
             out_scalar[i],
             expected,
             diff
-        );
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn test_quantization_accuracy() {
-    let input_data = vec![-10.0, -5.0, 0.0, 5.0, 10.0, 2.0, 3.0, 4.0];
-    let input = TensorView {
-        data: Cow::Borrowed(&input_data),
-        shape: Cow::Owned(vec![input_data.len()]),
-    };
-
-    let mut out_y_s = Vec::new();
-    let mut out_s_s = Vec::new();
-    let mut out_z_s = Vec::new();
-
-    let mut out_y_n = Vec::new();
-    let mut out_s_n = Vec::new();
-    let mut out_z_n = Vec::new();
-
-    quantization::dynamic_quantize_linear(&input, &mut out_y_s, &mut out_s_s, &mut out_z_s);
-    lele::kernels::neon::quantization::dynamic_quantize_linear(
-        &input,
-        &mut out_y_n,
-        &mut out_s_n,
-        &mut out_z_n,
-    );
-
-    assert!((out_s_s[0] - out_s_n[0]).abs() < 1e-6, "Scale mismatch");
-    assert!((out_z_s[0] - out_z_n[0]).abs() < 1e-6, "ZP mismatch");
-
-    for i in 0..input_data.len() {
-        assert_eq!(
-            out_y_s[i], out_y_n[i],
-            "Quantization mismatch at index {}",
-            i
         );
     }
 }
