@@ -1,3 +1,5 @@
+use crate::kernels::bias_act::bias_act_inplace;
+use crate::kernels::conv2d::Activation;
 use crate::kernels::utils;
 use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul as strided_matmul};
 use crate::tensor::TensorView;
@@ -143,53 +145,10 @@ pub fn matmul_fused_add<'a>(
         let bias_data = &bias.data;
 
         if bias_data.len() == 1 {
-            let b_val = bias_data[0];
-            #[cfg(target_arch = "aarch64")]
-            {
-                use core::arch::aarch64::*;
-                unsafe {
-                    let b_vec = vdupq_n_f32(b_val);
-                    let mut i = 0;
-                    while i + 4 <= len {
-                        let v = vld1q_f32(out_slice.as_ptr().add(i));
-                        vst1q_f32(out_slice.as_mut_ptr().add(i), vaddq_f32(v, b_vec));
-                        i += 4;
-                    }
-                    while i < len {
-                        out_slice[i] += b_val;
-                        i += 1;
-                    }
-                }
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                for i in 0..len {
-                    out_slice[i] += b_val;
-                }
-            }
+            bias_act_inplace(&mut out_slice[..len], bias_data[0], Activation::None);
         } else if bias_data.len() == len {
-            #[cfg(target_arch = "aarch64")]
-            {
-                use core::arch::aarch64::*;
-                unsafe {
-                    let mut i = 0;
-                    while i + 4 <= len {
-                        let v = vld1q_f32(out_slice.as_ptr().add(i));
-                        let b = vld1q_f32(bias_data.as_ptr().add(i));
-                        vst1q_f32(out_slice.as_mut_ptr().add(i), vaddq_f32(v, b));
-                        i += 4;
-                    }
-                    while i < len {
-                        out_slice[i] += bias_data[i];
-                        i += 1;
-                    }
-                }
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                for i in 0..len {
-                    out_slice[i] += bias_data[i];
-                }
+            for (o, &b) in out_slice[..len].iter_mut().zip(bias_data.iter()) {
+                *o += b;
             }
         } else {
             let b_len = bias_data.len();
@@ -317,6 +276,34 @@ mod tests {
         let expected = vec![22.0f32, 28.0, 49.0, 64.0];
         for (i, (r, e)) in result.data.iter().zip(expected.iter()).enumerate() {
             assert!((r - e).abs() < 0.01, "Mismatch at {i}: {r} vs {e}");
+        }
+    }
+
+    /// Biases that are not one value per column take the path that adds
+    /// them after the product: one value, one per output, or repeated.
+    #[test]
+    fn test_matmul_fused_add_other_bias_shapes() {
+        // [2, 3, 5] x [5, 17]: long enough rows for whole vectors and tails.
+        let (batch, m, k, n) = (2, 3, 5, 17);
+        let a: Vec<f32> = (0..batch * m * k).map(|i| (i % 7) as f32 - 3.0).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 * 0.5 - 1.0).collect();
+        let product: Vec<f32> = (0..batch * m * n)
+            .map(|idx| {
+                let (bi, i, j) = (idx / (m * n), idx / n % m, idx % n);
+                (0..k).map(|p| a[(bi * m + i) * k + p] * b[p * n + j]).sum()
+            })
+            .collect();
+        let at = TensorView::from_slice(&a, vec![batch, m, k]);
+        let bt = TensorView::from_slice(&b, vec![k, n]);
+        let full: Vec<f32> = (0..batch * m * n).map(|i| i as f32 * 0.25).collect();
+        for bias in [vec![1.5f32], full, vec![10.0, 20.0, 30.0]] {
+            let mut out = Vec::new();
+            let got = matmul_fused_add(&at, &bt, &TensorView::from_slice(&bias, vec![bias.len()]), &mut out);
+            assert_eq!(got.shape.as_ref(), &[batch, m, n]);
+            for (i, (&g, &p)) in got.data.iter().zip(&product).enumerate() {
+                let want = p + bias[i % bias.len()];
+                assert!((g - want).abs() < 1e-4, "bias len {} at {i}: {g} vs {want}", bias.len());
+            }
         }
     }
 
