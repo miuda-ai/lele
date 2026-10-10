@@ -146,20 +146,9 @@ fn pair(v: &[i64], default: usize) -> [usize; 2] {
     }
 }
 
-/// `dst[j * rows + i] = src[i * cols + j]` for a row-major `rows x cols` `src`, a block at
-/// a time so both sides stay in cache.
+/// `dst[j * rows + i] = src[i * cols + j]` for a row-major `rows x cols` `src`.
 fn transpose(src: &[f32], rows: usize, cols: usize, dst: &mut [f32]) {
-    const B: usize = 16;
-    let (src, dst) = (&src[..rows * cols], &mut dst[..rows * cols]);
-    for i0 in (0..rows).step_by(B) {
-        for j0 in (0..cols).step_by(B) {
-            for i in i0..(i0 + B).min(rows) {
-                for j in j0..(j0 + B).min(cols) {
-                    dst[j * rows + i] = src[i * cols + j];
-                }
-            }
-        }
-    }
+    crate::kernels::manipulation::transpose_matrix(src, cols, dst, rows, rows, cols);
 }
 
 thread_local! {
