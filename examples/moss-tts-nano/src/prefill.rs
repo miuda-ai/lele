@@ -62,9 +62,7 @@ impl PrefillWorkspace {
 pub struct Prefill<'a> {
     data: &'a [u8],
     _phantom: std::marker::PhantomData<&'a ()>,
-    #[cfg(target_arch = "aarch64")]
-    prepared_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::PreparedWeightsArm>>>,
-    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QuantizedWeights>)>>,
+    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,
     qweights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize, bool), (std::vec::Vec<f32>, std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,
     conv_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, bool), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::ConvWeights>)>>,
 }
@@ -74,8 +72,6 @@ impl<'a> Prefill<'a> {
         Self {
             data,
             _phantom: std::marker::PhantomData,
-            #[cfg(target_arch = "aarch64")]
-            prepared_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             quantized_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             qweights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             conv_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -144,99 +140,8 @@ fn linear_quantized_relu<'c, 'd>(
     )
 }
 
-/// Zero point of a weight for the ARM kernels, which take u8 codes: `get_prepared_weight`
-/// shifts i8 weights by 128, so their zero point moves with them.
-#[cfg(target_arch = "aarch64")]
-fn arm_zero_point(z: f32, signed: bool) -> u8 {
-    if signed { (z as i32 + 128) as u8 } else { z as u8 }
-}
-
-#[cfg(target_arch = "aarch64")]
-fn linear_quantized_arm<'c, 'd>(
-    &self,
-    input: &lele::tensor::TensorView<'c, f32>,
-    weight_offset: usize,
-    weight_len: usize,
-    weight_k: usize,
-    weight_n: usize,
-    weight_signed: bool,
-    weight_scale: lele::tensor::TensorView<'c, f32>,
-    weight_zero: lele::tensor::TensorView<'c, f32>,
-    bias: lele::tensor::TensorView<'c, f32>,
-    output_buf: &'d mut Vec<f32>,
-) -> lele::tensor::TensorView<'d, f32> {
-    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n, weight_signed);
-    let zp_b = Some(Self::arm_zero_point(weight_zero.data.first().copied().unwrap_or(0.0), weight_signed));
-
-    lele::kernels::fused_dq_gemm_prepared_arm(
-        input,
-        &pw,
-        zp_b,
-        &weight_scale,
-        Some(&bias),
-        false,
-        output_buf,
-    )
-}
-
-/// ARM-optimized quantized linear + ReLU with pre-packed weights.
-/// Uses fused DynQuant+GEMM: eliminates f32 intermediate buffer, per-call u8
-/// allocation, and separate f32→u8 conversion pass.
-#[cfg(target_arch = "aarch64")]
-fn linear_quantized_relu_arm<'c, 'd>(
-    &self,
-    input: &lele::tensor::TensorView<'c, f32>,
-    weight_offset: usize,
-    weight_len: usize,
-    weight_k: usize,
-    weight_n: usize,
-    weight_signed: bool,
-    weight_scale: lele::tensor::TensorView<'c, f32>,
-    weight_zero: lele::tensor::TensorView<'c, f32>,
-    bias: lele::tensor::TensorView<'c, f32>,
-    output_buf: &'d mut Vec<f32>,
-) -> lele::tensor::TensorView<'d, f32> {
-    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n, weight_signed);
-    let zp_b = Some(Self::arm_zero_point(weight_zero.data.first().copied().unwrap_or(0.0), weight_signed));
-
-    lele::kernels::fused_dq_gemm_prepared_arm(
-        input,
-        &pw,
-        zp_b,
-        &weight_scale,
-        Some(&bias),
-        true,
-        output_buf,
-    )
-}
-
-/// ARM-optimized MatMulInteger with pre-packed weight cache.
-/// Used for unfused MatMulInteger nodes where B is a static model weight.
-/// Eliminates: per-call B packing, B u8→f32→u8 roundtrip, heap alloc.
-#[cfg(target_arch = "aarch64")]
-fn mat_mul_integer_arm<'c, 'd>(
-    &self,
-    a: &lele::tensor::TensorView<'c, f32>,
-    weight_offset: usize,
-    weight_len: usize,
-    weight_k: usize,
-    weight_n: usize,
-    weight_signed: bool,
-    a_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
-    b_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
-    output_buf: &'d mut Vec<f32>,
-) -> lele::tensor::TensorView<'d, f32> {
-    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n, weight_signed);
-    let zp_a = a_zero_point.and_then(|z| z.data.first().cloned());
-    let zb = b_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0);
-    let zp_b = Some(Self::arm_zero_point(zb, weight_signed));
-
-    lele::kernels::mat_mul_integer_prepared_arm(a, &pw, zp_a, zp_b, None, None, false, output_buf)
-}
-
 /// Dynamically quantized linear layer (+ ReLU) against an int8 weight packed
 /// once for the integer GEMM.
-#[cfg(not(target_arch = "aarch64"))]
 fn linear_quantized_packed<'c, 'd>(
     &self,
     input: &lele::tensor::TensorView<'c, f32>,
@@ -257,7 +162,6 @@ fn linear_quantized_packed<'c, 'd>(
 }
 
 /// MatMulInteger against a static weight packed once for the integer GEMM.
-#[cfg(not(target_arch = "aarch64"))]
 fn mat_mul_integer_packed<'c, 'd>(
     &self,
     a: &lele::tensor::TensorView<'c, f32>,
@@ -3109,24 +3013,7 @@ fn embedding_concat_i64<'c, 'd>(
     }
 
 
-    #[cfg(target_arch = "aarch64")]
-    fn get_prepared_weight(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool) -> std::sync::Arc<lele::kernels::PreparedWeightsArm> {
-        let key = (offset, len);
-        {
-            let cache = self.prepared_weights_cache.borrow();
-            if let Some(pw) = cache.get(&key) {
-                return pw.clone();
-            }
-        }
-        let raw_bytes = &self.data[offset..offset+len];
-        // The ARM kernels take u8 codes: i8 ones are shifted by 128 (their zero point too, see `arm_zero_point`), which leaves `b - zero_point` unchanged.
-        let shifted: Vec<u8>;
-        let raw_bytes = if signed { shifted = raw_bytes.iter().map(|b| b ^ 0x80).collect(); &shifted[..] } else { raw_bytes };
-        let pw = std::sync::Arc::new(lele::kernels::prepare_weights_arm(raw_bytes, k, n));
-        self.prepared_weights_cache.borrow_mut().insert(key, pw.clone());
-        pw
-    }
-    fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &lele::tensor::TensorView<f32>) -> std::sync::Arc<lele::kernels::QuantizedWeights> {
+    fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &lele::tensor::TensorView<f32>) -> std::sync::Arc<lele::kernels::QWeights> {
         // Distinct initializers can share identical bytes, and one initializer can sit behind several DequantizeLinear nodes carrying different scales, so the key must include the shape and the cached entry must match the exact scale.
         let key = (offset, len, k, n);
         {
