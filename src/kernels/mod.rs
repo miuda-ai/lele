@@ -31,7 +31,7 @@ pub use conv1d::conv1d;
 pub use conv1d::conv1d_fused;
 pub use conv2d::{
     conv_transpose, conv2d, conv2d_fused, conv2d_silu, gather_elements, max_pool2d,
-    print_conv_stats, reset_conv_stats, resize_nearest, topk,
+    resize_nearest, topk,
 };
 pub use conv_integer::{ConvWeights, conv_integer, conv_integer_packed};
 pub use gemm::{gemm, matmul, matmul_fused_add};

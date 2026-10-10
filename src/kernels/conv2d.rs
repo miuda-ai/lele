@@ -62,7 +62,6 @@ unsafe fn accel_sgemm(m: usize, n: usize, k: usize, a: *const f32, b: *const f32
     }
 }
 
-pub fn print_conv_stats() {}
 /// C = A^T * B (row-major, A transposed).
 /// A stored as [k, m] row-major, B as [k, n], C as [m, n].
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -87,8 +86,6 @@ unsafe fn accel_sgemm_ta(m: usize, n: usize, k: usize, a: *const f32, b: *const 
         );
     }
 }
-
-pub fn reset_conv_stats() {}
 
 /// 2D Convolution using im2col + GEMM approach.
 /// Input shape: [N, C_in, H, W]
