@@ -66,6 +66,7 @@ pub struct Prefill<'a> {
     prepared_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::PreparedWeightsArm>>>,
     quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QuantizedWeights>)>>,
     qweights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize, bool), (std::vec::Vec<f32>, std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,
+    conv_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, bool), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::ConvWeights>)>>,
 }
 
 impl<'a> Prefill<'a> {
@@ -77,6 +78,7 @@ impl<'a> Prefill<'a> {
             prepared_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             quantized_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             qweights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            conv_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 fn conv1d_relu<'c, 'd>(
@@ -272,6 +274,28 @@ fn mat_mul_integer_packed<'c, 'd>(
     let w = self.get_qweights(weight_offset, weight_len, weight_k, weight_n, weight_signed, zb, &[1.0]);
     let za = a_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0) as i32;
     lele::kernels::mat_mul_integer_qweights(a, za, &w, output_buf)
+}
+
+/// ConvInteger against a static weight prepared once.
+fn conv_integer_packed<'c, 'd>(
+    &self,
+    x: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_shape: [usize; 4],
+    weight_signed: bool,
+    group: i64,
+    x_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    w_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    dilations: &[i64],
+    pads: &[i64],
+    strides: &[i64],
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let zw = w_zero_point.filter(|z| !z.data.is_empty()).map_or(&[0.0f32][..], |z| &z.data[..]);
+    let w = self.get_conv_weights(weight_offset, weight_len, weight_shape, group as usize, weight_signed, zw);
+    let zx = x_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0) as i32;
+    lele::kernels::conv_integer_packed(x, &w, zx, dilations, pads, strides, output_buf)
 }
 
 // Helper for pre-quantized inputs (used in attention where input is already quantized)
@@ -3129,6 +3153,19 @@ fn embedding_concat_i64<'c, 'd>(
         let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();
         let w = std::sync::Arc::new(lele::kernels::QWeights::new(&self.data[offset..offset + len], k, n, signed, &zp, scale));
         self.qweights_cache.borrow_mut().insert(key, (zero_point.to_vec(), scale.to_vec(), w.clone()));
+        w
+    }
+    #[allow(dead_code)]
+    fn get_conv_weights(&self, offset: usize, len: usize, shape: [usize; 4], groups: usize, signed: bool, zero_point: &[f32]) -> std::sync::Arc<lele::kernels::ConvWeights> {
+        let key = (offset, len, groups, signed);
+        if let Some((z, w)) = self.conv_weights_cache.borrow().get(&key) {
+            if z.as_slice() == zero_point {
+                return w.clone();
+            }
+        }
+        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();
+        let w = std::sync::Arc::new(lele::kernels::ConvWeights::new(&self.data[offset..offset + len], &shape, groups, signed, &zp));
+        self.conv_weights_cache.borrow_mut().insert(key, (zero_point.to_vec(), w.clone()));
         w
     }
     pub fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {
