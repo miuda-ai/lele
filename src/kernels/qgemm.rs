@@ -19,11 +19,12 @@
 //! `vpmaddubsw` route does 32 products per instruction but saturates at `i16`, so it is
 //! exact only for 7-bit weights.)
 //!
-//! Where VNNI is guaranteed (`fearless_simd`'s AVX-512 level), weights are packed for
-//! [`crate::kernels::qgemm_vnni`] instead, which is about four times faster; [`QWeights`]
+//! Where a 4-byte dot-product instruction is available (VNNI with `fearless_simd`'s AVX-512
+//! level, `sdot` on aarch64 builds with `dotprod`), weights are packed for
+//! [`crate::kernels::qgemm_dot`] instead, which is about four times faster; [`QWeights`]
 //! picks the layout when it packs, and [`run_at`] the matching kernel.
 
-use crate::kernels::qgemm_vnni::{self, QuadWeights};
+use crate::kernels::qgemm_dot::{self, Dot, QuadWeights};
 use crate::kernels::simd::simd_call;
 use crate::tensor::TensorView;
 use fearless_simd::{Level, Simd, f32x8, i16x16, i32x8};
@@ -91,28 +92,44 @@ pub struct QWeights {
 pub(crate) enum Layout {
     /// Centered 16-bit pairs, for `vpmaddwd` and its equivalents ([`qgemm_at`]).
     Pairs,
-    /// `i8` quads for VNNI's `vpdpbusd` ([`crate::kernels::qgemm_vnni`]). (Chosen only on
-    /// x86; elsewhere only the tests pack them, emulating the instruction.)
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    Quads,
+    /// `i8` quads for VNNI's `vpdpbusd` or Arm's `sdot` ([`crate::kernels::qgemm_dot`]).
+    /// (Each chosen only where its instruction is; elsewhere only the tests pack them,
+    /// emulating it.)
+    Dot(Dot),
+    /// Centered codes in `f32`, multiplied by the f32 GEMM: where no integer instruction
+    /// beats it (aarch64 without `dotprod`, whose widening multiplies do no more per
+    /// instruction than f32 multiply-adds), and on macOS, whose Accelerate runs f32 on the
+    /// matrix units. Sums are exact while they stay under 2^24 (depths up to 258), and
+    /// rounded as an f32 GEMM's are beyond.
+    Float,
 }
 
 impl Layout {
-    /// The layout that runs fastest at `level`: quads where VNNI is guaranteed.
+    /// The layout that runs fastest at `level`.
     pub(crate) fn for_level(level: Level) -> Self {
         match level {
             #[cfg(target_arch = "x86_64")]
-            Level::Avx512(_) => Layout::Quads,
+            Level::Avx512(_) => Layout::Dot(Dot::Vnni),
+            #[cfg(target_arch = "aarch64")]
+            Level::Neon(_) if cfg!(target_os = "macos") || !cfg!(target_feature = "dotprod") => Layout::Float,
+            #[cfg(target_arch = "aarch64")]
+            Level::Neon(_) => Layout::Dot(Dot::Sdot),
             _ => Layout::Pairs,
         }
     }
+
+    /// The layouts the tests run at every level.
+    #[cfg(test)]
+    pub(crate) const ALL: [Layout; 4] = [Layout::Pairs, Layout::Dot(Dot::Vnni), Layout::Dot(Dot::Sdot), Layout::Float];
 }
 
 enum Packed {
     /// Panels of `NR` columns, each `pairs` rows of `NR` packed pairs (`b - zb`); zero past
     /// `k` and `n`.
     Pairs { pairs: usize, data: AlignedI32 },
-    Quads(QuadWeights),
+    Dot(QuadWeights),
+    /// Row-major `k x n` centered codes (`b - zb`).
+    Float(Vec<f32>),
 }
 
 impl QWeights {
@@ -182,9 +199,10 @@ impl QWeights {
                 }
                 Packed::Pairs { pairs, data }
             }
-            Layout::Quads => Packed::Quads(qgemm_vnni::pack(k, n, code, shift, zp)),
+            Layout::Dot(dot) => Packed::Dot(qgemm_dot::pack(dot, k, n, code, shift, zp)),
+            Layout::Float => Packed::Float((0..k * n).map(|i| (code(i) - zp(i % n)) as f32).collect()),
         };
-        let mut col_scale = vec![0.0; n.div_ceil(qgemm_vnni::NR) * qgemm_vnni::NR];
+        let mut col_scale = vec![0.0; n.div_ceil(qgemm_dot::NR) * qgemm_dot::NR];
         for (j, s) in col_scale[..n].iter_mut().enumerate() {
             *s = scale[if scale.len() == 1 { 0 } else { j }];
         }
@@ -201,9 +219,10 @@ impl QWeights {
 
     #[cfg(test)]
     pub(crate) fn layout(&self) -> Layout {
-        match self.packed {
+        match &self.packed {
             Packed::Pairs { .. } => Layout::Pairs,
-            Packed::Quads(_) => Layout::Quads,
+            Packed::Dot(q) => Layout::Dot(q.dot),
+            Packed::Float(_) => Layout::Float,
         }
     }
 
@@ -211,7 +230,7 @@ impl QWeights {
     fn pairs(&self) -> (usize, &[i32]) {
         match &self.packed {
             Packed::Pairs { pairs, data } => (*pairs, data),
-            Packed::Quads(_) => panic!("weights packed for VNNI used as pairs"),
+            _ => panic!("weights not packed as pairs used as pairs"),
         }
     }
 }
@@ -638,6 +657,8 @@ thread_local! {
     /// Rows of A, quantized, and (for the quads) their sums.
     static A_ROWS: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
     static ROW_SUMS: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Rows of A, quantized and centered, in `f32`.
+    static A_FLOAT: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// `C = epilogue(A * w)` for the `m x k` activations `src`, quantized with `scale` and
@@ -659,11 +680,91 @@ pub(crate) fn run_at(
             quantize_rows_at(level, src, m, w.k, scale, zero_point, center, a);
             qgemm_at(level, a, m, *pairs, w, e, c);
         }
-        Packed::Quads(q) => ROW_SUMS.with_borrow_mut(|sums| {
-            qgemm_vnni::quantize_rows(level, src, m, w.k, scale, zero_point, a, sums);
-            qgemm_vnni::qgemm(level, a, sums, m, q.quads, center, q, w.n, &w.scale, e, c);
+        Packed::Dot(q) => ROW_SUMS.with_borrow_mut(|sums| {
+            qgemm_dot::quantize_rows(level, q.dot, src, m, w.k, scale, zero_point, a, sums);
+            qgemm_dot::qgemm(level, a, sums, m, q.quads, center, q, w.n, &w.scale, e, c);
+        }),
+        Packed::Float(b) => A_FLOAT.with_borrow_mut(|a| {
+            let (k, n) = (w.k, w.n);
+            crate::kernels::utils::ensure_capacity(a, m * k);
+            simd_call!(level, quantize_rows_f32_simd(src, m * k, scale, zero_point, center, a));
+            sgemm(&a[..m * k], b, m, k, n, &mut c[..m * n]);
+            simd_call!(level, epilogue_simd(m, n, &w.scale, e, c));
         }),
     })
+}
+
+/// `dst = clamp(round_ties_even(x / scale) + zero_point, 0, 255) - center`, in `f32`.
+#[simd]
+fn quantize_rows_f32_simd<S: Simd>(simd: S, src: &[f32], len: usize, scale: f32, zero_point: i32, center: i32, dst: &mut [f32]) {
+    use fearless_simd::prelude::*;
+    let (src, dst) = (&src[..len], &mut dst[..len]);
+    let code = |x: f32| {
+        let q = (x / scale).round_ties_even().clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+        (q.saturating_add(zero_point).clamp(0, 255) - center) as f32
+    };
+    let sv = f32x8::splat(simd, scale);
+    let (lo, hi) = (f32x8::splat(simd, -zero_point as f32), f32x8::splat(simd, (255 - zero_point) as f32));
+    let shift = f32x8::splat(simd, (zero_point - center) as f32);
+    let (chunks, rest) = src.as_chunks::<8>();
+    let (out, out_rest) = dst.as_chunks_mut::<8>();
+    for (x, o) in chunks.iter().zip(out) {
+        // Clamping the rounded quotient before adding the zero point keeps it exact in f32.
+        let q = (f32x8::from_slice(simd, x) / sv).round_ties_even().max(lo).min(hi);
+        (q + shift).store_slice(o);
+    }
+    for (x, o) in rest.iter().zip(out_rest) {
+        *o = code(*x);
+    }
+}
+
+/// `c = a * b` for row-major `m x k` and `k x n` operands.
+fn sgemm(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, c: &mut [f32]) {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        crate::kernels::gemm::accelerate_init();
+        // SAFETY: the slices hold the row-major operands of the sizes given.
+        unsafe {
+            crate::kernels::gemm::accelerate_sgemm(
+                m as i32, n as i32, k as i32, 1.0, a.as_ptr(), k as i32, b.as_ptr(), n as i32, 0.0,
+                c.as_mut_ptr(), n as i32,
+            );
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    {
+        use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul};
+        assert!(a.len() >= m * k && b.len() >= k * n && c.len() >= m * n);
+        // SAFETY: the slices hold the row-major operands of the sizes given.
+        unsafe {
+            let a = MatRef::<f32>::from_raw_parts(a.as_ptr(), m, k, k as isize, 1);
+            let b = MatRef::<f32>::from_raw_parts(b.as_ptr(), k, n, n as isize, 1);
+            let c = MatMut::<f32>::from_raw_parts_mut(c.as_mut_ptr(), m, n, n as isize, 1);
+            matmul(c, Accum::Replace, a, b, 1.0, Par::Seq);
+        }
+    }
+}
+
+/// `c[i][j] = relu?(c[i][j] * e.scale * col_scale[j] + bias[j])`, in place.
+#[simd]
+fn epilogue_simd<S: Simd>(simd: S, m: usize, n: usize, col_scale: &[f32], e: &Epilogue, c: &mut [f32]) {
+    use fearless_simd::prelude::*;
+    let zero = f32x8::splat(simd, 0.0);
+    let sa = f32x8::splat(simd, e.scale);
+    for row in c[..m * n].chunks_exact_mut(n) {
+        let (chunks, rest) = row.as_chunks_mut::<8>();
+        for (i, o) in chunks.iter_mut().enumerate() {
+            let s = f32x8::from_slice(simd, &col_scale[8 * i..][..8]) * sa;
+            let b = e.bias.map_or(zero, |b| f32x8::from_slice(simd, &b[8 * i..][..8]));
+            let x = f32x8::from_slice(simd, o) * s + b;
+            (if e.relu { x.max(zero) } else { x }).store_slice(o);
+        }
+        let done = chunks.len() * 8;
+        for (j, o) in rest.iter_mut().enumerate() {
+            let x = *o * (e.scale * col_scale[done + j]) + e.bias.map_or(0.0, |b| b[done + j]);
+            *o = if e.relu { x.max(0.0) } else { x };
+        }
+    }
 }
 
 /// Quantizes `x` with `scale`, `zero_point` and `center` (as [`quantize_rows_at`]) and
@@ -739,8 +840,8 @@ mod tests {
             // Several depth blocks.
             (7, 2100, 20), (2, 4500, 33),
         ];
-        // Both layouts at every level: the quads emulate VNNI off the AVX-512 level.
-        for (level, layout) in levels().into_iter().flat_map(|l| [(l, Layout::Pairs), (l, Layout::Quads)]) {
+        // Every layout at every level: the dot layouts emulate their instructions elsewhere.
+        for (level, layout) in levels().into_iter().flat_map(|l| Layout::ALL.map(|layout| (l, layout))) {
             for &(m, k, n) in &sizes {
                 for case in 0..4 {
                     let signed = case % 2 == 0;
@@ -786,7 +887,16 @@ mod tests {
                             want[i * n + j] = v;
                         }
                     }
-                    assert_same_bits(&c, &want, &format!("{level:?} {layout:?} {m}x{k}x{n} case {case}"));
+                    let what = format!("{level:?} {layout:?} {m}x{k}x{n} case {case}");
+                    if layout == Layout::Float && k > 258 {
+                        // Sums past 2^24 are rounded by the f32 GEMM.
+                        let scale = want.iter().fold(1.0f32, |a, v| a.max(v.abs()));
+                        for (g, w) in c.iter().zip(&want) {
+                            assert!((g - w).abs() <= 1e-5 * scale, "{what}: {g} vs {w}");
+                        }
+                    } else {
+                        assert_same_bits(&c, &want, &what);
+                    }
                 }
             }
         }
