@@ -2,24 +2,9 @@
 use crate::kernels::bias_act::bias_act_inplace;
 use crate::kernels::timing;
 use crate::kernels::utils;
-#[cfg(target_arch = "wasm32")]
-use crate::kernels::wasm_matmul::{Accum, MatMut, MatRef, Par, matmul as faer_matmul};
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul as faer_matmul};
 use crate::tensor::TensorView;
-#[cfg(not(any(
-    target_arch = "wasm32",
-    all(target_arch = "aarch64", target_os = "macos")
-)))]
-use faer::linalg::matmul::matmul as faer_matmul;
-#[cfg(not(any(
-    target_arch = "wasm32",
-    all(target_arch = "aarch64", target_os = "macos")
-)))]
-use faer::mat::{MatMut, MatRef};
-#[cfg(not(any(
-    target_arch = "wasm32",
-    all(target_arch = "aarch64", target_os = "macos")
-)))]
-use faer::{Accum, Par};
 
 // Apple Accelerate framework bindings for AMX-accelerated GEMM on macOS aarch64
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]

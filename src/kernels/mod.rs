@@ -12,6 +12,9 @@ pub mod fft;
 pub mod gemm;
 pub mod manipulation;
 pub mod math;
+pub mod matmul;
+pub(crate) mod matmul_dot;
+pub(crate) mod matmul_nn;
 #[cfg(target_arch = "aarch64")]
 pub mod neon;
 pub mod norm;
@@ -26,8 +29,6 @@ pub(crate) mod simd_math;
 pub(crate) mod test_util;
 pub mod timing;
 pub mod utils;
-#[cfg(target_arch = "wasm32")]
-pub mod wasm_matmul;
 pub use conv1d::conv1d;
 pub use conv1d::conv1d_fused;
 pub use conv2d::{

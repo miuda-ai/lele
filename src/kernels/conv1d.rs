@@ -5,15 +5,8 @@ use crate::kernels::conv1d_direct::{
 use crate::kernels::conv2d::Activation;
 use crate::kernels::utils;
 use fearless_simd::Level;
-#[cfg(target_arch = "wasm32")]
-use crate::kernels::wasm_matmul::{Accum, MatMut, MatRef, Par, matmul};
+use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul};
 use crate::tensor::TensorView;
-#[cfg(not(target_arch = "wasm32"))]
-use faer::{
-    Accum, Par,
-    linalg::matmul::matmul,
-    mat::{MatMut, MatRef},
-};
 
 /// Adds `bias[oc]` to every `[oc, ..]` row of `out` (laid out `[batch, out_channels, len]`)
 /// and applies ReLU if asked.
