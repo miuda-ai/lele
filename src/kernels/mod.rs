@@ -17,6 +17,9 @@ pub mod qmatmul_i8;
 pub mod quantization;
 pub mod rnn;
 pub mod shape;
+pub(crate) mod simd;
+#[cfg(test)]
+pub(crate) mod test_util;
 pub mod timing;
 pub mod utils;
 #[cfg(target_arch = "wasm32")]

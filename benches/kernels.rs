@@ -110,6 +110,7 @@ fn bench_layer_norm(c: &mut Criterion) {
         (16, 256),
         (64, 128),
         (128, 512),
+        (16, 1027),
     ];
 
     for &(outer, norm_size) in &sizes {
@@ -136,6 +137,44 @@ fn bench_layer_norm(c: &mut Criterion) {
                         black_box(&input),
                         black_box(&scale),
                         black_box(&bias),
+                        -1,
+                        1e-5,
+                        &mut out_buf,
+                    );
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_rms_norm(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rms_norm");
+
+    let sizes = [(1, 512), (4, 512), (16, 256), (64, 128), (128, 512), (16, 1027)];
+
+    for &(outer, norm_size) in &sizes {
+        let input_data: Vec<f32> = (0..outer * norm_size)
+            .map(|i| ((i % 20) as f32 - 10.0) * 0.1)
+            .collect();
+        let weight: Vec<f32> = (0..norm_size).map(|i| 1.0 + ((i % 5) as f32) * 0.1).collect();
+        let mut out_buf = vec![0.0f32; outer * norm_size];
+
+        let input_shape = vec![outer, norm_size];
+        let weight_shape = vec![norm_size];
+        let input = TensorView { data: Cow::Borrowed(&input_data), shape: Cow::Borrowed(&input_shape) };
+        let weight = TensorView { data: Cow::Borrowed(&weight), shape: Cow::Borrowed(&weight_shape) };
+
+        group.throughput(Throughput::Elements((outer * norm_size) as u64));
+        group.bench_with_input(
+            BenchmarkId::new("rms_norm", format!("{}x{}", outer, norm_size)),
+            &(outer, norm_size),
+            |bencher, _| {
+                bencher.iter(|| {
+                    let _ = lele::kernels::norm::rms_norm(
+                        black_box(&input),
+                        black_box(&weight),
                         -1,
                         1e-5,
                         &mut out_buf,
@@ -381,6 +420,7 @@ criterion_group!(
     bench_gemm,
     bench_softmax,
     bench_layer_norm,
+    bench_rms_norm,
     bench_transpose,
     bench_elementwise,
     bench_leaky_relu,
