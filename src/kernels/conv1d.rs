@@ -209,7 +209,7 @@ fn conv1d_fused_at<'b, 'a>(
 
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             unsafe {
-                // Use Apple Accelerate AMX for pointwise conv (much faster than faer NEON)
+                // Use Apple Accelerate AMX for pointwise conv
                 crate::kernels::gemm::accelerate_init();
                 crate::kernels::gemm::accelerate_sgemm(
                     out_channels as i32,

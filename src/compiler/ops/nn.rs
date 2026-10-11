@@ -404,21 +404,43 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
             } else {
                 "None".to_string()
             };
-            writeln!(
-                w,
-                "{}let {} = lele::kernels::conv_integer(&{}, &{}, {}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
-                tab,
-                outputs[0],
-                inputs[0],
-                inputs[1],
-                x_zero_point,
-                w_zero_point,
-                dilations,
-                group,
-                pads,
-                strides,
-                buf_expr
-            )?;
+            // A static weight is prepared once, on first use.
+            let weight = ctx.known_weights.get(&super::super::sanitize_name(&ctx.node.input[1]));
+            match weight {
+                Some((offset, len, shape, dt)) if (*dt == 2 || *dt == 3) && shape.len() == 4 => writeln!(
+                    w,
+                    "{}let {} = self.conv_integer_packed(&{}, {}, {}, {:?}, {}, {}, {}, {}, &{:?}, &{:?}, &{:?}, {});",
+                    tab,
+                    outputs[0],
+                    inputs[0],
+                    offset,
+                    len,
+                    shape,
+                    *dt == 3,
+                    group,
+                    x_zero_point,
+                    w_zero_point,
+                    dilations,
+                    pads,
+                    strides,
+                    buf_expr
+                )?,
+                _ => writeln!(
+                    w,
+                    "{}let {} = lele::kernels::conv_integer(&{}, &{}, {}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
+                    tab,
+                    outputs[0],
+                    inputs[0],
+                    inputs[1],
+                    x_zero_point,
+                    w_zero_point,
+                    dilations,
+                    group,
+                    pads,
+                    strides,
+                    buf_expr
+                )?,
+            }
         }
         "BatchNormalization" => {
             let epsilon = ctx

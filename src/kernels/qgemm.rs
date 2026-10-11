@@ -139,9 +139,19 @@ impl QWeights {
     /// As [`QWeights::new`], from codes held in `f32` (as lele keeps integer tensors); they
     /// are taken as `i8` if any is negative and `u8` otherwise.
     pub fn from_f32_codes(codes: &[f32], k: usize, n: usize, zero_point: &[i32], scale: &[f32]) -> Self {
+        Self::from_f32_codes_with_layout(Layout::for_level(Level::new()), codes, k, n, zero_point, scale)
+    }
+
+    pub(crate) fn from_f32_codes_with_layout(
+        layout: Layout,
+        codes: &[f32],
+        k: usize,
+        n: usize,
+        zero_point: &[i32],
+        scale: &[f32],
+    ) -> Self {
         assert_eq!(codes.len(), k * n);
         let shift = if codes.iter().any(|&c| c < 0.0) { 0 } else { 128 };
-        let layout = Layout::for_level(Level::new());
         Self::pack(layout, k, n, |i| codes[i] as i32, shift, zero_point, scale)
     }
 

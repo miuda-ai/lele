@@ -69,7 +69,6 @@ fearless_simd_macros = "0.1"
 approx = "0.5"
 test-log = "0.2"
 unicode-normalization = "0.1"
-faer = "0.24.0"
 criterion = "0.8.2"
 # Lets tests run kernels at the scalar level too, on targets whose baseline has SIMD.
 fearless_simd = { version = "1.1", features = ["force_support_fallback"] }

@@ -1442,6 +1442,10 @@ impl Compiler {
             &mut code,
             "    qweights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize, bool), (std::vec::Vec<f32>, std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,"
         )?;
+        writeln!(
+            &mut code,
+            "    conv_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, bool), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::ConvWeights>)>>,"
+        )?;
         writeln!(&mut code, "}}")?;
         writeln!(&mut code, "\nimpl<'a> {}<'a> {{", struct_name)?;
         writeln!(&mut code, "    pub fn new(data: &'a [u8]) -> Self {{")?;
@@ -1460,6 +1464,10 @@ impl Compiler {
         writeln!(
             &mut code,
             "            qweights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
+        )?;
+        writeln!(
+            &mut code,
+            "            conv_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
         )?;
         writeln!(&mut code, "        }}")?;
         writeln!(&mut code, "    }}")?;
@@ -1590,6 +1598,35 @@ impl Compiler {
         writeln!(
             &mut code,
             "        self.qweights_cache.borrow_mut().insert(key, (zero_point.to_vec(), scale.to_vec(), w.clone()));"
+        )?;
+        writeln!(&mut code, "        w")?;
+        writeln!(&mut code, "    }}")?;
+
+        // ConvInteger weights, prepared with their zero points, which the entry must match.
+        writeln!(
+            &mut code,
+            "    #[allow(dead_code)]\n    fn get_conv_weights(&self, offset: usize, len: usize, shape: [usize; 4], groups: usize, signed: bool, zero_point: &[f32]) -> std::sync::Arc<lele::kernels::ConvWeights> {{"
+        )?;
+        writeln!(&mut code, "        let key = (offset, len, groups, signed);")?;
+        writeln!(
+            &mut code,
+            "        if let Some((z, w)) = self.conv_weights_cache.borrow().get(&key) {{"
+        )?;
+        writeln!(&mut code, "            if z.as_slice() == zero_point {{")?;
+        writeln!(&mut code, "                return w.clone();")?;
+        writeln!(&mut code, "            }}")?;
+        writeln!(&mut code, "        }}")?;
+        writeln!(
+            &mut code,
+            "        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();"
+        )?;
+        writeln!(
+            &mut code,
+            "        let w = std::sync::Arc::new(lele::kernels::ConvWeights::new(&self.data[offset..offset + len], &shape, groups, signed, &zp));"
+        )?;
+        writeln!(
+            &mut code,
+            "        self.conv_weights_cache.borrow_mut().insert(key, (zero_point.to_vec(), w.clone()));"
         )?;
         writeln!(&mut code, "        w")?;
         writeln!(&mut code, "    }}")?;
