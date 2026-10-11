@@ -81,16 +81,24 @@ Share of whole-process samples:
    through code that calls `_mm256_fmadd_ps` / `_mm256_loadu_ps` as out-of-line
    functions: the intrinsics are not inlined, because the caller has no
    `target_feature`. That accounts for 19% of PP-OCR on its own.
-5. **int8 matmul runs at about f32 speed (SenseVoice 83%, Smart Turn 57%, BERT 54%).**
+5. **int8 matmul ran at about f32 speed (SenseVoice 83%, Smart Turn 57%, BERT 54%).**
    Without VNNI, the `MatMulInteger` / `fused_quantized_linear` path
-   (`avx::quantization::gemm_2rows_avx2`) does `97x512x2048` in 1.33 ms, about
+   (`avx::quantization::gemm_2rows_avx2`) did `97x512x2048` in 1.33 ms, about
    150 GOP/s, the same as the f32 GEMM's FLOP rate. The QDQ path Smart Turn takes
-   (`qmatmul_i8` → `avx::qgemm::qgemm_u8s8_f32_avx2`) does `400x384x1536` in 2.6 ms,
-   about 180 GOP/s. On AVX2, `vpmaddubsw`-based int8 should reach about twice the f32
-   rate, and the two int8 paths could share the faster kernel.
-   SenseVoice's int8 `[97,512] x [512,25055]` CTC head is 16 ms per call. In BERT, a
-   per-call `HashMap` lookup of the cached quantized weights is 7% of the run, and an
-   11-token forward still costs 1.3 ms against 5.2 ms for 107 tokens.
+   (`qmatmul_i8` → `avx::qgemm::qgemm_u8s8_f32_avx2`) did `400x384x1536` in 2.6 ms,
+   about 180 GOP/s. SenseVoice's int8 `[97,512] x [512,25055]` CTC head was 16 ms per
+   call. In BERT, a per-call `HashMap` lookup of the cached quantized weights was 7% of
+   the run, and an 11-token forward still cost 1.3 ms against 5.2 ms for 107 tokens.
+
+   *Since done (branch `pr_simd_qgemm`):* both paths now share `kernels::qgemm`, which
+   runs at about 200 GOP/s on these shapes (1.5x the f32 GEMM; `vpmaddubsw` turned out
+   to be exact only for 7-bit weights, so it uses `vpmaddwd`). The generated code packs
+   each weight once. Same-machine A/B: SenseVoice 315 → 276 ms, BERT 4.94 → 4.43 ms (107
+   tokens), Smart Turn unchanged (the old QDQ kernel was already near this rate). The
+   old `MatMulInteger` path also read `i8` weights as `u8`, clamping negative values to
+   0: BERT's output had cosine 0.716 against onnxruntime, and now 0.9993.
+   SenseVoice's transcript is wrong on `main` as well, for a reason elsewhere in the
+   graph: its first int8 linear matches onnxruntime exactly.
 6. **MOSS decode is GEMV, and DRAM-bound.** 68% of its GEMM time is `m = 1`:
    `1x3072x768`, `1x768x3072`, `1x768x2304`, `1x768x768`, and the `1x768x16384` LM head.
    These run at 13–20 GFLOP/s, which is 35–40 GB/s of weights, about what DRAM delivers.

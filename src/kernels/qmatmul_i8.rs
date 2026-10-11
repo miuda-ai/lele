@@ -9,38 +9,22 @@
 //! Which kernel actually runs is a runtime decision made once per weight, when
 //! it is prepared:
 //!
-//! * With AVX-512 VNNI, `vpdpbusd` does 64 MAC per instruction on two ports —
-//!   four times the f32 FMA rate — so the weight is packed for
-//!   [`crate::kernels::avx512::qgemm`] and the multiply runs in integers.
-//! * With AVX2, [`crate::kernels::avx::qgemm`] does the same thing through
-//!   `vpmaddwd`, which is exact but reaches half the MAC rate.
-//! * Everywhere else the weight is dequantized to f32 once and the ordinary
+//! * Everywhere but on aarch64, [`crate::kernels::qgemm`] runs it in integers:
+//!   with AVX-512 VNNI through `vpdpbusd` (four times the AVX2 rate), elsewhere
+//!   through 16-bit multiply-adds (`vpmaddwd` with AVX2), at 1.5 times the f32
+//!   GEMM's rate.
+//! * On aarch64 the weight is dequantized to f32 once and the ordinary
 //!   [`matmul`] runs, which is bit-identical to not having taken this path at
-//!   all.
+//!   all. (Neon's widening multiplies do 8 MAC per instruction, no more than
+//!   f32 multiply-adds.)
 
+use crate::kernels::qgemm::{QWeights, qlinear_static};
 use crate::tensor::TensorView;
-
-#[cfg(target_arch = "x86_64")]
-use crate::kernels::avx::qgemm::{
-    PackedI8WeightsAvx2, has_avx2_int8, pack_i8_weights_avx2, qgemm_u8s8_f32_avx2,
-};
-#[cfg(target_arch = "x86_64")]
-use crate::kernels::avx512::qgemm::{PackedI8Weights, has_vnni, pack_i8_weights, qgemm_u8s8_f32};
 
 /// A weight tensor prepared for whichever quantized path this machine can run.
 pub enum QuantizedWeights {
-    /// Packed for `vpdpbusd`, with the per-output-channel scale alongside.
-    #[cfg(target_arch = "x86_64")]
-    Vnni {
-        packed: PackedI8Weights,
-        scale: Vec<f32>,
-    },
-    /// Packed for `vpmaddwd`.
-    #[cfg(target_arch = "x86_64")]
-    Avx2 {
-        packed: PackedI8WeightsAvx2,
-        scale: Vec<f32>,
-    },
+    /// Packed for [`crate::kernels::qgemm`].
+    Int(QWeights),
     /// Dequantized to f32 `[k, n]`; the ordinary f32 GEMM handles it.
     Float { data: Vec<f32>, k: usize, n: usize },
 }
@@ -48,17 +32,7 @@ pub enum QuantizedWeights {
 impl QuantizedWeights {
     /// True when an integer kernel will run, rather than the f32 fallback.
     pub fn is_integer(&self) -> bool {
-        #[cfg(target_arch = "x86_64")]
-        {
-            matches!(
-                self,
-                QuantizedWeights::Vnni { .. } | QuantizedWeights::Avx2 { .. }
-            )
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            false
-        }
+        !matches!(self, QuantizedWeights::Float { .. })
     }
 }
 
@@ -77,27 +51,8 @@ pub fn prepare_quantized_weights(
     debug_assert_eq!(raw.len(), k * n);
     debug_assert!(w_scale.len() == 1 || w_scale.len() == n);
 
-    #[cfg(target_arch = "x86_64")]
-    if has_vnni() || has_avx2_int8() {
-        // SAFETY: i8 and u8 have the same size and alignment, and every bit
-        // pattern is valid for both.
-        let as_i8: &[i8] = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, k * n) };
-        let scale = if w_scale.len() == 1 {
-            vec![w_scale[0]; n]
-        } else {
-            w_scale.to_vec()
-        };
-        return if has_vnni() {
-            QuantizedWeights::Vnni {
-                packed: pack_i8_weights(as_i8, k, n),
-                scale,
-            }
-        } else {
-            QuantizedWeights::Avx2 {
-                packed: pack_i8_weights_avx2(as_i8, k, n),
-                scale,
-            }
-        };
+    if cfg!(not(target_arch = "aarch64")) {
+        return QuantizedWeights::Int(QWeights::new(raw, k, n, true, &[0], w_scale));
     }
 
     let mut data = vec![0f32; k * n];
@@ -108,104 +63,6 @@ pub fn prepare_quantized_weights(
         }
     }
     QuantizedWeights::Float { data, k, n }
-}
-
-/// Recovers the integer codes from an activation that a `QuantizeLinear` ->
-/// `DequantizeLinear` pair already snapped onto the quantization grid.
-///
-/// The dequantized value is `scale * (code - zero_point)` exactly, so dividing
-/// it back out lands within a fraction of an ulp of an integer and rounding
-/// recovers the code. Rows are written at stride `lda` so K can be padded up to
-/// the multiple of four `vpdpbusd` consumes.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f", enable = "avx512bw")]
-unsafe fn requantize_rows_avx512(
-    src: *const f32,
-    dst: *mut u8,
-    rows: usize,
-    k: usize,
-    lda: usize,
-    scale: f32,
-    zero_point: i32,
-) {
-    use std::arch::x86_64::*;
-    unsafe {
-        let sv = _mm512_set1_ps(scale);
-        let zv = _mm512_set1_epi32(zero_point);
-        let zero = _mm512_setzero_si512();
-        for r in 0..rows {
-            let s = src.add(r * k);
-            let d = dst.add(r * lda);
-            let mut i = 0;
-            while i + 16 <= k {
-                let v = _mm512_loadu_ps(s.add(i));
-                // Default rounding is round-to-nearest-even, matching the
-                // round_ties_even the quantize kernel used.
-                let q = _mm512_cvtps_epi32(_mm512_div_ps(v, sv));
-                let q = _mm512_max_epi32(_mm512_add_epi32(q, zv), zero);
-                _mm_storeu_si128(d.add(i) as *mut __m128i, _mm512_cvtusepi32_epi8(q));
-                i += 16;
-            }
-            while i < k {
-                let q = (*s.add(i) / scale).round_ties_even() as i32 + zero_point;
-                *d.add(i) = q.clamp(0, 255) as u8;
-                i += 1;
-            }
-            // Zero the padding so it cannot perturb the accumulator even if the
-            // packed weight bytes were ever non-zero there.
-            for i in k..lda {
-                *d.add(i) = 0;
-            }
-        }
-    }
-}
-
-/// The AVX2 counterpart, widening straight to the i16 the `vpmaddwd` kernel
-/// consumes rather than going through u8 and converting again.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn requantize_rows_i16_avx2(
-    src: *const f32,
-    dst: *mut i16,
-    rows: usize,
-    k: usize,
-    lda: usize,
-    scale: f32,
-    zero_point: i32,
-) {
-    use std::arch::x86_64::*;
-    unsafe {
-        let sv = _mm256_set1_ps(scale);
-        let zv = _mm256_set1_epi32(zero_point);
-        let lo = _mm256_setzero_si256();
-        let hi = _mm256_set1_epi32(255);
-        for r in 0..rows {
-            let s = src.add(r * k);
-            let d = dst.add(r * lda);
-            let mut i = 0;
-            while i + 8 <= k {
-                let v = _mm256_loadu_ps(s.add(i));
-                // Round to nearest even, matching the quantize kernel.
-                let q = _mm256_cvtps_epi32(_mm256_div_ps(v, sv));
-                let q = _mm256_min_epi32(_mm256_max_epi32(_mm256_add_epi32(q, zv), lo), hi);
-                // Codes are in [0, 255], so the narrowing packs are exact; the
-                // lane crossing that `vpackssdw` introduces is undone by the
-                // permute.
-                let packed = _mm256_packs_epi32(q, q);
-                let packed = _mm256_permute4x64_epi64::<0b1000>(packed);
-                _mm_storeu_si128(d.add(i) as *mut __m128i, _mm256_castsi256_si128(packed));
-                i += 8;
-            }
-            while i < k {
-                let q = (*s.add(i) / scale).round_ties_even() as i32 + zero_point;
-                *d.add(i) = q.clamp(0, 255) as i16;
-                i += 1;
-            }
-            for i in k..lda {
-                *d.add(i) = 0;
-            }
-        }
-    }
 }
 
 /// `out = a @ dequantize(w)`, computed in integers where the hardware allows.
@@ -220,8 +77,8 @@ pub fn qmatmul_i8<'a>(
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
     // ONNX MatMul semantics: a 1-D activation is a vector @ matrix product.
-    // The integer kernels below index `dims - 2`, so view the vector as a
-    // single row, compute `[1, n]`, and drop the leading dimension.
+    // View the vector as a single row, compute `[1, n]`, and drop the leading
+    // dimension.
     if a.shape.len() == 1 {
         let k = a.shape[0];
         let row = TensorView::from_slice(&a.data, vec![1, k]);
@@ -236,122 +93,10 @@ pub fn qmatmul_i8<'a>(
             let w = TensorView::from_slice(data.as_slice(), vec![*k, *n]);
             crate::kernels::matmul(a, &w, out)
         }
-        #[cfg(target_arch = "x86_64")]
-        QuantizedWeights::Vnni { packed, scale } => {
-            let dims = a.shape.len();
-            let m = a.shape[dims - 2];
-            let k = a.shape[dims - 1];
-            let n = packed.n;
-            let batch: usize = a.shape[..dims - 2].iter().product::<usize>().max(1);
-
-            let output_len = batch * m * n;
-            crate::kernels::utils::ensure_capacity(out, output_len);
-            out.resize(output_len, 0.0);
-
+        QuantizedWeights::Int(w) => {
             let sa = a_scale.data.first().copied().unwrap_or(1.0);
             let za = a_zero_point.data.first().copied().unwrap_or(0.0) as i32;
-            let lda = packed.k4;
-
-            // The requantized activation is scratch, and this runs dozens of
-            // times per forward pass, so keep the buffer rather than allocating
-            // one each call.
-            thread_local! {
-                static A_U8: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-            }
-            A_U8.with(|cell| {
-                let mut a_u8 = cell.borrow_mut();
-                a_u8.clear();
-                a_u8.resize(m * lda, 0);
-                let a_ptr = a.data.as_ptr();
-                for b in 0..batch {
-                    unsafe {
-                        requantize_rows_avx512(
-                            a_ptr.add(b * m * k),
-                            a_u8.as_mut_ptr(),
-                            m,
-                            k,
-                            lda,
-                            sa,
-                            za,
-                        );
-                        qgemm_u8s8_f32(
-                            a_u8.as_ptr(),
-                            m,
-                            lda,
-                            packed,
-                            za,
-                            sa,
-                            scale.as_ptr(),
-                            scale.len(),
-                            None,
-                            out.as_mut_ptr().add(b * m * n),
-                            n,
-                        );
-                    }
-                }
-            });
-
-            let mut shape = a.shape[..dims - 2].to_vec();
-            shape.push(m);
-            shape.push(n);
-            TensorView::from_slice(out.as_slice(), shape)
-        }
-        #[cfg(target_arch = "x86_64")]
-        QuantizedWeights::Avx2 { packed, scale } => {
-            let dims = a.shape.len();
-            let m = a.shape[dims - 2];
-            let k = a.shape[dims - 1];
-            let n = packed.n;
-            let batch: usize = a.shape[..dims - 2].iter().product::<usize>().max(1);
-
-            let output_len = batch * m * n;
-            crate::kernels::utils::ensure_capacity(out, output_len);
-            out.resize(output_len, 0.0);
-
-            let sa = a_scale.data.first().copied().unwrap_or(1.0);
-            let za = a_zero_point.data.first().copied().unwrap_or(0.0) as i32;
-            let lda = packed.k2;
-
-            thread_local! {
-                static A_I16: std::cell::RefCell<Vec<i16>> = const { std::cell::RefCell::new(Vec::new()) };
-            }
-            A_I16.with(|cell| {
-                let mut a_i16 = cell.borrow_mut();
-                a_i16.clear();
-                a_i16.resize(m * lda, 0);
-                let a_ptr = a.data.as_ptr();
-                for b in 0..batch {
-                    unsafe {
-                        requantize_rows_i16_avx2(
-                            a_ptr.add(b * m * k),
-                            a_i16.as_mut_ptr(),
-                            m,
-                            k,
-                            lda,
-                            sa,
-                            za,
-                        );
-                        qgemm_u8s8_f32_avx2(
-                            a_i16.as_ptr(),
-                            m,
-                            lda,
-                            packed,
-                            za,
-                            sa,
-                            scale.as_ptr(),
-                            scale.len(),
-                            None,
-                            out.as_mut_ptr().add(b * m * n),
-                            n,
-                        );
-                    }
-                }
-            });
-
-            let mut shape = a.shape[..dims - 2].to_vec();
-            shape.push(m);
-            shape.push(n);
-            TensorView::from_slice(out.as_slice(), shape)
+            qlinear_static(a, sa, za, w, out)
         }
     }
 }
