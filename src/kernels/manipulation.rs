@@ -1328,19 +1328,12 @@ pub fn split_owned<T: Clone + Copy + std::fmt::Debug>(
         out_shape[axis] = split_size;
         let out_numel = out_shape.iter().product::<usize>();
 
-        // Allocate owned buffer for this split
+        // Gather this split's rows from every outer index, in order
         let mut buffer = Vec::with_capacity(out_numel);
-        unsafe {
-            buffer.set_len(out_numel);
-        }
-
-        // Copy data from input to this split's buffer
         for outer_idx in 0..outer_dim {
             let src_offset = outer_idx * input.shape[axis] * inner_dim + axis_offset * inner_dim;
-            let dst_offset = outer_idx * split_size * inner_dim;
             let copy_len = split_size * inner_dim;
-            buffer[dst_offset..dst_offset + copy_len]
-                .copy_from_slice(&input.data[src_offset..src_offset + copy_len]);
+            buffer.extend_from_slice(&input.data[src_offset..src_offset + copy_len]);
         }
 
         // Create owned TensorView
@@ -1555,6 +1548,25 @@ where
 mod tests {
     use super::*;
     use crate::tensor::TensorView;
+
+    #[test]
+    fn test_split_owned_matches_split() {
+        // [2, 5, 3] split on the middle axis: each part gathers rows from both
+        // outer indices. The empty part covers a zero-sized split.
+        let data: Vec<f32> = (0..30).map(|v| v as f32).collect();
+        let t = TensorView::from_owned(data, vec![2, 5, 3]);
+        let splits = [1i64, 0, 3, 1];
+        let owned = split_owned(&t, 1, &splits);
+        let mut bufs = vec![Vec::new(); splits.len()];
+        let borrowed = split(&t, 1, &splits, &mut bufs);
+        assert_eq!(owned.len(), borrowed.len());
+        for (o, b) in owned.iter().zip(&borrowed) {
+            assert_eq!(o.shape, b.shape);
+            assert_eq!(o.data, b.data);
+        }
+        assert_eq!(&*owned[0].data, &[0.0, 1.0, 2.0, 15.0, 16.0, 17.0]);
+    }
+
     #[test]
     fn test_concat() {
         let d1 = vec![1.0, 2.0, 3.0, 4.0];
