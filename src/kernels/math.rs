@@ -1193,15 +1193,15 @@ pub fn reduce_mean<'b, 'a>(
             // Eight independent accumulators: f32 addition is not associative,
             // so a single one would keep the loop serial on the add latency.
             let mut acc = [0.0f32; 8];
-            let mut chunks = run.chunks_exact(8);
-            for c in &mut chunks {
+            let (chunks, rest) = run.as_chunks::<8>();
+            for c in chunks {
                 for (a, &v) in acc.iter_mut().zip(c) {
                     *a += v;
                 }
             }
             let mut s =
                 ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
-            for &v in chunks.remainder() {
+            for &v in rest {
                 s += v;
             }
             *dst = s * scale;

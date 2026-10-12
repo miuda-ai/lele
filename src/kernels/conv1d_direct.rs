@@ -94,8 +94,8 @@ fn depthwise_simd<S: Simd>(
             &*padded
         };
         if stride == 2 {
-            for ((e, o), pair) in even.iter_mut().zip(odd.iter_mut()).zip(x.chunks_exact(2)) {
-                (*e, *o) = (pair[0], pair[1]);
+            for ((e, o), &[x0, x1]) in even.iter_mut().zip(odd.iter_mut()).zip(x.as_chunks().0) {
+                (*e, *o) = (x0, x1);
             }
         }
         let phase: [&[f32]; 2] = [&*even, &*odd];
@@ -318,7 +318,7 @@ fn kernel3_cols_simd<S: Simd>(
             let x = &input[b * ic * len..][..ic * len];
             let out = &mut out[b * s.out_channels * len..][..s.out_channels * len];
             for (t, col) in cols.chunks_exact_mut(ic3).enumerate() {
-                for (c, taps) in col.chunks_exact_mut(3).enumerate() {
+                for (c, taps) in col.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                     for (k, tap) in taps.iter_mut().enumerate() {
                         // Input `t + k - 1`, zero outside the row.
                         *tap = (t + k)
@@ -412,7 +412,7 @@ fn kernel3_simd<S: Simd>(
                 kernel3_tile8::<S, 1>(simd, s, padded, weights, tile, oc, 0);
                 oc += 1;
             }
-            for (y, t) in out.chunks_exact_mut(len).zip(tile.chunks_exact(8)) {
+            for (y, t) in out.chunks_exact_mut(len).zip(tile.as_chunks::<8>().0) {
                 y.copy_from_slice(&t[..len]);
             }
         }

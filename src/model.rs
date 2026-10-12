@@ -99,32 +99,26 @@ pub fn tensor_to_array(tensor: &TensorProto) -> Result<(Vec<f32>, Vec<usize>), M
         match tensor.data_type {
             1 => tensor
                 .raw_data
-                .chunks_exact(4)
-                .map(|chunk| {
-                    let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                    f32::from_le_bytes(bytes)
-                })
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&chunk| f32::from_le_bytes(chunk))
                 .collect(),
             2 => tensor.raw_data.iter().map(|&x| x as f32).collect(),
             3 => tensor.raw_data.iter().map(|&x| (x as i8) as f32).collect(),
             6 => tensor
                 .raw_data
-                .chunks_exact(4)
-                .map(|chunk| {
-                    let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                    i32::from_le_bytes(bytes) as f32
-                })
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&chunk| i32::from_le_bytes(chunk) as f32)
                 .collect(),
             7 => tensor
                 .raw_data
-                .chunks_exact(8)
-                .map(|chunk| {
-                    let bytes = [
-                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
-                        chunk[7],
-                    ];
-                    i64::from_le_bytes(bytes) as f32
-                })
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&chunk| i64::from_le_bytes(chunk) as f32)
                 .collect(),
             9 => tensor
                 .raw_data

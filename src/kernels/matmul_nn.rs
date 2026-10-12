@@ -216,7 +216,7 @@ fn pack_b<S: Simd>(
         let j = jc + jp * NR;
         let width = NR.min(jc + nc - j);
         if !b_cols {
-            for (p, row) in panel.chunks_exact_mut(NR).enumerate() {
+            for (p, row) in panel.as_chunks_mut::<NR>().0.iter_mut().enumerate() {
                 row[..width].copy_from_slice(&b[(pc + p) * ldb + j..][..width]);
                 row[width..].fill(0.0);
             }

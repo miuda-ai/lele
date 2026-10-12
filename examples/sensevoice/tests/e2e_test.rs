@@ -6,8 +6,8 @@ fn load_npy_f32(path: &str) -> Option<Vec<f32>> {
     let header_end = bytes.iter().position(|&b| b == b'\n')? + 1;
     let data = &bytes[header_end..];
     let mut out = Vec::with_capacity(data.len() / 4);
-    for chunk in data.chunks_exact(4) {
-        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for &chunk in data.as_chunks::<4>().0 {
+        out.push(f32::from_le_bytes(chunk));
     }
     Some(out)
 }
@@ -17,8 +17,8 @@ fn load_npy_i32_as_i64(path: &str) -> Option<Vec<i64>> {
     let header_end = bytes.iter().position(|&b| b == b'\n')? + 1;
     let data = &bytes[header_end..];
     let mut out = Vec::with_capacity(data.len() / 4);
-    for chunk in data.chunks_exact(4) {
-        out.push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as i64);
+    for &chunk in data.as_chunks::<4>().0 {
+        out.push(i32::from_le_bytes(chunk) as i64);
     }
     Some(out)
 }

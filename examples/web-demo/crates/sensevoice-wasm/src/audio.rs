@@ -37,16 +37,20 @@ pub fn decode_wav_bytes(data: &[u8]) -> Result<(Vec<f32>, u32), String> {
             let audio_data = &data[pos + 8..data.len().min(pos + 8 + chunk_size)];
             let samples: Vec<f32> = match bits_per_sample {
                 16 => audio_data
-                    .chunks_exact(2)
-                    .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&c| i16::from_le_bytes(c) as f32 / 32768.0)
                     .collect(),
                 8 => audio_data
                     .iter()
                     .map(|&b| (b as f32 - 128.0) / 128.0)
                     .collect(),
                 32 => audio_data
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&c| f32::from_le_bytes(c))
                     .collect(),
                 _ => return Err(format!("Unsupported bits per sample: {}", bits_per_sample)),
             };

@@ -107,7 +107,7 @@ impl Image {
     pub fn from_rgba(width: usize, height: usize, rgba: &[u8]) -> Self {
         // Convert RGBA to RGB
         let mut rgb = Vec::with_capacity(width * height * 3);
-        for pixel in rgba.chunks_exact(4) {
+        for pixel in rgba.as_chunks::<4>().0 {
             rgb.push(pixel[0]);
             rgb.push(pixel[1]);
             rgb.push(pixel[2]);

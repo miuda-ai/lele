@@ -161,8 +161,8 @@ fn rfft_scalar(
 ) {
     let m = fft.n / 2;
     let [mut xr, mut xi, mut yr, mut yi] = fft.split_scratch(scratch);
-    for (j, pair) in input.chunks_exact(2).enumerate() {
-        (xr[j], xi[j]) = (pair[0], pair[1]);
+    for (j, &[re, im]) in input.as_chunks().0.iter().enumerate() {
+        (xr[j], xi[j]) = (re, im);
     }
     for st in &fft.stages {
         let s = st.s;
