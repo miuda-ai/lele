@@ -243,12 +243,12 @@ fn solve_allocation(graph: &GraphProto, outputs: &[String]) -> (Allocator, Analy
                     // patterns (e.g. Conv+Sigmoid+Mul → Conv2d+SiLU consumes 3 nodes,
                     // Triple SiLU consumes 6 nodes)
                     for prev in 1..=5 {
-                        if id >= prev {
-                            if let Some(inps) = visitor.node_inputs.get(&(id - prev)) {
-                                input_bufs.extend(
-                                    inps.iter().filter_map(|n| all_allocations.get(n)).cloned(),
-                                );
-                            }
+                        if id >= prev
+                            && let Some(inps) = visitor.node_inputs.get(&(id - prev))
+                        {
+                            input_bufs.extend(
+                                inps.iter().filter_map(|n| all_allocations.get(n)).cloned(),
+                            );
                         }
                     }
                     let mut deferred = Vec::new();
@@ -1476,16 +1476,13 @@ impl Compiler {
             &mut code,
             "            let cache = self.quantized_weights_cache.borrow();"
         )?;
+        // A single `if let` with `filter`: let chains would need edition 2024,
+        // and the generated code also builds in edition 2021 crates.
         writeln!(
             &mut code,
-            "            if let Some((cached_scale, qw)) = cache.get(&key) {{"
+            "            if let Some((_, qw)) = cache.get(&key).filter(|(cached_scale, _)| cached_scale.len() == scale.data.len() && cached_scale.iter().zip(scale.data.iter()).all(|(a, b)| a.to_bits() == b.to_bits())) {{"
         )?;
-        writeln!(
-            &mut code,
-            "                if cached_scale.len() == scale.data.len() && cached_scale.iter().zip(scale.data.iter()).all(|(a, b)| a.to_bits() == b.to_bits()) {{"
-        )?;
-        writeln!(&mut code, "                    return qw.clone();")?;
-        writeln!(&mut code, "                }}")?;
+        writeln!(&mut code, "                return qw.clone();")?;
         writeln!(&mut code, "            }}")?;
         writeln!(&mut code, "        }}")?;
         writeln!(
@@ -1512,14 +1509,9 @@ impl Compiler {
         writeln!(&mut code, "        let key = (offset, len, k, n, signed);")?;
         writeln!(
             &mut code,
-            "        if let Some((z, s, w)) = self.qweights_cache.borrow().get(&key) {{"
+            "        if let Some((_, _, w)) = self.qweights_cache.borrow().get(&key).filter(|(z, s, _)| z.as_slice() == zero_point && s.as_slice() == scale) {{"
         )?;
-        writeln!(
-            &mut code,
-            "            if z.as_slice() == zero_point && s.as_slice() == scale {{"
-        )?;
-        writeln!(&mut code, "                return w.clone();")?;
-        writeln!(&mut code, "            }}")?;
+        writeln!(&mut code, "            return w.clone();")?;
         writeln!(&mut code, "        }}")?;
         writeln!(
             &mut code,
@@ -1547,11 +1539,9 @@ impl Compiler {
         )?;
         writeln!(
             &mut code,
-            "        if let Some((z, w)) = self.conv_weights_cache.borrow().get(&key) {{"
+            "        if let Some((_, w)) = self.conv_weights_cache.borrow().get(&key).filter(|(z, _)| z.as_slice() == zero_point) {{"
         )?;
-        writeln!(&mut code, "            if z.as_slice() == zero_point {{")?;
-        writeln!(&mut code, "                return w.clone();")?;
-        writeln!(&mut code, "            }}")?;
+        writeln!(&mut code, "            return w.clone();")?;
         writeln!(&mut code, "        }}")?;
         writeln!(
             &mut code,
@@ -1902,44 +1892,44 @@ fn collect_weights(
                 }
             }
 
-            if let Ok((bytes, shape, data_type)) = crate::model::tensor_to_vec_u8(t) {
-                if !bytes.is_empty() {
-                    // Compute content hash for deduplication
-                    let hash = compute_hash(&bytes);
+            if let Ok((bytes, shape, data_type)) = crate::model::tensor_to_vec_u8(t)
+                && !bytes.is_empty()
+            {
+                // Compute content hash for deduplication
+                let hash = compute_hash(&bytes);
 
-                    // Check if we already have identical weight content
-                    if let Some(&(existing_offset, existing_len)) = content_hash_map.get(&hash) {
-                        // Reuse existing offset, but keep current weight's shape and dtype
-                        if let Some(out_name) = node.output.first() {
-                            offset_map.push((
-                                out_name.clone(),
-                                existing_offset,
-                                existing_len,
-                                shape,
-                                data_type,
-                            ));
-                        }
-                    } else {
-                        // New weight: align, write, and record
-                        let remainder = *current_offset % 16;
-                        if remainder != 0 {
-                            let padding = 16 - remainder;
-                            bin_data.write_all(&vec![0u8; padding])?;
-                            *current_offset += padding;
-                        }
+                // Check if we already have identical weight content
+                if let Some(&(existing_offset, existing_len)) = content_hash_map.get(&hash) {
+                    // Reuse existing offset, but keep current weight's shape and dtype
+                    if let Some(out_name) = node.output.first() {
+                        offset_map.push((
+                            out_name.clone(),
+                            existing_offset,
+                            existing_len,
+                            shape,
+                            data_type,
+                        ));
+                    }
+                } else {
+                    // New weight: align, write, and record
+                    let remainder = *current_offset % 16;
+                    if remainder != 0 {
+                        let padding = 16 - remainder;
+                        bin_data.write_all(&vec![0u8; padding])?;
+                        *current_offset += padding;
+                    }
 
-                        bin_data.write_all(&bytes)?;
-                        if let Some(out_name) = node.output.first() {
-                            offset_map.push((
-                                out_name.clone(),
-                                *current_offset,
-                                bytes.len(),
-                                shape.clone(),
-                                data_type,
-                            ));
-                            content_hash_map.insert(hash, (*current_offset, bytes.len()));
-                            *current_offset += bytes.len();
-                        }
+                    bin_data.write_all(&bytes)?;
+                    if let Some(out_name) = node.output.first() {
+                        offset_map.push((
+                            out_name.clone(),
+                            *current_offset,
+                            bytes.len(),
+                            shape.clone(),
+                            data_type,
+                        ));
+                        content_hash_map.insert(hash, (*current_offset, bytes.len()));
+                        *current_offset += bytes.len();
                     }
                 }
             }

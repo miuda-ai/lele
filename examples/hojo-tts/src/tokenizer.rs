@@ -168,25 +168,22 @@ impl HojoTokenizer {
 
         // Post-processor template (single-sequence encode).
         let mut single_template: Vec<TemplateItem> = Vec::new();
-        if let Some(pp) = root.get("post_processor") {
-            if pp.get("type").and_then(|v| v.as_str()) == Some("TemplateProcessing") {
-                if let Some(single) = pp.get("single").and_then(|v| v.as_array()) {
-                    for item in single {
-                        if let Some(obj) = item.as_object() {
-                            if obj.contains_key("Sequence") {
-                                single_template.push(TemplateItem {
-                                    is_sequence: true,
-                                    token: "A".to_string(),
-                                });
-                            } else if let Some(st) =
-                                obj.get("SpecialToken").and_then(|v| v.as_str())
-                            {
-                                single_template.push(TemplateItem {
-                                    is_sequence: false,
-                                    token: st.to_string(),
-                                });
-                            }
-                        }
+        if let Some(pp) = root.get("post_processor")
+            && pp.get("type").and_then(|v| v.as_str()) == Some("TemplateProcessing")
+            && let Some(single) = pp.get("single").and_then(|v| v.as_array())
+        {
+            for item in single {
+                if let Some(obj) = item.as_object() {
+                    if obj.contains_key("Sequence") {
+                        single_template.push(TemplateItem {
+                            is_sequence: true,
+                            token: "A".to_string(),
+                        });
+                    } else if let Some(st) = obj.get("SpecialToken").and_then(|v| v.as_str()) {
+                        single_template.push(TemplateItem {
+                            is_sequence: false,
+                            token: st.to_string(),
+                        });
                     }
                 }
             }

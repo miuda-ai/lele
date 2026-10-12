@@ -255,28 +255,29 @@ pub fn get_default_patterns() -> Vec<Pattern> {
 
                 // A static weight is packed once for the integer GEMM.
                 let weight_name = sanitize_name(&nodes[2].input[1]);
-                if let Some((o, l, sh, dt)) = weights.get(&weight_name) {
-                    if (*dt == 3 || *dt == 2) && sh.len() == 2 {
-                        let k = sh[0];
-                        let n = sh[1];
-                        writeln!(
-                            w,
-                            "{}let {} = self.linear_quantized_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {}, true, {});",
-                            tab,
-                            output_name,
-                            input,
-                            *o,
-                            *l,
-                            k,
-                            n,
-                            *dt == 3,
-                            weight_scale,
-                            weight_zero,
-                            bias,
-                            buf_expr
-                        )?;
-                        return Ok(());
-                    }
+                if let Some((o, l, sh, dt)) = weights.get(&weight_name)
+                    && (*dt == 3 || *dt == 2)
+                    && sh.len() == 2
+                {
+                    let k = sh[0];
+                    let n = sh[1];
+                    writeln!(
+                        w,
+                        "{}let {} = self.linear_quantized_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {}, true, {});",
+                        tab,
+                        output_name,
+                        input,
+                        *o,
+                        *l,
+                        k,
+                        n,
+                        *dt == 3,
+                        weight_scale,
+                        weight_zero,
+                        bias,
+                        buf_expr
+                    )?;
+                    return Ok(());
                 }
 
                 writeln!(
@@ -396,28 +397,29 @@ pub fn get_default_patterns() -> Vec<Pattern> {
 
                 // A static weight is packed once for the integer GEMM.
                 let weight_name = sanitize_name(&nodes[2].input[1]);
-                if let Some((o, l, sh, dt)) = weights.get(&weight_name) {
-                    if (*dt == 3 || *dt == 2) && sh.len() == 2 {
-                        let k = sh[0];
-                        let n = sh[1];
-                        writeln!(
-                            w,
-                            "{}let {} = self.linear_quantized_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {}, false, {});",
-                            tab,
-                            output_name,
-                            input,
-                            *o,
-                            *l,
-                            k,
-                            n,
-                            *dt == 3,
-                            weight_scale,
-                            weight_zero,
-                            bias,
-                            buf_expr
-                        )?;
-                        return Ok(());
-                    }
+                if let Some((o, l, sh, dt)) = weights.get(&weight_name)
+                    && (*dt == 3 || *dt == 2)
+                    && sh.len() == 2
+                {
+                    let k = sh[0];
+                    let n = sh[1];
+                    writeln!(
+                        w,
+                        "{}let {} = self.linear_quantized_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {}, false, {});",
+                        tab,
+                        output_name,
+                        input,
+                        *o,
+                        *l,
+                        k,
+                        n,
+                        *dt == 3,
+                        weight_scale,
+                        weight_zero,
+                        bias,
+                        buf_expr
+                    )?;
+                    return Ok(());
                 }
 
                 writeln!(
@@ -1111,10 +1113,10 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                                w: &mut dyn std::io::Write,
                                allocator: Option<&super::Allocator>|
                  -> std::io::Result<String> {
-                    if let Some(alloc) = allocator {
-                        if let Some(&idx) = alloc.tensor_to_buffer.get(out_key) {
-                            return Ok(format!("&mut ws.buf_{}", idx));
-                        }
+                    if let Some(alloc) = allocator
+                        && let Some(&idx) = alloc.tensor_to_buffer.get(out_key)
+                    {
+                        return Ok(format!("&mut ws.buf_{}", idx));
                     }
                     writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, name)?;
                     Ok(format!("&mut buf_{}", name))
@@ -1188,10 +1190,10 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                                w: &mut dyn std::io::Write,
                                allocator: Option<&super::Allocator>|
                  -> std::io::Result<String> {
-                    if let Some(alloc) = allocator {
-                        if let Some(&idx) = alloc.tensor_to_buffer.get(out_key) {
-                            return Ok(format!("&mut ws.buf_{}", idx));
-                        }
+                    if let Some(alloc) = allocator
+                        && let Some(&idx) = alloc.tensor_to_buffer.get(out_key)
+                    {
+                        return Ok(format!("&mut ws.buf_{}", idx));
                     }
                     writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, name)?;
                     Ok(format!("&mut buf_{}", name))

@@ -95,18 +95,18 @@ pub(crate) fn infer_variable_types(
 
     let constant_of_shape_output_type = |node: &NodeProto| -> String {
         let mut out_type = "f32".to_string();
-        if let Some(attr) = node.attribute.iter().find(|a| a.name == "value") {
-            if let Some(t) = &attr.t {
-                let dt = t.data_type;
-                if dt == 6 || dt == 7 {
-                    out_type = "i64".to_string();
-                } else if dt == 1 || dt == 10 {
-                    out_type = "f32".to_string();
-                } else if !t.int64_data.is_empty() || !t.int32_data.is_empty() {
-                    out_type = "i64".to_string();
-                } else if !t.float_data.is_empty() {
-                    out_type = "f32".to_string();
-                }
+        if let Some(attr) = node.attribute.iter().find(|a| a.name == "value")
+            && let Some(t) = &attr.t
+        {
+            let dt = t.data_type;
+            if dt == 6 || dt == 7 {
+                out_type = "i64".to_string();
+            } else if dt == 1 || dt == 10 {
+                out_type = "f32".to_string();
+            } else if !t.int64_data.is_empty() || !t.int32_data.is_empty() {
+                out_type = "i64".to_string();
+            } else if !t.float_data.is_empty() {
+                out_type = "f32".to_string();
             }
         }
         out_type
@@ -120,18 +120,18 @@ pub(crate) fn infer_variable_types(
         let name = sanitize_name(&input.name);
         let mut ty_str = "f32".to_string();
 
-        if let Some(ty) = &input.r#type {
-            if let Some(val) = &ty.value {
-                use crate::model::onnx_proto::type_proto::Value;
-                match val {
-                    Value::TensorType(tt) => {
-                        // 6=INT32, 7=INT64, 9=BOOL
-                        if tt.elem_type == 7 || tt.elem_type == 6 || tt.elem_type == 9 {
-                            ty_str = "i64".to_string();
-                        }
+        if let Some(ty) = &input.r#type
+            && let Some(val) = &ty.value
+        {
+            use crate::model::onnx_proto::type_proto::Value;
+            match val {
+                Value::TensorType(tt) => {
+                    // 6=INT32, 7=INT64, 9=BOOL
+                    if tt.elem_type == 7 || tt.elem_type == 6 || tt.elem_type == 9 {
+                        ty_str = "i64".to_string();
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
         types.insert(name.clone(), ty_str);
@@ -170,18 +170,18 @@ pub(crate) fn infer_variable_types(
                     // ConstantOfShape output type depends on the "value" attribute.
                     // Default is float (f32) if not specified.
                     let mut out_type = "f32".to_string();
-                    if let Some(attr) = node.attribute.iter().find(|a| a.name == "value") {
-                        if let Some(t) = &attr.t {
-                            let dt = t.data_type;
-                            if dt == 6 || dt == 7 || dt == 9 {
-                                out_type = "i64".to_string();
-                            } else if dt == 1 || dt == 10 || dt == 11 {
-                                out_type = "f32".to_string();
-                            } else if !t.int64_data.is_empty() || !t.int32_data.is_empty() {
-                                out_type = "i64".to_string();
-                            } else if !t.float_data.is_empty() {
-                                out_type = "f32".to_string();
-                            }
+                    if let Some(attr) = node.attribute.iter().find(|a| a.name == "value")
+                        && let Some(t) = &attr.t
+                    {
+                        let dt = t.data_type;
+                        if dt == 6 || dt == 7 || dt == 9 {
+                            out_type = "i64".to_string();
+                        } else if dt == 1 || dt == 10 || dt == 11 {
+                            out_type = "f32".to_string();
+                        } else if !t.int64_data.is_empty() || !t.int32_data.is_empty() {
+                            out_type = "i64".to_string();
+                        } else if !t.float_data.is_empty() {
+                            out_type = "f32".to_string();
                         }
                     }
                     for out in &node.output {
@@ -442,12 +442,11 @@ pub(crate) fn infer_variable_types(
                         if inp.is_empty() {
                             continue;
                         }
-                        if let Some(prod) = producer_map.get(inp) {
-                            if prod.op_type == "ConstantOfShape" {
-                                if constant_of_shape_output_type(prod) == "f32" {
-                                    has_const_of_shape_f32 = true;
-                                }
-                            }
+                        if let Some(prod) = producer_map.get(inp)
+                            && prod.op_type == "ConstantOfShape"
+                            && constant_of_shape_output_type(prod) == "f32"
+                        {
+                            has_const_of_shape_f32 = true;
                         }
                     }
 
@@ -488,24 +487,26 @@ pub(crate) fn infer_variable_types(
                     // Input 0 and output share type. Input 1 (indices) is i64.
                     let mut has_f32 = false;
                     let mut has_i64 = false;
-                    if !node.input.is_empty() && !node.input[0].is_empty() {
-                        if let Some(t) = types.get(&sanitize_name(&node.input[0])) {
-                            if t == "f32" {
-                                has_f32 = true;
-                            }
-                            if t == "i64" {
-                                has_i64 = true;
-                            }
+                    if !node.input.is_empty()
+                        && !node.input[0].is_empty()
+                        && let Some(t) = types.get(&sanitize_name(&node.input[0]))
+                    {
+                        if t == "f32" {
+                            has_f32 = true;
+                        }
+                        if t == "i64" {
+                            has_i64 = true;
                         }
                     }
-                    if !node.output.is_empty() && !node.output[0].is_empty() {
-                        if let Some(t) = types.get(&sanitize_name(&node.output[0])) {
-                            if t == "f32" {
-                                has_f32 = true;
-                            }
-                            if t == "i64" {
-                                has_i64 = true;
-                            }
+                    if !node.output.is_empty()
+                        && !node.output[0].is_empty()
+                        && let Some(t) = types.get(&sanitize_name(&node.output[0]))
+                    {
+                        if t == "f32" {
+                            has_f32 = true;
+                        }
+                        if t == "i64" {
+                            has_i64 = true;
                         }
                     }
 
@@ -546,25 +547,27 @@ pub(crate) fn infer_variable_types(
                     let mut has_f32 = false;
                     let mut has_i64 = false;
                     for idx in [1, 2] {
-                        if node.input.len() > idx && !node.input[idx].is_empty() {
-                            if let Some(t) = types.get(&sanitize_name(&node.input[idx])) {
-                                if t == "f32" {
-                                    has_f32 = true;
-                                }
-                                if t == "i64" {
-                                    has_i64 = true;
-                                }
-                            }
-                        }
-                    }
-                    if !node.output.is_empty() && !node.output[0].is_empty() {
-                        if let Some(t) = types.get(&sanitize_name(&node.output[0])) {
+                        if node.input.len() > idx
+                            && !node.input[idx].is_empty()
+                            && let Some(t) = types.get(&sanitize_name(&node.input[idx]))
+                        {
                             if t == "f32" {
                                 has_f32 = true;
                             }
                             if t == "i64" {
                                 has_i64 = true;
                             }
+                        }
+                    }
+                    if !node.output.is_empty()
+                        && !node.output[0].is_empty()
+                        && let Some(t) = types.get(&sanitize_name(&node.output[0]))
+                    {
+                        if t == "f32" {
+                            has_f32 = true;
+                        }
+                        if t == "i64" {
+                            has_i64 = true;
                         }
                     }
 

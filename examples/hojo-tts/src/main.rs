@@ -185,10 +185,10 @@ fn build_prompt(
 fn build_id_to_code(tk: &HojoTokenizer) -> HashMap<i64, i64> {
     let mut map = HashMap::new();
     for id in 0..(tk.vocab_size() as u32) {
-        if let Some(s) = tk.id_to_token_str(id) {
-            if let Some(code) = parse_speech_token(s) {
-                map.insert(id as i64, code);
-            }
+        if let Some(s) = tk.id_to_token_str(id)
+            && let Some(code) = parse_speech_token(s)
+        {
+            map.insert(id as i64, code);
         }
     }
     map

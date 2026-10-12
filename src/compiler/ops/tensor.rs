@@ -307,10 +307,10 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 .find(|a| a.name == "value")
                 .and_then(|a| a.t.as_ref())
                 .map(|t| {
-                    if let Ok((data, _)) = crate::model::tensor_to_array(t) {
-                        if !data.is_empty() {
-                            return data[0];
-                        }
+                    if let Ok((data, _)) = crate::model::tensor_to_array(t)
+                        && !data.is_empty()
+                    {
+                        return data[0];
                     }
                     0.0
                 })

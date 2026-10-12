@@ -3120,10 +3120,8 @@ fn embedding_concat_i64<'c, 'd>(
         let key = (offset, len, k, n);
         {
             let cache = self.quantized_weights_cache.borrow();
-            if let Some((cached_scale, qw)) = cache.get(&key) {
-                if cached_scale.len() == scale.data.len() && cached_scale.iter().zip(scale.data.iter()).all(|(a, b)| a.to_bits() == b.to_bits()) {
-                    return qw.clone();
-                }
+            if let Some((_, qw)) = cache.get(&key).filter(|(cached_scale, _)| cached_scale.len() == scale.data.len() && cached_scale.iter().zip(scale.data.iter()).all(|(a, b)| a.to_bits() == b.to_bits())) {
+                return qw.clone();
             }
         }
         let raw = &self.data[offset..offset+len];
@@ -3134,10 +3132,8 @@ fn embedding_concat_i64<'c, 'd>(
     #[allow(dead_code)]
     fn get_qweights(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool, zero_point: &[f32], scale: &[f32]) -> std::sync::Arc<lele::kernels::QWeights> {
         let key = (offset, len, k, n, signed);
-        if let Some((z, s, w)) = self.qweights_cache.borrow().get(&key) {
-            if z.as_slice() == zero_point && s.as_slice() == scale {
-                return w.clone();
-            }
+        if let Some((_, _, w)) = self.qweights_cache.borrow().get(&key).filter(|(z, s, _)| z.as_slice() == zero_point && s.as_slice() == scale) {
+            return w.clone();
         }
         let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();
         let w = std::sync::Arc::new(lele::kernels::QWeights::new(&self.data[offset..offset + len], k, n, signed, &zp, scale));
@@ -3147,10 +3143,8 @@ fn embedding_concat_i64<'c, 'd>(
     #[allow(dead_code)]
     fn get_conv_weights(&self, offset: usize, len: usize, shape: [usize; 4], groups: usize, signed: bool, zero_point: &[f32]) -> std::sync::Arc<lele::kernels::ConvWeights> {
         let key = (offset, len, groups, signed);
-        if let Some((z, w)) = self.conv_weights_cache.borrow().get(&key) {
-            if z.as_slice() == zero_point {
-                return w.clone();
-            }
+        if let Some((_, w)) = self.conv_weights_cache.borrow().get(&key).filter(|(z, _)| z.as_slice() == zero_point) {
+            return w.clone();
         }
         let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();
         let w = std::sync::Arc::new(lele::kernels::ConvWeights::new(&self.data[offset..offset + len], &shape, groups, signed, &zp));

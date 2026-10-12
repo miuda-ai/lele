@@ -395,10 +395,12 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 .map(|a| a.ints.clone())
                 .unwrap_or(vec![]);
             // If axes attribute is empty, check second input
-            if axes.is_empty() && inputs.len() > 1 && !ctx.node.input[1].is_empty() {
-                if let Some((data, _shape)) = ctx.int64_map.get(&ctx.node.input[1]) {
-                    axes = data.clone();
-                }
+            if axes.is_empty()
+                && inputs.len() > 1
+                && !ctx.node.input[1].is_empty()
+                && let Some((data, _shape)) = ctx.int64_map.get(&ctx.node.input[1])
+            {
+                axes = data.clone();
             }
             let keepdims = ctx
                 .node
@@ -423,10 +425,12 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 .map(|a| a.ints.clone())
                 .unwrap_or(vec![]);
             // If axes attribute is empty, check second input
-            if axes.is_empty() && inputs.len() > 1 && !ctx.node.input[1].is_empty() {
-                if let Some((data, _shape)) = ctx.int64_map.get(&ctx.node.input[1]) {
-                    axes = data.clone();
-                }
+            if axes.is_empty()
+                && inputs.len() > 1
+                && !ctx.node.input[1].is_empty()
+                && let Some((data, _shape)) = ctx.int64_map.get(&ctx.node.input[1])
+            {
+                axes = data.clone();
             }
             let keepdims = ctx
                 .node

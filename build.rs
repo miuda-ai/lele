@@ -14,9 +14,9 @@ fn main() {
     // Downstream crates compiled with stable Rust will skip all std::simd code
     // automatically without needing to set any feature flag.
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    if let Ok(out) = std::process::Command::new(&rustc).arg("--version").output() {
-        if String::from_utf8_lossy(&out.stdout).contains("nightly") {
-            println!("cargo:rustc-cfg=nightly_build");
-        }
+    if let Ok(out) = std::process::Command::new(&rustc).arg("--version").output()
+        && String::from_utf8_lossy(&out.stdout).contains("nightly")
+    {
+        println!("cargo:rustc-cfg=nightly_build");
     }
 }
