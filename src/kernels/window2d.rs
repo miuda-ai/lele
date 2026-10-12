@@ -294,7 +294,14 @@ fn depthwise_simd<S: Simd>(
 /// # Safety
 ///
 /// `(R - 1) * row_step + max(taps) + 16 <= x.len()`.
-#[inline(always)]
+///
+/// Inlined in optimized builds only. `depthwise_simd` calls it in 18 places,
+/// and unoptimized builds give every temporary of every inlined copy its own
+/// stack slot: inlined there, the frame grew past 1 MiB and overflowed test
+/// threads. Out of line it runs without the caller's target features, which
+/// only costs speed.
+#[cfg_attr(debug_assertions, inline(never))]
+#[cfg_attr(not(debug_assertions), inline(always))]
 unsafe fn depthwise_rows<S: Simd, const R: usize>(
     simd: S,
     x: &[f32],

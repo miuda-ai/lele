@@ -545,6 +545,83 @@ fn bench_matmul_fused_add(c: &mut Criterion) {
 }
 
 // ============================================================================
+// Depthwise Conv2d / MaxPool Benchmarks
+// ============================================================================
+
+fn bench_window2d(c: &mut Criterion) {
+    let mut group = c.benchmark_group("window2d");
+
+    // (channels, h, w, kernel, stride, pad): 3x3 and 5x5 have unrolled tap
+    // loops, 7x7 takes the generic one, stride 2 the scalar one.
+    let cases = [
+        (64, 56, 56, 3, 1, 1),
+        (96, 28, 28, 5, 1, 2),
+        (32, 32, 32, 7, 1, 3),
+        (64, 56, 56, 3, 2, 1),
+    ];
+    for &(ch, h, w, k, s, p) in &cases {
+        let x: Vec<f32> = (0..ch * h * w)
+            .map(|i| (i as f32 % 10.0) * 0.1 - 0.5)
+            .collect();
+        let wt: Vec<f32> = (0..ch * k * k)
+            .map(|i| (i as f32 % 7.0) * 0.1 - 0.3)
+            .collect();
+        let b: Vec<f32> = (0..ch).map(|i| i as f32 * 0.01).collect();
+        let input = TensorView::from_slice(&x, vec![1, ch, h, w]);
+        let weights = TensorView::from_slice(&wt, vec![ch, 1, k, k]);
+        let bias = TensorView::from_slice(&b, vec![ch]);
+        let (pads, strides, dil) = ([p as i64; 4], [s as i64; 2], [1i64; 2]);
+        let mut out = Vec::new();
+        let name = format!("{}x{}x{}_k{}_s{}", ch, h, w, k, s);
+
+        group.throughput(Throughput::Elements((ch * h * w) as u64));
+        group.bench_function(BenchmarkId::new("depthwise", &name), |bencher| {
+            bencher.iter(|| {
+                let _ = lele::kernels::conv2d(
+                    black_box(&input),
+                    &weights,
+                    Some(&bias),
+                    &dil,
+                    ch as i64,
+                    &pads,
+                    &strides,
+                    &mut out,
+                );
+            });
+        });
+        group.bench_function(BenchmarkId::new("depthwise_silu", &name), |bencher| {
+            bencher.iter(|| {
+                let _ = lele::kernels::conv2d_silu(
+                    black_box(&input),
+                    &weights,
+                    Some(&bias),
+                    &dil,
+                    ch as i64,
+                    &pads,
+                    &strides,
+                    &mut out,
+                );
+            });
+        });
+        group.bench_function(BenchmarkId::new("max_pool", &name), |bencher| {
+            bencher.iter(|| {
+                let _ = lele::kernels::max_pool2d(
+                    black_box(&input),
+                    &[k as i64; 2],
+                    &strides,
+                    &pads,
+                    &dil,
+                    false,
+                    &mut out,
+                );
+            });
+        });
+    }
+
+    group.finish();
+}
+
+// ============================================================================
 // Feature Extraction Benchmarks
 // ============================================================================
 
@@ -589,6 +666,7 @@ criterion_group!(
     bench_leaky_relu,
     bench_matmul_fused_add,
     bench_activations,
+    bench_window2d,
     bench_sensevoice_frontend,
 );
 
