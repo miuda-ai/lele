@@ -120,7 +120,11 @@ fn test_sensevoice_matches_ort() {
     let mut ws = sensevoice_example::sensevoice::SenseVoiceWorkspace::new();
     let logits = model.forward_with_workspace(&mut ws, x_tv, x_len_tv, lang_tv, tn_tv);
 
-    assert_eq!(logits.data.len(), ort_logits.len(), "logits length mismatch");
+    assert_eq!(
+        logits.data.len(),
+        ort_logits.len(),
+        "logits length mismatch"
+    );
 
     let mut max_diff = 0.0f32;
     let mut max_idx = 0;
@@ -141,7 +145,10 @@ fn test_sensevoice_matches_ort() {
     assert!(
         mae <= 1.0,
         "sensevoice_logits mae {:.4} too large (got {:.4}, expected {:.4} at idx {})",
-        mae, logits.data[max_idx], ort_logits[max_idx], max_idx,
+        mae,
+        logits.data[max_idx],
+        ort_logits[max_idx],
+        max_idx,
     );
 
     // Check argmax of first row matches
@@ -167,11 +174,7 @@ fn test_sensevoice_matches_ort() {
                 .0
         })
         .collect();
-    assert_eq!(
-        our_argmax.len(),
-        ort_argmax.len(),
-        "argmax length mismatch"
-    );
+    assert_eq!(our_argmax.len(), ort_argmax.len(), "argmax length mismatch");
     let matching = our_argmax
         .iter()
         .zip(ort_argmax.iter())

@@ -1,7 +1,11 @@
 use lele_build::*;
 use std::path::Path;
 
-fn generate_stub(class_name: &str, output_dir: &Path, error_msg: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn generate_stub(
+    class_name: &str,
+    output_dir: &Path,
+    error_msg: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(output_dir)?;
     let rs_filename = format!("{}.rs", class_name.to_lowercase());
 
@@ -84,9 +88,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Download all supertonic files
     let model_toml = "../../../../examples/supertonic/model.toml";
     if let Ok(config) = config::ModelConfig::load(model_toml) {
-        if let config::ModelSource::HuggingFaceHub { repo, revision, files } = &config.model {
+        if let config::ModelSource::HuggingFaceHub {
+            repo,
+            revision,
+            files,
+        } = &config.model
+        {
             for file_spec in files {
-                let dest_name = file_spec.dest.as_ref().map(|s| s.as_str()).unwrap_or(&file_spec.file);
+                let dest_name = file_spec
+                    .dest
+                    .as_ref()
+                    .map(|s| s.as_str())
+                    .unwrap_or(&file_spec.file);
                 let dest_path = Path::new(dest_name);
                 if dest_path.exists() && !should_force_regenerate() {
                     continue;
@@ -94,13 +107,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(parent) = dest_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                match download_from_hf_hub(repo, &file_spec.file, revision.as_deref(), Some(&get_model_cache_dir())) {
+                match download_from_hf_hub(
+                    repo,
+                    &file_spec.file,
+                    revision.as_deref(),
+                    Some(&get_model_cache_dir()),
+                ) {
                     Ok(cached_path) => {
                         if cached_path != dest_path {
                             std::fs::copy(&cached_path, dest_path)?;
                         }
                     }
-                    Err(e) => println!("cargo:warning=Failed to download {}: {}", file_spec.file, e),
+                    Err(e) => {
+                        println!("cargo:warning=Failed to download {}: {}", file_spec.file, e)
+                    }
                 }
             }
         }
@@ -132,7 +152,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("cargo:warning=Generating code for {}...", class_name);
         if let Err(e) = generate_model_code(onnx_path, class_name, output_dir, &[]) {
-            println!("cargo:warning=Failed to generate code for {}: {}", class_name, e);
+            println!(
+                "cargo:warning=Failed to generate code for {}: {}",
+                class_name, e
+            );
             generate_stub(class_name, output_dir, &e.to_string())?;
         }
     }

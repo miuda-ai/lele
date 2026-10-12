@@ -95,7 +95,10 @@ fn main() {
 
     // Warmup run
     {
-        let input_data: Vec<f32> = padded_audio[..chunk_size].iter().map(|&x| x * 32768.0).collect();
+        let input_data: Vec<f32> = padded_audio[..chunk_size]
+            .iter()
+            .map(|&x| x * 32768.0)
+            .collect();
         let input = TensorView::from_owned(input_data, vec![1, chunk_size]);
         let state = TensorView::from_owned(state_data.clone(), vec![2, 1, 128]);
         let sr = TensorView::from_slice(&sr_data, vec![1]);
@@ -142,7 +145,11 @@ fn main() {
         infer_elapsed.as_secs_f64() * 1000.0,
         num_chunks - 1,
     );
-    println!("✓ Avg per chunk: {:.2}µs ({:.4}ms)", avg_chunk_us, avg_chunk_us / 1000.0);
+    println!(
+        "✓ Avg per chunk: {:.2}µs ({:.4}ms)",
+        avg_chunk_us,
+        avg_chunk_us / 1000.0
+    );
     println!("✓ RTF: {:.4} (Audio: {:.2}s)", rtf, audio_duration);
 
     let max_prob = all_outputs.iter().cloned().fold(0.0f32, f32::max);

@@ -37,12 +37,7 @@ impl<'a> {name}<'a> {{
     Ok(())
 }
 
-fn download_model_files(
-    repo: &str,
-    revision: &str,
-    files: &[(&str, &str)],
-    model_dir: &Path,
-) {
+fn download_model_files(repo: &str, revision: &str, files: &[(&str, &str)], model_dir: &Path) {
     for (file, dest_rel) in files {
         let dest_path = model_dir.join(dest_rel);
         if dest_path.exists() {
@@ -54,7 +49,12 @@ fn download_model_files(
         match download_from_hf_hub(repo, file, Some(revision), Some(&get_model_cache_dir())) {
             Ok(cached_path) => {
                 std::fs::copy(&cached_path, &dest_path).ok();
-                println!("cargo:warning=Downloaded: {}/{} -> {}", repo, file, dest_path.display());
+                println!(
+                    "cargo:warning=Downloaded: {}/{} -> {}",
+                    repo,
+                    file,
+                    dest_path.display()
+                );
             }
             Err(e) => {
                 println!("cargo:warning=Failed to download {}/{}: {}", repo, file, e);
@@ -80,7 +80,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("moss_tts_prefill.onnx", "moss_tts_prefill.onnx"),
         ("moss_tts_global_shared.data", "moss_tts_global_shared.data"),
         ("moss_tts_decode_step.onnx", "moss_tts_decode_step.onnx"),
-        ("moss_tts_local_fixed_sampled_frame.onnx", "moss_tts_local_fixed_sampled_frame.onnx"),
+        (
+            "moss_tts_local_fixed_sampled_frame.onnx",
+            "moss_tts_local_fixed_sampled_frame.onnx",
+        ),
         ("moss_tts_local_shared.data", "moss_tts_local_shared.data"),
         ("tokenizer.model", "tokenizer.model"),
         ("tts_browser_onnx_meta.json", "tts_browser_onnx_meta.json"),
@@ -95,9 +98,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Download codec model files
     let codec_files = [
-        ("moss_audio_tokenizer_decode_full.onnx", "moss_audio_tokenizer_decode_full.onnx"),
-        ("moss_audio_tokenizer_decode_shared.data", "moss_audio_tokenizer_decode_shared.data"),
-        ("codec_browser_onnx_meta.json", "codec_browser_onnx_meta.json"),
+        (
+            "moss_audio_tokenizer_decode_full.onnx",
+            "moss_audio_tokenizer_decode_full.onnx",
+        ),
+        (
+            "moss_audio_tokenizer_decode_shared.data",
+            "moss_audio_tokenizer_decode_shared.data",
+        ),
+        (
+            "codec_browser_onnx_meta.json",
+            "codec_browser_onnx_meta.json",
+        ),
     ];
     download_model_files(
         "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX",
@@ -112,21 +124,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let models = [
         ("moss_tts_prefill.onnx", &tts_dir, "Prefill"),
         ("moss_tts_decode_step.onnx", &tts_dir, "DecodeStep"),
-        ("moss_tts_local_fixed_sampled_frame.onnx", &tts_dir, "LocalFixedSampledFrame"),
-        ("moss_audio_tokenizer_decode_full.onnx", &codec_dir, "CodecDecodeFull"),
+        (
+            "moss_tts_local_fixed_sampled_frame.onnx",
+            &tts_dir,
+            "LocalFixedSampledFrame",
+        ),
+        (
+            "moss_audio_tokenizer_decode_full.onnx",
+            &codec_dir,
+            "CodecDecodeFull",
+        ),
     ];
 
     for (onnx_name, dir, class_name) in models {
         let onnx_path = dir.join(onnx_name);
         if !onnx_path.exists() {
             println!("cargo:warning=ONNX file not found: {}", onnx_path.display());
-            generate_custom_stub(class_name, output_dir, &format!("{} not found", onnx_path.display()))?;
+            generate_custom_stub(
+                class_name,
+                output_dir,
+                &format!("{} not found", onnx_path.display()),
+            )?;
             continue;
         }
 
         println!("cargo:warning=Generating code for {}...", class_name);
         if let Err(e) = generate_model_code(&onnx_path, class_name, output_dir, &[]) {
-            println!("cargo:warning=Failed to generate code for {}: {}", class_name, e);
+            println!(
+                "cargo:warning=Failed to generate code for {}: {}",
+                class_name, e
+            );
             generate_custom_stub(class_name, output_dir, &e.to_string())?;
         }
     }

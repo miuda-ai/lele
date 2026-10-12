@@ -19,8 +19,7 @@ fn load_npy_i64(path: &str) -> Option<Vec<i64>> {
     let mut out = Vec::with_capacity(data.len() / 8);
     for chunk in data.chunks_exact(8) {
         out.push(i64::from_le_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3],
-            chunk[4], chunk[5], chunk[6], chunk[7],
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]));
     }
     Some(out)
@@ -135,15 +134,26 @@ fn test_silero_vad_matches_ort() {
     let mut ws = silero_example::silerovad::SileroVadWorkspace::new();
     let (output, state_out) = model.forward_with_workspace(&mut ws, input_tv, state_tv, sr_tv);
 
-    assert_eq!(output.data.len(), ort_output.len(), "output length mismatch");
+    assert_eq!(
+        output.data.len(),
+        ort_output.len(),
+        "output length mismatch"
+    );
     let (diff, idx) = max_diff(&output.data, &ort_output);
     assert!(
         diff <= 1e-4,
         "silero_output max_diff {:.6e} at idx {} (got {:.8}, expected {:.8})",
-        diff, idx, output.data[idx], ort_output[idx],
+        diff,
+        idx,
+        output.data[idx],
+        ort_output[idx],
     );
 
-    assert_eq!(state_out.data.len(), ort_state.len(), "state length mismatch");
+    assert_eq!(
+        state_out.data.len(),
+        ort_state.len(),
+        "state length mismatch"
+    );
     let (diff, idx) = max_diff(&state_out.data, &ort_state);
     // NOTE: GRU state may differ from ORT due to implementation differences.
     // The output probability is the primary accuracy metric.

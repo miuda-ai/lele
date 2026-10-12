@@ -83,7 +83,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config::ModelSource::Local { files } => {
             for file_spec in files {
                 if !Path::new(&file_spec.path).exists() {
-                    println!("cargo:warning=Local model file not found: {}", file_spec.path);
+                    println!(
+                        "cargo:warning=Local model file not found: {}",
+                        file_spec.path
+                    );
                 }
                 if let Some(dest) = &file_spec.dest {
                     let dest_path = Path::new(dest);
@@ -130,7 +133,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if cached_path != dest_path {
                             std::fs::copy(&cached_path, dest_path)?;
                         }
-                        println!("cargo:warning=Downloaded: {} -> {}", file_spec.file, dest_name);
+                        println!(
+                            "cargo:warning=Downloaded: {} -> {}",
+                            file_spec.file, dest_name
+                        );
                     }
                     Err(e) => {
                         println!("cargo:warning=Failed to download {}: {}", file_spec.file, e);
@@ -148,7 +154,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::fs::create_dir_all(parent)?;
                 }
                 if let Err(e) = download_from_url(&file_spec.url, dest_path) {
-                    println!("cargo:warning=Failed to download from {}: {}", file_spec.url, e);
+                    println!(
+                        "cargo:warning=Failed to download from {}: {}",
+                        file_spec.url, e
+                    );
                 }
             }
         }
@@ -172,12 +181,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let rs_path = output_dir.join(format!("{}.rs", class_name.to_lowercase()));
         if rs_path.exists() && std::env::var("LELE_SKIP_GEN").is_ok() {
-            println!("cargo:warning=Skipping code generation for {} (LELE_SKIP_GEN)", class_name);
+            println!(
+                "cargo:warning=Skipping code generation for {} (LELE_SKIP_GEN)",
+                class_name
+            );
             continue;
         }
         println!("cargo:warning=Generating code for {}...", class_name);
         match generate_model_code(onnx_path, class_name, output_dir, &[]) {
-            Ok(()) => println!("cargo:warning=Code generation successful for {}", class_name),
+            Ok(()) => println!(
+                "cargo:warning=Code generation successful for {}",
+                class_name
+            ),
             Err(e) => {
                 println!(
                     "cargo:warning=Failed to generate code for {}: {}",

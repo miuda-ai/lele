@@ -91,21 +91,37 @@ fn test_yolo26_matches_ort() {
     let mut ws = yolo26_example::yolo26::Yolo26Workspace::new();
     let (logits, pred_boxes) = model.forward_with_workspace(&mut ws, input_tv);
 
-    assert_eq!(logits.data.len(), ort_logits.len(), "logits length mismatch");
+    assert_eq!(
+        logits.data.len(),
+        ort_logits.len(),
+        "logits length mismatch"
+    );
 
     // Logits can have large absolute differences but same ranking.
     // Check correlation: mean absolute error and top-class agreement.
     let (max_d, _) = max_diff(&logits.data, &ort_logits);
-    let sum_abs: f32 = logits.data.iter().zip(ort_logits.iter()).map(|(a, b)| (a - b).abs()).sum();
+    let sum_abs: f32 = logits
+        .data
+        .iter()
+        .zip(ort_logits.iter())
+        .map(|(a, b)| (a - b).abs())
+        .sum();
     let mae = sum_abs / logits.data.len() as f32;
     eprintln!("yolo26_logits max_diff={:.4} mae={:.4}", max_d, mae);
 
-    assert_eq!(pred_boxes.data.len(), ort_boxes.len(), "pred_boxes length mismatch");
+    assert_eq!(
+        pred_boxes.data.len(),
+        ort_boxes.len(),
+        "pred_boxes length mismatch"
+    );
     let (diff, idx) = max_diff(&pred_boxes.data, &ort_boxes);
     assert!(
         diff <= 1.0,
         "yolo26_pred_boxes max_diff {:.6e} at idx {} (got {:.8}, expected {:.8})",
-        diff, idx, pred_boxes.data[idx], ort_boxes[idx],
+        diff,
+        idx,
+        pred_boxes.data[idx],
+        ort_boxes[idx],
     );
 
     let mut ort_best = (0usize, 0i32, f32::NEG_INFINITY);

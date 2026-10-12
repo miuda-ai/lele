@@ -15,7 +15,10 @@ pub fn decode_wav_bytes(data: &[u8]) -> Result<(Vec<f32>, u32), String> {
 
     let audio_format = u16::from_le_bytes([data[20], data[21]]);
     if audio_format != 1 {
-        return Err(format!("Unsupported audio format: {} (only PCM)", audio_format));
+        return Err(format!(
+            "Unsupported audio format: {} (only PCM)",
+            audio_format
+        ));
     }
 
     let num_channels = u16::from_le_bytes([data[22], data[23]]);
@@ -26,12 +29,9 @@ pub fn decode_wav_bytes(data: &[u8]) -> Result<(Vec<f32>, u32), String> {
     let mut pos = 36;
     while pos + 8 <= data.len() {
         let chunk_id = &data[pos..pos + 4];
-        let chunk_size = u32::from_le_bytes([
-            data[pos + 4],
-            data[pos + 5],
-            data[pos + 6],
-            data[pos + 7],
-        ]) as usize;
+        let chunk_size =
+            u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                as usize;
 
         if chunk_id == b"data" {
             let audio_data = &data[pos + 8..data.len().min(pos + 8 + chunk_size)];

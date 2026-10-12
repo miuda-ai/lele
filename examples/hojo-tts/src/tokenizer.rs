@@ -67,7 +67,10 @@ impl HojoTokenizer {
         if let Some(merges) = model.get("merges").and_then(|v| v.as_array()) {
             for (rank, m) in merges.iter().enumerate() {
                 let pair = if let Some(arr) = m.as_array() {
-                    match (arr.get(0).and_then(|x| x.as_str()), arr.get(1).and_then(|x| x.as_str())) {
+                    match (
+                        arr.get(0).and_then(|x| x.as_str()),
+                        arr.get(1).and_then(|x| x.as_str()),
+                    ) {
                         (Some(a), Some(b)) => Some((a.to_string(), b.to_string())),
                         _ => None,
                     }
@@ -92,7 +95,9 @@ impl HojoTokenizer {
             for tok in arr {
                 if let (Some(id), Some(content)) = (
                     tok.get("id").and_then(|v| v.as_u64()).map(|i| i as u32),
-                    tok.get("content").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    tok.get("content")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                 ) {
                     vocab.insert(content.clone(), id);
                     atomic.insert(content);
@@ -120,15 +125,16 @@ impl HojoTokenizer {
         let mut do_nfkc = false;
         let mut collapse_ws = false;
         let norm = root.get("normalizer");
-        let norm_items: Vec<&Value> = match norm.and_then(|n| n.get("type")).and_then(|v| v.as_str()) {
-            Some("Sequence") => norm
-                .and_then(|n| n.get("normalizers"))
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().collect())
-                .unwrap_or_default(),
-            Some(_) => norm.map(|n| vec![n]).unwrap_or_default(),
-            None => Vec::new(),
-        };
+        let norm_items: Vec<&Value> =
+            match norm.and_then(|n| n.get("type")).and_then(|v| v.as_str()) {
+                Some("Sequence") => norm
+                    .and_then(|n| n.get("normalizers"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().collect())
+                    .unwrap_or_default(),
+                Some(_) => norm.map(|n| vec![n]).unwrap_or_default(),
+                None => Vec::new(),
+            };
         for n in &norm_items {
             match n.get("type").and_then(|v| v.as_str()) {
                 Some("Lowercase") => do_lower_case = true,
@@ -149,7 +155,10 @@ impl HojoTokenizer {
                     }
                 }
                 Some("BertNormalizer") => {
-                    if n.get("lowercase").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    if n.get("lowercase")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
                         do_lower_case = true;
                     }
                 }
@@ -169,7 +178,8 @@ impl HojoTokenizer {
                                     is_sequence: true,
                                     token: "A".to_string(),
                                 });
-                            } else if let Some(st) = obj.get("SpecialToken").and_then(|v| v.as_str())
+                            } else if let Some(st) =
+                                obj.get("SpecialToken").and_then(|v| v.as_str())
                             {
                                 single_template.push(TemplateItem {
                                     is_sequence: false,
@@ -366,7 +376,9 @@ impl HojoTokenizer {
         loop {
             let mut best: Option<(usize, u32)> = None;
             for i in 0..symbols.len().saturating_sub(1) {
-                if let Some(&rank) = self.bpe_ranks.get(&(symbols[i].clone(), symbols[i + 1].clone()))
+                if let Some(&rank) = self
+                    .bpe_ranks
+                    .get(&(symbols[i].clone(), symbols[i + 1].clone()))
                 {
                     match best {
                         Some((_, r)) if r <= rank => {}
