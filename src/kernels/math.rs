@@ -1676,10 +1676,10 @@ pub fn max<'b, 'a>(
     b: &TensorView<'b>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let len = a.data.len().max(b.data.len());
-    utils::ensure_capacity(out, len);
-    let out_slice = out.as_mut_slice();
     if a.shape == b.shape {
+        let len = a.data.len();
+        utils::ensure_capacity(out, len);
+        let out_slice = out.as_mut_slice();
         for i in 0..len {
             out_slice[i] = a.data[i].max(b.data[i]);
         }
@@ -1694,7 +1694,10 @@ pub fn max<'b, 'a>(
                 a.shape, b.shape
             )
         });
-        let _out_strides = utils::compute_strides(&out_shape);
+        // Both inputs can be broadcast, so the output can be larger than either.
+        let len = out_shape.iter().product();
+        utils::ensure_capacity(out, len);
+        let out_slice = out.as_mut_slice();
         let ndim = out_shape.len();
         let mut coords = vec![0usize; ndim];
         for o in &mut out_slice[..len] {
@@ -2327,6 +2330,16 @@ mod tests {
         assert_eq!(res.shape.as_ref(), &[2, 3, 2]);
         let half = [1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
         assert_eq!(res.data.as_ref(), &[half, half].concat()[..]);
+    }
+
+    #[test]
+    fn test_max_broadcasts_both_inputs() {
+        let a = TensorView::from_owned(vec![1.0, 5.0], vec![2, 1]);
+        let b = TensorView::from_owned(vec![2.0, 3.0, 4.0], vec![3]);
+        let mut out = Vec::new();
+        let res = max(&a, &b, &mut out);
+        assert_eq!(res.shape.as_ref(), &[2, 3]);
+        assert_eq!(res.data.as_ref(), &[2.0, 3.0, 4.0, 5.0, 5.0, 5.0]);
     }
 
     #[test]
