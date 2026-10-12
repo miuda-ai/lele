@@ -1,4 +1,6 @@
-use crate::model::onnx_proto::{type_proto, tensor_shape_proto, GraphProto, NodeProto, TensorProto};
+use crate::model::onnx_proto::{
+    GraphProto, NodeProto, TensorProto, tensor_shape_proto, type_proto,
+};
 use crate::model::tensor_to_array;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -241,14 +243,12 @@ fn solve_allocation(graph: &GraphProto, outputs: &[String]) -> (Allocator, Analy
                     // patterns (e.g. Conv+Sigmoid+Mul → Conv2d+SiLU consumes 3 nodes,
                     // Triple SiLU consumes 6 nodes)
                     for prev in 1..=5 {
-                        if id >= prev {
-                            if let Some(inps) = visitor.node_inputs.get(&(id - prev)) {
-                                input_bufs.extend(
-                                    inps.iter()
-                                        .filter_map(|n| all_allocations.get(n))
-                                        .cloned(),
-                                );
-                            }
+                        if id >= prev
+                            && let Some(inps) = visitor.node_inputs.get(&(id - prev))
+                        {
+                            input_bufs.extend(
+                                inps.iter().filter_map(|n| all_allocations.get(n)).cloned(),
+                            );
                         }
                     }
                     let mut deferred = Vec::new();
@@ -371,7 +371,6 @@ impl Compiler {
     }
 
     pub fn with_default_optimizations(mut self) -> Self {
-        self = self.with_custom_method(include_str!("snippets/default_methods.rs"));
         for p in patterns::get_default_patterns() {
             self.patterns.push(p);
         }
@@ -440,10 +439,7 @@ impl Compiler {
                 }
                 if !dims.is_empty() && !has_dynamic {
                     let shape_usize: Vec<usize> = dims.iter().map(|&d| d as usize).collect();
-                    constants.insert(
-                        inp.name.clone(),
-                        (dims, shape_usize, 7),
-                    );
+                    constants.insert(inp.name.clone(), (dims, shape_usize, 7));
                 }
             }
         }
@@ -460,11 +456,8 @@ impl Compiler {
         }
         let mut folded_indices = std::collections::HashSet::new();
         let mut new_initializers = Vec::new();
-        let graph_input_names: std::collections::HashSet<&str> = graph
-            .input
-            .iter()
-            .map(|i| i.name.as_str())
-            .collect();
+        let graph_input_names: std::collections::HashSet<&str> =
+            graph.input.iter().map(|i| i.name.as_str()).collect();
         // 3. Simple single-pass folding (can be iterative but single-pass handles most ONNX patterns which are DAG)
         for (i, node) in graph.node.iter().enumerate() {
             let mut all_inputs_const = true;
@@ -494,6 +487,14 @@ impl Compiler {
                     .find(|a| a.name == "to")
                     .map(|a| a.i as i32)
                     .unwrap_or(input_dt),
+                // Typed by its fill value, not by the int64 shape it consumes.
+                "ConstantOfShape" => node
+                    .attribute
+                    .iter()
+                    .find(|a| a.name == "value")
+                    .and_then(|a| a.t.as_ref())
+                    .map(|t| t.data_type)
+                    .unwrap_or(1),
                 // QDQ weights fold back to plain float initializers.
                 "DequantizeLinear" => 1,
                 "QuantizeLinear" => Self::quantize_output_dtype(node, &constants),
@@ -873,12 +874,7 @@ impl Compiler {
                 let (_, shape, _) = &constants[&node.input[0]];
                 // opset-15 `start`/`end` slice the reported shape.
                 let rank = shape.len() as i64;
-                let attr = |name: &str| {
-                    node.attribute
-                        .iter()
-                        .find(|a| a.name == name)
-                        .map(|a| a.i)
-                };
+                let attr = |name: &str| node.attribute.iter().find(|a| a.name == name).map(|a| a.i);
                 let clamp = |v: i64| (if v < 0 { v + rank } else { v }).clamp(0, rank) as usize;
                 let start = clamp(attr("start").unwrap_or(0));
                 let end = clamp(attr("end").unwrap_or(rank)).max(start);
@@ -1092,17 +1088,15 @@ impl Compiler {
                     .find(|a| a.name == "value")
                     .and_then(|a| a.t.as_ref())
                     .and_then(|t| {
-                        if !t.float_data.is_empty() {
-                            Some(t.float_data[0])
-                        } else if !t.double_data.is_empty() {
-                            Some(t.double_data[0] as f32)
-                        } else if !t.int32_data.is_empty() {
-                            Some(t.int32_data[0] as f32)
-                        } else if !t.int64_data.is_empty() {
-                            Some(t.int64_data[0] as f32)
-                        } else {
-                            None
+                        if !t.double_data.is_empty() {
+                            return Some(t.double_data[0] as f32);
                         }
+                        // PyTorch's exporter stores the fill value in
+                        // `raw_data`; reading only the typed fields folded
+                        // `ConstantOfShape(value=1)` to zeros.
+                        tensor_to_array(t)
+                            .ok()
+                            .and_then(|(d, _)| d.first().copied())
                     })
                     .unwrap_or(0.0);
                 let shape: Vec<usize> = data.iter().map(|&x| x as usize).collect();
@@ -1295,18 +1289,13 @@ impl Compiler {
                     .flat_map(|&idx| nodes[idx].output.iter().map(|s| s.as_str()))
                     .collect();
 
-                let mut safe = true;
-                for j in i..=add_idx {
-                    if !chain_set.contains(&j)
-                        && nodes[j]
+                let safe = (i..=add_idx).zip(&nodes[i..=add_idx]).all(|(j, node)| {
+                    chain_set.contains(&j)
+                        || !node
                             .input
                             .iter()
                             .any(|inp| chain_outputs.contains(inp.as_str()))
-                    {
-                        safe = false;
-                        break;
-                    }
-                }
+                });
                 if safe {
                     chains.push(chain);
                     in_chain.extend(chain.iter());
@@ -1425,51 +1414,27 @@ impl Compiler {
         writeln!(&mut code, "        Self::default()")?;
         writeln!(&mut code, "    }}")?;
         writeln!(&mut code, "}}")?;
-        // Main Struct (Silero style: holds data reference)
+        // Main struct: wraps the weights and derefs to them, so the weight
+        // accessors and fused ops in lele::runtime are called as `self.*`.
         writeln!(&mut code, "\npub struct {}<'a> {{", struct_name)?;
-        writeln!(&mut code, "    data: &'a [u8],")?;
-        writeln!(&mut code, "    _phantom: std::marker::PhantomData<&'a ()>,")?;
-        writeln!(&mut code, "    #[cfg(target_arch = \"aarch64\")]")?;
+        writeln!(&mut code, "    weights: lele::runtime::Weights<'a>,")?;
+        writeln!(&mut code, "}}")?;
         writeln!(
             &mut code,
-            "    prepared_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::PreparedWeightsArm>>>,"
+            "\nimpl<'a> std::ops::Deref for {}<'a> {{",
+            struct_name
         )?;
-        writeln!(
-            &mut code,
-            "    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QuantizedWeights>)>>,"
-        )?;
-        writeln!(
-            &mut code,
-            "    qweights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize, bool), (std::vec::Vec<f32>, std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,"
-        )?;
-        writeln!(
-            &mut code,
-            "    conv_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, bool), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::ConvWeights>)>>,"
-        )?;
+        writeln!(&mut code, "    type Target = lele::runtime::Weights<'a>;")?;
+        writeln!(&mut code, "    fn deref(&self) -> &Self::Target {{")?;
+        writeln!(&mut code, "        &self.weights")?;
+        writeln!(&mut code, "    }}")?;
         writeln!(&mut code, "}}")?;
         writeln!(&mut code, "\nimpl<'a> {}<'a> {{", struct_name)?;
         writeln!(&mut code, "    pub fn new(data: &'a [u8]) -> Self {{")?;
-        writeln!(&mut code, "        Self {{")?;
-        writeln!(&mut code, "            data,")?;
-        writeln!(&mut code, "            _phantom: std::marker::PhantomData,")?;
-        writeln!(&mut code, "            #[cfg(target_arch = \"aarch64\")]")?;
         writeln!(
             &mut code,
-            "            prepared_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
+            "        Self {{ weights: lele::runtime::Weights::new(data) }}"
         )?;
-        writeln!(
-            &mut code,
-            "            quantized_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
-        )?;
-        writeln!(
-            &mut code,
-            "            qweights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
-        )?;
-        writeln!(
-            &mut code,
-            "            conv_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
-        )?;
-        writeln!(&mut code, "        }}")?;
         writeln!(&mut code, "    }}")?;
         for method in &self.custom_methods {
             writeln!(&mut code, "{}", method)?;
@@ -1478,257 +1443,6 @@ impl Compiler {
         for func in &chunk_functions {
             writeln!(&mut code, "{}", func)?;
         }
-
-        // ARM prepared weights helper
-        writeln!(&mut code, "    #[cfg(target_arch = \"aarch64\")]")?;
-        writeln!(
-            &mut code,
-            "    fn get_prepared_weight(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool) -> std::sync::Arc<lele::kernels::PreparedWeightsArm> {{"
-        )?;
-        writeln!(&mut code, "        let key = (offset, len);")?;
-        writeln!(&mut code, "        {{")?;
-        writeln!(
-            &mut code,
-            "            let cache = self.prepared_weights_cache.borrow();"
-        )?;
-        writeln!(
-            &mut code,
-            "            if let Some(pw) = cache.get(&key) {{"
-        )?;
-        writeln!(&mut code, "                return pw.clone();")?;
-        writeln!(&mut code, "            }}")?;
-        writeln!(&mut code, "        }}")?;
-        writeln!(
-            &mut code,
-            "        let raw_bytes = &self.data[offset..offset+len];"
-        )?;
-        writeln!(
-            &mut code,
-            "        // The ARM kernels take u8 codes: i8 ones are shifted by 128 (their zero point too, see `arm_zero_point`), which leaves `b - zero_point` unchanged."
-        )?;
-        writeln!(
-            &mut code,
-            "        let shifted: Vec<u8>;"
-        )?;
-        writeln!(
-            &mut code,
-            "        let raw_bytes = if signed {{ shifted = raw_bytes.iter().map(|b| b ^ 0x80).collect(); &shifted[..] }} else {{ raw_bytes }};"
-        )?;
-        writeln!(
-            &mut code,
-            "        let pw = std::sync::Arc::new(lele::kernels::prepare_weights_arm(raw_bytes, k, n));"
-        )?;
-        writeln!(
-            &mut code,
-            "        self.prepared_weights_cache.borrow_mut().insert(key, pw.clone());"
-        )?;
-        writeln!(&mut code, "        pw")?;
-        writeln!(&mut code, "    }}")?;
-
-        // Int8 weights for QLinearMatMulI8. Preparing is architecture
-        // dependent and costs a full pass over the weight, so it happens once
-        // per tensor and the result is cached for the life of the model.
-        writeln!(
-            &mut code,
-            "    fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &lele::tensor::TensorView<f32>) -> std::sync::Arc<lele::kernels::QuantizedWeights> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        // Distinct initializers can share identical bytes, and one initializer can sit behind several DequantizeLinear nodes carrying different scales, so the key must include the shape and the cached entry must match the exact scale."
-        )?;
-        writeln!(&mut code, "        let key = (offset, len, k, n);")?;
-        writeln!(&mut code, "        {{")?;
-        writeln!(
-            &mut code,
-            "            let cache = self.quantized_weights_cache.borrow();"
-        )?;
-        writeln!(
-            &mut code,
-            "            if let Some((cached_scale, qw)) = cache.get(&key) {{"
-        )?;
-        writeln!(
-            &mut code,
-            "                if cached_scale.len() == scale.data.len() && cached_scale.iter().zip(scale.data.iter()).all(|(a, b)| a.to_bits() == b.to_bits()) {{"
-        )?;
-        writeln!(&mut code, "                    return qw.clone();")?;
-        writeln!(&mut code, "                }}")?;
-        writeln!(&mut code, "            }}")?;
-        writeln!(&mut code, "        }}")?;
-        writeln!(
-            &mut code,
-            "        let raw = &self.data[offset..offset+len];"
-        )?;
-        writeln!(
-            &mut code,
-            "        let qw = std::sync::Arc::new(lele::kernels::prepare_quantized_weights(raw, k, n, &scale.data));"
-        )?;
-        writeln!(
-            &mut code,
-            "        self.quantized_weights_cache.borrow_mut().insert(key, (scale.data.to_vec(), qw.clone()));"
-        )?;
-        writeln!(&mut code, "        qw")?;
-        writeln!(&mut code, "    }}")?;
-
-        // 8-bit weights packed for the integer GEMM, with their zero points
-        // subtracted, so the cached entry must match those and the scales.
-        writeln!(
-            &mut code,
-            "    #[allow(dead_code)]\n    fn get_qweights(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool, zero_point: &[f32], scale: &[f32]) -> std::sync::Arc<lele::kernels::QWeights> {{"
-        )?;
-        writeln!(&mut code, "        let key = (offset, len, k, n, signed);")?;
-        writeln!(
-            &mut code,
-            "        if let Some((z, s, w)) = self.qweights_cache.borrow().get(&key) {{"
-        )?;
-        writeln!(
-            &mut code,
-            "            if z.as_slice() == zero_point && s.as_slice() == scale {{"
-        )?;
-        writeln!(&mut code, "                return w.clone();")?;
-        writeln!(&mut code, "            }}")?;
-        writeln!(&mut code, "        }}")?;
-        writeln!(
-            &mut code,
-            "        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();"
-        )?;
-        writeln!(
-            &mut code,
-            "        let w = std::sync::Arc::new(lele::kernels::QWeights::new(&self.data[offset..offset + len], k, n, signed, &zp, scale));"
-        )?;
-        writeln!(
-            &mut code,
-            "        self.qweights_cache.borrow_mut().insert(key, (zero_point.to_vec(), scale.to_vec(), w.clone()));"
-        )?;
-        writeln!(&mut code, "        w")?;
-        writeln!(&mut code, "    }}")?;
-
-        // ConvInteger weights, prepared with their zero points, which the entry must match.
-        writeln!(
-            &mut code,
-            "    #[allow(dead_code)]\n    fn get_conv_weights(&self, offset: usize, len: usize, shape: [usize; 4], groups: usize, signed: bool, zero_point: &[f32]) -> std::sync::Arc<lele::kernels::ConvWeights> {{"
-        )?;
-        writeln!(&mut code, "        let key = (offset, len, groups, signed);")?;
-        writeln!(
-            &mut code,
-            "        if let Some((z, w)) = self.conv_weights_cache.borrow().get(&key) {{"
-        )?;
-        writeln!(&mut code, "            if z.as_slice() == zero_point {{")?;
-        writeln!(&mut code, "                return w.clone();")?;
-        writeln!(&mut code, "            }}")?;
-        writeln!(&mut code, "        }}")?;
-        writeln!(
-            &mut code,
-            "        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();"
-        )?;
-        writeln!(
-            &mut code,
-            "        let w = std::sync::Arc::new(lele::kernels::ConvWeights::new(&self.data[offset..offset + len], &shape, groups, signed, &zp));"
-        )?;
-        writeln!(
-            &mut code,
-            "        self.conv_weights_cache.borrow_mut().insert(key, (zero_point.to_vec(), w.clone()));"
-        )?;
-        writeln!(&mut code, "        w")?;
-        writeln!(&mut code, "    }}")?;
-
-        // Helpers for weights
-        writeln!(
-            &mut code,
-            "    pub fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_f32(&self.data[offset..offset+len], shape)"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_i64(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_i32_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_i32_as_i64(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_i32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i32> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_i32(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_i64_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_i64_as_f32(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_i32_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_i32_as_f32(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_u8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_u8(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_i8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_i8(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_f16(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_f16(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        // Raw byte accessors for prepared weights (no f32 conversion)
-        writeln!(
-            &mut code,
-            "    pub fn weight_u8_raw(&self, offset: usize, len: usize) -> &'a [u8] {{"
-        )?;
-        writeln!(&mut code, "        &self.data[offset..offset+len]")?;
-        writeln!(&mut code, "    }}")?;
 
         // Inference Function
         writeln!(&mut code, "\n    // Inference Entry Point")?;
@@ -1824,6 +1538,7 @@ impl Compiler {
                         match data_type {
                             7 => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape),
                             6 => format!("self.weight_i32_i64({}, {}, &{:?})", offset, len, shape),
+                            9 => format!("self.weight_bool_i64({}, {}, &{:?})", offset, len, shape),
                             _ => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape),
                         }
                     } else {
@@ -1954,44 +1669,44 @@ fn collect_weights(
                 }
             }
 
-            if let Ok((bytes, shape, data_type)) = crate::model::tensor_to_vec_u8(t) {
-                if !bytes.is_empty() {
-                    // Compute content hash for deduplication
-                    let hash = compute_hash(&bytes);
+            if let Ok((bytes, shape, data_type)) = crate::model::tensor_to_vec_u8(t)
+                && !bytes.is_empty()
+            {
+                // Compute content hash for deduplication
+                let hash = compute_hash(&bytes);
 
-                    // Check if we already have identical weight content
-                    if let Some(&(existing_offset, existing_len)) = content_hash_map.get(&hash) {
-                        // Reuse existing offset, but keep current weight's shape and dtype
-                        if let Some(out_name) = node.output.first() {
-                            offset_map.push((
-                                out_name.clone(),
-                                existing_offset,
-                                existing_len,
-                                shape,
-                                data_type,
-                            ));
-                        }
-                    } else {
-                        // New weight: align, write, and record
-                        let remainder = *current_offset % 16;
-                        if remainder != 0 {
-                            let padding = 16 - remainder;
-                            bin_data.write_all(&vec![0u8; padding])?;
-                            *current_offset += padding;
-                        }
+                // Check if we already have identical weight content
+                if let Some(&(existing_offset, existing_len)) = content_hash_map.get(&hash) {
+                    // Reuse existing offset, but keep current weight's shape and dtype
+                    if let Some(out_name) = node.output.first() {
+                        offset_map.push((
+                            out_name.clone(),
+                            existing_offset,
+                            existing_len,
+                            shape,
+                            data_type,
+                        ));
+                    }
+                } else {
+                    // New weight: align, write, and record
+                    let remainder = *current_offset % 16;
+                    if remainder != 0 {
+                        let padding = 16 - remainder;
+                        bin_data.write_all(&vec![0u8; padding])?;
+                        *current_offset += padding;
+                    }
 
-                        bin_data.write_all(&bytes)?;
-                        if let Some(out_name) = node.output.first() {
-                            offset_map.push((
-                                out_name.clone(),
-                                *current_offset,
-                                bytes.len(),
-                                shape.clone(),
-                                data_type,
-                            ));
-                            content_hash_map.insert(hash, (*current_offset, bytes.len()));
-                            *current_offset += bytes.len();
-                        }
+                    bin_data.write_all(&bytes)?;
+                    if let Some(out_name) = node.output.first() {
+                        offset_map.push((
+                            out_name.clone(),
+                            *current_offset,
+                            bytes.len(),
+                            shape.clone(),
+                            data_type,
+                        ));
+                        content_hash_map.insert(hash, (*current_offset, bytes.len()));
+                        *current_offset += bytes.len();
                     }
                 }
             }
@@ -1999,7 +1714,14 @@ fn collect_weights(
         // 3. Recurse
         for attr in &node.attribute {
             if let Some(g) = &attr.g {
-                collect_weights(g, bin_data, offset_map, current_offset, int64_map, content_hash_map)?;
+                collect_weights(
+                    g,
+                    bin_data,
+                    offset_map,
+                    current_offset,
+                    int64_map,
+                    content_hash_map,
+                )?;
             }
         }
     }
@@ -2048,7 +1770,12 @@ mod qdq_fusion_tests {
     #[test]
     fn fuses_matching_quantize_dequantize_pair() {
         let mut g = graph(vec![
-            node("QuantizeLinear", &["x", "s", "z"], "q", &[("output_dtype", 2)]),
+            node(
+                "QuantizeLinear",
+                &["x", "s", "z"],
+                "q",
+                &[("output_dtype", 2)],
+            ),
             node("DequantizeLinear", &["q", "s", "z"], "y", &[]),
         ]);
         Compiler::fuse_qdq(&mut g);
@@ -2157,41 +1884,6 @@ mod codegen_smoke_tests {
         }
     }
 
-    /// The weight-cache helper is emitted verbatim for every compiled model, so
-    /// a trivial graph is enough to exercise it. It must store an owned copy of
-    /// the DequantizeLinear scale: `TensorView::data` is a `Cow<[f32]>` while
-    /// the cache field is a `Vec<f32>`, so cloning the `Cow` produces code that
-    /// does not type-check (this regressed whenever a model was regenerated).
-    #[test]
-    fn weight_cache_stores_owned_scale() {
-        let g = graph(
-            vec![NodeProto {
-                op_type: "Relu".to_string(),
-                input: vec!["x".to_string()],
-                output: vec!["y".to_string()],
-                ..Default::default()
-            }],
-            &["x"],
-        );
-
-        let result = Compiler::new()
-            .with_name("WeightCacheSmoke")
-            .compile(&g)
-            .expect("compilation of a trivial graph should succeed");
-
-        assert!(
-            result.code.contains("quantized_weights_cache"),
-            "generated code should contain the quantized weight cache helper"
-        );
-        assert!(
-            result.code.contains("(scale.data.to_vec(), qw.clone())"),
-            "weight cache must store an owned Vec<f32> scale copy"
-        );
-        assert!(
-            !result.code.contains("scale.data.clone()"),
-            "weight cache must not clone the Cow<[f32]> scale (does not type-check)"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -2255,7 +1947,12 @@ mod qdq_matmul_fusion_tests {
     fn nodes() -> Vec<NodeProto> {
         vec![
             node("DequantizeLinear", &["xq", "a_scale", "a_zp"], "a", &[]),
-            node("DequantizeLinear", &["w", "w_scale", "w_zp"], "wd", &[("axis", 1)]),
+            node(
+                "DequantizeLinear",
+                &["w", "w_scale", "w_zp"],
+                "wd",
+                &[("axis", 1)],
+            ),
             node("MatMul", &["a", "wd"], "y", &[]),
         ]
     }
@@ -2344,7 +2041,13 @@ mod qdq_matmul_fusion_tests {
         let mut g = graph(n);
         Compiler::fuse_qdq_matmul(&mut g);
         assert!(op_types(&g).contains(&"MatMul"));
-        assert_eq!(op_types(&g).iter().filter(|o| **o == "DequantizeLinear").count(), 2);
+        assert_eq!(
+            op_types(&g)
+                .iter()
+                .filter(|o| **o == "DequantizeLinear")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -2392,5 +2095,162 @@ mod qdq_matmul_fusion_tests {
         let mut g = graph(n);
         Compiler::fuse_qdq_matmul(&mut g);
         assert_eq!(op_types(&g).last(), Some(&"MatMul"));
+    }
+}
+
+#[cfg(test)]
+mod conv_pattern_tests {
+    use super::*;
+    use crate::model::onnx_proto::{AttributeProto, ValueInfoProto};
+
+    /// A depthwise 3x3 Conv with stride `[2, 1]` (as in PP-OCR's recognizer),
+    /// followed by `next` (`Relu`, or `Add` of a bias initializer).
+    fn graph(next: &str) -> GraphProto {
+        let ints = |name: &str, v: &[i64]| AttributeProto {
+            name: name.to_string(),
+            ints: v.to_vec(),
+            ..Default::default()
+        };
+        let mut group = ints("group", &[]);
+        group.i = 4;
+        let conv = NodeProto {
+            op_type: "Conv".to_string(),
+            input: vec!["x".to_string(), "w".to_string()],
+            output: vec!["c".to_string()],
+            attribute: vec![
+                ints("kernel_shape", &[3, 3]),
+                ints("strides", &[2, 1]),
+                ints("dilations", &[1, 2]),
+                ints("pads", &[1, 2, 1, 2]),
+                group,
+            ],
+            ..Default::default()
+        };
+        let mut inputs = vec!["c".to_string()];
+        if next == "Add" {
+            inputs.push("b".to_string());
+        }
+        let after = NodeProto {
+            op_type: next.to_string(),
+            input: inputs,
+            output: vec!["y".to_string()],
+            ..Default::default()
+        };
+        let init = |name: &str, dims: &[i64]| TensorProto {
+            name: name.to_string(),
+            data_type: 1,
+            dims: dims.to_vec(),
+            raw_data: vec![0u8; 4 * dims.iter().product::<i64>() as usize],
+            ..Default::default()
+        };
+        GraphProto {
+            node: vec![conv, after],
+            initializer: vec![init("w", &[4, 1, 3, 3]), init("b", &[1, 4, 1, 1])],
+            input: vec![ValueInfoProto {
+                name: "x".to_string(),
+                ..Default::default()
+            }],
+            output: vec![ValueInfoProto {
+                name: "y".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The fused Conv patterns used to keep only the first stride and
+    /// dilation and repeat it, turning `[2, 1]` into `[2, 2]`.
+    #[test]
+    fn fused_conv_keeps_per_axis_strides_and_dilations() {
+        for next in ["Relu", "Add"] {
+            let result = Compiler::new()
+                .with_name("ConvStrides")
+                .with_default_optimizations()
+                .compile(&graph(next))
+                .expect("compilation should succeed");
+            let call = result
+                .code
+                .lines()
+                .find(|l| l.contains("lele::kernels::conv2d"))
+                .unwrap_or_else(|| panic!("{next}: no conv2d call in\n{}", result.code));
+            assert!(
+                call.contains("&[1, 2], 4, &[1, 2, 1, 2], &[2, 1]"),
+                "{next}: {call}"
+            );
+            // Both went through their fused pattern.
+            let fused = if next == "Relu" {
+                "conv2d_fused("
+            } else {
+                "Some(&self.weight_f32"
+            };
+            assert!(call.contains(fused), "{next}: {call}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod constant_folding_tests {
+    use super::*;
+    use crate::model::onnx_proto::AttributeProto;
+
+    /// `ConstantOfShape([2], value)` with the shape as an int64 initializer.
+    fn constant_of_shape(value: TensorProto) -> GraphProto {
+        GraphProto {
+            node: vec![NodeProto {
+                op_type: "ConstantOfShape".to_string(),
+                input: vec!["shape".to_string()],
+                output: vec!["y".to_string()],
+                attribute: vec![AttributeProto {
+                    name: "value".to_string(),
+                    t: Some(value),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            initializer: vec![TensorProto {
+                name: "shape".to_string(),
+                data_type: 7,
+                dims: vec![1],
+                int64_data: vec![2],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn folded(g: &GraphProto) -> &TensorProto {
+        assert!(g.node.is_empty(), "ConstantOfShape was not folded");
+        g.initializer.iter().find(|t| t.name == "y").unwrap()
+    }
+
+    #[test]
+    fn folds_constant_of_shape_with_raw_int64_value() {
+        // PyTorch's exporter writes the fill value as raw bytes; reading only
+        // the typed fields used to fold this to zeros.
+        let mut g = constant_of_shape(TensorProto {
+            data_type: 7,
+            dims: vec![1],
+            raw_data: 1i64.to_le_bytes().to_vec(),
+            ..Default::default()
+        });
+        Compiler::fold_constants_graph(&mut g, &HashMap::new());
+        let y = folded(&g);
+        assert_eq!(y.data_type, 7);
+        assert_eq!(y.int64_data, [1, 1]);
+    }
+
+    #[test]
+    fn folds_constant_of_shape_with_float_value_as_float() {
+        // The output takes the value's type, not the int64 shape's.
+        let mut g = constant_of_shape(TensorProto {
+            data_type: 1,
+            dims: vec![1],
+            raw_data: 0.5f32.to_le_bytes().to_vec(),
+            ..Default::default()
+        });
+        Compiler::fold_constants_graph(&mut g, &HashMap::new());
+        let y = folded(&g);
+        assert_eq!(y.data_type, 1);
+        assert_eq!(y.float_data, [0.5, 0.5]);
     }
 }

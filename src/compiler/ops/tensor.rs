@@ -87,7 +87,12 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             let shape_raw = resolve_i64_with_temp(1, ctx, w, &tab)?;
             // Replace 0 with -1 in reshape targets (ONNX 0 means "copy from source",
             // but in static compilation -1/infer is more robust)
-            let shape = if shape_raw.starts_with('&') && shape_raw.contains(" 0,") || shape_raw.contains("[0,") || shape_raw.contains("[0]") || shape_raw.contains(", 0]") || shape_raw.contains(", 0,") {
+            let shape = if shape_raw.starts_with('&') && shape_raw.contains(" 0,")
+                || shape_raw.contains("[0,")
+                || shape_raw.contains("[0]")
+                || shape_raw.contains(", 0]")
+                || shape_raw.contains(", 0,")
+            {
                 // Replace standalone 0 values (not 10, 100, etc.) with -1
                 let s = shape_raw;
                 // Use regex-free approach: split on known patterns
@@ -302,10 +307,10 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 .find(|a| a.name == "value")
                 .and_then(|a| a.t.as_ref())
                 .map(|t| {
-                    if let Ok((data, _)) = crate::model::tensor_to_array(t) {
-                        if !data.is_empty() {
-                            return data[0];
-                        }
+                    if let Ok((data, _)) = crate::model::tensor_to_array(t)
+                        && !data.is_empty()
+                    {
+                        return data[0];
                     }
                     0.0
                 })

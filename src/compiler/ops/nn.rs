@@ -12,11 +12,11 @@ fn compute_same_pads(
     if auto_pad == "NOTSET" || auto_pad.is_empty() {
         return None;
     }
-    let kh = kernel_shape.get(0).copied().unwrap_or(1);
+    let kh = kernel_shape.first().copied().unwrap_or(1);
     let kw = kernel_shape.get(1).copied().unwrap_or(kh);
-    let sh = strides.get(0).copied().unwrap_or(1);
+    let sh = strides.first().copied().unwrap_or(1);
     let sw = strides.get(1).copied().unwrap_or(sh);
-    let dh = dilations.get(0).copied().unwrap_or(1);
+    let dh = dilations.first().copied().unwrap_or(1);
     let dw = dilations.get(1).copied().unwrap_or(dh);
 
     let eff_kh = (kh - 1) * dh + 1;
@@ -102,8 +102,7 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                     .unwrap_or_default()
             };
             let pads = if auto_pad != "NOTSET" && !auto_pad.is_empty() {
-                compute_same_pads(&kernel_shape, &[1, 1], &dilations, auto_pad)
-                    .unwrap_or_default()
+                compute_same_pads(&kernel_shape, &[1, 1], &dilations, auto_pad).unwrap_or_default()
             } else {
                 ctx.node
                     .attribute
@@ -266,11 +265,7 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 tab, outputs[0]
             )?;
             if outputs.len() >= 2 {
-                writeln!(
-                    w,
-                    "{}let mut buf_{} = Vec::<f32>::new();",
-                    tab, outputs[0]
-                )?;
+                writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[0])?;
                 writeln!(
                     w,
                     "{}let ({}, {}) = lele::kernels::gru(&{}, &{}, &{}, {}, {}, {}, &mut buf_{}, &mut buf_{}_h);",
@@ -287,11 +282,7 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                     outputs[0]
                 )?;
             } else {
-                writeln!(
-                    w,
-                    "{}let mut buf_{} = Vec::<f32>::new();",
-                    tab, outputs[0]
-                )?;
+                writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[0])?;
                 writeln!(
                     w,
                     "{}let ({}, _) = lele::kernels::gru(&{}, &{}, &{}, {}, {}, {}, &mut buf_{}, &mut buf_{}_h);",
@@ -405,26 +396,30 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 "None".to_string()
             };
             // A static weight is prepared once, on first use.
-            let weight = ctx.known_weights.get(&super::super::sanitize_name(&ctx.node.input[1]));
+            let weight = ctx
+                .known_weights
+                .get(&super::super::sanitize_name(&ctx.node.input[1]));
             match weight {
-                Some((offset, len, shape, dt)) if (*dt == 2 || *dt == 3) && shape.len() == 4 => writeln!(
-                    w,
-                    "{}let {} = self.conv_integer_packed(&{}, {}, {}, {:?}, {}, {}, {}, {}, &{:?}, &{:?}, &{:?}, {});",
-                    tab,
-                    outputs[0],
-                    inputs[0],
-                    offset,
-                    len,
-                    shape,
-                    *dt == 3,
-                    group,
-                    x_zero_point,
-                    w_zero_point,
-                    dilations,
-                    pads,
-                    strides,
-                    buf_expr
-                )?,
+                Some((offset, len, shape, dt)) if (*dt == 2 || *dt == 3) && shape.len() == 4 => {
+                    writeln!(
+                        w,
+                        "{}let {} = self.conv_integer_packed(&{}, {}, {}, {:?}, {}, {}, {}, {}, &{:?}, &{:?}, &{:?}, {});",
+                        tab,
+                        outputs[0],
+                        inputs[0],
+                        offset,
+                        len,
+                        shape,
+                        *dt == 3,
+                        group,
+                        x_zero_point,
+                        w_zero_point,
+                        dilations,
+                        pads,
+                        strides,
+                        buf_expr
+                    )?
+                }
                 _ => writeln!(
                     w,
                     "{}let {} = lele::kernels::conv_integer(&{}, &{}, {}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
@@ -494,8 +489,7 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 .map(|a| a.ints.clone())
                 .unwrap_or(vec![]);
             let pads = if auto_pad != "NOTSET" && !auto_pad.is_empty() {
-                compute_same_pads(&kernel_shape, &strides, &dilations, auto_pad)
-                    .unwrap_or_default()
+                compute_same_pads(&kernel_shape, &strides, &dilations, auto_pad).unwrap_or_default()
             } else {
                 ctx.node
                     .attribute
