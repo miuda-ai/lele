@@ -1,6 +1,6 @@
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub(crate) mod accelerate;
 pub mod activations;
-#[cfg(target_arch = "x86_64")]
-pub mod avx;
 pub(crate) mod bias_act;
 pub(crate) mod binary;
 pub mod conv1d;
@@ -14,12 +14,10 @@ pub mod math;
 pub mod matmul;
 pub(crate) mod matmul_dot;
 pub(crate) mod matmul_nn;
-#[cfg(target_arch = "aarch64")]
-pub mod neon;
 pub mod norm;
 pub mod pooling;
 pub mod qgemm;
-pub(crate) mod qgemm_vnni;
+pub(crate) mod qgemm_dot;
 pub mod qmatmul_i8;
 pub mod quantization;
 pub mod rnn;
@@ -30,11 +28,12 @@ pub(crate) mod simd_math;
 pub(crate) mod test_util;
 pub mod timing;
 pub mod utils;
+pub(crate) mod window2d;
 pub use conv1d::conv1d;
 pub use conv1d::conv1d_fused;
 pub use conv2d::{
     conv_transpose, conv2d, conv2d_fused, conv2d_silu, gather_elements, max_pool2d,
-    print_conv_stats, reset_conv_stats, resize_nearest, topk,
+    resize_nearest, topk,
 };
 pub use conv_integer::{ConvWeights, conv_integer, conv_integer_packed};
 pub use gemm::{gemm, matmul, matmul_fused_add};
@@ -46,7 +45,7 @@ pub use norm::*;
 pub use pooling::*;
 pub use pooling::{average_pool2d, global_average_pool};
 pub use qgemm::{QWeights, mat_mul_integer_qweights, qlinear_dynamic, qlinear_static};
-pub use qmatmul_i8::{QuantizedWeights, prepare_quantized_weights, qmatmul_i8};
+pub use qmatmul_i8::{prepare_quantized_weights, qmatmul_i8};
 pub use quantization::*;
 pub use rnn::*;
 pub use shape::*;

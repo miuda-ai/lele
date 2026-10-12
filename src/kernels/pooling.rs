@@ -15,9 +15,6 @@ pub fn global_average_pool<'b, 'a>(
     let spatial = in_h * in_w;
     let numel = batch * channels;
     crate::kernels::utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let data = &input.data;
     let o_slice = out.as_mut_slice();
     for nc in 0..numel {
@@ -89,9 +86,6 @@ pub fn average_pool2d<'b, 'a>(
 
     let total = batch * channels * out_h * out_w;
     crate::kernels::utils::ensure_capacity(out, total);
-    unsafe {
-        out.set_len(total);
-    }
 
     let data = &input.data;
     let o_slice = out.as_mut_slice();
