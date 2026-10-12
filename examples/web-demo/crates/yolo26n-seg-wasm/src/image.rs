@@ -181,7 +181,7 @@ fn sigmoid(x: f32) -> f32 {
 #[inline]
 fn mask_dot(mask_coeffs: &[f32], mask_features: &[f32], mask_hw: usize, pixel_index: usize) -> f32 {
     let mut channel = 0;
-    let mut acc = unsafe { f32x4_splat(0.0) };
+    let mut acc = f32x4_splat(0.0);
 
     while channel + 4 <= mask_coeffs.len() {
         let coeffs = unsafe { v128_load(mask_coeffs.as_ptr().add(channel) as *const v128) };
@@ -193,16 +193,14 @@ fn mask_dot(mask_coeffs: &[f32], mask_features: &[f32], mask_hw: usize, pixel_in
                 *mask_features.get_unchecked((channel + 3) * mask_hw + pixel_index),
             )
         };
-        acc = unsafe { f32x4_add(acc, f32x4_mul(coeffs, features)) };
+        acc = f32x4_add(acc, f32x4_mul(coeffs, features));
         channel += 4;
     }
 
-    let mut sum = unsafe {
-        f32x4_extract_lane::<0>(acc)
-            + f32x4_extract_lane::<1>(acc)
-            + f32x4_extract_lane::<2>(acc)
-            + f32x4_extract_lane::<3>(acc)
-    };
+    let mut sum = f32x4_extract_lane::<0>(acc)
+        + f32x4_extract_lane::<1>(acc)
+        + f32x4_extract_lane::<2>(acc)
+        + f32x4_extract_lane::<3>(acc);
     while channel < mask_coeffs.len() {
         sum += mask_coeffs[channel] * mask_features[channel * mask_hw + pixel_index];
         channel += 1;

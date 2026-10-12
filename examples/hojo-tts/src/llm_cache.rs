@@ -2,7 +2,6 @@ use crate::llm::Llm;
 
 const D_MODEL: usize = 512;
 const N_HEADS: usize = 4;
-const N_KV_HEADS: usize = 1;
 const D_HEAD: usize = 128;
 const D_FF: usize = 2304;
 const N_LAYERS: usize = 17;
@@ -58,10 +57,6 @@ impl LlmCache {
             attn_scale,
             seq_len: 0,
         }
-    }
-
-    pub fn seq_len(&self) -> usize {
-        self.seq_len
     }
 }
 

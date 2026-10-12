@@ -93,7 +93,8 @@ where
     pub unsafe fn detach_or_own<'b>(&self) -> TensorView<'b, T> {
         match &self.data {
             Cow::Borrowed(slice) => {
-                let data_slice = std::slice::from_raw_parts(slice.as_ptr(), slice.len());
+                // SAFETY: the caller guarantees the storage outlives `'b`.
+                let data_slice = unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) };
                 TensorView {
                     data: Cow::Borrowed(data_slice),
                     shape: Cow::Owned(self.shape.to_vec()),

@@ -41,6 +41,7 @@ pub(crate) const NR: usize = 64;
 /// Which dot-product instruction B is packed for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Dot {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     Vnni,
     Sdot,
 }

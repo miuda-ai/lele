@@ -95,12 +95,17 @@ pub(crate) enum Layout {
     /// `i8` quads for VNNI's `vpdpbusd` or Arm's `sdot` ([`crate::kernels::qgemm_dot`]).
     /// (Each chosen only where its instruction is; elsewhere only the tests pack them,
     /// emulating it.)
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
     Dot(Dot),
     /// Centered codes in `f32`, multiplied by the f32 GEMM: where no integer instruction
     /// beats it (aarch64 without `dotprod`, whose widening multiplies do no more per
     /// instruction than f32 multiply-adds), and on macOS, whose Accelerate runs f32 on the
     /// matrix units. Sums are exact while they stay under 2^24 (depths up to 258), and
     /// rounded as an f32 GEMM's are beyond.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     Float,
 }
 

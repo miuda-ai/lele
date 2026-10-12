@@ -423,7 +423,6 @@ fn main() -> Result<()> {
     let mut cache = llm_cache::LlmCache::new(&llm);
     let logits = llm.forward_prompt(&mut cache, &cur);
 
-    let vocab = logits.len();
     let row = &logits[..];
 
     let mut next_id = sample_next(

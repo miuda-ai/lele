@@ -101,9 +101,7 @@ pub fn average_pool2d<'b, 'a>(
             for oh in 0..out_h {
                 for ow in 0..out_w {
                     let h_start = oh * sh;
-                    let h_end = (h_start + kh).min(in_h + pad_bottom);
                     let w_start = ow * sw;
-                    let w_end = (w_start + kw).min(in_w + pad_right);
                     let mut sum = 0.0f32;
                     let mut count = 0;
                     for kh_i in 0..kh {
