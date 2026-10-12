@@ -26,8 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_file = config
         .codegen
         .model_file
-        .as_ref()
-        .map(|s| s.as_str())
+        .as_deref()
         .unwrap_or("yolo26n-seg.onnx");
 
     // Check if regeneration is needed
@@ -74,11 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             for file_spec in files {
-                let dest_name = file_spec
-                    .dest
-                    .as_ref()
-                    .map(|s| s.as_str())
-                    .unwrap_or(&file_spec.file);
+                let dest_name = file_spec.dest.as_deref().unwrap_or(&file_spec.file);
                 let dest_path = Path::new(dest_name);
 
                 if dest_path.exists() && !should_force_regenerate() {

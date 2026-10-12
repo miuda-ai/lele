@@ -23,12 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_dir = Path::new("src");
 
     // Determine which file to use for code generation
-    let model_file = config
-        .codegen
-        .model_file
-        .as_ref()
-        .map(|s| s.as_str())
-        .unwrap_or("model.onnx");
+    let model_file = config.codegen.model_file.as_deref().unwrap_or("model.onnx");
 
     // Check if regeneration is needed
     if !need_regenerate(class_name, output_dir, "model.toml") && !should_force_regenerate() {
@@ -69,11 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             for file_spec in files {
-                let dest_name = file_spec
-                    .dest
-                    .as_ref()
-                    .map(|s| s.as_str())
-                    .unwrap_or(&file_spec.file);
+                let dest_name = file_spec.dest.as_deref().unwrap_or(&file_spec.file);
                 let dest_path = Path::new(dest_name);
 
                 // Skip if file already exists
