@@ -371,7 +371,6 @@ impl Compiler {
     }
 
     pub fn with_default_optimizations(mut self) -> Self {
-        self = self.with_custom_method(include_str!("snippets/default_methods.rs"));
         for p in patterns::get_default_patterns() {
             self.patterns.push(p);
         }
@@ -1415,41 +1414,27 @@ impl Compiler {
         writeln!(&mut code, "        Self::default()")?;
         writeln!(&mut code, "    }}")?;
         writeln!(&mut code, "}}")?;
-        // Main Struct (Silero style: holds data reference)
+        // Main struct: wraps the weights and derefs to them, so the weight
+        // accessors and fused ops in lele::runtime are called as `self.*`.
         writeln!(&mut code, "\npub struct {}<'a> {{", struct_name)?;
-        writeln!(&mut code, "    data: &'a [u8],")?;
-        writeln!(&mut code, "    _phantom: std::marker::PhantomData<&'a ()>,")?;
+        writeln!(&mut code, "    weights: lele::runtime::Weights<'a>,")?;
+        writeln!(&mut code, "}}")?;
         writeln!(
             &mut code,
-            "    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,"
+            "\nimpl<'a> std::ops::Deref for {}<'a> {{",
+            struct_name
         )?;
-        writeln!(
-            &mut code,
-            "    qweights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize, bool), (std::vec::Vec<f32>, std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,"
-        )?;
-        writeln!(
-            &mut code,
-            "    conv_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, bool), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::ConvWeights>)>>,"
-        )?;
+        writeln!(&mut code, "    type Target = lele::runtime::Weights<'a>;")?;
+        writeln!(&mut code, "    fn deref(&self) -> &Self::Target {{")?;
+        writeln!(&mut code, "        &self.weights")?;
+        writeln!(&mut code, "    }}")?;
         writeln!(&mut code, "}}")?;
         writeln!(&mut code, "\nimpl<'a> {}<'a> {{", struct_name)?;
         writeln!(&mut code, "    pub fn new(data: &'a [u8]) -> Self {{")?;
-        writeln!(&mut code, "        Self {{")?;
-        writeln!(&mut code, "            data,")?;
-        writeln!(&mut code, "            _phantom: std::marker::PhantomData,")?;
         writeln!(
             &mut code,
-            "            quantized_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
+            "        Self {{ weights: lele::runtime::Weights::new(data) }}"
         )?;
-        writeln!(
-            &mut code,
-            "            qweights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
-        )?;
-        writeln!(
-            &mut code,
-            "            conv_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),"
-        )?;
-        writeln!(&mut code, "        }}")?;
         writeln!(&mut code, "    }}")?;
         for method in &self.custom_methods {
             writeln!(&mut code, "{}", method)?;
@@ -1458,214 +1443,6 @@ impl Compiler {
         for func in &chunk_functions {
             writeln!(&mut code, "{}", func)?;
         }
-
-        // Int8 weights for QLinearMatMulI8. Preparing is architecture
-        // dependent and costs a full pass over the weight, so it happens once
-        // per tensor and the result is cached for the life of the model.
-        writeln!(
-            &mut code,
-            "    fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &lele::tensor::TensorView<f32>) -> std::sync::Arc<lele::kernels::QWeights> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        // Distinct initializers can share identical bytes, and one initializer can sit behind several DequantizeLinear nodes carrying different scales, so the key must include the shape and the cached entry must match the exact scale."
-        )?;
-        writeln!(&mut code, "        let key = (offset, len, k, n);")?;
-        writeln!(&mut code, "        {{")?;
-        writeln!(
-            &mut code,
-            "            let cache = self.quantized_weights_cache.borrow();"
-        )?;
-        // A single `if let` with `filter`: let chains would need edition 2024,
-        // and the generated code also builds in edition 2021 crates.
-        writeln!(
-            &mut code,
-            "            if let Some((_, qw)) = cache.get(&key).filter(|(cached_scale, _)| cached_scale.len() == scale.data.len() && cached_scale.iter().zip(scale.data.iter()).all(|(a, b)| a.to_bits() == b.to_bits())) {{"
-        )?;
-        writeln!(&mut code, "                return qw.clone();")?;
-        writeln!(&mut code, "            }}")?;
-        writeln!(&mut code, "        }}")?;
-        writeln!(
-            &mut code,
-            "        let raw = &self.data[offset..offset+len];"
-        )?;
-        writeln!(
-            &mut code,
-            "        let qw = std::sync::Arc::new(lele::kernels::prepare_quantized_weights(raw, k, n, &scale.data));"
-        )?;
-        writeln!(
-            &mut code,
-            "        self.quantized_weights_cache.borrow_mut().insert(key, (scale.data.to_vec(), qw.clone()));"
-        )?;
-        writeln!(&mut code, "        qw")?;
-        writeln!(&mut code, "    }}")?;
-
-        // 8-bit weights packed for the integer GEMM, with their zero points
-        // subtracted, so the cached entry must match those and the scales.
-        writeln!(
-            &mut code,
-            "    #[allow(dead_code)]\n    fn get_qweights(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool, zero_point: &[f32], scale: &[f32]) -> std::sync::Arc<lele::kernels::QWeights> {{"
-        )?;
-        writeln!(&mut code, "        let key = (offset, len, k, n, signed);")?;
-        writeln!(
-            &mut code,
-            "        if let Some((_, _, w)) = self.qweights_cache.borrow().get(&key).filter(|(z, s, _)| z.as_slice() == zero_point && s.as_slice() == scale) {{"
-        )?;
-        writeln!(&mut code, "            return w.clone();")?;
-        writeln!(&mut code, "        }}")?;
-        writeln!(
-            &mut code,
-            "        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();"
-        )?;
-        writeln!(
-            &mut code,
-            "        let w = std::sync::Arc::new(lele::kernels::QWeights::new(&self.data[offset..offset + len], k, n, signed, &zp, scale));"
-        )?;
-        writeln!(
-            &mut code,
-            "        self.qweights_cache.borrow_mut().insert(key, (zero_point.to_vec(), scale.to_vec(), w.clone()));"
-        )?;
-        writeln!(&mut code, "        w")?;
-        writeln!(&mut code, "    }}")?;
-
-        // ConvInteger weights, prepared with their zero points, which the entry must match.
-        writeln!(
-            &mut code,
-            "    #[allow(dead_code)]\n    fn get_conv_weights(&self, offset: usize, len: usize, shape: [usize; 4], groups: usize, signed: bool, zero_point: &[f32]) -> std::sync::Arc<lele::kernels::ConvWeights> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        let key = (offset, len, groups, signed);"
-        )?;
-        writeln!(
-            &mut code,
-            "        if let Some((_, w)) = self.conv_weights_cache.borrow().get(&key).filter(|(z, _)| z.as_slice() == zero_point) {{"
-        )?;
-        writeln!(&mut code, "            return w.clone();")?;
-        writeln!(&mut code, "        }}")?;
-        writeln!(
-            &mut code,
-            "        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();"
-        )?;
-        writeln!(
-            &mut code,
-            "        let w = std::sync::Arc::new(lele::kernels::ConvWeights::new(&self.data[offset..offset + len], &shape, groups, signed, &zp));"
-        )?;
-        writeln!(
-            &mut code,
-            "        self.conv_weights_cache.borrow_mut().insert(key, (zero_point.to_vec(), w.clone()));"
-        )?;
-        writeln!(&mut code, "        w")?;
-        writeln!(&mut code, "    }}")?;
-
-        // Helpers for weights
-        writeln!(
-            &mut code,
-            "    pub fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_f32(&self.data[offset..offset+len], shape)"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_i64(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_i32_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_i32_as_i64(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_bool_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_bool_as_i64(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_i32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i32> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_i32(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_i64_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_i64_as_f32(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_i32_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_i32_as_f32(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_u8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_u8(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_i8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_i8(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        writeln!(
-            &mut code,
-            "    pub fn weight_f16(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {{"
-        )?;
-        writeln!(
-            &mut code,
-            "        TensorView::from_bytes_f16(&self.data[offset..offset+len], shape.to_vec())"
-        )?;
-        writeln!(&mut code, "    }}")?;
-
-        // Raw byte accessors for prepared weights (no f32 conversion)
-        writeln!(
-            &mut code,
-            "    pub fn weight_u8_raw(&self, offset: usize, len: usize) -> &'a [u8] {{"
-        )?;
-        writeln!(&mut code, "        &self.data[offset..offset+len]")?;
-        writeln!(&mut code, "    }}")?;
 
         // Inference Function
         writeln!(&mut code, "\n    // Inference Entry Point")?;
@@ -2107,41 +1884,6 @@ mod codegen_smoke_tests {
         }
     }
 
-    /// The weight-cache helper is emitted verbatim for every compiled model, so
-    /// a trivial graph is enough to exercise it. It must store an owned copy of
-    /// the DequantizeLinear scale: `TensorView::data` is a `Cow<[f32]>` while
-    /// the cache field is a `Vec<f32>`, so cloning the `Cow` produces code that
-    /// does not type-check (this regressed whenever a model was regenerated).
-    #[test]
-    fn weight_cache_stores_owned_scale() {
-        let g = graph(
-            vec![NodeProto {
-                op_type: "Relu".to_string(),
-                input: vec!["x".to_string()],
-                output: vec!["y".to_string()],
-                ..Default::default()
-            }],
-            &["x"],
-        );
-
-        let result = Compiler::new()
-            .with_name("WeightCacheSmoke")
-            .compile(&g)
-            .expect("compilation of a trivial graph should succeed");
-
-        assert!(
-            result.code.contains("quantized_weights_cache"),
-            "generated code should contain the quantized weight cache helper"
-        );
-        assert!(
-            result.code.contains("(scale.data.to_vec(), qw.clone())"),
-            "weight cache must store an owned Vec<f32> scale copy"
-        );
-        assert!(
-            !result.code.contains("scale.data.clone()"),
-            "weight cache must not clone the Cow<[f32]> scale (does not type-check)"
-        );
-    }
 }
 
 #[cfg(test)]
