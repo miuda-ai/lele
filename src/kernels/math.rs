@@ -1697,10 +1697,10 @@ pub fn max<'b, 'a>(
         let _out_strides = utils::compute_strides(&out_shape);
         let ndim = out_shape.len();
         let mut coords = vec![0usize; ndim];
-        for i in 0..len {
+        for o in &mut out_slice[..len] {
             let mut a_idx = 0;
             let mut b_idx = 0;
-            for d in 0..ndim {
+            for (d, &coord) in coords.iter().enumerate() {
                 let a_dim = if d + a.shape.len() >= ndim {
                     d + a.shape.len() - ndim
                 } else {
@@ -1712,10 +1712,10 @@ pub fn max<'b, 'a>(
                     usize::MAX
                 };
                 if a_dim != usize::MAX && a.shape[a_dim] > 1 {
-                    a_idx += coords[d] * a_strides[a_dim];
+                    a_idx += coord * a_strides[a_dim];
                 }
                 if b_dim != usize::MAX && b.shape[b_dim] > 1 {
-                    b_idx += coords[d] * b_strides[b_dim];
+                    b_idx += coord * b_strides[b_dim];
                 }
             }
             let a_val = if a_idx < a.data.len() {
@@ -1728,7 +1728,7 @@ pub fn max<'b, 'a>(
             } else {
                 f32::NEG_INFINITY
             };
-            out_slice[i] = a_val.max(b_val);
+            *o = a_val.max(b_val);
             for d in (0..ndim).rev() {
                 coords[d] += 1;
                 if coords[d] < out_shape[d] {
@@ -1803,8 +1803,8 @@ pub fn range<'a>(
     };
     utils::ensure_capacity(out, n);
     let out_slice = out.as_mut_slice();
-    for i in 0..n {
-        out_slice[i] = start_val + (i as f32) * delta_val;
+    for (i, o) in out_slice[..n].iter_mut().enumerate() {
+        *o = start_val + (i as f32) * delta_val;
     }
     TensorView::from_slice(out, vec![n])
 }
@@ -1827,8 +1827,8 @@ pub fn range_i64<'a>(
     };
     utils::ensure_capacity(out, n);
     let out_slice = out.as_mut_slice();
-    for i in 0..n {
-        out_slice[i] = start_val + (i as i64) * delta_val;
+    for (i, o) in out_slice[..n].iter_mut().enumerate() {
+        *o = start_val + (i as i64) * delta_val;
     }
     TensorView::from_slice(out, vec![n])
 }
@@ -2090,28 +2090,23 @@ pub fn expand<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     let numel: usize = out_shape.iter().product();
     utils::ensure_capacity(out, numel);
     let input_strides = utils::compute_strides(input_shape);
-    let mut virtual_strides = vec![0; ndim_out];
-    for i in 0..ndim_out {
-        let offset_in = ndim_out - ndim_in;
-        if i < offset_in {
-            virtual_strides[i] = 0;
-        } else {
-            let idx_in = i - offset_in;
-            if input_shape[idx_in] == 1 {
-                virtual_strides[i] = 0;
-            } else {
-                virtual_strides[i] = input_strides[idx_in];
-            }
-        }
-    }
+    // Broadcast dimensions (missing or of size 1) don't advance the input.
+    let offset_in = ndim_out - ndim_in;
+    let virtual_strides: Vec<usize> = (0..ndim_out)
+        .map(|i| match i.checked_sub(offset_in) {
+            Some(idx_in) if input_shape[idx_in] != 1 => input_strides[idx_in],
+            _ => 0,
+        })
+        .collect();
     let out_slice = out.as_mut_slice();
     let mut coords = vec![0; ndim_out];
-    for i in 0..numel {
-        let mut in_idx = 0;
-        for d in 0..ndim_out {
-            in_idx += coords[d] * virtual_strides[d];
-        }
-        out_slice[i] = input.data[in_idx];
+    for o in &mut out_slice[..numel] {
+        let in_idx: usize = coords
+            .iter()
+            .zip(&virtual_strides)
+            .map(|(c, s)| c * s)
+            .sum();
+        *o = input.data[in_idx];
         for d in (0..ndim_out).rev() {
             coords[d] += 1;
             if coords[d] < out_shape[d] {
@@ -2143,18 +2138,16 @@ pub fn tile<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     let numel = out_shape.iter().product();
     utils::ensure_capacity(out, numel);
     let out_slice = out.as_mut_slice();
+    let input_strides = utils::compute_strides(&input.shape);
     let mut coords = vec![0; ndim];
-    for i in 0..numel {
-        let mut in_idx = 0;
-        let mut in_coords = vec![0; ndim];
-        for d in 0..ndim {
-            in_coords[d] = coords[d] % input.shape[d];
-        }
-        let input_strides = utils::compute_strides(&input.shape);
-        for d in 0..ndim {
-            in_idx += in_coords[d] * input_strides[d];
-        }
-        out_slice[i] = input.data[in_idx];
+    for o in &mut out_slice[..numel] {
+        let in_idx: usize = coords
+            .iter()
+            .zip(&*input.shape)
+            .zip(&input_strides)
+            .map(|((&c, &dim), &stride)| (c % dim) * stride)
+            .sum();
+        *o = input.data[in_idx];
         for d in (0..ndim).rev() {
             coords[d] += 1;
             if coords[d] < out_shape[d] {
@@ -2198,11 +2191,11 @@ pub fn stft<'b, 'a>(
     let window_data: Vec<f32> = if let Some(w) = window {
         w.data.iter().copied().collect()
     } else {
-        let mut w = vec![0.0f32; win_length];
-        for i in 0..win_length {
-            w[i] = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / win_length as f32).cos());
-        }
-        w
+        (0..win_length)
+            .map(|i| {
+                0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / win_length as f32).cos())
+            })
+            .collect()
     };
 
     let fft = crate::kernels::fft::Rfft::new(n_fft);
@@ -2263,11 +2256,11 @@ pub fn stft_power_spectrum<'b, 'a>(
     let window_data: Vec<f32> = if let Some(w) = window {
         w.data.iter().copied().collect()
     } else {
-        let mut w = vec![0.0f32; win_length];
-        for i in 0..win_length {
-            w[i] = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / win_length as f32).cos());
-        }
-        w
+        (0..win_length)
+            .map(|i| {
+                0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / win_length as f32).cos())
+            })
+            .collect()
     };
 
     let fft = crate::kernels::fft::Rfft::new(n_fft);
@@ -2309,6 +2302,46 @@ pub fn stft_power_spectrum<'b, 'a>(
 mod tests {
     use super::*;
     use crate::tensor::TensorView;
+
+    #[test]
+    fn test_tile_repeats_every_axis() {
+        let t = TensorView::from_owned(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let mut out = Vec::new();
+        let res = tile(&t, &[2, 2], &mut out);
+        assert_eq!(res.shape.as_ref(), &[4, 4]);
+        #[rustfmt::skip]
+        let expected = [
+            1.0, 2.0, 1.0, 2.0,
+            3.0, 4.0, 3.0, 4.0,
+            1.0, 2.0, 1.0, 2.0,
+            3.0, 4.0, 3.0, 4.0,
+        ];
+        assert_eq!(res.data.as_ref(), &expected);
+    }
+
+    #[test]
+    fn test_expand_broadcasts_size_one_and_missing_axes() {
+        let t = TensorView::from_owned(vec![1.0, 2.0, 3.0], vec![3, 1]);
+        let mut out = Vec::new();
+        let res = expand(&t, &[2, 1, 2], &mut out);
+        assert_eq!(res.shape.as_ref(), &[2, 3, 2]);
+        let half = [1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
+        assert_eq!(res.data.as_ref(), &[half, half].concat()[..]);
+    }
+
+    #[test]
+    fn test_range() {
+        let scalar = |v: f32| TensorView::from_owned(vec![v], vec![]);
+        let mut out = Vec::new();
+        let res = range(&scalar(1.0), &scalar(2.0), &scalar(0.25), &mut out);
+        assert_eq!(res.data.as_ref(), &[1.0, 1.25, 1.5, 1.75]);
+
+        let scalar = |v: i64| TensorView::from_owned(vec![v], vec![]);
+        let mut out = Vec::new();
+        let res = range_i64(&scalar(10), &scalar(0), &scalar(-3), &mut out);
+        assert_eq!(res.data.as_ref(), &[10, 7, 4, 1]);
+    }
+
     #[test]
     fn test_expand() {
         let input_data = vec![1.0, 2.0, 3.0];

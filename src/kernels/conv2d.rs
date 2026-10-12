@@ -788,12 +788,11 @@ fn resize_nearest_inner<'b, 'a>(
         for c in 0..channels {
             let in_offset = (n * channels + c) * in_h * in_w;
             let out_offset = (n * channels + c) * out_h * out_w;
-            for oh in 0..out_h {
-                let ih = row_map[oh];
-                let in_row = in_offset + ih * in_w;
-                let out_row = out_offset + oh * out_w;
-                for ow in 0..out_w {
-                    out[out_row + ow] = data[in_row + col_map[ow]];
+            for (oh, &ih) in row_map.iter().enumerate() {
+                let in_row = &data[in_offset + ih * in_w..][..in_w];
+                let out_row = &mut out[out_offset + oh * out_w..][..out_w];
+                for (o, &iw) in out_row.iter_mut().zip(&col_map) {
+                    *o = in_row[iw];
                 }
             }
         }

@@ -1290,18 +1290,13 @@ impl Compiler {
                     .flat_map(|&idx| nodes[idx].output.iter().map(|s| s.as_str()))
                     .collect();
 
-                let mut safe = true;
-                for j in i..=add_idx {
-                    if !chain_set.contains(&j)
-                        && nodes[j]
+                let safe = (i..=add_idx).zip(&nodes[i..=add_idx]).all(|(j, node)| {
+                    chain_set.contains(&j)
+                        || !node
                             .input
                             .iter()
                             .any(|inp| chain_outputs.contains(inp.as_str()))
-                    {
-                        safe = false;
-                        break;
-                    }
-                }
+                });
                 if safe {
                     chains.push(chain);
                     in_chain.extend(chain.iter());

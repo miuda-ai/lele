@@ -799,13 +799,13 @@ pub fn slice<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     let in_strides = utils::compute_strides(&input.shape);
     let mut coords = vec![0; ndim];
     let out_slice = out.as_mut_slice();
-    for i in 0..out_numel {
+    for o in &mut out_slice[..out_numel] {
         let mut in_off = 0isize;
         for d in 0..ndim {
             let in_idx = actual_starts[d] + (coords[d] as isize) * actual_steps[d];
             in_off += in_idx * (in_strides[d] as isize);
         }
-        out_slice[i] = input.data[in_off as usize];
+        *o = input.data[in_off as usize];
         for d in (0..ndim).rev() {
             coords[d] += 1;
             if coords[d] < out_shape[d] {
@@ -1548,6 +1548,16 @@ where
 mod tests {
     use super::*;
     use crate::tensor::TensorView;
+
+    #[test]
+    fn test_slice_with_step_on_inner_axis() {
+        let data: Vec<f32> = (0..8).map(|v| v as f32).collect();
+        let t = TensorView::from_owned(data, vec![2, 4]);
+        let mut out = Vec::new();
+        let res = slice(&t, &[1], &[4], &[1], &[2], &mut out);
+        assert_eq!(res.shape.as_ref(), &[2, 2]);
+        assert_eq!(res.data.as_ref(), &[1.0, 3.0, 5.0, 7.0]);
+    }
 
     #[test]
     fn test_split_owned_matches_split() {

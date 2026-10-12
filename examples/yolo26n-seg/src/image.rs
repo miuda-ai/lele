@@ -287,9 +287,9 @@ pub fn postprocess_segmentation(
         for y in 0..mask_h {
             for x in 0..mask_w {
                 let mut sum = 0.0f32;
-                for c in 0..MASK_DIM {
+                for (c, &coeff) in det.mask_coeffs[..MASK_DIM].iter().enumerate() {
                     let idx = c * mask_h * mask_w + y * mask_w + x;
-                    sum += det.mask_coeffs[c] * mask_features[idx];
+                    sum += coeff * mask_features[idx];
                 }
                 // Sigmoid activation
                 det_mask[y * mask_w + x] = 1.0 / (1.0 + (-sum).exp());

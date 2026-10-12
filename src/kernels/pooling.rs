@@ -17,13 +17,9 @@ pub fn global_average_pool<'b, 'a>(
     crate::kernels::utils::ensure_capacity(out, numel);
     let data = &input.data;
     let o_slice = out.as_mut_slice();
-    for nc in 0..numel {
-        let base = nc * spatial;
-        let mut sum = 0.0f32;
-        for i in 0..spatial {
-            sum += data[base + i];
-        }
-        o_slice[nc] = sum / spatial as f32;
+    for (nc, o) in o_slice[..numel].iter_mut().enumerate() {
+        let sum: f32 = data[nc * spatial..][..spatial].iter().sum();
+        *o = sum / spatial as f32;
     }
     TensorView {
         data: Cow::Borrowed(out),
@@ -163,5 +159,20 @@ pub fn adaptive_avg_pool1d(
             }
             output[out_offset + i] = sum / kernel_len as f32;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_global_average_pool() {
+        let data: Vec<f32> = (0..8).map(|v| v as f32).collect();
+        let t = TensorView::from_owned(data, vec![1, 2, 2, 2]);
+        let mut out = Vec::new();
+        let res = global_average_pool(&t, &mut out);
+        assert_eq!(res.shape.as_ref(), &[1, 2, 1, 1]);
+        assert_eq!(res.data.as_ref(), &[1.5, 5.5]);
     }
 }

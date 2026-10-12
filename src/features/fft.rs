@@ -34,9 +34,9 @@ impl RealFft {
                 im: freq_im[i],
             };
         }
-        for i in half..n {
+        for (i, out) in output[..n].iter_mut().enumerate().skip(half) {
             let j = n - i;
-            output[i] = Complex {
+            *out = Complex {
                 re: freq_re[j],
                 im: -freq_im[j],
             };

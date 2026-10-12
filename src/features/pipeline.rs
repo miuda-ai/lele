@@ -149,10 +149,10 @@ impl SenseVoiceFrontend {
                 for j in 0..offset {
                     frame_buf[j] = raw_frame[j] * self.window[j];
                 }
-                for j in 0..middle.len() {
+                for (j, &x) in middle.iter().enumerate() {
                     let idx = offset + j * 8;
                     let w = f32x8::from_slice(&self.window[idx..idx + 8]);
-                    let res = middle[j] * w;
+                    let res = x * w;
                     res.copy_to_slice(&mut frame_buf[idx..idx + 8]);
                 }
                 for j in (offset + middle.len() * 8)..frame_len {
@@ -166,9 +166,7 @@ impl SenseVoiceFrontend {
                 }
             }
 
-            for j in frame_len..self.fft_len {
-                frame_buf[j] = 0.0;
-            }
+            frame_buf[frame_len..self.fft_len].fill(0.0);
 
             // 5. FFT
             self.fft

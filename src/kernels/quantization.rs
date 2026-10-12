@@ -332,8 +332,7 @@ fn qdq_apply<F>(
         }
         QParamLayout::PerAxis { outer, dim, inner } => {
             for _o in 0..outer {
-                for d in 0..dim {
-                    let s = scale_data[d];
+                for (d, &s) in scale_data[..dim].iter().enumerate() {
                     let z = zp_at(d);
                     let base = out.len();
                     out.extend(x.data[base..base + inner].iter().map(|&v| f(v, s, z)));
