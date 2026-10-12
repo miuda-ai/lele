@@ -68,7 +68,7 @@ impl HojoTokenizer {
             for (rank, m) in merges.iter().enumerate() {
                 let pair = if let Some(arr) = m.as_array() {
                     match (
-                        arr.get(0).and_then(|x| x.as_str()),
+                        arr.first().and_then(|x| x.as_str()),
                         arr.get(1).and_then(|x| x.as_str()),
                     ) {
                         (Some(a), Some(b)) => Some((a.to_string(), b.to_string())),

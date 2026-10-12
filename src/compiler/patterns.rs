@@ -572,7 +572,7 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     Some(o) => o,
                     None => return None,
                 };
-                let in0_match = n1.input.get(0).map(|s| s == conv_out).unwrap_or(false);
+                let in0_match = n1.input.first().map(|s| s == conv_out).unwrap_or(false);
                 let in1_match = n1.input.get(1).map(|s| s == conv_out).unwrap_or(false);
                 if !in0_match && !in1_match {
                     return None;
@@ -948,9 +948,9 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 }
                 let sig_out = &n1.output[0];
                 // Mul must take conv_out and sigmoid_out (SiLU = x * sigmoid(x))
-                let is_silu = (n2.input.get(0) == Some(conv_out)
+                let is_silu = (n2.input.first() == Some(conv_out)
                     && n2.input.get(1) == Some(sig_out))
-                    || (n2.input.get(0) == Some(sig_out) && n2.input.get(1) == Some(conv_out));
+                    || (n2.input.first() == Some(sig_out) && n2.input.get(1) == Some(conv_out));
                 if !is_silu {
                     return None;
                 }
@@ -1077,8 +1077,8 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 let check_silu = |sig: &NodeProto, mul: &NodeProto| -> bool {
                     let sig_in = &sig.input[0];
                     let sig_out = &sig.output[0];
-                    (mul.input.get(0) == Some(sig_in) && mul.input.get(1) == Some(sig_out))
-                        || (mul.input.get(0) == Some(sig_out) && mul.input.get(1) == Some(sig_in))
+                    (mul.input.first() == Some(sig_in) && mul.input.get(1) == Some(sig_out))
+                        || (mul.input.first() == Some(sig_out) && mul.input.get(1) == Some(sig_in))
                 };
                 if check_silu(n0, n3) && check_silu(n1, n4) && check_silu(n2, n5) {
                     Some(6)
@@ -1154,13 +1154,13 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 let sig_b_in = &n1.input[0];
                 let sig_b_out = &n1.output[0];
                 // Mul(A, sig_A)
-                let mul_a_ok = (n2.input.get(0) == Some(sig_a_in)
+                let mul_a_ok = (n2.input.first() == Some(sig_a_in)
                     && n2.input.get(1) == Some(sig_a_out))
-                    || (n2.input.get(0) == Some(sig_a_out) && n2.input.get(1) == Some(sig_a_in));
+                    || (n2.input.first() == Some(sig_a_out) && n2.input.get(1) == Some(sig_a_in));
                 // Mul(B, sig_B)
-                let mul_b_ok = (n3.input.get(0) == Some(sig_b_in)
+                let mul_b_ok = (n3.input.first() == Some(sig_b_in)
                     && n3.input.get(1) == Some(sig_b_out))
-                    || (n3.input.get(0) == Some(sig_b_out) && n3.input.get(1) == Some(sig_b_in));
+                    || (n3.input.first() == Some(sig_b_out) && n3.input.get(1) == Some(sig_b_in));
                 if mul_a_ok && mul_b_ok { Some(4) } else { None }
             }),
             generator: Box::new(|nodes, weights, allocator, w, indent| {
@@ -1233,9 +1233,9 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 let sig_input = &n0.input[0];
                 let sig_out = &n0.output[0];
                 // Mul must take original input and sigmoid output
-                let is_silu = (n1.input.get(0) == Some(sig_input)
+                let is_silu = (n1.input.first() == Some(sig_input)
                     && n1.input.get(1) == Some(sig_out))
-                    || (n1.input.get(0) == Some(sig_out) && n1.input.get(1) == Some(sig_input));
+                    || (n1.input.first() == Some(sig_out) && n1.input.get(1) == Some(sig_input));
                 if !is_silu {
                     return None;
                 }

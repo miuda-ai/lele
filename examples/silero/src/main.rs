@@ -103,7 +103,7 @@ fn main() {
         let state = TensorView::from_owned(state_data.clone(), vec![2, 1, 128]);
         let sr = TensorView::from_slice(&sr_data, vec![1]);
         let (output, new_state) = model.forward_with_workspace(&mut ws, input, state, sr);
-        if let Some(&prob) = output.data.get(0) {
+        if let Some(&prob) = output.data.first() {
             all_outputs.push(prob);
         }
         state_data = new_state.data.to_vec();
@@ -124,7 +124,7 @@ fn main() {
         let (output, new_state) = model.forward_with_workspace(&mut ws, input, state, sr);
 
         // Output is [1, 1] probability
-        if let Some(&prob) = output.data.get(0) {
+        if let Some(&prob) = output.data.first() {
             all_outputs.push(prob);
         }
 

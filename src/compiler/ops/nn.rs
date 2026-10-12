@@ -12,11 +12,11 @@ fn compute_same_pads(
     if auto_pad == "NOTSET" || auto_pad.is_empty() {
         return None;
     }
-    let kh = kernel_shape.get(0).copied().unwrap_or(1);
+    let kh = kernel_shape.first().copied().unwrap_or(1);
     let kw = kernel_shape.get(1).copied().unwrap_or(kh);
-    let sh = strides.get(0).copied().unwrap_or(1);
+    let sh = strides.first().copied().unwrap_or(1);
     let sw = strides.get(1).copied().unwrap_or(sh);
-    let dh = dilations.get(0).copied().unwrap_or(1);
+    let dh = dilations.first().copied().unwrap_or(1);
     let dw = dilations.get(1).copied().unwrap_or(dh);
 
     let eff_kh = (kh - 1) * dh + 1;

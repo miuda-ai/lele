@@ -3830,7 +3830,7 @@ fn embedding_concat_i64<'c, 'd>(
         let _Gather_34_output_0 = lele::kernels::gather(&_Shape_2_output_0, &self.weight_i64(44198944, 8, &[1]), 0, &mut buf__Gather_34_output_0);
         let mut buf__Equal_output_0 = Vec::<i64>::new();
         let _Equal_output_0 = lele::kernels::equal_i64(&_Gather_34_output_0, &self.weight_i64(44198944, 8, &[1]), &mut buf__Equal_output_0);
-        let (_If_output_0) = if _Equal_output_0.data.get(0).map(|v| *v != 0).unwrap_or(false) {
+        let (_If_output_0) = if _Equal_output_0.data.first().is_some_and(|&v| v != 0) {
             let _Squeeze_output_0 = lele::kernels::squeeze(&_decoder_8_Reshape_1_output_0, Some(&[1]));
             (_Squeeze_output_0.to_owned())
         } else {

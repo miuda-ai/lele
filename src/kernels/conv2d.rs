@@ -1000,9 +1000,9 @@ fn conv_transpose_1d<'b, 'a>(
     let group = group as usize;
     let out_channels = out_channels_per_group * group;
 
-    let stride = strides.get(0).copied().unwrap_or(1) as usize;
-    let dilation = dilations.get(0).copied().unwrap_or(1) as usize;
-    let pad_begin = pads.get(0).copied().unwrap_or(0) as usize;
+    let stride = strides.first().copied().unwrap_or(1) as usize;
+    let dilation = dilations.first().copied().unwrap_or(1) as usize;
+    let pad_begin = pads.first().copied().unwrap_or(0) as usize;
     let pad_end = pads.get(1).copied().unwrap_or(0) as usize;
 
     let l_out = (l_in as i64 - 1) * stride as i64 - (pad_begin as i64 + pad_end as i64)
@@ -1330,11 +1330,11 @@ fn conv_transpose_inner<'b, 'a>(
     let kernel_w = w_shape[3] as usize;
     let out_channels = (w_shape[1] as i64 * group) as usize;
 
-    let stride_h = strides.get(0).copied().unwrap_or(1) as usize;
+    let stride_h = strides.first().copied().unwrap_or(1) as usize;
     let stride_w = strides.get(1).copied().unwrap_or(1) as usize;
-    let dilation_h = dilations.get(0).copied().unwrap_or(1) as usize;
+    let dilation_h = dilations.first().copied().unwrap_or(1) as usize;
     let dilation_w = dilations.get(1).copied().unwrap_or(1) as usize;
-    let pad_top = pads.get(0).copied().unwrap_or(0) as usize;
+    let pad_top = pads.first().copied().unwrap_or(0) as usize;
     let pad_left = pads.get(1).copied().unwrap_or(0) as usize;
     let pad_bottom = pads.get(2).copied().unwrap_or(pad_top as i64) as usize;
     let pad_right = pads.get(3).copied().unwrap_or(pad_left as i64) as usize;

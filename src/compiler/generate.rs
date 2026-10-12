@@ -916,7 +916,7 @@ pub(crate) fn generate_nodes(
         // Check if Div/Mod output is i64 (e.g. integer division for shape computation)
         let div_mod_output_is_i64 = if matches!(op, "Div" | "Mod") {
             outputs
-                .get(0)
+                .first()
                 .and_then(|out| var_types.get(out))
                 .map(|t| t == "i64")
                 .unwrap_or(false)
@@ -990,7 +990,7 @@ pub(crate) fn generate_nodes(
             false
         } else {
             outputs
-                .get(0)
+                .first()
                 .and_then(|out| var_types.get(out))
                 .map(|t| t == "i64")
                 .unwrap_or(false)
