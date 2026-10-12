@@ -3853,7 +3853,7 @@ fn embedding_concat_i64<'c, 'd>(
         let mut buf__Less_output_0 = Vec::<i64>::new();
         let _Less_output_0 = lele::kernels::less_i64(&_decoder_8_Mul_1_output_0, &self.weight_i64(44198928, 8, &[]), &mut buf__Less_output_0);
         let mut buf__Xor_output_0 = Vec::<i64>::new();
-        let _Xor_output_0 = lele::kernels::logical_xor(&_Less_output_0, &self.weight_i64(44199472, 1, &[]), &mut buf__Xor_output_0);
+        let _Xor_output_0 = lele::kernels::logical_xor(&_Less_output_0, &self.weight_bool_i64(44199472, 1, &[]), &mut buf__Xor_output_0);
         let _Mod_output_0 = lele::kernels::mod_f32(&_decoder_8_Mul_1_output_0, &self.weight_i64_f32(44198960, 8, &[]), &mut ws.buf_4);
         let mut buf__Equal_1_output_0 = Vec::<i64>::new();
         let _Equal_1_output_0 = lele::kernels::equal_i64_f32_lhs(&_Mod_output_0, &self.weight_i64(44198928, 8, &[]), &mut buf__Equal_1_output_0);
@@ -3923,6 +3923,9 @@ fn embedding_concat_i64<'c, 'd>(
     }
     pub fn weight_i32_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
         TensorView::from_bytes_i32_as_i64(&self.data[offset..offset+len], shape.to_vec())
+    }
+    pub fn weight_bool_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
+        TensorView::from_bytes_bool_as_i64(&self.data[offset..offset+len], shape.to_vec())
     }
     pub fn weight_i32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i32> {
         TensorView::from_bytes_i32(&self.data[offset..offset+len], shape.to_vec())

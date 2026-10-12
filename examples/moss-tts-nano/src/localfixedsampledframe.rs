@@ -5285,6 +5285,9 @@ fn embedding_concat_i64<'c, 'd>(
     pub fn weight_i32_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
         TensorView::from_bytes_i32_as_i64(&self.data[offset..offset+len], shape.to_vec())
     }
+    pub fn weight_bool_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
+        TensorView::from_bytes_bool_as_i64(&self.data[offset..offset+len], shape.to_vec())
+    }
     pub fn weight_i32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i32> {
         TensorView::from_bytes_i32(&self.data[offset..offset+len], shape.to_vec())
     }
