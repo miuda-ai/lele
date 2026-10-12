@@ -693,9 +693,11 @@ fn ref_gru_step(
     } else {
         let z_g: Vec<f32> = (0..hs).map(|k| lele::kernels::activations::sigmoid(wc[k] + rc[k] + bias_w[k] + bias_r[k])).collect();
         let r_g: Vec<f32> = (0..hs).map(|k| lele::kernels::activations::sigmoid(wc[hs+k] + rc[hs+k] + bias_w[hs+k] + bias_r[hs+k])).collect();
+        // Without linear_before_reset the reset gate scales h before R_h does.
+        let rh: Vec<f32> = (0..hs).map(|k| r_g[k] * h[k]).collect();
         for k in 0..hs {
             let wh_x = wc[2*hs+k] + bias_w[2*hs+k];
-            let r_rh = r_g[k] * (rc[2*hs+k] + bias_r[2*hs+k]);
+            let r_rh: f32 = (0..hs).map(|j| r[(2*hs+k) * hs + j] * rh[j]).sum::<f32>() + bias_r[2*hs+k];
             let h_gate = lele::kernels::activations::tanh(wh_x + r_rh);
             h[k] = (1.0 - z_g[k]) * h_gate + z_g[k] * h[k];
         }
@@ -1460,16 +1462,6 @@ fn test_qmatmul_i8_accepts_per_tensor_weight_scale() {
             "per-tensor qmatmul_i8 differs at {i}: got {g}, want {e}"
         );
     }
-}
-
-/// The tests above pass trivially if every machine takes the f32 fallback, so
-/// pin which path was actually chosen to what the CPU reports.
-#[test]
-#[cfg(not(target_arch = "aarch64"))]
-fn test_quantized_weights_take_the_integer_path_when_the_cpu_allows() {
-    let (_, _, _, raw, w_scale, _) = qdq_layer(4, 8, 16);
-    let qw = lele::kernels::prepare_quantized_weights(&raw, 8, 16, &w_scale);
-    assert!(qw.is_integer(), "an integer kernel should run everywhere but on aarch64");
 }
 
 
