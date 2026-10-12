@@ -1,4 +1,6 @@
-use crate::model::onnx_proto::{type_proto, tensor_shape_proto, GraphProto, NodeProto, TensorProto};
+use crate::model::onnx_proto::{
+    GraphProto, NodeProto, TensorProto, tensor_shape_proto, type_proto,
+};
 use crate::model::tensor_to_array;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -244,9 +246,7 @@ fn solve_allocation(graph: &GraphProto, outputs: &[String]) -> (Allocator, Analy
                         if id >= prev {
                             if let Some(inps) = visitor.node_inputs.get(&(id - prev)) {
                                 input_bufs.extend(
-                                    inps.iter()
-                                        .filter_map(|n| all_allocations.get(n))
-                                        .cloned(),
+                                    inps.iter().filter_map(|n| all_allocations.get(n)).cloned(),
                                 );
                             }
                         }
@@ -440,10 +440,7 @@ impl Compiler {
                 }
                 if !dims.is_empty() && !has_dynamic {
                     let shape_usize: Vec<usize> = dims.iter().map(|&d| d as usize).collect();
-                    constants.insert(
-                        inp.name.clone(),
-                        (dims, shape_usize, 7),
-                    );
+                    constants.insert(inp.name.clone(), (dims, shape_usize, 7));
                 }
             }
         }
@@ -460,11 +457,8 @@ impl Compiler {
         }
         let mut folded_indices = std::collections::HashSet::new();
         let mut new_initializers = Vec::new();
-        let graph_input_names: std::collections::HashSet<&str> = graph
-            .input
-            .iter()
-            .map(|i| i.name.as_str())
-            .collect();
+        let graph_input_names: std::collections::HashSet<&str> =
+            graph.input.iter().map(|i| i.name.as_str()).collect();
         // 3. Simple single-pass folding (can be iterative but single-pass handles most ONNX patterns which are DAG)
         for (i, node) in graph.node.iter().enumerate() {
             let mut all_inputs_const = true;
@@ -881,12 +875,7 @@ impl Compiler {
                 let (_, shape, _) = &constants[&node.input[0]];
                 // opset-15 `start`/`end` slice the reported shape.
                 let rank = shape.len() as i64;
-                let attr = |name: &str| {
-                    node.attribute
-                        .iter()
-                        .find(|a| a.name == name)
-                        .map(|a| a.i)
-                };
+                let attr = |name: &str| node.attribute.iter().find(|a| a.name == name).map(|a| a.i);
                 let clamp = |v: i64| (if v < 0 { v + rank } else { v }).clamp(0, rank) as usize;
                 let start = clamp(attr("start").unwrap_or(0));
                 let end = clamp(attr("end").unwrap_or(rank)).max(start);
@@ -1106,7 +1095,9 @@ impl Compiler {
                         // PyTorch's exporter stores the fill value in
                         // `raw_data`; reading only the typed fields folded
                         // `ConstantOfShape(value=1)` to zeros.
-                        tensor_to_array(t).ok().and_then(|(d, _)| d.first().copied())
+                        tensor_to_array(t)
+                            .ok()
+                            .and_then(|(d, _)| d.first().copied())
                     })
                     .unwrap_or(0.0);
                 let shape: Vec<usize> = data.iter().map(|&x| x as usize).collect();
@@ -1555,7 +1546,10 @@ impl Compiler {
             &mut code,
             "    #[allow(dead_code)]\n    fn get_conv_weights(&self, offset: usize, len: usize, shape: [usize; 4], groups: usize, signed: bool, zero_point: &[f32]) -> std::sync::Arc<lele::kernels::ConvWeights> {{"
         )?;
-        writeln!(&mut code, "        let key = (offset, len, groups, signed);")?;
+        writeln!(
+            &mut code,
+            "        let key = (offset, len, groups, signed);"
+        )?;
         writeln!(
             &mut code,
             "        if let Some((z, w)) = self.conv_weights_cache.borrow().get(&key) {{"
@@ -1958,7 +1952,14 @@ fn collect_weights(
         // 3. Recurse
         for attr in &node.attribute {
             if let Some(g) = &attr.g {
-                collect_weights(g, bin_data, offset_map, current_offset, int64_map, content_hash_map)?;
+                collect_weights(
+                    g,
+                    bin_data,
+                    offset_map,
+                    current_offset,
+                    int64_map,
+                    content_hash_map,
+                )?;
             }
         }
     }
@@ -2007,7 +2008,12 @@ mod qdq_fusion_tests {
     #[test]
     fn fuses_matching_quantize_dequantize_pair() {
         let mut g = graph(vec![
-            node("QuantizeLinear", &["x", "s", "z"], "q", &[("output_dtype", 2)]),
+            node(
+                "QuantizeLinear",
+                &["x", "s", "z"],
+                "q",
+                &[("output_dtype", 2)],
+            ),
             node("DequantizeLinear", &["q", "s", "z"], "y", &[]),
         ]);
         Compiler::fuse_qdq(&mut g);
@@ -2214,7 +2220,12 @@ mod qdq_matmul_fusion_tests {
     fn nodes() -> Vec<NodeProto> {
         vec![
             node("DequantizeLinear", &["xq", "a_scale", "a_zp"], "a", &[]),
-            node("DequantizeLinear", &["w", "w_scale", "w_zp"], "wd", &[("axis", 1)]),
+            node(
+                "DequantizeLinear",
+                &["w", "w_scale", "w_zp"],
+                "wd",
+                &[("axis", 1)],
+            ),
             node("MatMul", &["a", "wd"], "y", &[]),
         ]
     }
@@ -2303,7 +2314,13 @@ mod qdq_matmul_fusion_tests {
         let mut g = graph(n);
         Compiler::fuse_qdq_matmul(&mut g);
         assert!(op_types(&g).contains(&"MatMul"));
-        assert_eq!(op_types(&g).iter().filter(|o| **o == "DequantizeLinear").count(), 2);
+        assert_eq!(
+            op_types(&g)
+                .iter()
+                .filter(|o| **o == "DequantizeLinear")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -2429,9 +2446,16 @@ mod conv_pattern_tests {
                 .lines()
                 .find(|l| l.contains("lele::kernels::conv2d"))
                 .unwrap_or_else(|| panic!("{next}: no conv2d call in\n{}", result.code));
-            assert!(call.contains("&[1, 2], 4, &[1, 2, 1, 2], &[2, 1]"), "{next}: {call}");
+            assert!(
+                call.contains("&[1, 2], 4, &[1, 2, 1, 2], &[2, 1]"),
+                "{next}: {call}"
+            );
             // Both went through their fused pattern.
-            let fused = if next == "Relu" { "conv2d_fused(" } else { "Some(&self.weight_f32" };
+            let fused = if next == "Relu" {
+                "conv2d_fused("
+            } else {
+                "Some(&self.weight_f32"
+            };
             assert!(call.contains(fused), "{next}: {call}");
         }
     }

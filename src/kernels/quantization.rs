@@ -91,7 +91,13 @@ pub fn fused_quantized_linear<'a>(
     if zero_point.is_empty() {
         zero_point.push(0);
     }
-    let w = QWeights::from_f32_codes(&weight_int8.data[..k * n], k, n, &zero_point, &weight_scale.data);
+    let w = QWeights::from_f32_codes(
+        &weight_int8.data[..k * n],
+        k,
+        n,
+        &zero_point,
+        &weight_scale.data,
+    );
     let bias = (!bias.data.is_empty()).then_some(&bias.data[..]);
     qlinear_dynamic(input, &w, bias, apply_relu, out)
 }
@@ -108,7 +114,9 @@ fn mat_mul_integer_with_scale_bias_activation<'a, 'b, 'c>(
     apply_relu: bool,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
-    let a_zp = a_zero_point.and_then(|z| z.data.first()).map_or(0, |&z| z as i32);
+    let a_zp = a_zero_point
+        .and_then(|z| z.data.first())
+        .map_or(0, |&z| z as i32);
     let b_zp: Vec<i32> = match b_zero_point {
         Some(z) if !z.data.is_empty() => z.data.iter().map(|&z| z as i32).collect(),
         _ => vec![0],
@@ -143,7 +151,13 @@ pub fn dynamic_quantize_linear<'a, 'b>(
     out_scale.push(scale);
     out_zp.clear();
     out_zp.push(zero_point as f32);
-    let p = PerTensor { scale, zero_point: zero_point as f32, qmin: 0.0, qmax: 255.0, round_trip: false };
+    let p = PerTensor {
+        scale,
+        zero_point: zero_point as f32,
+        qmin: 0.0,
+        qmax: 255.0,
+        round_trip: false,
+    };
     quantize_per_tensor(Level::new(), &p, &x.data, out_y_storage);
     (
         TensorView::from_slice(out_y_storage, x.shape.to_vec()),
@@ -168,7 +182,11 @@ impl PerTensor {
     #[inline(always)]
     fn apply(&self, x: f32) -> f32 {
         let q = ((x / self.scale).round_ties_even() + self.zero_point).clamp(self.qmin, self.qmax);
-        if self.round_trip { (q - self.zero_point) * self.scale } else { q }
+        if self.round_trip {
+            (q - self.zero_point) * self.scale
+        } else {
+            q
+        }
     }
 }
 
@@ -185,12 +203,17 @@ pub(crate) fn quantize_per_tensor(level: Level, p: &PerTensor, src: &[f32], out:
 #[simd]
 fn quantize_per_tensor_simd<S: Simd>(simd: S, p: &PerTensor, src: &[f32], dst: &mut [f32]) {
     use fearless_simd::prelude::*;
-    let (scale, zp) = (f32x8::splat(simd, p.scale), f32x8::splat(simd, p.zero_point));
+    let (scale, zp) = (
+        f32x8::splat(simd, p.scale),
+        f32x8::splat(simd, p.zero_point),
+    );
     let (lo, hi) = (f32x8::splat(simd, p.qmin), f32x8::splat(simd, p.qmax));
     let (src_chunks, src_rest) = src.as_chunks::<8>();
     let (dst_chunks, dst_rest) = dst.as_chunks_mut::<8>();
     for (x, y) in src_chunks.iter().zip(dst_chunks) {
-        let q = ((f32x8::from_slice(simd, x) / scale).round_ties_even() + zp).max(lo).min(hi);
+        let q = ((f32x8::from_slice(simd, x) / scale).round_ties_even() + zp)
+            .max(lo)
+            .min(hi);
         let r = if p.round_trip { (q - zp) * scale } else { q };
         r.store_slice(y);
     }
@@ -212,7 +235,11 @@ enum QParamLayout {
     /// One scale for the whole tensor.
     PerTensor,
     /// One scale per slice along `axis`.
-    PerAxis { outer: usize, dim: usize, inner: usize },
+    PerAxis {
+        outer: usize,
+        dim: usize,
+        inner: usize,
+    },
     /// One scale per block of `block_size` elements along `axis`.
     Blocked {
         outer: usize,
@@ -351,12 +378,27 @@ pub fn quantize_linear<'a>(
     qmax: f32,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
-    if let Some(p) = per_tensor(x, y_scale, y_zero_point, axis, block_size, qmin, qmax, false) {
+    if let Some(p) = per_tensor(
+        x,
+        y_scale,
+        y_zero_point,
+        axis,
+        block_size,
+        qmin,
+        qmax,
+        false,
+    ) {
         quantize_per_tensor(Level::new(), &p, &x.data, out);
     } else {
-        qdq_apply(x, y_scale, y_zero_point, axis, block_size, out, |v, s, z| {
-            ((v / s).round_ties_even() + z).clamp(qmin, qmax)
-        });
+        qdq_apply(
+            x,
+            y_scale,
+            y_zero_point,
+            axis,
+            block_size,
+            out,
+            |v, s, z| ((v / s).round_ties_even() + z).clamp(qmin, qmax),
+        );
     }
     TensorView::from_slice(out.as_slice(), x.shape.to_vec())
 }
@@ -372,10 +414,18 @@ fn per_tensor(
     qmax: f32,
     round_trip: bool,
 ) -> Option<PerTensor> {
-    let layout = qparam_layout(&x.shape, scale.data.len(), scale.shape.len(), axis, block_size);
+    let layout = qparam_layout(
+        &x.shape,
+        scale.data.len(),
+        scale.shape.len(),
+        axis,
+        block_size,
+    );
     matches!(layout, QParamLayout::PerTensor).then(|| PerTensor {
         scale: scale.data.first().copied().unwrap_or(1.0),
-        zero_point: zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0),
+        zero_point: zero_point
+            .and_then(|z| z.data.first().copied())
+            .unwrap_or(0.0),
         qmin,
         qmax,
         round_trip,
@@ -391,9 +441,15 @@ pub fn dequantize_linear<'a>(
     block_size: usize,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
-    qdq_apply(x, x_scale, x_zero_point, axis, block_size, out, |v, s, z| {
-        (v - z) * s
-    });
+    qdq_apply(
+        x,
+        x_scale,
+        x_zero_point,
+        axis,
+        block_size,
+        out,
+        |v, s, z| (v - z) * s,
+    );
     TensorView::from_slice(out.as_slice(), x.shape.to_vec())
 }
 
@@ -435,14 +491,14 @@ pub fn fake_quantize_linear<'a>(
 /// Returns `None` for types that are not valid quantization targets.
 pub fn quant_range(onnx_dtype: i32) -> Option<(f32, f32)> {
     match onnx_dtype {
-        2 => Some((0.0, 255.0)),                            // UINT8
-        3 => Some((-128.0, 127.0)),                         // INT8
-        4 => Some((0.0, 65535.0)),                          // UINT16
-        5 => Some((-32768.0, 32767.0)),                     // INT16
-        6 => Some((i32::MIN as f32, i32::MAX as f32)),      // INT32
-        12 => Some((0.0, u32::MAX as f32)),                 // UINT32
-        21 => Some((0.0, 15.0)),                            // UINT4
-        22 => Some((-8.0, 7.0)),                            // INT4
+        2 => Some((0.0, 255.0)),                       // UINT8
+        3 => Some((-128.0, 127.0)),                    // INT8
+        4 => Some((0.0, 65535.0)),                     // UINT16
+        5 => Some((-32768.0, 32767.0)),                // INT16
+        6 => Some((i32::MIN as f32, i32::MAX as f32)), // INT32
+        12 => Some((0.0, u32::MAX as f32)),            // UINT32
+        21 => Some((0.0, 15.0)),                       // UINT4
+        22 => Some((-8.0, 7.0)),                       // INT4
         _ => None,
     }
 }
@@ -457,21 +513,38 @@ mod tests {
         let mut rng = Rng::new(17);
         for level in levels() {
             for &len in AWKWARD_LENS {
-                for (scale, zero_point, qmin, qmax) in [(0.02, 128.0, 0.0, 255.0), (0.05, 0.0, -128.0, 127.0), (0.3, -3.0, -8.0, 7.0)] {
+                for (scale, zero_point, qmin, qmax) in [
+                    (0.02, 128.0, 0.0, 255.0),
+                    (0.05, 0.0, -128.0, 127.0),
+                    (0.3, -3.0, -8.0, 7.0),
+                ] {
                     // Values on the grid, at its rounding ties, and past both ends.
                     let mut x = rng.vec(len, -40.0, 40.0);
                     for (i, v) in x.iter_mut().enumerate().step_by(3) {
                         *v = scale * ((i % 300) as f32 * 0.5 - 75.0);
                     }
                     for round_trip in [false, true] {
-                        let p = PerTensor { scale, zero_point, qmin, qmax, round_trip };
+                        let p = PerTensor {
+                            scale,
+                            zero_point,
+                            qmin,
+                            qmax,
+                            round_trip,
+                        };
                         let mut got = Vec::new();
                         quantize_per_tensor(level, &p, &x, &mut got);
                         for (i, (&g, &v)) in got.iter().zip(&x).enumerate() {
                             let q = ((v / scale).round_ties_even() + zero_point).clamp(qmin, qmax);
-                            let want = if round_trip { (q - zero_point) * scale } else { q };
+                            let want = if round_trip {
+                                (q - zero_point) * scale
+                            } else {
+                                q
+                            };
                             // `==`, not bits: a clamp may keep either zero's sign.
-                            assert!(g == want, "{level:?} len {len} round_trip {round_trip} at {i}: {v} -> {g}, want {want}");
+                            assert!(
+                                g == want,
+                                "{level:?} len {len} round_trip {round_trip} at {i}: {v} -> {g}, want {want}"
+                            );
                         }
                     }
                 }
@@ -483,13 +556,21 @@ mod tests {
     fn test_dynamic_quantize_linear_follows_onnx() {
         let x: Vec<f32> = (0..37).map(|i| i as f32 * 0.37 - 4.1).collect();
         let (mut y, mut s, mut z) = (Vec::new(), Vec::new(), Vec::new());
-        let (q, scale, zp) = dynamic_quantize_linear(&TensorView::from_slice(&x, vec![37]), &mut y, &mut s, &mut z);
+        let (q, scale, zp) = dynamic_quantize_linear(
+            &TensorView::from_slice(&x, vec![37]),
+            &mut y,
+            &mut s,
+            &mut z,
+        );
         let (min, max) = (-4.1f32, 36.0 * 0.37 - 4.1);
         let want_scale = (max - min) / 255.0;
         let want_zp = (-min / want_scale).round_ties_even().clamp(0.0, 255.0);
         assert_eq!((scale.data[0], zp.data[0]), (want_scale, want_zp));
         for (&g, &v) in q.data.iter().zip(&x) {
-            assert_eq!(g, ((v / want_scale).round_ties_even() + want_zp).clamp(0.0, 255.0));
+            assert_eq!(
+                g,
+                ((v / want_scale).round_ties_even() + want_zp).clamp(0.0, 255.0)
+            );
         }
     }
 }

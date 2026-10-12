@@ -1,7 +1,7 @@
 use crate::kernels::bias_act::bias_act_inplace;
 use crate::kernels::conv2d::Activation;
-use crate::kernels::utils;
 use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul as strided_matmul};
+use crate::kernels::utils;
 use crate::tensor::TensorView;
 use std::borrow::Cow;
 
@@ -298,11 +298,20 @@ mod tests {
         let full: Vec<f32> = (0..batch * m * n).map(|i| i as f32 * 0.25).collect();
         for bias in [vec![1.5f32], full, vec![10.0, 20.0, 30.0]] {
             let mut out = Vec::new();
-            let got = matmul_fused_add(&at, &bt, &TensorView::from_slice(&bias, vec![bias.len()]), &mut out);
+            let got = matmul_fused_add(
+                &at,
+                &bt,
+                &TensorView::from_slice(&bias, vec![bias.len()]),
+                &mut out,
+            );
             assert_eq!(got.shape.as_ref(), &[batch, m, n]);
             for (i, (&g, &p)) in got.data.iter().zip(&product).enumerate() {
                 let want = p + bias[i % bias.len()];
-                assert!((g - want).abs() < 1e-4, "bias len {} at {i}: {g} vs {want}", bias.len());
+                assert!(
+                    (g - want).abs() < 1e-4,
+                    "bias len {} at {i}: {g} vs {want}",
+                    bias.len()
+                );
             }
         }
     }
@@ -323,5 +332,4 @@ mod tests {
             assert!((r - e).abs() < 0.01, "Mismatch at {i}: {r} vs {e}");
         }
     }
-
 }

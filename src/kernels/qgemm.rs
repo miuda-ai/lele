@@ -111,7 +111,9 @@ impl Layout {
             #[cfg(target_arch = "x86_64")]
             Level::Avx512(_) => Layout::Dot(Dot::Vnni),
             #[cfg(target_arch = "aarch64")]
-            Level::Neon(_) if cfg!(target_os = "macos") || !cfg!(target_feature = "dotprod") => Layout::Float,
+            Level::Neon(_) if cfg!(target_os = "macos") || !cfg!(target_feature = "dotprod") => {
+                Layout::Float
+            }
             #[cfg(target_arch = "aarch64")]
             Level::Neon(_) => Layout::Dot(Dot::Sdot),
             _ => Layout::Pairs,
@@ -120,13 +122,21 @@ impl Layout {
 
     /// The layouts the tests run at every level.
     #[cfg(test)]
-    pub(crate) const ALL: [Layout; 4] = [Layout::Pairs, Layout::Dot(Dot::Vnni), Layout::Dot(Dot::Sdot), Layout::Float];
+    pub(crate) const ALL: [Layout; 4] = [
+        Layout::Pairs,
+        Layout::Dot(Dot::Vnni),
+        Layout::Dot(Dot::Sdot),
+        Layout::Float,
+    ];
 }
 
 enum Packed {
     /// Panels of `NR` columns, each `pairs` rows of `NR` packed pairs (`b - zb`); zero past
     /// `k` and `n`.
-    Pairs { pairs: usize, data: AlignedI32 },
+    Pairs {
+        pairs: usize,
+        data: AlignedI32,
+    },
     Dot(QuadWeights),
     /// Row-major `k x n` centered codes (`b - zb`).
     Float(Vec<f32>),
@@ -135,8 +145,23 @@ enum Packed {
 impl QWeights {
     /// Packs row-major `k x n` codes, `i8` if `signed` and `u8` otherwise, with one zero
     /// point and one scale for all columns or one of each per column.
-    pub fn new(codes: &[u8], k: usize, n: usize, signed: bool, zero_point: &[i32], scale: &[f32]) -> Self {
-        Self::with_layout(Layout::for_level(Level::new()), codes, k, n, signed, zero_point, scale)
+    pub fn new(
+        codes: &[u8],
+        k: usize,
+        n: usize,
+        signed: bool,
+        zero_point: &[i32],
+        scale: &[f32],
+    ) -> Self {
+        Self::with_layout(
+            Layout::for_level(Level::new()),
+            codes,
+            k,
+            n,
+            signed,
+            zero_point,
+            scale,
+        )
     }
 
     pub(crate) fn with_layout(
@@ -149,14 +174,41 @@ impl QWeights {
         scale: &[f32],
     ) -> Self {
         assert_eq!(codes.len(), k * n);
-        let code = |i: usize| if signed { codes[i] as i8 as i32 } else { codes[i] as i32 };
-        Self::pack(layout, k, n, code, if signed { 0 } else { 128 }, zero_point, scale)
+        let code = |i: usize| {
+            if signed {
+                codes[i] as i8 as i32
+            } else {
+                codes[i] as i32
+            }
+        };
+        Self::pack(
+            layout,
+            k,
+            n,
+            code,
+            if signed { 0 } else { 128 },
+            zero_point,
+            scale,
+        )
     }
 
     /// As [`QWeights::new`], from codes held in `f32` (as lele keeps integer tensors); they
     /// are taken as `i8` if any is negative and `u8` otherwise.
-    pub fn from_f32_codes(codes: &[f32], k: usize, n: usize, zero_point: &[i32], scale: &[f32]) -> Self {
-        Self::from_f32_codes_with_layout(Layout::for_level(Level::new()), codes, k, n, zero_point, scale)
+    pub fn from_f32_codes(
+        codes: &[f32],
+        k: usize,
+        n: usize,
+        zero_point: &[i32],
+        scale: &[f32],
+    ) -> Self {
+        Self::from_f32_codes_with_layout(
+            Layout::for_level(Level::new()),
+            codes,
+            k,
+            n,
+            zero_point,
+            scale,
+        )
     }
 
     pub(crate) fn from_f32_codes_with_layout(
@@ -168,7 +220,11 @@ impl QWeights {
         scale: &[f32],
     ) -> Self {
         assert_eq!(codes.len(), k * n);
-        let shift = if codes.iter().any(|&c| c < 0.0) { 0 } else { 128 };
+        let shift = if codes.iter().any(|&c| c < 0.0) {
+            0
+        } else {
+            128
+        };
         Self::pack(layout, k, n, |i| codes[i] as i32, shift, zero_point, scale)
     }
 
@@ -189,7 +245,8 @@ impl QWeights {
         let packed = match layout {
             Layout::Pairs => {
                 let pairs = k.div_ceil(2);
-                let centered = |kk: usize, j: usize| if kk < k { code(kk * n + j) - zp(j) } else { 0 };
+                let centered =
+                    |kk: usize, j: usize| if kk < k { code(kk * n + j) - zp(j) } else { 0 };
                 let mut data = AlignedI32::zeroed(n.div_ceil(NR) * pairs * NR);
                 for p in 0..pairs {
                     for j in 0..n {
@@ -200,13 +257,20 @@ impl QWeights {
                 Packed::Pairs { pairs, data }
             }
             Layout::Dot(dot) => Packed::Dot(qgemm_dot::pack(dot, k, n, code, shift, zp)),
-            Layout::Float => Packed::Float((0..k * n).map(|i| (code(i) - zp(i % n)) as f32).collect()),
+            Layout::Float => {
+                Packed::Float((0..k * n).map(|i| (code(i) - zp(i % n)) as f32).collect())
+            }
         };
         let mut col_scale = vec![0.0; n.div_ceil(qgemm_dot::NR) * qgemm_dot::NR];
         for (j, s) in col_scale[..n].iter_mut().enumerate() {
             *s = scale[if scale.len() == 1 { 0 } else { j }];
         }
-        Self { k, n, packed, scale: col_scale }
+        Self {
+            k,
+            n,
+            packed,
+            scale: col_scale,
+        }
     }
 
     pub fn k(&self) -> usize {
@@ -247,7 +311,15 @@ pub(crate) struct Epilogue<'a> {
 
 /// `C = epilogue(A * B)` for B in the pairs layout. A is `m` rows of `w.pairs()` packed
 /// pairs, `lda` apart, as [`quantize_rows_at`] writes them; C is `m x n`, row-major.
-pub(crate) fn qgemm_at(level: Level, a: &[i32], m: usize, lda: usize, w: &QWeights, e: &Epilogue, c: &mut [f32]) {
+pub(crate) fn qgemm_at(
+    level: Level,
+    a: &[i32],
+    m: usize,
+    lda: usize,
+    w: &QWeights,
+    e: &Epilogue,
+    c: &mut [f32],
+) {
     let (pairs, _) = w.pairs();
     assert!(lda >= pairs && a.len() >= m.saturating_sub(1) * lda + pairs);
     assert!(c.len() >= m * w.n);
@@ -307,7 +379,11 @@ fn qgemm_simd<S: Simd>(
             while ir < m {
                 let a = &a[ir * lda + pc..];
                 // (Empty with a single depth block.)
-                let sums = if sums.is_empty() { &mut [][..] } else { &mut sums[ir * lds + j..] };
+                let sums = if sums.is_empty() {
+                    &mut [][..]
+                } else {
+                    &mut sums[ir * lds + j..]
+                };
                 let c = &mut c[ir * w.n + j..];
                 match MR.min(m - ir) {
                     6 => tile6(simd, &t, a, b, sums, c),
@@ -356,7 +432,14 @@ macro_rules! tile_fn {
     ($name:ident, $r:literal) => {
         #[simd]
         #[inline(never)]
-        fn $name<S: Simd>(simd: S, t: &Tile, a: &[i32], b: &[i32], sums: &mut [i32], c: &mut [f32]) {
+        fn $name<S: Simd>(
+            simd: S,
+            t: &Tile,
+            a: &[i32],
+            b: &[i32],
+            sums: &mut [i32],
+            c: &mut [f32],
+        ) {
             use fearless_simd::prelude::*;
             const R: usize = $r;
             let kc = t.kc;
@@ -376,7 +459,8 @@ macro_rules! tile_fn {
                 for r in 0..R {
                     // A float broadcast: from memory, it takes no vector ALU slot on Zen 3
                     // (an integer one does), which is worth 4%.
-                    let av: i16x16<S> = f32x8::splat(simd, f32::from_bits(a_rows[r][p] as u32)).bitcast();
+                    let av: i16x16<S> =
+                        f32x8::splat(simd, f32::from_bits(a_rows[r][p] as u32)).bitcast();
                     acc[r][0] = acc[r][0] + madd(simd, av, b0);
                     acc[r][1] = acc[r][1] + madd(simd, av, b1);
                 }
@@ -412,7 +496,8 @@ fn finish<S: Simd, const R: usize>(simd: S, t: &Tile, acc: [[i32x8<S>; 2]; R], c
     if let Some(b) = t.bias {
         bias[..t.width].copy_from_slice(b);
     }
-    let bias: [f32x8<S>; 2] = core::array::from_fn(|v| f32x8::from_slice(simd, &bias[8 * v..][..8]));
+    let bias: [f32x8<S>; 2] =
+        core::array::from_fn(|v| f32x8::from_slice(simd, &bias[8 * v..][..8]));
     let zero = f32x8::splat(simd, 0.0);
     for r in 0..R {
         let vals: [f32x8<S>; 2] = core::array::from_fn(|v| {
@@ -463,7 +548,9 @@ fn madd<S: Simd>(simd: S, a: i16x16<S>, b: i16x16<S>) -> i32x8<S> {
         }
         #[cfg(target_arch = "aarch64")]
         Level::Neon(_) => {
-            use core::arch::aarch64::{int16x8_t, int32x4_t, vget_low_s16, vmull_high_s16, vmull_s16, vpaddq_s32};
+            use core::arch::aarch64::{
+                int16x8_t, int32x4_t, vget_low_s16, vmull_high_s16, vmull_s16, vpaddq_s32,
+            };
             use fearless_simd::SimdInto;
             let (a0, a1) = simd.split_i16x16(a);
             let (b0, b1) = simd.split_i16x16(b);
@@ -474,7 +561,10 @@ fn madd<S: Simd>(simd: S, a: i16x16<S>, b: i16x16<S>) -> i32x8<S> {
                     vpaddq_s32(lo, vmull_high_s16(a, b))
                 }
             };
-            simd.combine_i32x4(half(a0.into(), b0.into()).simd_into(simd), half(a1.into(), b1.into()).simd_into(simd))
+            simd.combine_i32x4(
+                half(a0.into(), b0.into()).simd_into(simd),
+                half(a1.into(), b1.into()).simd_into(simd),
+            )
         }
         #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
         Level::WasmSimd128(_) => {
@@ -489,8 +579,9 @@ fn madd<S: Simd>(simd: S, a: i16x16<S>, b: i16x16<S>) -> i32x8<S> {
         _ => {
             use fearless_simd::prelude::*;
             let (a, b) = (a.as_slice(), b.as_slice());
-            let out: [i32; 8] =
-                core::array::from_fn(|i| a[2 * i] as i32 * b[2 * i] as i32 + a[2 * i + 1] as i32 * b[2 * i + 1] as i32);
+            let out: [i32; 8] = core::array::from_fn(|i| {
+                a[2 * i] as i32 * b[2 * i] as i32 + a[2 * i + 1] as i32 * b[2 * i + 1] as i32
+            });
             i32x8::from_slice(simd, &out)
         }
     }
@@ -516,7 +607,10 @@ pub(crate) fn quantize_rows_at(
     assert!(src.len() >= m * k);
     // Every pair is written, so the buffer is not filled first.
     crate::kernels::utils::ensure_capacity(dst, m * k.div_ceil(2));
-    simd_call!(level, quantize_rows_simd(src, m, k, scale, zero_point, center, dst))
+    simd_call!(
+        level,
+        quantize_rows_simd(src, m, k, scale, zero_point, center, dst)
+    )
 }
 
 #[simd]
@@ -533,7 +627,9 @@ fn quantize_rows_simd<S: Simd>(
     use fearless_simd::prelude::*;
     let pairs = k.div_ceil(2);
     let code = |x: f32| {
-        let q = (x / scale).round_ties_even().clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+        let q = (x / scale)
+            .round_ties_even()
+            .clamp(i32::MIN as f32, i32::MAX as f32) as i32;
         q.saturating_add(zero_point).clamp(0, 255) - center
     };
     let sv = f32x8::splat(simd, scale);
@@ -627,28 +723,68 @@ pub fn mat_mul_integer_f32<'a>(
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
     let (ad, bd) = (a.shape.len(), b.shape.len());
-    assert!(ad >= 2 && bd >= 2, "MatMulInteger of {:?} and {:?}", a.shape, b.shape);
+    assert!(
+        ad >= 2 && bd >= 2,
+        "MatMulInteger of {:?} and {:?}",
+        a.shape,
+        b.shape
+    );
     let (m, k, n) = (a.shape[ad - 2], a.shape[ad - 1], b.shape[bd - 1]);
-    assert_eq!(b.shape[bd - 2], k, "MatMulInteger of {:?} and {:?}", a.shape, b.shape);
+    assert_eq!(
+        b.shape[bd - 2],
+        k,
+        "MatMulInteger of {:?} and {:?}",
+        a.shape,
+        b.shape
+    );
     let batch_a: usize = a.shape[..ad - 2].iter().product();
     let batch_b: usize = b.shape[..bd - 2].iter().product();
     let batch = batch_a.max(batch_b);
     crate::kernels::utils::ensure_capacity(out, batch * m * n);
     let scale = scale.unwrap_or(&[1.0]);
-    let e = Epilogue { scale: 1.0, bias, relu };
+    let e = Epilogue {
+        scale: 1.0,
+        bias,
+        relu,
+    };
     let level = Level::new();
     if batch_b == 1 {
         // One B for every batch of A: all their rows in one product.
         let w = QWeights::from_f32_codes(&b.data[..k * n], k, n, b_zero_point, scale);
-        run_at(level, &w, &a.data, batch_a * m, 1.0, 0, a_zero_point, &e, out);
+        run_at(
+            level,
+            &w,
+            &a.data,
+            batch_a * m,
+            1.0,
+            0,
+            a_zero_point,
+            &e,
+            out,
+        );
     } else {
         for i in 0..batch {
-            let w = QWeights::from_f32_codes(&b.data[i * k * n..][..k * n], k, n, b_zero_point, scale);
+            let w =
+                QWeights::from_f32_codes(&b.data[i * k * n..][..k * n], k, n, b_zero_point, scale);
             let a = &a.data[if batch_a == 1 { 0 } else { i * m * k }..][..m * k];
-            run_at(level, &w, a, m, 1.0, 0, a_zero_point, &e, &mut out[i * m * n..][..m * n]);
+            run_at(
+                level,
+                &w,
+                a,
+                m,
+                1.0,
+                0,
+                a_zero_point,
+                &e,
+                &mut out[i * m * n..][..m * n],
+            );
         }
     }
-    let mut shape = if batch_a >= batch_b { a.shape[..ad - 2].to_vec() } else { b.shape[..bd - 2].to_vec() };
+    let mut shape = if batch_a >= batch_b {
+        a.shape[..ad - 2].to_vec()
+    } else {
+        b.shape[..bd - 2].to_vec()
+    };
     shape.extend([m, n]);
     TensorView::from_slice(out, shape)
 }
@@ -687,7 +823,10 @@ pub(crate) fn run_at(
         Packed::Float(b) => A_FLOAT.with_borrow_mut(|a| {
             let (k, n) = (w.k, w.n);
             crate::kernels::utils::ensure_capacity(a, m * k);
-            simd_call!(level, quantize_rows_f32_simd(src, m * k, scale, zero_point, center, a));
+            simd_call!(
+                level,
+                quantize_rows_f32_simd(src, m * k, scale, zero_point, center, a)
+            );
             sgemm(&a[..m * k], b, m, k, n, &mut c[..m * n]);
             simd_call!(level, epilogue_simd(m, n, &w.scale, e, c));
         }),
@@ -696,21 +835,37 @@ pub(crate) fn run_at(
 
 /// `dst = clamp(round_ties_even(x / scale) + zero_point, 0, 255) - center`, in `f32`.
 #[simd]
-fn quantize_rows_f32_simd<S: Simd>(simd: S, src: &[f32], len: usize, scale: f32, zero_point: i32, center: i32, dst: &mut [f32]) {
+fn quantize_rows_f32_simd<S: Simd>(
+    simd: S,
+    src: &[f32],
+    len: usize,
+    scale: f32,
+    zero_point: i32,
+    center: i32,
+    dst: &mut [f32],
+) {
     use fearless_simd::prelude::*;
     let (src, dst) = (&src[..len], &mut dst[..len]);
     let code = |x: f32| {
-        let q = (x / scale).round_ties_even().clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+        let q = (x / scale)
+            .round_ties_even()
+            .clamp(i32::MIN as f32, i32::MAX as f32) as i32;
         (q.saturating_add(zero_point).clamp(0, 255) - center) as f32
     };
     let sv = f32x8::splat(simd, scale);
-    let (lo, hi) = (f32x8::splat(simd, -zero_point as f32), f32x8::splat(simd, (255 - zero_point) as f32));
+    let (lo, hi) = (
+        f32x8::splat(simd, -zero_point as f32),
+        f32x8::splat(simd, (255 - zero_point) as f32),
+    );
     let shift = f32x8::splat(simd, (zero_point - center) as f32);
     let (chunks, rest) = src.as_chunks::<8>();
     let (out, out_rest) = dst.as_chunks_mut::<8>();
     for (x, o) in chunks.iter().zip(out) {
         // Clamping the rounded quotient before adding the zero point keeps it exact in f32.
-        let q = (f32x8::from_slice(simd, x) / sv).round_ties_even().max(lo).min(hi);
+        let q = (f32x8::from_slice(simd, x) / sv)
+            .round_ties_even()
+            .max(lo)
+            .min(hi);
         (q + shift).store_slice(o);
     }
     for (x, o) in rest.iter().zip(out_rest) {
@@ -733,7 +888,14 @@ fn sgemm(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, c: &mut [f32]) {
 
 /// `c[i][j] = relu?(c[i][j] * e.scale * col_scale[j] + bias[j])`, in place.
 #[simd]
-fn epilogue_simd<S: Simd>(simd: S, m: usize, n: usize, col_scale: &[f32], e: &Epilogue, c: &mut [f32]) {
+fn epilogue_simd<S: Simd>(
+    simd: S,
+    m: usize,
+    n: usize,
+    col_scale: &[f32],
+    e: &Epilogue,
+    c: &mut [f32],
+) {
     use fearless_simd::prelude::*;
     let zero = f32x8::splat(simd, 0.0);
     let sa = f32x8::splat(simd, e.scale);
@@ -741,7 +903,9 @@ fn epilogue_simd<S: Simd>(simd: S, m: usize, n: usize, col_scale: &[f32], e: &Ep
         let (chunks, rest) = row.as_chunks_mut::<8>();
         for (i, o) in chunks.iter_mut().enumerate() {
             let s = f32x8::from_slice(simd, &col_scale[8 * i..][..8]) * sa;
-            let b = e.bias.map_or(zero, |b| f32x8::from_slice(simd, &b[8 * i..][..8]));
+            let b = e
+                .bias
+                .map_or(zero, |b| f32x8::from_slice(simd, &b[8 * i..][..8]));
             let x = f32x8::from_slice(simd, o) * s + b;
             (if e.relu { x.max(zero) } else { x }).store_slice(o);
         }
@@ -766,11 +930,25 @@ fn quantized_matmul<'a>(
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
     let k = x.shape.last().copied().unwrap_or(1);
-    assert_eq!(k, w.k, "depth of {:?} against a {}x{} weight", x.shape, w.k, w.n);
+    assert_eq!(
+        k, w.k,
+        "depth of {:?} against a {}x{} weight",
+        x.shape, w.k, w.n
+    );
     let m: usize = x.shape[..x.shape.len().saturating_sub(1)].iter().product();
     // C is written whole, so the buffer is not filled first.
     crate::kernels::utils::ensure_capacity(out, m * w.n);
-    run_at(Level::new(), w, &x.data, m, scale, zero_point, center, &Epilogue { scale, bias, relu }, out);
+    run_at(
+        Level::new(),
+        w,
+        &x.data,
+        m,
+        scale,
+        zero_point,
+        center,
+        &Epilogue { scale, bias, relu },
+        out,
+    );
     let mut shape = x.shape.to_vec();
     match shape.last_mut() {
         Some(last) => *last = w.n,
@@ -790,8 +968,14 @@ fn min_max_simd<S: Simd>(simd: S, x: &[f32]) -> (f32, f32) {
         lo = lo.min(v);
         hi = hi.max(v);
     }
-    let lo = rest.iter().fold(lo.as_slice().iter().copied().fold(f32::MAX, f32::min), |a, &b| a.min(b));
-    let hi = rest.iter().fold(hi.as_slice().iter().copied().fold(f32::MIN, f32::max), |a, &b| a.max(b));
+    let lo = rest.iter().fold(
+        lo.as_slice().iter().copied().fold(f32::MAX, f32::min),
+        |a, &b| a.min(b),
+    );
+    let hi = rest.iter().fold(
+        hi.as_slice().iter().copied().fold(f32::MIN, f32::max),
+        |a, &b| a.max(b),
+    );
     (lo, hi)
 }
 
@@ -811,7 +995,11 @@ mod tests {
         for r in 0..m {
             for kk in 0..k {
                 let p = a[r * pairs + kk / 2];
-                out[r * k + kk] = if kk % 2 == 0 { p as i16 as i32 } else { p >> 16 };
+                out[r * k + kk] = if kk % 2 == 0 {
+                    p as i16 as i32
+                } else {
+                    p >> 16
+                };
             }
         }
         out
@@ -821,13 +1009,28 @@ mod tests {
     fn test_qgemm_matches_reference_at_every_level() {
         let mut rng = Rng::new(7);
         let sizes = [
-            (1, 1, 1), (1, 2, 16), (2, 3, 17), (3, 7, 5), (4, 64, 33), (5, 31, 40), (6, 16, 16),
-            (7, 40, 48), (13, 9, 100), (1, 600, 70), (9, 513, 20), (8, 1100, 37), (17, 0, 9),
+            (1, 1, 1),
+            (1, 2, 16),
+            (2, 3, 17),
+            (3, 7, 5),
+            (4, 64, 33),
+            (5, 31, 40),
+            (6, 16, 16),
+            (7, 40, 48),
+            (13, 9, 100),
+            (1, 600, 70),
+            (9, 513, 20),
+            (8, 1100, 37),
+            (17, 0, 9),
             // Several depth blocks.
-            (7, 2100, 20), (2, 4500, 33),
+            (7, 2100, 20),
+            (2, 4500, 33),
         ];
         // Every layout at every level: the dot layouts emulate their instructions elsewhere.
-        for (level, layout) in levels().into_iter().flat_map(|l| Layout::ALL.map(|layout| (l, layout))) {
+        for (level, layout) in levels()
+            .into_iter()
+            .flat_map(|l| Layout::ALL.map(|layout| (l, layout)))
+        {
             for &(m, k, n) in &sizes {
                 for case in 0..4 {
                     let signed = case % 2 == 0;
@@ -841,19 +1044,27 @@ mod tests {
                             _ => rng.f32(0.0, 256.0) as i32,
                         })
                         .collect();
-                    let ws: Vec<f32> = (0..if per_col { n } else { 1 }).map(|_| rng.f32(0.001, 0.1)).collect();
+                    let ws: Vec<f32> = (0..if per_col { n } else { 1 })
+                        .map(|_| rng.f32(0.001, 0.1))
+                        .collect();
                     let w = QWeights::with_layout(layout, &raw, k, n, signed, &zp, &ws);
                     assert_eq!(w.layout(), layout);
                     let x = rng.vec(m * k, -3.0, 3.0);
                     let (sa, za) = (rng.f32(0.01, 0.05), rng.f32(0.0, 256.0) as i32);
                     let bias = rng.vec(n, -1.0, 1.0);
                     let relu = case == 1;
-                    let e = Epilogue { scale: sa, bias: (case != 3).then_some(&bias[..]), relu };
+                    let e = Epilogue {
+                        scale: sa,
+                        bias: (case != 3).then_some(&bias[..]),
+                        relu,
+                    };
                     let mut c = vec![f32::NAN; m * n];
                     run_at(level, &w, &x, m, sa, za, za, &e, &mut c);
 
-                    let ac: Vec<i32> =
-                        x.iter().map(|&v| ((v / sa).round_ties_even() as i32 + za).clamp(0, 255) - za).collect();
+                    let ac: Vec<i32> = x
+                        .iter()
+                        .map(|&v| ((v / sa).round_ties_even() as i32 + za).clamp(0, 255) - za)
+                        .collect();
                     let mut want = vec![0.0f32; m * n];
                     for i in 0..m {
                         for j in 0..n {
@@ -894,7 +1105,13 @@ mod tests {
         for level in levels() {
             for &(m, k) in &[(1, 1), (1, 16), (2, 17), (3, 33), (4, 100)] {
                 // The last: codes already, less their zero point.
-                for &(scale, zp, center) in &[(0.02f32, 128, 128), (0.01, 0, 0), (0.05, 255, 255), (1.0, 3, 3), (1.0, 0, 179)] {
+                for &(scale, zp, center) in &[
+                    (0.02f32, 128, 128),
+                    (0.01, 0, 0),
+                    (0.05, 255, 255),
+                    (1.0, 3, 3),
+                    (1.0, 0, 179),
+                ] {
                     // On the grid (as QDQ activations are), off it, and out of range.
                     let mut x = rng.vec(m * k, -8.0, 8.0);
                     for (i, v) in x.iter_mut().enumerate().step_by(3) {
@@ -904,8 +1121,12 @@ mod tests {
                     quantize_rows_at(level, &x, m, k, scale, zp, center, &mut got);
                     let got = unpack_rows(&got, m, k);
                     for (i, (&g, &v)) in got.iter().zip(&x).enumerate() {
-                        let want = ((v / scale).round_ties_even() as i32 + zp).clamp(0, 255) - center;
-                        assert_eq!(g, want, "{level:?} {m}x{k} scale {scale} zp {zp} center {center} at {i}: {v}");
+                        let want =
+                            ((v / scale).round_ties_even() as i32 + zp).clamp(0, 255) - center;
+                        assert_eq!(
+                            g, want,
+                            "{level:?} {m}x{k} scale {scale} zp {zp} center {center} at {i}: {v}"
+                        );
                     }
                 }
             }
@@ -922,51 +1143,80 @@ mod tests {
         let w_i8 = |kk: usize, j: usize| raw[kk * n + j] as i8 as f64;
         let ws: Vec<f32> = (0..n).map(|_| rng.f32(0.001, 0.01)).collect();
         let bias = rng.vec(n, -1.0, 1.0);
-        let matmul = |a: &dyn Fn(usize, usize) -> f64, b: &dyn Fn(usize, usize) -> f64| -> Vec<f64> {
-            let mut out = vec![0.0; batch * m * n];
-            for i in 0..batch * m {
-                for j in 0..n {
-                    out[i * n + j] = (0..k).map(|kk| a(i, kk) * b(kk, j)).sum();
+        let matmul =
+            |a: &dyn Fn(usize, usize) -> f64, b: &dyn Fn(usize, usize) -> f64| -> Vec<f64> {
+                let mut out = vec![0.0; batch * m * n];
+                for i in 0..batch * m {
+                    for j in 0..n {
+                        out[i * n + j] = (0..k).map(|kk| a(i, kk) * b(kk, j)).sum();
+                    }
                 }
-            }
-            out
-        };
+                out
+            };
         let rows = batch * m;
 
         // MatMulInteger: codes in, integer sums out; u8 B with a zero point.
         let a_codes: Vec<f32> = (0..rows * k).map(|_| rng.f32(0.0, 256.0).floor()).collect();
         let w = QWeights::new(&raw, k, n, false, &[131], &[1.0]);
         let mut out = Vec::new();
-        let got = mat_mul_integer_qweights(&TensorView::from_slice(&a_codes, vec![batch, m, k]), 179, &w, &mut out);
+        let got = mat_mul_integer_qweights(
+            &TensorView::from_slice(&a_codes, vec![batch, m, k]),
+            179,
+            &w,
+            &mut out,
+        );
         assert_eq!(got.shape.as_ref(), &[batch, m, n]);
-        let want = matmul(&|i, kk| a_codes[i * k + kk] as f64 - 179.0, &|kk, j| raw[kk * n + j] as f64 - 131.0);
+        let want = matmul(&|i, kk| a_codes[i * k + kk] as f64 - 179.0, &|kk, j| {
+            raw[kk * n + j] as f64 - 131.0
+        });
         assert_close(&got.data, &want, 0.0, "MatMulInteger");
 
         // Static QDQ: activations on the grid, i8 B, per-column scales.
         let w = QWeights::new(&raw, k, n, true, &[0], &ws);
         let (sa, za) = (0.03f32, 100);
-        let x: Vec<f32> = (0..rows * k).map(|_| sa * (rng.f32(0.0, 256.0).floor() - za as f32)).collect();
-        let got = qlinear_static(&TensorView::from_slice(&x, vec![batch, m, k]), sa, za, &w, &mut out);
-        let want = matmul(&|i, kk| x[i * k + kk] as f64, &|kk, j| w_i8(kk, j) * ws[j] as f64);
+        let x: Vec<f32> = (0..rows * k)
+            .map(|_| sa * (rng.f32(0.0, 256.0).floor() - za as f32))
+            .collect();
+        let got = qlinear_static(
+            &TensorView::from_slice(&x, vec![batch, m, k]),
+            sa,
+            za,
+            &w,
+            &mut out,
+        );
+        let want = matmul(&|i, kk| x[i * k + kk] as f64, &|kk, j| {
+            w_i8(kk, j) * ws[j] as f64
+        });
         assert_close(&got.data, &want, 1e-5, "QDQ");
 
         // Dynamic: anything in, quantized to its own range; bias and ReLU.
         let x = rng.vec(rows * k, -2.0, 3.0);
-        let got = qlinear_dynamic(&TensorView::from_slice(&x, vec![batch, m, k]), &w, Some(&bias), true, &mut out);
+        let got = qlinear_dynamic(
+            &TensorView::from_slice(&x, vec![batch, m, k]),
+            &w,
+            Some(&bias),
+            true,
+            &mut out,
+        );
         let (s, z) = dynamic_quant_params(&x);
-        let dq = |v: f32| s as f64 * (((v / s).round_ties_even() as i32 + z).clamp(0, 255) - z) as f64;
-        let want: Vec<f64> = matmul(&|i, kk| dq(x[i * k + kk]), &|kk, j| w_i8(kk, j) * ws[j] as f64)
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| (v + bias[i % n] as f64).max(0.0))
-            .collect();
+        let dq =
+            |v: f32| s as f64 * (((v / s).round_ties_even() as i32 + z).clamp(0, 255) - z) as f64;
+        let want: Vec<f64> = matmul(&|i, kk| dq(x[i * k + kk]), &|kk, j| {
+            w_i8(kk, j) * ws[j] as f64
+        })
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (v + bias[i % n] as f64).max(0.0))
+        .collect();
         assert_close(&got.data, &want, 1e-5, "dynamic");
         // And close to the unquantized product, so the quantization itself is sane.
-        let exact: Vec<f64> = matmul(&|i, kk| x[i * k + kk] as f64, &|kk, j| w_i8(kk, j) * ws[j] as f64)
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| (v + bias[i % n] as f64).max(0.0))
-            .collect();
+        let exact: Vec<f64> = matmul(&|i, kk| x[i * k + kk] as f64, &|kk, j| {
+            w_i8(kk, j) * ws[j] as f64
+        })
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (v + bias[i % n] as f64).max(0.0))
+        .collect();
         assert_close(&got.data, &exact, 0.05, "dynamic vs f32");
     }
 

@@ -1,10 +1,10 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::kernels::bias_act::bias_act_inplace;
+use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul as strided_matmul};
+use crate::kernels::simd::simd_call;
 use crate::kernels::timing;
 use crate::kernels::utils;
-use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul as strided_matmul};
 use crate::kernels::window2d::{self, Window};
-use crate::kernels::simd::simd_call;
 use crate::tensor::TensorView;
 use fearless_simd::{Level, Simd, f32x16};
 use fearless_simd_macros::simd;
@@ -252,8 +252,13 @@ fn conv2d_activation<'b, 'a>(
                     in_channels as isize,
                     1,
                 );
-                let in_mat =
-                    MatRef::<f32>::from_raw_parts(in_ptr, in_channels, spatial, spatial as isize, 1);
+                let in_mat = MatRef::<f32>::from_raw_parts(
+                    in_ptr,
+                    in_channels,
+                    spatial,
+                    spatial as isize,
+                    1,
+                );
                 let out_mat = MatMut::<f32>::from_raw_parts_mut(
                     out_ptr,
                     out_channels,
@@ -538,7 +543,16 @@ pub fn max_pool2d<'b, 'a>(
     ceil_mode: bool,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    max_pool2d_at(Level::new(), input, kernel_shape, strides, pads, dilations, ceil_mode, out)
+    max_pool2d_at(
+        Level::new(),
+        input,
+        kernel_shape,
+        strides,
+        pads,
+        dilations,
+        ceil_mode,
+        out,
+    )
 }
 
 fn max_pool2d_at<'b, 'a>(
@@ -920,7 +934,17 @@ pub fn conv_transpose<'b, 'a>(
     } else {
         None
     };
-    let r = conv_transpose_at(Level::new(), input, weights, bias, dilations, group, pads, strides, out);
+    let r = conv_transpose_at(
+        Level::new(),
+        input,
+        weights,
+        bias,
+        dilations,
+        group,
+        pads,
+        strides,
+        out,
+    );
     if crate::kernels::timing::TIMING_ENABLED {
         crate::kernels::timing::CONV_TRANS_NS.fetch_add(
             _t0.unwrap().elapsed().as_nanos() as u64,
@@ -942,9 +966,13 @@ fn conv_transpose_at<'b, 'a>(
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     if input.shape.len() == 3 {
-        conv_transpose_1d(level, input, weights, bias, dilations, group, pads, strides, out)
+        conv_transpose_1d(
+            level, input, weights, bias, dilations, group, pads, strides, out,
+        )
     } else {
-        conv_transpose_inner(level, input, weights, bias, dilations, group, pads, strides, out)
+        conv_transpose_inner(
+            level, input, weights, bias, dilations, group, pads, strides, out,
+        )
     }
 }
 
@@ -978,8 +1006,7 @@ fn conv_transpose_1d<'b, 'a>(
     let pad_begin = pads.get(0).copied().unwrap_or(0) as usize;
     let pad_end = pads.get(1).copied().unwrap_or(0) as usize;
 
-    let l_out = (l_in as i64 - 1) * stride as i64
-        - (pad_begin as i64 + pad_end as i64)
+    let l_out = (l_in as i64 - 1) * stride as i64 - (pad_begin as i64 + pad_end as i64)
         + dilation as i64 * (kernel as i64 - 1)
         + 1;
     assert!(
@@ -1048,7 +1075,10 @@ fn conv_transpose_depthwise_1d(
             phases.fill(bias.map_or(0.0, |b| b[ch]));
             for (k, &w) in weights[ch * kernel..][..kernel].iter().enumerate() {
                 let shift = (k * s.dilation_w) as isize - s.pad_left as isize;
-                let (q, r) = (shift.div_euclid(stride as isize), shift.rem_euclid(stride as isize) as usize);
+                let (q, r) = (
+                    shift.div_euclid(stride as isize),
+                    shift.rem_euclid(stride as isize) as usize,
+                );
                 // Phase `r` holds the outputs `r, r + stride, ...` below `out_len`.
                 let entries = out_len.saturating_sub(r).div_ceil(stride) as isize;
                 let (lo, hi) = ((-q).max(0), (entries - q).min(len as isize));
@@ -1079,7 +1109,8 @@ fn mul_add_into<S: Simd>(simd: S, dst: &mut [f32], src: &[f32], w: f32) {
     let (d16, d_rest) = dst.as_chunks_mut::<16>();
     let (s16, s_rest) = src.as_chunks::<16>();
     for (d, s) in d16.iter_mut().zip(s16) {
-        wv.mul_add(f32x16::from_slice(simd, s), f32x16::from_slice(simd, d)).store_slice(d);
+        wv.mul_add(f32x16::from_slice(simd, s), f32x16::from_slice(simd, d))
+            .store_slice(d);
     }
     for (d, &s) in d_rest.iter_mut().zip(s_rest) {
         *d += w * s;
@@ -1092,8 +1123,13 @@ fn interleave_into<S: Simd>(simd: S, out: &mut [f32], even: &[f32], odd: &[f32])
     use fearless_simd::prelude::*;
     let (o32, _) = out.as_chunks_mut::<32>();
     let pairs = o32.len();
-    for ((o, e), d) in o32.iter_mut().zip(even.as_chunks::<16>().0).zip(odd.as_chunks::<16>().0) {
-        let (a, b) = simd.interleave_f32x16(f32x16::from_slice(simd, e), f32x16::from_slice(simd, d));
+    for ((o, e), d) in o32
+        .iter_mut()
+        .zip(even.as_chunks::<16>().0)
+        .zip(odd.as_chunks::<16>().0)
+    {
+        let (a, b) =
+            simd.interleave_f32x16(f32x16::from_slice(simd, e), f32x16::from_slice(simd, d));
         let (lo, hi) = o.split_at_mut(16);
         a.store_slice(lo);
         b.store_slice(hi);
@@ -1159,9 +1195,21 @@ fn conv_transpose_gemm(
                 let w = &weights[g * icg * col_rows..][..icg * col_rows];
                 // `w` is `[icg, col_rows]`, so `col = w^T * x`.
                 unsafe {
-                    let w_t = MatRef::<f32>::from_raw_parts(w.as_ptr(), col_rows, icg, 1, col_rows as isize);
+                    let w_t = MatRef::<f32>::from_raw_parts(
+                        w.as_ptr(),
+                        col_rows,
+                        icg,
+                        1,
+                        col_rows as isize,
+                    );
                     let x = MatRef::<f32>::from_raw_parts(x.as_ptr(), icg, hw, hw as isize, 1);
-                    let c = MatMut::<f32>::from_raw_parts_mut(col.as_mut_ptr(), col_rows, hw, hw as isize, 1);
+                    let c = MatMut::<f32>::from_raw_parts_mut(
+                        col.as_mut_ptr(),
+                        col_rows,
+                        hw,
+                        hw as isize,
+                        1,
+                    );
                     strided_matmul(c, Accum::Replace, w_t, x, 1.0, Par::Seq);
                 }
                 let y = &mut out[(n * s.out_channels + g * ocg) * out_hw..][..ocg * out_hw];
@@ -1180,9 +1228,16 @@ fn add_every_other<S: Simd>(simd: S, dst: &mut [f32], src: &[f32]) {
     // Whole vectors where the odd entries between them exist too; they are
     // stored back unchanged.
     let vectors = (src.len() / 16).min(dst.len() / 32);
-    for (s, d) in src.as_chunks::<16>().0.iter().zip(dst.as_chunks_mut::<32>().0).take(vectors) {
+    for (s, d) in src
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<32>().0)
+        .take(vectors)
+    {
         let (a, b) = d.split_at_mut(16);
-        let (even, odd) = simd.deinterleave_f32x16(f32x16::from_slice(simd, a), f32x16::from_slice(simd, b));
+        let (even, odd) =
+            simd.deinterleave_f32x16(f32x16::from_slice(simd, a), f32x16::from_slice(simd, b));
         let (a2, b2) = simd.interleave_f32x16(even + f32x16::from_slice(simd, s), odd);
         a2.store_slice(a);
         b2.store_slice(b);
@@ -1226,10 +1281,19 @@ fn col2im(level: Level, s: &Transposed, col: &[f32], out: &mut [f32]) {
 }
 
 /// The inputs `i` whose output `i * stride + shift - pad` lies in `0..out_len`.
-fn tap_range(in_len: usize, stride: usize, shift: usize, pad: usize, out_len: usize) -> std::ops::Range<usize> {
+fn tap_range(
+    in_len: usize,
+    stride: usize,
+    shift: usize,
+    pad: usize,
+    out_len: usize,
+) -> std::ops::Range<usize> {
     // i * stride + shift >= pad and i * stride + shift < out_len + pad.
     let start = pad.saturating_sub(shift).div_ceil(stride);
-    let end = (out_len + pad).saturating_sub(shift).div_ceil(stride).min(in_len);
+    let end = (out_len + pad)
+        .saturating_sub(shift)
+        .div_ceil(stride)
+        .min(in_len);
     start.min(end)..end
 }
 
@@ -1312,7 +1376,14 @@ fn conv_transpose_inner<'b, 'a>(
         out_h,
         out_w,
     };
-    conv_transpose_gemm(level, &shape, &input.data, &weights.data, bias.map(|b| &b.data[..]), out);
+    conv_transpose_gemm(
+        level,
+        &shape,
+        &input.data,
+        &weights.data,
+        bias.map(|b| &b.data[..]),
+        out,
+    );
 
     TensorView::from_slice(out, vec![batch_size, out_channels, out_h, out_w])
 }
@@ -1320,7 +1391,7 @@ fn conv_transpose_inner<'b, 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::test_util::{assert_close, levels, Rng, AWKWARD_LENS};
+    use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_close, levels};
 
     /// `[channels, h, w]`, `[kh, kw]`, strides, dilations and pads `[top, left, bottom, right]`.
     type WindowCase = ([usize; 3], [usize; 2], [usize; 2], [usize; 2], [usize; 4]);
@@ -1350,7 +1421,10 @@ mod tests {
 
     fn out_dims(case: &WindowCase) -> (usize, usize) {
         let ([_, h, w], [kh, kw], [sh, sw], [dh, dw], [pt, pl, pb, pr]) = *case;
-        ((h + pt + pb - dh * (kh - 1) - 1) / sh + 1, (w + pl + pr - dw * (kw - 1) - 1) / sw + 1)
+        (
+            (h + pt + pb - dh * (kh - 1) - 1) / sh + 1,
+            (w + pl + pr - dw * (kw - 1) - 1) / sw + 1,
+        )
     }
 
     /// Each output's valid taps `(input index, tap index)` for one channel plane.
@@ -1431,7 +1505,15 @@ mod tests {
     fn test_conv_transpose_matches_reference() {
         // (in [c, h, w], out channels, groups, kernel [kh, kw], strides, dilations,
         // pads [top, left, bottom, right]); h = 0 makes it 1D, of length w.
-        let cases: &[([usize; 3], usize, usize, [usize; 2], [usize; 2], [usize; 2], [usize; 4])] = &[
+        let cases: &[(
+            [usize; 3],
+            usize,
+            usize,
+            [usize; 2],
+            [usize; 2],
+            [usize; 2],
+            [usize; 4],
+        )] = &[
             ([4, 5, 7], 6, 1, [2, 2], [2, 2], [1, 1], [0, 0, 0, 0]),
             ([4, 4, 6], 4, 2, [3, 3], [2, 2], [1, 1], [1, 1, 1, 1]),
             ([3, 3, 9], 2, 1, [3, 2], [1, 3], [2, 1], [0, 1, 2, 0]),
@@ -1467,18 +1549,27 @@ mod tests {
                         for (ih, iw, ki, kj) in input_taps(h, w, kh, kw) {
                             let oh = (ih * sh + ki * dh) as isize - pt as isize;
                             let ow = (iw * sw + kj * dw) as isize - pl as isize;
-                            if !(0..out_h as isize).contains(&oh) || !(0..out_w as isize).contains(&ow) {
+                            if !(0..out_h as isize).contains(&oh)
+                                || !(0..out_w as isize).contains(&ow)
+                            {
                                 continue;
                             }
                             let xv = x[((n * c + ic) * h + ih) * w + iw] as f64;
                             let wv = wt[((ic * ocg + o) * kh + ki) * kw + kj] as f64;
-                            want[((n * oc + oc_global) * out_h + oh as usize) * out_w + ow as usize] += xv * wv;
+                            want[((n * oc + oc_global) * out_h + oh as usize) * out_w
+                                + ow as usize] += xv * wv;
                         }
                     }
                 }
             }
             let (in_shape, w_shape, strides, dilations, pads) = if one_d {
-                (vec![batch, c, w], vec![c, ocg, kw], vec![sw as i64], vec![dw as i64], vec![pl as i64, pr as i64])
+                (
+                    vec![batch, c, w],
+                    vec![c, ocg, kw],
+                    vec![sw as i64],
+                    vec![dw as i64],
+                    vec![pl as i64, pr as i64],
+                )
             } else {
                 (
                     vec![batch, c, h, w],
@@ -1491,7 +1582,11 @@ mod tests {
             let input = TensorView::from_slice(&x, in_shape);
             let weights = TensorView::from_slice(&wt, w_shape);
             let bias = TensorView::from_slice(&b, vec![oc]);
-            let want_shape = if one_d { vec![batch, oc, out_w] } else { vec![batch, oc, out_h, out_w] };
+            let want_shape = if one_d {
+                vec![batch, oc, out_w]
+            } else {
+                vec![batch, oc, out_h, out_w]
+            };
             for level in levels() {
                 // A dirty buffer: every output must be written.
                 let mut out = vec![f32::NAN; 3];
@@ -1525,18 +1620,37 @@ mod tests {
                     let mut got = dst.clone();
                     simd_call!(level, add_every_other(&mut got, &src));
                     let want: Vec<f64> = (0..dst.len())
-                        .map(|i| dst[i] as f64 + if i % 2 == 0 && i / 2 < len { src[i / 2] as f64 } else { 0.0 })
+                        .map(|i| {
+                            dst[i] as f64
+                                + if i % 2 == 0 && i / 2 < len {
+                                    src[i / 2] as f64
+                                } else {
+                                    0.0
+                                }
+                        })
                         .collect();
-                    assert_close(&got, &want, 1e-6, &format!("{level:?} len {len} extra {extra}"));
+                    assert_close(
+                        &got,
+                        &want,
+                        1e-6,
+                        &format!("{level:?} len {len} extra {extra}"),
+                    );
                 }
             }
         }
     }
 
     /// Every `(ih, iw, ki, kj)`.
-    fn input_taps(h: usize, w: usize, kh: usize, kw: usize) -> impl Iterator<Item = (usize, usize, usize, usize)> {
+    fn input_taps(
+        h: usize,
+        w: usize,
+        kh: usize,
+        kw: usize,
+    ) -> impl Iterator<Item = (usize, usize, usize, usize)> {
         (0..h).flat_map(move |ih| {
-            (0..w).flat_map(move |iw| (0..kh).flat_map(move |ki| (0..kw).map(move |kj| (ih, iw, ki, kj))))
+            (0..w).flat_map(move |iw| {
+                (0..kh).flat_map(move |ki| (0..kw).map(move |kj| (ih, iw, ki, kj)))
+            })
         })
     }
 

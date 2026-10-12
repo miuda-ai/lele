@@ -29,18 +29,21 @@ pub(crate) mod test_util;
 pub mod timing;
 pub mod utils;
 pub(crate) mod window2d;
+pub use conv_integer::{ConvWeights, conv_integer, conv_integer_packed};
 pub use conv1d::conv1d;
 pub use conv1d::conv1d_fused;
 pub use conv2d::{
-    conv_transpose, conv2d, conv2d_fused, conv2d_silu, gather_elements, max_pool2d,
-    resize_nearest, topk,
+    conv_transpose, conv2d, conv2d_fused, conv2d_silu, gather_elements, max_pool2d, resize_nearest,
+    topk,
 };
-pub use conv_integer::{ConvWeights, conv_integer, conv_integer_packed};
 pub use gemm::{gemm, matmul, matmul_fused_add};
 pub use manipulation::*;
 pub use manipulation::{split, where_op};
 pub use math::*;
-pub use math::{cos, cumsum, einsum_bs_d_bsd, exp, expand, greater_or_equal, hard_sigmoid, less, leaky_relu, logical_and, logical_or, logical_xor, min_max, neg, range, sin, tile};
+pub use math::{
+    cos, cumsum, einsum_bs_d_bsd, exp, expand, greater_or_equal, hard_sigmoid, leaky_relu, less,
+    logical_and, logical_or, logical_xor, min_max, neg, range, sin, tile,
+};
 pub use norm::*;
 pub use pooling::*;
 pub use pooling::{average_pool2d, global_average_pool};

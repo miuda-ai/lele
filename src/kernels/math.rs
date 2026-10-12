@@ -365,9 +365,17 @@ where
         let cols = out_shape[dims - 1];
         let leading = numel / (rows * cols);
         let a_last = a.shape[a.shape.len() - 1];
-        let a_prev = if a.shape.len() >= 2 { a.shape[a.shape.len() - 2] } else { 1 };
+        let a_prev = if a.shape.len() >= 2 {
+            a.shape[a.shape.len() - 2]
+        } else {
+            1
+        };
         let b_last = b.shape[b.shape.len() - 1];
-        let b_prev = if b.shape.len() >= 2 { b.shape[b.shape.len() - 2] } else { 1 };
+        let b_prev = if b.shape.len() >= 2 {
+            b.shape[b.shape.len() - 2]
+        } else {
+            1
+        };
         // a is [1,N] (a_prev==1, a_last==cols), b is [M,1] (b_prev==rows, b_last==1).
         // Only when they have no leading dimensions: the loops below index a by
         // column and b by row alone.
@@ -389,7 +397,8 @@ where
                     let base = lbase + r * cols;
                     for c in 0..cols {
                         unsafe {
-                            *o_slice.get_unchecked_mut(base + c) = op(*a_slice.get_unchecked(c), bv);
+                            *o_slice.get_unchecked_mut(base + c) =
+                                op(*a_slice.get_unchecked(c), bv);
                         }
                     }
                 }
@@ -418,7 +427,8 @@ where
                     let base = lbase + r * cols;
                     for c in 0..cols {
                         unsafe {
-                            *o_slice.get_unchecked_mut(base + c) = op(av, *b_slice.get_unchecked(c));
+                            *o_slice.get_unchecked_mut(base + c) =
+                                op(av, *b_slice.get_unchecked(c));
                         }
                     }
                 }
@@ -923,12 +933,8 @@ fn equal_i64_impl<'a, T: PartialEq + Copy>(
     b_shape: &[usize],
     out: &'a mut Vec<i64>,
 ) -> TensorView<'a, i64> {
-    let out_shape = utils::broadcast_shapes(a_shape, b_shape).unwrap_or_else(|| {
-        panic!(
-            "Shapes not broadcastable: a={:?} b={:?}",
-            a_shape, b_shape
-        )
-    });
+    let out_shape = utils::broadcast_shapes(a_shape, b_shape)
+        .unwrap_or_else(|| panic!("Shapes not broadcastable: a={:?} b={:?}", a_shape, b_shape));
     let numel = out_shape.iter().product::<usize>();
     utils::ensure_capacity(out, numel);
     if a_data.len() == 1 && b_data.len() == 1 {
@@ -1005,7 +1011,9 @@ pub fn leaky_relu<'a, 'b>(
     alpha: f32,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    unary(input, out, |level, src, out| leaky_relu_into(level, src, out, alpha))
+    unary(input, out, |level, src, out| {
+        leaky_relu_into(level, src, out, alpha)
+    })
 }
 
 pub fn sqrt<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
@@ -1089,8 +1097,7 @@ pub fn pow<'b, 'a, T: ElementOps>(
             let exp_t = *b.data.first().unwrap();
             for i in 0..len {
                 unsafe {
-                    *o_slice.get_unchecked_mut(i) =
-                        a_slice.get_unchecked(i).pow(exp_t);
+                    *o_slice.get_unchecked_mut(i) = a_slice.get_unchecked(i).pow(exp_t);
                 }
             }
         }
@@ -1182,8 +1189,8 @@ pub fn reduce_mean<'b, 'a>(
                     *a += v;
                 }
             }
-            let mut s = ((acc[0] + acc[4]) + (acc[1] + acc[5]))
-                + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
+            let mut s =
+                ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
             for &v in chunks.remainder() {
                 s += v;
             }
@@ -1527,10 +1534,7 @@ pub fn reduce_l2<'b, 'a>(
     resolved_axes.sort();
     resolved_axes.dedup();
 
-    if resolved_axes.len() == 1
-        && resolved_axes[0] == dims - 1
-        && input.shape[dims - 1] == 2
-    {
+    if resolved_axes.len() == 1 && resolved_axes[0] == dims - 1 && input.shape[dims - 1] == 2 {
         let n = input.data.len() / 2;
         utils::ensure_capacity(out, n);
         let mut out_shape = Vec::new();
@@ -1556,13 +1560,15 @@ pub fn reduce_l2<'b, 'a>(
                         let v1 = _mm_loadu_ps(src.add(base + 4));
                         let re0 = _mm_shuffle_ps(v0, v1, 0x88);
                         let im0 = _mm_shuffle_ps(v0, v1, 0xDD);
-                        let res0 = _mm_sqrt_ps(_mm_add_ps(_mm_mul_ps(re0, re0), _mm_mul_ps(im0, im0)));
+                        let res0 =
+                            _mm_sqrt_ps(_mm_add_ps(_mm_mul_ps(re0, re0), _mm_mul_ps(im0, im0)));
 
                         let v2 = _mm_loadu_ps(src.add(base + 8));
                         let v3 = _mm_loadu_ps(src.add(base + 12));
                         let re1 = _mm_shuffle_ps(v2, v3, 0x88);
                         let im1 = _mm_shuffle_ps(v2, v3, 0xDD);
-                        let res1 = _mm_sqrt_ps(_mm_add_ps(_mm_mul_ps(re1, re1), _mm_mul_ps(im1, im1)));
+                        let res1 =
+                            _mm_sqrt_ps(_mm_add_ps(_mm_mul_ps(re1, re1), _mm_mul_ps(im1, im1)));
 
                         _mm_storeu_ps(dst.add(i), res0);
                         _mm_storeu_ps(dst.add(i + 4), res1);
@@ -1673,7 +1679,10 @@ pub fn max<'b, 'a>(
         let a_strides = utils::compute_strides(&a.shape);
         let b_strides = utils::compute_strides(&b.shape);
         let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap_or_else(|| {
-            panic!("max: cannot broadcast shapes {:?} and {:?}", a.shape, b.shape)
+            panic!(
+                "max: cannot broadcast shapes {:?} and {:?}",
+                a.shape, b.shape
+            )
         });
         let _out_strides = utils::compute_strides(&out_shape);
         let ndim = out_shape.len();
@@ -1699,8 +1708,16 @@ pub fn max<'b, 'a>(
                     b_idx += coords[d] * b_strides[b_dim];
                 }
             }
-            let a_val = if a_idx < a.data.len() { a.data[a_idx] } else { f32::NEG_INFINITY };
-            let b_val = if b_idx < b.data.len() { b.data[b_idx] } else { f32::NEG_INFINITY };
+            let a_val = if a_idx < a.data.len() {
+                a.data[a_idx]
+            } else {
+                f32::NEG_INFINITY
+            };
+            let b_val = if b_idx < b.data.len() {
+                b.data[b_idx]
+            } else {
+                f32::NEG_INFINITY
+            };
             out_slice[i] = a_val.max(b_val);
             for d in (0..ndim).rev() {
                 coords[d] += 1;
@@ -1835,7 +1852,10 @@ pub fn log<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
     }
     TensorView::from_slice(out, input.shape.to_vec())
 }
-pub fn neg<'b, 'a, T: ElementOps>(input: &TensorView<'b, T>, out: &'a mut Vec<T>) -> TensorView<'a, T> {
+pub fn neg<'b, 'a, T: ElementOps>(
+    input: &TensorView<'b, T>,
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
     let out_slice = out.as_mut_slice();
@@ -1893,7 +1913,12 @@ pub fn logical_and<'b, 'a, T: ElementOps>(
 ) -> TensorView<'a, T> {
     let zero = T::from_f32(0.0);
     let one = T::from_f32(1.0);
-    broadcast_binary_op(a, b, out, move |x, y| if x != zero && y != zero { one } else { zero })
+    broadcast_binary_op(
+        a,
+        b,
+        out,
+        move |x, y| if x != zero && y != zero { one } else { zero },
+    )
 }
 pub fn logical_or<'b, 'a, T: ElementOps>(
     a: &TensorView<'b, T>,
@@ -1902,7 +1927,12 @@ pub fn logical_or<'b, 'a, T: ElementOps>(
 ) -> TensorView<'a, T> {
     let zero = T::from_f32(0.0);
     let one = T::from_f32(1.0);
-    broadcast_binary_op(a, b, out, move |x, y| if x != zero || y != zero { one } else { zero })
+    broadcast_binary_op(
+        a,
+        b,
+        out,
+        move |x, y| if x != zero || y != zero { one } else { zero },
+    )
 }
 pub fn logical_xor<'b, 'a, T: ElementOps>(
     a: &TensorView<'b, T>,
@@ -1912,7 +1942,11 @@ pub fn logical_xor<'b, 'a, T: ElementOps>(
     let zero = T::from_f32(0.0);
     let one = T::from_f32(1.0);
     broadcast_binary_op(a, b, out, move |x, y| {
-        if (x != zero) != (y != zero) { one } else { zero }
+        if (x != zero) != (y != zero) {
+            one
+        } else {
+            zero
+        }
     })
 }
 pub fn cumsum<'b, 'a, T>(
@@ -2026,11 +2060,7 @@ pub fn expand<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         let dim_target = if i >= offset_target {
             let raw = target_shape_vec[i - offset_target];
             // ONNX convention: 0 means "use the input dimension size"
-            if raw == 0 {
-                dim_in
-            } else {
-                raw
-            }
+            if raw == 0 { dim_in } else { raw }
         } else {
             1
         };
@@ -2189,7 +2219,9 @@ pub fn stft<'b, 'a>(
         }
     }
 
-    let batch: usize = input.shape[..input.shape.len().saturating_sub(1)].iter().product();
+    let batch: usize = input.shape[..input.shape.len().saturating_sub(1)]
+        .iter()
+        .product();
     let mut stft_shape = vec![batch, num_frames, n_freqs, 2];
     if input.dim() <= 1 {
         stft_shape = vec![num_frames, n_freqs, 2];
@@ -2253,7 +2285,9 @@ pub fn stft_power_spectrum<'b, 'a>(
         }
     }
 
-    let batch: usize = input.shape[..input.shape.len().saturating_sub(1)].iter().product();
+    let batch: usize = input.shape[..input.shape.len().saturating_sub(1)]
+        .iter()
+        .product();
     let mut stft_shape = vec![batch, num_frames, n_freqs];
     if input.dim() <= 1 {
         stft_shape = vec![num_frames, n_freqs];
@@ -2289,7 +2323,7 @@ mod tests {
     #[test]
     fn test_add_sub_mul_div_match_broadcast_reference() {
         use crate::kernels::test_util::{
-            assert_same_bits, binary_inputs, binary_shapes, broadcast_reference, BINARY_OPS,
+            BINARY_OPS, assert_same_bits, binary_inputs, binary_shapes, broadcast_reference,
         };
         for (a_shape, b_shape) in &binary_shapes() {
             let (a, b) = binary_inputs(a_shape, b_shape);
@@ -2368,7 +2402,10 @@ mod tests {
         let input = TensorView::from_slice(&data, vec![data.len()]);
         let mut out = Vec::new();
         let res = leaky_relu(&input, 0.01, &mut out);
-        let expected: Vec<f32> = data.iter().map(|&x| if x >= 0.0 { x } else { 0.01 * x }).collect();
+        let expected: Vec<f32> = data
+            .iter()
+            .map(|&x| if x >= 0.0 { x } else { 0.01 * x })
+            .collect();
         assert_eq!(res.shape, vec![data.len()]);
         for (a, b) in res.data.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-6, "got {} expected {}", a, b);
@@ -2393,7 +2430,10 @@ mod tests {
         let input = TensorView::from_slice(&data, vec![2, 4]);
         let mut out = Vec::new();
         let res = leaky_relu(&input, 0.1, &mut out);
-        let expected: Vec<f32> = data.iter().map(|&x| if x >= 0.0 { x } else { 0.1 * x }).collect();
+        let expected: Vec<f32> = data
+            .iter()
+            .map(|&x| if x >= 0.0 { x } else { 0.1 * x })
+            .collect();
         assert_eq!(res.shape, vec![2, 4]);
         for (a, b) in res.data.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-6, "got {} expected {}", a, b);
@@ -2483,16 +2523,31 @@ mod tests {
         use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_close, levels};
         type Kernel = fn(Level, &[f32], &mut [f32]);
         let kernels: [(&str, Kernel, fn(f64) -> f64, f64); 7] = [
-            ("gelu", gelu_into, |x| 0.5 * x * (1.0 + libm::erf(x * std::f64::consts::FRAC_1_SQRT_2)), 2e-6),
-            ("fast_gelu", fast_gelu_into, |x| {
-                let inner = (2.0 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x);
-                0.5 * x * (1.0 + inner.tanh())
-            }, 2e-6),
+            (
+                "gelu",
+                gelu_into,
+                |x| 0.5 * x * (1.0 + libm::erf(x * std::f64::consts::FRAC_1_SQRT_2)),
+                2e-6,
+            ),
+            (
+                "fast_gelu",
+                fast_gelu_into,
+                |x| {
+                    let inner = (2.0 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x);
+                    0.5 * x * (1.0 + inner.tanh())
+                },
+                2e-6,
+            ),
             ("sigmoid", sigmoid_into, sigmoid_ref, 1e-6),
             ("tanh", tanh_into, f64::tanh, 1e-6),
             ("silu", silu_into, silu_ref, 1e-6),
             ("erf", erf_into, libm::erf, 1e-6),
-            ("gelu_erf", gelu_erf_into, |x| 0.5 * x * (1.0 + libm::erf(x * std::f64::consts::FRAC_1_SQRT_2)), 2e-6),
+            (
+                "gelu_erf",
+                gelu_erf_into,
+                |x| 0.5 * x * (1.0 + libm::erf(x * std::f64::consts::FRAC_1_SQRT_2)),
+                2e-6,
+            ),
         ];
         for level in levels() {
             let mut rng = Rng::new(12);
@@ -2542,12 +2597,21 @@ mod tests {
             for (&x, &got) in x.iter().zip(&apply(exp, &x)) {
                 let want = (x as f64).exp();
                 let err = ((got as f64 - want) / want).abs();
-                assert!(err < 2e-6, "exp({x}) = {got}, want {want}, relative error {err:.2e}");
+                assert!(
+                    err < 2e-6,
+                    "exp({x}) = {got}, want {want}, relative error {err:.2e}"
+                );
             }
         }
         let got = apply(exp, &[100.0, 1000.0, -200.0, -1000.0, 0.0]);
-        assert!(got[0] == f32::INFINITY && got[1] == f32::INFINITY, "overflow: {got:?}");
-        assert!(got[2] < 1e-30 && got[3] < 1e-30 && got[2] >= 0.0, "underflow: {got:?}");
+        assert!(
+            got[0] == f32::INFINITY && got[1] == f32::INFINITY,
+            "overflow: {got:?}"
+        );
+        assert!(
+            got[2] < 1e-30 && got[3] < 1e-30 && got[2] >= 0.0,
+            "underflow: {got:?}"
+        );
         assert_eq!(got[4], 1.0);
     }
 
@@ -2572,7 +2636,11 @@ mod tests {
             for x in [&x[..n], &x[1..]] {
                 let got = apply(|i, o| leaky_relu(i, 0.1, o), x);
                 for (&x, &got) in x.iter().zip(&got) {
-                    assert_eq!(got, if x >= 0.0 { x } else { 0.1 * x }, "leaky_relu({x}) n={n}");
+                    assert_eq!(
+                        got,
+                        if x >= 0.0 { x } else { 0.1 * x },
+                        "leaky_relu({x}) n={n}"
+                    );
                 }
             }
         }
@@ -2586,19 +2654,36 @@ mod tests {
     #[test]
     fn test_activations_saturate_without_overflow() {
         // Far past where exp overflows or underflows in f32.
-        let x = [-1000.0, -100.0, -88.0, -20.0, 20.0, 88.0, 100.0, 1000.0, 0.0, -0.5, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let x = [
+            -1000.0, -100.0, -88.0, -20.0, 20.0, 88.0, 100.0, 1000.0, 0.0, -0.5, 0.5, 1.0, 2.0,
+            3.0, 4.0, 5.0, 6.0,
+        ];
         for (name, got, want) in [
-            ("sigmoid", apply(sigmoid, &x), x.map(|v| sigmoid_ref(v as f64))),
+            (
+                "sigmoid",
+                apply(sigmoid, &x),
+                x.map(|v| sigmoid_ref(v as f64)),
+            ),
             ("tanh", apply(tanh_kernel, &x), x.map(|v| (v as f64).tanh())),
             ("silu", apply(silu, &x), x.map(|v| silu_ref(v as f64))),
-            ("fast_gelu", apply(fast_gelu, &x), x.map(|v| {
-                let v = v as f64;
-                0.5 * v * (1.0 + ((2.0 / std::f64::consts::PI).sqrt() * (v + 0.044715 * v * v * v)).tanh())
-            })),
+            (
+                "fast_gelu",
+                apply(fast_gelu, &x),
+                x.map(|v| {
+                    let v = v as f64;
+                    0.5 * v
+                        * (1.0
+                            + ((2.0 / std::f64::consts::PI).sqrt() * (v + 0.044715 * v * v * v))
+                                .tanh())
+                }),
+            ),
         ] {
             for ((&g, &w), &v) in got.iter().zip(&want).zip(&x) {
                 assert!(g.is_finite(), "{name}({v}) = {g}");
-                assert!((g as f64 - w).abs() <= 1e-6 * w.abs().max(1.0), "{name}({v}) = {g}, want {w}");
+                assert!(
+                    (g as f64 - w).abs() <= 1e-6 * w.abs().max(1.0),
+                    "{name}({v}) = {g}, want {w}"
+                );
             }
         }
     }
@@ -2613,7 +2698,10 @@ mod tests {
         let mut out = Vec::new();
         let alpha = 0.01f32;
         let res = leaky_relu(&input, alpha, &mut out);
-        let expected: Vec<f32> = data.iter().map(|&x| if x >= 0.0 { x } else { alpha * x }).collect();
+        let expected: Vec<f32> = data
+            .iter()
+            .map(|&x| if x >= 0.0 { x } else { alpha * x })
+            .collect();
         for (a, b) in res.data.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-6, "mismatch: got {} expected {}", a, b);
         }

@@ -4,7 +4,9 @@ pub struct RealFft {
 
 impl RealFft {
     pub fn new(length: usize) -> Self {
-        Self { fft: crate::kernels::fft::Rfft::new(length) }
+        Self {
+            fft: crate::kernels::fft::Rfft::new(length),
+        }
     }
 
     pub fn scratch_len(&self) -> usize {
@@ -27,11 +29,17 @@ impl RealFft {
         self.fft.forward(input, scratch, freq_re, freq_im);
 
         for i in 0..half {
-            output[i] = Complex { re: freq_re[i], im: freq_im[i] };
+            output[i] = Complex {
+                re: freq_re[i],
+                im: freq_im[i],
+            };
         }
         for i in half..n {
             let j = n - i;
-            output[i] = Complex { re: freq_re[j], im: -freq_im[j] };
+            output[i] = Complex {
+                re: freq_re[j],
+                im: -freq_im[j],
+            };
         }
     }
 

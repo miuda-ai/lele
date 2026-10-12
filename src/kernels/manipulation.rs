@@ -25,7 +25,10 @@ struct Small<T: Copy> {
 
 impl<T: Copy + Default> Small<T> {
     fn new() -> Self {
-        Self { len: 0, items: [T::default(); MAX_RANK] }
+        Self {
+            len: 0,
+            items: [T::default(); MAX_RANK],
+        }
     }
 
     fn push(&mut self, value: T) {
@@ -152,13 +155,29 @@ pub(crate) fn transpose_matrix<T: Copy + 'static>(
     } else {
         assert_matrix_fits(src.len(), src_ld, dst.len(), dst_ld, rows, cols);
         // SAFETY: checked just above.
-        unsafe { transpose_scalar(src.as_ptr(), src_ld, dst.as_mut_ptr(), dst_ld, 0..rows, 0..cols) };
+        unsafe {
+            transpose_scalar(
+                src.as_ptr(),
+                src_ld,
+                dst.as_mut_ptr(),
+                dst_ld,
+                0..rows,
+                0..cols,
+            )
+        };
     }
 }
 
 /// Copies `count` rows of `row` elements, `src_stride` apart in `src` and
 /// `dst_stride` apart in `dst`.
-fn copy_rows<T: Copy>(src: &[T], src_stride: usize, dst: &mut [T], dst_stride: usize, count: usize, row: usize) {
+fn copy_rows<T: Copy>(
+    src: &[T],
+    src_stride: usize,
+    dst: &mut [T],
+    dst_stride: usize,
+    count: usize,
+    row: usize,
+) {
     if count == 0 || row == 0 {
         return;
     }
@@ -178,7 +197,10 @@ fn copy_rows<T: Copy>(src: &[T], src_stride: usize, dst: &mut [T], dst_stride: u
                 std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<f32>(), dst.len()),
             )
         };
-        simd_call!(Level::new(), copy_rows_simd(src, src_stride, dst, dst_stride, count, row));
+        simd_call!(
+            Level::new(),
+            copy_rows_simd(src, src_stride, dst, dst_stride, count, row)
+        );
     } else {
         for i in 0..count {
             dst[i * dst_stride..][..row].copy_from_slice(&src[i * src_stride..][..row]);
@@ -210,13 +232,16 @@ fn copy_rows_simd<S: Simd>(
             if row >= 8 {
                 let mut k = 0;
                 while k + 8 < row {
-                    f32x8::load_array_ref(simd, &*s.add(k).cast()).store_array(&mut *d.add(k).cast());
+                    f32x8::load_array_ref(simd, &*s.add(k).cast())
+                        .store_array(&mut *d.add(k).cast());
                     k += 8;
                 }
-                f32x8::load_array_ref(simd, &*s.add(row - 8).cast()).store_array(&mut *d.add(row - 8).cast());
+                f32x8::load_array_ref(simd, &*s.add(row - 8).cast())
+                    .store_array(&mut *d.add(row - 8).cast());
             } else {
                 f32x4::load_array_ref(simd, &*s.cast()).store_array(&mut *d.cast());
-                f32x4::load_array_ref(simd, &*s.add(row - 4).cast()).store_array(&mut *d.add(row - 4).cast());
+                f32x4::load_array_ref(simd, &*s.add(row - 4).cast())
+                    .store_array(&mut *d.add(row - 4).cast());
             }
         }
     }
@@ -224,12 +249,22 @@ fn copy_rows_simd<S: Simd>(
 
 /// Panics unless a `rows x cols` matrix with `src_ld` between rows fits in
 /// `src_len` elements, and its transpose with `dst_ld` in `dst_len`.
-fn assert_matrix_fits(src_len: usize, src_ld: usize, dst_len: usize, dst_ld: usize, rows: usize, cols: usize) {
+fn assert_matrix_fits(
+    src_len: usize,
+    src_ld: usize,
+    dst_len: usize,
+    dst_ld: usize,
+    rows: usize,
+    cols: usize,
+) {
     if rows == 0 || cols == 0 {
         return;
     }
     assert!(
-        cols <= src_ld && rows <= dst_ld && (rows - 1) * src_ld + cols <= src_len && (cols - 1) * dst_ld + rows <= dst_len,
+        cols <= src_ld
+            && rows <= dst_ld
+            && (rows - 1) * src_ld + cols <= src_len
+            && (cols - 1) * dst_ld + rows <= dst_len,
         "transpose: {rows}x{cols} matrix (leading dimensions {src_ld} -> {dst_ld}) overruns {src_len} -> {dst_len} elements"
     );
 }
@@ -280,7 +315,10 @@ fn transpose_matrix_u32(
     rows: usize,
     cols: usize,
 ) {
-    simd_call!(level, transpose_matrix_simd(src, src_ld, dst, dst_ld, rows, cols))
+    simd_call!(
+        level,
+        transpose_matrix_simd(src, src_ld, dst, dst_ld, rows, cols)
+    )
 }
 
 #[simd]
@@ -305,13 +343,33 @@ fn transpose_matrix_simd<S: Simd>(
             transpose_tiles::<S, 8>(simd, src, src_ld, dst, dst_ld, 0..rows8, 0..cols8);
             match cols - cols8 {
                 0 => {}
-                1..=4 => transpose_tiles::<S, 4>(simd, src, src_ld, dst, dst_ld, 0..rows, cols - 4..cols),
-                _ => transpose_tiles::<S, 8>(simd, src, src_ld, dst, dst_ld, 0..rows, cols - 8..cols),
+                1..=4 => {
+                    transpose_tiles::<S, 4>(simd, src, src_ld, dst, dst_ld, 0..rows, cols - 4..cols)
+                }
+                _ => {
+                    transpose_tiles::<S, 8>(simd, src, src_ld, dst, dst_ld, 0..rows, cols - 8..cols)
+                }
             }
             match rows - rows8 {
                 0 => {}
-                1..=4 => transpose_tiles::<S, 4>(simd, src, src_ld, dst, dst_ld, rows - 4..rows, 0..cols8),
-                _ => transpose_tiles::<S, 8>(simd, src, src_ld, dst, dst_ld, rows - 8..rows, 0..cols8),
+                1..=4 => transpose_tiles::<S, 4>(
+                    simd,
+                    src,
+                    src_ld,
+                    dst,
+                    dst_ld,
+                    rows - 4..rows,
+                    0..cols8,
+                ),
+                _ => transpose_tiles::<S, 8>(
+                    simd,
+                    src,
+                    src_ld,
+                    dst,
+                    dst_ld,
+                    rows - 8..rows,
+                    0..cols8,
+                ),
             }
         } else if rows >= 4 && cols >= 4 {
             transpose_tiles::<S, 4>(simd, src, src_ld, dst, dst_ld, 0..rows, 0..cols);
@@ -425,7 +483,13 @@ fn interleave_pair_halves<S: Simd>(a: f32x8<S>, b: f32x8<S>) -> (f32x8<S>, f32x8
 /// 8 rows of 8 elements, `src_ld` and `dst_ld` apart, must be readable at
 /// `src` and writable at `dst`.
 #[inline(always)]
-unsafe fn transpose_8x8<S: Simd>(simd: S, src: *const u32, src_ld: usize, dst: *mut u32, dst_ld: usize) {
+unsafe fn transpose_8x8<S: Simd>(
+    simd: S,
+    src: *const u32,
+    src_ld: usize,
+    dst: *mut u32,
+    dst_ld: usize,
+) {
     let (src, dst) = (src.cast::<f32>(), dst.cast::<f32>());
     // Loops rather than `array::from_fn`, for the reason `transpose_tiles`
     // gives for not using closures.
@@ -443,16 +507,27 @@ unsafe fn transpose_8x8<S: Simd>(simd: S, src: *const u32, src_ld: usize, dst: *
     let (s2, s3) = interleave_pair_halves(t1, t3);
     let (s4, s5) = interleave_pair_halves(t4, t6);
     let (s6, s7) = interleave_pair_halves(t5, t7);
-    for (i, (top, bottom)) in [(s0, s4), (s1, s5), (s2, s6), (s3, s7)].into_iter().enumerate() {
+    for (i, (top, bottom)) in [(s0, s4), (s1, s5), (s2, s6), (s3, s7)]
+        .into_iter()
+        .enumerate()
+    {
         let ((top0, top1), (bottom0, bottom1)) = (top.split(), bottom.split());
-        top0.combine(bottom0).store_array(unsafe { &mut *dst.add(i * dst_ld).cast() });
-        top1.combine(bottom1).store_array(unsafe { &mut *dst.add((i + 4) * dst_ld).cast() });
+        top0.combine(bottom0)
+            .store_array(unsafe { &mut *dst.add(i * dst_ld).cast() });
+        top1.combine(bottom1)
+            .store_array(unsafe { &mut *dst.add((i + 4) * dst_ld).cast() });
     }
 }
 
 /// `transpose_8x8` for 4x4 tiles, in two rounds.
 #[inline(always)]
-unsafe fn transpose_4x4<S: Simd>(simd: S, src: *const u32, src_ld: usize, dst: *mut u32, dst_ld: usize) {
+unsafe fn transpose_4x4<S: Simd>(
+    simd: S,
+    src: *const u32,
+    src_ld: usize,
+    dst: *mut u32,
+    dst_ld: usize,
+) {
     let (src, dst) = (src.cast::<f32>(), dst.cast::<f32>());
     let mut v = [f32x4::splat(simd, 0.0); 4];
     for (i, v) in v.iter_mut().enumerate() {
@@ -1047,7 +1122,8 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
     }
     let in_stride = |axis: usize| shape[axis + 1..].iter().product::<usize>();
     // Each output axis as (length, input stride, output stride).
-    let mut axes: Small<(usize, usize, usize)> = perm.iter().map(|&p| (shape[p], in_stride(p), 0)).collect();
+    let mut axes: Small<(usize, usize, usize)> =
+        perm.iter().map(|&p| (shape[p], in_stride(p), 0)).collect();
     let mut out_stride = 1;
     for axis in axes.iter_mut().rev() {
         axis.2 = out_stride;
@@ -1059,15 +1135,28 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
         let row = shape[n - 1];
         let (count, src_stride, dst_stride) = axes[n - 2];
         for_each_offset(&axes[..n - 2], |s, d| {
-            copy_rows(&input_data[s..], src_stride, &mut dst[d..], dst_stride, count, row);
+            copy_rows(
+                &input_data[s..],
+                src_stride,
+                &mut dst[d..],
+                dst_stride,
+                count,
+                row,
+            );
         });
     } else {
         // A matrix transpose for each index of the other axes: its rows run
         // along the input axis that becomes innermost, its columns along the
         // input's innermost axis.
         let rows_axis = perm[n - 1];
-        let cols_at = perm.iter().position(|&p| p == n - 1).expect("perm is a permutation");
-        let outer: Small<_> = (0..n - 1).filter(|&i| i != cols_at).map(|i| axes[i]).collect();
+        let cols_at = perm
+            .iter()
+            .position(|&p| p == n - 1)
+            .expect("perm is a permutation");
+        let outer: Small<_> = (0..n - 1)
+            .filter(|&i| i != cols_at)
+            .map(|i| axes[i])
+            .collect();
         for_each_offset(&outer, |s, d| {
             transpose_matrix(
                 &input_data[s..],
@@ -1088,7 +1177,9 @@ fn transpose_any_rank<T: Copy>(src: &[T], shape: &[usize], perm: &[usize], dst: 
     let out_shape: Vec<usize> = perm.iter().map(|&p| shape[p]).collect();
     let mut index = vec![0; shape.len()];
     for value in dst.iter_mut() {
-        *value = src[(0..shape.len()).map(|d| index[d] * strides[perm[d]]).sum::<usize>()];
+        *value = src[(0..shape.len())
+            .map(|d| index[d] * strides[perm[d]])
+            .sum::<usize>()];
         for d in (0..shape.len()).rev() {
             index[d] += 1;
             if index[d] < out_shape[d] {
@@ -1136,7 +1227,13 @@ pub fn split<'a, T: Clone + Copy + std::fmt::Debug>(
     } else {
         axis as usize
     };
-    assert!(axis < ndim, "Split: axis out of bounds (axis={}, ndim={}, shape={:?})", axis, ndim, &*input.shape);
+    assert!(
+        axis < ndim,
+        "Split: axis out of bounds (axis={}, ndim={}, shape={:?})",
+        axis,
+        ndim,
+        &*input.shape
+    );
     let splits = &*resolve_split_sizes(splits, input.shape[axis]);
     let num_splits = splits.len();
     assert_eq!(
@@ -1203,7 +1300,13 @@ pub fn split_owned<T: Clone + Copy + std::fmt::Debug>(
     } else {
         axis as usize
     };
-    assert!(axis < ndim, "Split: axis out of bounds (axis={}, ndim={}, shape={:?})", axis, ndim, &*input.shape);
+    assert!(
+        axis < ndim,
+        "Split: axis out of bounds (axis={}, ndim={}, shape={:?})",
+        axis,
+        ndim,
+        &*input.shape
+    );
     let splits = &*resolve_split_sizes(splits, input.shape[axis]);
 
     let num_splits = splits.len();
@@ -1324,12 +1427,12 @@ where
                 let base = r * cond_numel;
                 for i in 0..cond_numel {
                     unsafe {
-                        *o.get_unchecked_mut(base + i) =
-                            if cond_data.get_unchecked(i).as_i64() != 0 {
-                                x_val
-                            } else {
-                                y_val
-                            };
+                        *o.get_unchecked_mut(base + i) = if cond_data.get_unchecked(i).as_i64() != 0
+                        {
+                            x_val
+                        } else {
+                            y_val
+                        };
                     }
                 }
             }
@@ -1475,7 +1578,9 @@ mod tests {
                     index[d] = i % out_shape[d];
                     i /= out_shape[d];
                 }
-                data[(0..shape.len()).map(|d| index[d] * strides[perm[d]]).sum::<usize>()]
+                data[(0..shape.len())
+                    .map(|d| index[d] * strides[perm[d]])
+                    .sum::<usize>()]
             })
             .collect()
     }
@@ -1506,7 +1611,11 @@ mod tests {
         let mut out = Vec::new();
         let got = transpose(&input, &perm_i64, &mut out);
         let want_shape: Vec<usize> = perm.iter().map(|&p| shape[p]).collect();
-        assert_eq!(&*got.shape, &want_shape[..], "shape {shape:?} perm {perm:?}");
+        assert_eq!(
+            &*got.shape,
+            &want_shape[..],
+            "shape {shape:?} perm {perm:?}"
+        );
         assert!(
             got.data == transpose_reference(&data, shape, perm),
             "shape {shape:?} perm {perm:?}"
@@ -1565,9 +1674,16 @@ mod tests {
             let floats: Vec<f32> = bits.iter().map(|&b| f32::from_bits(b)).collect();
             let perm_i64: Vec<i64> = perm.iter().map(|&p| p as i64).collect();
             let mut out = Vec::new();
-            let got = transpose(&TensorView::from_slice(&floats, shape.to_vec()), &perm_i64, &mut out);
+            let got = transpose(
+                &TensorView::from_slice(&floats, shape.to_vec()),
+                &perm_i64,
+                &mut out,
+            );
             let got: Vec<u32> = got.data.iter().map(|v| v.to_bits()).collect();
-            assert!(got == transpose_reference(&bits, shape, perm), "shape {shape:?} perm {perm:?}");
+            assert!(
+                got == transpose_reference(&bits, shape, perm),
+                "shape {shape:?} perm {perm:?}"
+            );
         }
     }
 
@@ -1575,12 +1691,12 @@ mod tests {
     fn test_transpose_model_shapes() {
         for (shape, perm) in [
             (&[1, 2, 400, 400][..], &[0, 1, 3, 2][..]), // YOLO26 head
-            (&[1, 80, 8400], &[0, 2, 1]),                // YOLO26 output
-            (&[1, 97, 4, 128], &[0, 2, 3, 1]),           // SenseVoice attention keys
+            (&[1, 80, 8400], &[0, 2, 1]),               // YOLO26 output
+            (&[1, 97, 4, 128], &[0, 2, 3, 1]),          // SenseVoice attention keys
             (&[1, 97, 4, 128], &[0, 2, 1, 3]),
-            (&[1, 16, 384, 30], &[1, 0, 2, 3]),          // T-one, only moves an axis of 1
+            (&[1, 16, 384, 30], &[1, 0, 2, 3]), // T-one, only moves an axis of 1
             (&[10, 1, 8, 48], &[1, 2, 3, 0]),
-            (&[1, 1856, 3, 4, 64], &[2, 0, 3, 1, 4]),    // MOSS-TTS QKV split
+            (&[1, 1856, 3, 4, 64], &[2, 0, 3, 1, 4]), // MOSS-TTS QKV split
         ] {
             check_transpose(shape, perm, |i| i as f32);
         }
@@ -1596,17 +1712,31 @@ mod tests {
                     // Padded leading dimensions, as for a matrix inside a larger
                     // tensor; multiples of 256 on either side, both or neither
                     // pick each order of walking the tiles.
-                    let pad = |len: usize, wide: bool| if wide { len.next_multiple_of(256) } else { len + 3 };
-                    for (wide_src, wide_dst) in [(false, false), (true, false), (false, true), (true, true)] {
+                    let pad = |len: usize, wide: bool| {
+                        if wide {
+                            len.next_multiple_of(256)
+                        } else {
+                            len + 3
+                        }
+                    };
+                    for (wide_src, wide_dst) in
+                        [(false, false), (true, false), (false, true), (true, true)]
+                    {
                         let (src_ld, dst_ld) = (pad(cols, wide_src), pad(rows, wide_dst));
                         // Spread over all 32 bits, so many are NaN patterns
                         // once the tiles move them as floats.
-                        let src: Vec<u32> = (0..rows * src_ld).map(|i| (i as u32).wrapping_mul(0x9e37_79b9)).collect();
+                        let src: Vec<u32> = (0..rows * src_ld)
+                            .map(|i| (i as u32).wrapping_mul(0x9e37_79b9))
+                            .collect();
                         let mut dst = vec![u32::MAX; cols * dst_ld];
                         transpose_matrix_u32(level, &src, src_ld, &mut dst, dst_ld, rows, cols);
                         for c in 0..cols {
                             for r in 0..dst_ld {
-                                let want = if r < rows { src[r * src_ld + c] } else { u32::MAX };
+                                let want = if r < rows {
+                                    src[r * src_ld + c]
+                                } else {
+                                    u32::MAX
+                                };
                                 assert_eq!(
                                     dst[c * dst_ld + r],
                                     want,
@@ -1627,11 +1757,26 @@ mod tests {
             (shape.to_vec(), perm.to_vec())
         };
         // Axes of 1 go, and runs kept in order merge.
-        assert_eq!(simplified(&[1, 16, 384, 30], &[1, 0, 2, 3]), (vec![184_320], vec![0]));
-        assert_eq!(simplified(&[1, 97, 4, 128], &[0, 2, 3, 1]), (vec![97, 512], vec![1, 0]));
-        assert_eq!(simplified(&[10, 1, 8, 48], &[1, 2, 3, 0]), (vec![10, 384], vec![1, 0]));
-        assert_eq!(simplified(&[2, 62, 8, 64], &[2, 0, 1, 3]), (vec![124, 8, 64], vec![1, 0, 2]));
-        assert_eq!(simplified(&[4, 3, 5], &[2, 1, 0]), (vec![4, 3, 5], vec![2, 1, 0]));
+        assert_eq!(
+            simplified(&[1, 16, 384, 30], &[1, 0, 2, 3]),
+            (vec![184_320], vec![0])
+        );
+        assert_eq!(
+            simplified(&[1, 97, 4, 128], &[0, 2, 3, 1]),
+            (vec![97, 512], vec![1, 0])
+        );
+        assert_eq!(
+            simplified(&[10, 1, 8, 48], &[1, 2, 3, 0]),
+            (vec![10, 384], vec![1, 0])
+        );
+        assert_eq!(
+            simplified(&[2, 62, 8, 64], &[2, 0, 1, 3]),
+            (vec![124, 8, 64], vec![1, 0, 2])
+        );
+        assert_eq!(
+            simplified(&[4, 3, 5], &[2, 1, 0]),
+            (vec![4, 3, 5], vec![2, 1, 0])
+        );
         assert_eq!(simplified(&[1, 1], &[1, 0]), (vec![], vec![]));
     }
 
@@ -1645,14 +1790,24 @@ mod tests {
         let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
         let input = TensorView::from_slice(&data, vec![2, 3, 4]);
         let mut out = Vec::new();
-        assert!(transpose(&input, &[], &mut out).data == transpose_reference(&data, &[2, 3, 4], &[2, 1, 0]));
-        assert!(transpose(&input, &[1, 0], &mut out).data == transpose_reference(&data, &[2, 3, 4], &[1, 0, 2]));
+        assert!(
+            transpose(&input, &[], &mut out).data
+                == transpose_reference(&data, &[2, 3, 4], &[2, 1, 0])
+        );
+        assert!(
+            transpose(&input, &[1, 0], &mut out).data
+                == transpose_reference(&data, &[2, 3, 4], &[1, 0, 2])
+        );
     }
 
     #[test]
     #[should_panic(expected = "not a permutation")]
     fn test_transpose_rejects_repeated_axis() {
         let data = [0.0f32; 6];
-        transpose(&TensorView::from_slice(&data, vec![2, 3]), &[0, 0], &mut Vec::new());
+        transpose(
+            &TensorView::from_slice(&data, vec![2, 3]),
+            &[0, 0],
+            &mut Vec::new(),
+        );
     }
 }

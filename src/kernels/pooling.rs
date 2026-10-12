@@ -55,7 +55,11 @@ pub fn average_pool2d<'b, 'a>(
         kh
     };
 
-    let sh = if strides.is_empty() { 1 } else { strides[0] as usize };
+    let sh = if strides.is_empty() {
+        1
+    } else {
+        strides[0] as usize
+    };
     let sw = if strides.len() > 1 {
         strides[1] as usize
     } else {
@@ -119,11 +123,7 @@ pub fn average_pool2d<'b, 'a>(
                     let denom = if count_include_pad {
                         (kh * kw) as f32
                     } else {
-                        if count > 0 {
-                            count as f32
-                        } else {
-                            1.0
-                        }
+                        if count > 0 { count as f32 } else { 1.0 }
                     };
                     o_slice[out_base + oh * out_w + ow] = sum / denom;
                 }

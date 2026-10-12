@@ -601,20 +601,25 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 } else {
                     input_s
                 };
-                let (weight_expr, weight_rank, weight_shape) = if let Some((o, l, s, dt)) = weights.get(&weight_s) {
-                    let loader = match *dt {
-                        1 => "weight_f32",
-                        2 => "weight_u8",
-                        3 => "weight_i8",
-                        6 => "weight_i32",
-                        7 => "weight_i64",
-                        10 => "weight_f16",
-                        _ => "weight_f32",
+                let (weight_expr, weight_rank, weight_shape) =
+                    if let Some((o, l, s, dt)) = weights.get(&weight_s) {
+                        let loader = match *dt {
+                            1 => "weight_f32",
+                            2 => "weight_u8",
+                            3 => "weight_i8",
+                            6 => "weight_i32",
+                            7 => "weight_i64",
+                            10 => "weight_f16",
+                            _ => "weight_f32",
+                        };
+                        (
+                            format!("self.{}({}, {}, &{:?})", loader, o, l, s),
+                            s.len(),
+                            s.to_vec(),
+                        )
+                    } else {
+                        (weight_s, 3, vec![3usize, 3, 3, 3])
                     };
-                    (format!("self.{}({}, {}, &{:?})", loader, o, l, s), s.len(), s.to_vec())
-                } else {
-                    (weight_s, 3, vec![3usize, 3, 3, 3])
-                };
                 let conv_out = &conv.output[0];
                 let bias_name_raw = if &add.input[0] == conv_out {
                     &add.input[1]
@@ -625,7 +630,11 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 let (strides, dilations, groups, mut pads_vec, auto_pad) = conv_attributes(conv);
                 if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") && pads_vec.is_empty() {
                     let kh = weight_shape.get(2).copied().unwrap_or(1) as i64;
-                    let kw = weight_shape.get(3).copied().unwrap_or(weight_shape.get(2).copied().unwrap_or(1) as usize) as i64;
+                    let kw = weight_shape
+                        .get(3)
+                        .copied()
+                        .unwrap_or(weight_shape.get(2).copied().unwrap_or(1) as usize)
+                        as i64;
                     let pad_total_h = (kh - 1) * dilations[0];
                     let pad_total_w = (kw - 1) * dilations[1];
                     let (pt, pb) = if auto_pad == "SAME_LOWER" {
@@ -672,15 +681,31 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         writeln!(
                             w,
                             "{}let {} = lele::kernels::conv2d(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
-                            tab, output_name, input_expr, weight_expr, bias_expr,
-                            dilations, groups, padding_arr.as_slice(), strides, buf_expr
+                            tab,
+                            output_name,
+                            input_expr,
+                            weight_expr,
+                            bias_expr,
+                            dilations,
+                            groups,
+                            padding_arr.as_slice(),
+                            strides,
+                            buf_expr
                         )?;
                     } else {
                         writeln!(
                             w,
                             "{}let {} = lele::kernels::conv1d(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
-                            tab, output_name, input_expr, weight_expr, bias_expr,
-                            [dilations[0]], groups, &padding_arr[..2], [strides[0]], buf_expr
+                            tab,
+                            output_name,
+                            input_expr,
+                            weight_expr,
+                            bias_expr,
+                            [dilations[0]],
+                            groups,
+                            &padding_arr[..2],
+                            [strides[0]],
+                            buf_expr
                         )?;
                     }
                 } else {
@@ -689,26 +714,48 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         if let Some(&idx) = alloc.tensor_to_buffer.get(conv_out as &str) {
                             format!("&mut ws.buf_{}", idx)
                         } else {
-                            writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, conv_out_name)?;
+                            writeln!(
+                                w,
+                                "{}let mut buf_{} = Vec::<f32>::new();",
+                                tab, conv_out_name
+                            )?;
                             format!("&mut buf_{}", conv_out_name)
                         }
                     } else {
-                        writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, conv_out_name)?;
+                        writeln!(
+                            w,
+                            "{}let mut buf_{} = Vec::<f32>::new();",
+                            tab, conv_out_name
+                        )?;
                         format!("&mut buf_{}", conv_out_name)
                     };
                     if weight_rank >= 4 {
                         writeln!(
                             w,
                             "{}let {} = lele::kernels::conv2d(&{}, &{}, None, &{:?}, {}, &{:?}, &{:?}, {});",
-                            tab, conv_out_name, input_expr, weight_expr,
-                            dilations, groups, padding_arr.as_slice(), strides, conv_buf
+                            tab,
+                            conv_out_name,
+                            input_expr,
+                            weight_expr,
+                            dilations,
+                            groups,
+                            padding_arr.as_slice(),
+                            strides,
+                            conv_buf
                         )?;
                     } else {
                         writeln!(
                             w,
                             "{}let {} = lele::kernels::conv1d(&{}, &{}, None, &{:?}, {}, &{:?}, &{:?}, {});",
-                            tab, conv_out_name, input_expr, weight_expr,
-                            [dilations[0]], groups, &padding_arr[..2], [strides[0]], conv_buf
+                            tab,
+                            conv_out_name,
+                            input_expr,
+                            weight_expr,
+                            [dilations[0]],
+                            groups,
+                            &padding_arr[..2],
+                            [strides[0]],
+                            conv_buf
                         )?;
                     }
                     writeln!(
@@ -767,7 +814,11 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         10 => "weight_f16",
                         _ => "weight_f32",
                     };
-                    (format!("self.{}({}, {}, &{:?})", loader, o, l, s), s.len(), s.to_vec())
+                    (
+                        format!("self.{}({}, {}, &{:?})", loader, o, l, s),
+                        s.len(),
+                        s.to_vec(),
+                    )
                 } else {
                     (weight_s, 3, vec![3usize, 3, 3, 3])
                 };
@@ -796,7 +847,11 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 // Compute SAME padding if auto_pad is set
                 if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") && pads_vec.is_empty() {
                     let kh = weight_shape.get(2).copied().unwrap_or(1) as i64;
-                    let kw = weight_shape.get(3).copied().unwrap_or(weight_shape.get(2).copied().unwrap_or(1) as usize) as i64;
+                    let kw = weight_shape
+                        .get(3)
+                        .copied()
+                        .unwrap_or(weight_shape.get(2).copied().unwrap_or(1) as usize)
+                        as i64;
                     let pad_total_h = (kh - 1) * dilations[0];
                     let pad_total_w = (kw - 1) * dilations[1];
                     let (pt, pb) = if auto_pad == "SAME_LOWER" {
@@ -1289,30 +1344,52 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 if nodes.len() < 5 {
                     return None;
                 }
-                if nodes[0].op_type != "Div" { return None; }
-                if nodes[1].op_type != "Erf" { return None; }
-                if nodes[2].op_type != "Add" { return None; }
-                if nodes[3].op_type != "Mul" { return None; }
-                if nodes[4].op_type != "Mul" { return None; }
+                if nodes[0].op_type != "Div" {
+                    return None;
+                }
+                if nodes[1].op_type != "Erf" {
+                    return None;
+                }
+                if nodes[2].op_type != "Add" {
+                    return None;
+                }
+                if nodes[3].op_type != "Mul" {
+                    return None;
+                }
+                if nodes[4].op_type != "Mul" {
+                    return None;
+                }
                 let gelu_input = &nodes[0].input[0];
                 let div_out = &nodes[0].output[0];
-                if nodes[1].input[0] != *div_out { return None; }
+                if nodes[1].input[0] != *div_out {
+                    return None;
+                }
                 let erf_out = &nodes[1].output[0];
                 let add_out = &nodes[2].output[0];
                 let uses_erf = nodes[2].input[0] == *erf_out || nodes[2].input[1] == *erf_out;
-                if !uses_erf { return None; }
+                if !uses_erf {
+                    return None;
+                }
                 let mul1_out = &nodes[3].output[0];
                 let uses_add = nodes[3].input[0] == *add_out || nodes[3].input[1] == *add_out;
-                if !uses_add { return None; }
+                if !uses_add {
+                    return None;
+                }
                 let chains = nodes[4].input[0] == *mul1_out || nodes[4].input[1] == *mul1_out;
-                if !chains { return None; }
+                if !chains {
+                    return None;
+                }
                 // The two Muls apply the GELU input and the 0.5 scale in either
                 // order: `(x * (1 + erf)) * 0.5` or `x * (0.5 * (1 + erf))`.
                 // Exactly one of them must take the input; the other takes the
                 // constant.
-                let mul1_uses_input = nodes[3].input[0] == *gelu_input || nodes[3].input[1] == *gelu_input;
-                let mul2_uses_input = nodes[4].input[0] == *gelu_input || nodes[4].input[1] == *gelu_input;
-                if mul1_uses_input == mul2_uses_input { return None; }
+                let mul1_uses_input =
+                    nodes[3].input[0] == *gelu_input || nodes[3].input[1] == *gelu_input;
+                let mul2_uses_input =
+                    nodes[4].input[0] == *gelu_input || nodes[4].input[1] == *gelu_input;
+                if mul1_uses_input == mul2_uses_input {
+                    return None;
+                }
                 Some(5)
             }),
             generator: Box::new(|nodes, _weights, allocator, w, indent| {

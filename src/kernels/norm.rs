@@ -1,7 +1,7 @@
-use crate::kernels::utils;
-use crate::tensor::TensorView;
 use crate::kernels::simd::simd_call;
 use crate::kernels::simd_math::exp;
+use crate::kernels::utils;
+use crate::tensor::TensorView;
 use fearless_simd::{Level, Simd, f32x16, prelude::*};
 use fearless_simd_macros::simd;
 use std::borrow::Cow;
@@ -50,7 +50,10 @@ fn softmax_rows(level: Level, rows: usize, src: &[f32], out: &mut [f32], n: usiz
 /// wide load stalls on store forwarding (80 ns against 51 for the scalar
 /// loop, on a row of 10).
 fn softmax_short_rows(rows: usize, n: usize, src: &[f32], out: &mut [f32]) {
-    for (row, out_row) in src[..rows * n].chunks_exact(n).zip(out[..rows * n].chunks_exact_mut(n)) {
+    for (row, out_row) in src[..rows * n]
+        .chunks_exact(n)
+        .zip(out[..rows * n].chunks_exact_mut(n))
+    {
         let max = row.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x));
         let mut sum = 0.0;
         for (&x, o) in row.iter().zip(&mut *out_row) {
@@ -71,13 +74,21 @@ fn softmax_short_rows(rows: usize, n: usize, src: &[f32], out: &mut [f32]) {
 /// only on their own input; the sum must skip the overlap.
 #[inline(always)]
 fn last_vector<S: Simd>(simd: S, row: &[f32]) -> f32x16<S> {
-    f32x16::load_array_ref(simd, row.last_chunk::<LANES>().expect("row at least a vector wide"))
+    f32x16::load_array_ref(
+        simd,
+        row.last_chunk::<LANES>()
+            .expect("row at least a vector wide"),
+    )
 }
 
 /// Stores the lanes of `v` that `last_vector` took from the end of `row`.
 #[inline(always)]
 fn store_last_vector<S: Simd>(v: f32x16<S>, out_row: &mut [f32]) {
-    v.store_array(out_row.last_chunk_mut::<LANES>().expect("row at least a vector wide"));
+    v.store_array(
+        out_row
+            .last_chunk_mut::<LANES>()
+            .expect("row at least a vector wide"),
+    );
 }
 
 /// `v` with the lanes `last_vector` shares with the last full vector zeroed,
@@ -168,8 +179,9 @@ fn softmax_rows_simd<S: Simd>(simd: S, rows: usize, n: usize, src: &[f32], out: 
     }
 }
 
-const LANE_INDEX: [f32; LANES] =
-    [0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15.];
+const LANE_INDEX: [f32; LANES] = [
+    0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15.,
+];
 
 /// `x - max - ln(sum(exp(x - max)))` along `axis`.
 ///
@@ -308,14 +320,23 @@ pub fn batch_norm<'b, 'a>(
     let out_slice = unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), numel) };
     // [outer, channels, inner...]: every rank is the 4D NCHW case with the
     // trailing dimensions flattened.
-    let (outer, c) = if shape.len() > 1 { (shape[0], shape[1]) } else { (1, shape[0]) };
+    let (outer, c) = if shape.len() > 1 {
+        (shape[0], shape[1])
+    } else {
+        (1, shape[0])
+    };
     let inner: usize = shape.iter().skip(2).product();
     batch_norm_channels(
         Level::new(),
         outer,
         inner,
         &input.data,
-        [&scale.data[..c], &bias.data[..c], &mean.data[..c], &var.data[..c]],
+        [
+            &scale.data[..c],
+            &bias.data[..c],
+            &mean.data[..c],
+            &var.data[..c],
+        ],
         epsilon,
         out_slice,
     );
@@ -339,7 +360,11 @@ fn batch_norm_channels(
     epsilon: f32,
     out: &mut [f32],
 ) {
-    simd_call!(level, max = Avx2, batch_norm_channels_simd(outer, inner, src, params, epsilon, out))
+    simd_call!(
+        level,
+        max = Avx2,
+        batch_norm_channels_simd(outer, inner, src, params, epsilon, out)
+    )
 }
 
 #[simd]
@@ -372,11 +397,15 @@ fn batch_norm_channels_simd<S: Simd>(
             let (o4, o1) = o.as_chunks_mut::<4>();
             for (x, o) in x4.iter().zip(o4) {
                 for (x, o) in x.iter().zip(o) {
-                    f32x16::load_array_ref(simd, x).mul_add(k_v, shift_v).store_array(o);
+                    f32x16::load_array_ref(simd, x)
+                        .mul_add(k_v, shift_v)
+                        .store_array(o);
                 }
             }
             for (x, o) in x1.iter().zip(o1) {
-                f32x16::load_array_ref(simd, x).mul_add(k_v, shift_v).store_array(o);
+                f32x16::load_array_ref(simd, x)
+                    .mul_add(k_v, shift_v)
+                    .store_array(o);
             }
             if !x_tail.is_empty() {
                 if let (Some(x), Some(o)) =
@@ -387,7 +416,9 @@ fn batch_norm_channels_simd<S: Simd>(
                     // the previous one, instead of finishing with scalars.
                     // Each output depends only on its own input, and `src`
                     // and `out` are distinct, so recomputing is harmless.
-                    f32x16::load_array_ref(simd, x).mul_add(k_v, shift_v).store_array(o);
+                    f32x16::load_array_ref(simd, x)
+                        .mul_add(k_v, shift_v)
+                        .store_array(o);
                 } else {
                     let from = inner - x_tail.len();
                     scale_shift_tail(x_tail, &mut out_row[from..], k, shift);
@@ -420,7 +451,14 @@ pub fn rms_norm<'b, 'a>(
     let out_slice =
         unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), input.data.len()) };
     debug_assert_eq!(outer_size * norm_size, input.data.len());
-    rms_norm_rows(Level::new(), outer_size, &input.data, &weight.data[..norm_size], out_slice, epsilon);
+    rms_norm_rows(
+        Level::new(),
+        outer_size,
+        &input.data,
+        &weight.data[..norm_size],
+        out_slice,
+        epsilon,
+    );
 
     TensorView {
         data: Cow::Borrowed(out_slice),
@@ -450,7 +488,11 @@ fn layer_norm_rows(
     out: &mut [f32],
     epsilon: f32,
 ) {
-    simd_call!(level, max = Avx2, layer_norm_rows_simd(rows, src, gamma, beta, out, epsilon))
+    simd_call!(
+        level,
+        max = Avx2,
+        layer_norm_rows_simd(rows, src, gamma, beta, out, epsilon)
+    )
 }
 
 #[simd]
@@ -497,7 +539,10 @@ fn layer_norm_rows_simd<S: Simd>(
         let norm = |x, g, b, o| {
             let normed = (f32x16::load_array_ref(simd, x) - mean_v) * inv_std_v;
             normed
-                .mul_add(f32x16::load_array_ref(simd, g), f32x16::load_array_ref(simd, b))
+                .mul_add(
+                    f32x16::load_array_ref(simd, g),
+                    f32x16::load_array_ref(simd, b),
+                )
                 .store_array(o);
         };
         let (x, x_tail) = row.as_chunks::<LANES>();
@@ -506,7 +551,8 @@ fn layer_norm_rows_simd<S: Simd>(
         let (o, o_tail) = out_row.as_chunks_mut::<LANES>();
         // Two vectors per step, like the reductions: this loop is bound by
         // stores, and halving its steps halves its loop overhead.
-        let ((x2, x1), (g2, g1), (b2, b1)) = (x.as_chunks::<2>(), g.as_chunks::<2>(), b.as_chunks::<2>());
+        let ((x2, x1), (g2, g1), (b2, b1)) =
+            (x.as_chunks::<2>(), g.as_chunks::<2>(), b.as_chunks::<2>());
         let (o2, o1) = o.as_chunks_mut::<2>();
         for ((([x0, x1], [g0, g1]), [b0, b1]), [o0, o1]) in x2.iter().zip(g2).zip(b2).zip(o2) {
             norm(x0, g0, b0, o0);
@@ -589,8 +635,19 @@ fn sums<S: Simd>(simd: S, row: &[f32], shift: f32) -> (f32, f32) {
 
 /// RMSNorm of the first `rows` `weight.len()`-wide rows of `src` into `out`;
 /// see [`layer_norm_rows`] for why the row count is passed.
-fn rms_norm_rows(level: Level, rows: usize, src: &[f32], weight: &[f32], out: &mut [f32], epsilon: f32) {
-    simd_call!(level, max = Avx2, rms_norm_rows_simd(rows, src, weight, out, epsilon))
+fn rms_norm_rows(
+    level: Level,
+    rows: usize,
+    src: &[f32],
+    weight: &[f32],
+    out: &mut [f32],
+    epsilon: f32,
+) {
+    simd_call!(
+        level,
+        max = Avx2,
+        rms_norm_rows_simd(rows, src, weight, out, epsilon)
+    )
 }
 
 #[simd]
@@ -636,7 +693,8 @@ fn rms_norm_rows_simd<S: Simd>(
         let (w, w_tail) = weight.as_chunks::<LANES>();
         let (o, o_tail) = out_row.as_chunks_mut::<LANES>();
         let scale = |x, w, o| {
-            (f32x16::load_array_ref(simd, x) * inv_rms_v * f32x16::load_array_ref(simd, w)).store_array(o);
+            (f32x16::load_array_ref(simd, x) * inv_rms_v * f32x16::load_array_ref(simd, w))
+                .store_array(o);
         };
         // Two vectors per step; see layer_norm_rows_simd.
         let ((x2, x1), (w2, w1)) = (vectors.as_chunks::<2>(), w.as_chunks::<2>());
@@ -703,7 +761,12 @@ mod tests {
                     let mut out = vec![0.0; x.len()];
                     layer_norm_rows(level, ROWS, &x, &gamma, &beta, &mut out, EPS);
                     let want = layer_norm_ref(&x, &gamma, &beta);
-                    assert_close(&out, &want, 1e-5, &format!("{level:?} x in [{lo}, {hi}) n={n}"));
+                    assert_close(
+                        &out,
+                        &want,
+                        1e-5,
+                        &format!("{level:?} x in [{lo}, {hi}) n={n}"),
+                    );
                 }
             }
         }
@@ -715,13 +778,22 @@ mod tests {
         // bits of the variance here.
         let mut rng = Rng::new(4);
         let n = 384;
-        let x: Vec<f32> = rng.vec(ROWS * n, -1.0, 1.0).iter().map(|v| v + 1000.0).collect();
+        let x: Vec<f32> = rng
+            .vec(ROWS * n, -1.0, 1.0)
+            .iter()
+            .map(|v| v + 1000.0)
+            .collect();
         let gamma = vec![1.0; n];
         let beta = vec![0.0; n];
         for level in levels() {
             let mut out = vec![0.0; x.len()];
             layer_norm_rows(level, ROWS, &x, &gamma, &beta, &mut out, EPS);
-            assert_close(&out, &layer_norm_ref(&x, &gamma, &beta), 1e-4, &format!("{level:?}"));
+            assert_close(
+                &out,
+                &layer_norm_ref(&x, &gamma, &beta),
+                1e-4,
+                &format!("{level:?}"),
+            );
         }
     }
 
@@ -752,7 +824,14 @@ mod tests {
         let input = TensorView::from_slice(x, vec![ROWS, n]);
         let weight = TensorView::from_slice(w, vec![n]);
         let mut out = Vec::new();
-        let got = layer_norm(&input, &weight, &TensorView::from_slice(b, vec![n]), -1, EPS, &mut out);
+        let got = layer_norm(
+            &input,
+            &weight,
+            &TensorView::from_slice(b, vec![n]),
+            -1,
+            EPS,
+            &mut out,
+        );
         assert_close(&got.data, &layer_norm_ref(x, w, b), 1e-5, "layer_norm");
         let got = rms_norm(&input, &weight, -1, EPS, &mut out);
         assert_close(&got.data, &rms_norm_ref(x, w), 1e-6, "rms_norm");
@@ -783,7 +862,12 @@ mod tests {
             for &n in AWKWARD_LENS {
                 let x = rng.vec(ROWS * n, lo, hi);
                 let got = softmax_of(&x, n);
-                assert_close(&got, &softmax_ref(&x, n), 1e-5, &format!("x in [{lo}, {hi}) n={n}"));
+                assert_close(
+                    &got,
+                    &softmax_ref(&x, n),
+                    1e-5,
+                    &format!("x in [{lo}, {hi}) n={n}"),
+                );
                 for (r, row) in got.chunks_exact(n).enumerate() {
                     let sum: f64 = row.iter().map(|&v| v as f64).sum();
                     assert!((sum - 1.0).abs() < 1e-5, "n={n} row {r} sums to {sum}");
@@ -810,7 +894,12 @@ mod tests {
         for &n in AWKWARD_LENS {
             for v in [0.0, -30.0, 70.0] {
                 let got = softmax_of(&vec![v; n], n);
-                assert_close(&got, &vec![1.0 / n as f64; n], 1e-6, &format!("v={v} n={n}"));
+                assert_close(
+                    &got,
+                    &vec![1.0 / n as f64; n],
+                    1e-6,
+                    &format!("v={v} n={n}"),
+                );
             }
         }
     }
@@ -861,7 +950,12 @@ mod tests {
                 x[0] = 50.0;
                 let mut out = vec![0.0; n];
                 log_softmax_rows(level, 1, &x, &mut out, n);
-                assert_close(&out, &log_softmax_ref(&x, n), 1e-7, &format!("{level:?} n={n}"));
+                assert_close(
+                    &out,
+                    &log_softmax_ref(&x, n),
+                    1e-7,
+                    &format!("{level:?} n={n}"),
+                );
             }
         }
     }
@@ -908,7 +1002,12 @@ mod tests {
             EPS,
             &mut out,
         );
-        assert_close(&got.data, &batch_norm_ref(&x, c, inner, &p), 1e-6, &format!("{shape:?}"));
+        assert_close(
+            &got.data,
+            &batch_norm_ref(&x, c, inner, &p),
+            1e-6,
+            &format!("{shape:?}"),
+        );
     }
 
     #[test]
@@ -925,7 +1024,15 @@ mod tests {
                     var: rng.vec(c, 0.5, 2.0),
                 };
                 let mut out = vec![0.0; x.len()];
-                batch_norm_channels(level, 2, inner, &x, [&p.scale, &p.bias, &p.mean, &p.var], EPS, &mut out);
+                batch_norm_channels(
+                    level,
+                    2,
+                    inner,
+                    &x,
+                    [&p.scale, &p.bias, &p.mean, &p.var],
+                    EPS,
+                    &mut out,
+                );
                 let want = batch_norm_ref(&x, c, inner, &p);
                 assert_close(&out, &want, 1e-6, &format!("{level:?} inner={inner}"));
             }

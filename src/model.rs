@@ -37,18 +37,25 @@ impl OnnxModel {
     }
 
     fn load_external_data(graph: &mut GraphProto, model_dir: &Path) -> Result<(), ModelError> {
-        let mut data_cache: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+        let mut data_cache: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
         for init in &mut graph.initializer {
             if init.data_location == 1 && init.raw_data.is_empty() {
-                let location = init.external_data.iter()
+                let location = init
+                    .external_data
+                    .iter()
                     .find(|e| e.key == "location")
                     .map(|e| e.value.as_str())
                     .unwrap_or("");
-                let offset: usize = init.external_data.iter()
+                let offset: usize = init
+                    .external_data
+                    .iter()
                     .find(|e| e.key == "offset")
                     .and_then(|e| e.value.parse().ok())
                     .unwrap_or(0);
-                let length: usize = init.external_data.iter()
+                let length: usize = init
+                    .external_data
+                    .iter()
                     .find(|e| e.key == "length")
                     .and_then(|e| e.value.parse().ok())
                     .unwrap_or(0);
@@ -119,7 +126,11 @@ pub fn tensor_to_array(tensor: &TensorProto) -> Result<(Vec<f32>, Vec<usize>), M
                     i64::from_le_bytes(bytes) as f32
                 })
                 .collect(),
-            9 => tensor.raw_data.iter().map(|&x| if x != 0 { 1.0 } else { 0.0 }).collect(),
+            9 => tensor
+                .raw_data
+                .iter()
+                .map(|&x| if x != 0 { 1.0 } else { 0.0 })
+                .collect(),
             _ => Vec::new(),
         }
     } else {

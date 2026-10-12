@@ -81,7 +81,14 @@ const PACKED_PANEL: u8 = 1;
 const PACK_NOW: u8 = 2;
 
 #[simd]
-fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: &[f32], c: &mut [f32], bpack: &mut [f32]) {
+fn gemm_nn_simd<S: Simd>(
+    simd: S,
+    d: &Dims,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    bpack: &mut [f32],
+) {
     let depth = block_depth(d.k);
     let lanes = by_lanes(simd);
     let mr = if lanes { LANE_MR } else { MR };
@@ -108,7 +115,18 @@ fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: &[f32], c: &mut [f32],
             } else {
                 nc / NR
             };
-            pack_b(simd, b, d.ldb, d.b_cols, pc, kc, jc, nc, first_prepacked, bpack);
+            pack_b(
+                simd,
+                b,
+                d.ldb,
+                d.b_cols,
+                pc,
+                kc,
+                jc,
+                nc,
+                first_prepacked,
+                bpack,
+            );
             let mut ir = 0;
             while ir < d.m {
                 let rows = mr.min(d.m - ir);
@@ -122,7 +140,13 @@ fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: &[f32], c: &mut [f32],
                     let in_place = || &b[pc * d.ldb + j..];
                     macro_rules! tile {
                         ($mode:expr, $src:expr, $lds:expr, $dst:expr) => {{
-                            let t = Tile { kc, mode: $mode, lds: $lds, width, accumulate };
+                            let t = Tile {
+                                kc,
+                                mode: $mode,
+                                lds: $lds,
+                                width,
+                                accumulate,
+                            };
                             // A panel no wider than a vector takes the one-vector tiles.
                             match (rows, width > 8) {
                                 _ if lanes => match (rows, width > 8) {
@@ -200,7 +224,8 @@ fn pack_b<S: Simd>(
             // 4x4 blocks: four depths of four columns, transposed in registers.
             let quads = kc / 4;
             for jq in 0..NR / 4 {
-                let src: [&[f32]; 4] = core::array::from_fn(|i| &b[(j + 4 * jq + i) * ldb + pc..][..kc]);
+                let src: [&[f32]; 4] =
+                    core::array::from_fn(|i| &b[(j + 4 * jq + i) * ldb + pc..][..kc]);
                 for q in 0..quads {
                     let [r0, r1, r2, r3] = src.map(|s| f32x4::from_slice(simd, &s[4 * q..][..4]));
                     let (a0, a1) = simd.interleave_f32x4(r0, r2);
@@ -251,7 +276,15 @@ macro_rules! tile_fn {
     ($name:ident, $r:literal, $v:expr) => {
         #[simd]
         #[inline(never)]
-        fn $name<S: Simd>(simd: S, d: &Dims, t: &Tile, a: &[f32], src: &[f32], dst: &mut [f32], c: &mut [f32]) {
+        fn $name<S: Simd>(
+            simd: S,
+            d: &Dims,
+            t: &Tile,
+            a: &[f32],
+            src: &[f32],
+            dst: &mut [f32],
+            c: &mut [f32],
+        ) {
             use fearless_simd::prelude::*;
             const R: usize = $r;
             const V: usize = $v;
@@ -262,7 +295,8 @@ macro_rules! tile_fn {
             macro_rules! step {
                 ($p:expr, $row:expr) => {{
                     let row: &[f32; 8 * V] = $row;
-                    let bv: [f32x8<S>; V] = core::array::from_fn(|v| f32x8::from_slice(simd, &row[v * 8..][..8]));
+                    let bv: [f32x8<S>; V] =
+                        core::array::from_fn(|v| f32x8::from_slice(simd, &row[v * 8..][..8]));
                     for r in 0..R {
                         let av = f32x8::splat(simd, a_rows[r][$p]);
                         for v in 0..V {
@@ -279,10 +313,14 @@ macro_rules! tile_fn {
                     let (pairs, rest) = rows.as_chunks::<2>();
                     let mut acc2 = [[zero; V]; R];
                     for (q, [row0, row1]) in pairs.iter().enumerate() {
-                        let (b0, b1) = (f32x8::from_slice(simd, &row0[..8]), f32x8::from_slice(simd, &row1[..8]));
+                        let (b0, b1) = (
+                            f32x8::from_slice(simd, &row0[..8]),
+                            f32x8::from_slice(simd, &row1[..8]),
+                        );
                         for r in 0..R {
                             acc[r][0] = f32x8::splat(simd, a_rows[r][2 * q]).mul_add(b0, acc[r][0]);
-                            acc2[r][0] = f32x8::splat(simd, a_rows[r][2 * q + 1]).mul_add(b1, acc2[r][0]);
+                            acc2[r][0] =
+                                f32x8::splat(simd, a_rows[r][2 * q + 1]).mul_add(b1, acc2[r][0]);
                         }
                     }
                     for row in rest {
@@ -368,7 +406,15 @@ macro_rules! lane_tile_fn {
     ($name:ident, $r:literal, $v:expr) => {
         #[simd]
         #[inline(never)]
-        fn $name<S: Simd>(simd: S, d: &Dims, t: &Tile, a: &[f32], src: &[f32], dst: &mut [f32], c: &mut [f32]) {
+        fn $name<S: Simd>(
+            simd: S,
+            d: &Dims,
+            t: &Tile,
+            a: &[f32],
+            src: &[f32],
+            dst: &mut [f32],
+            c: &mut [f32],
+        ) {
             use fearless_simd::prelude::*;
             const R: usize = $r;
             const V: usize = $v;
@@ -377,7 +423,10 @@ macro_rules! lane_tile_fn {
             let (b, ldb): (&[f32], usize) = match t.mode {
                 IN_PLACE => (src, t.lds),
                 PACK_NOW => {
-                    for (row, out) in src.chunks(t.lds).zip(&mut dst.as_chunks_mut::<NR>().0[..kc]) {
+                    for (row, out) in src
+                        .chunks(t.lds)
+                        .zip(&mut dst.as_chunks_mut::<NR>().0[..kc])
+                    {
                         out[..8 * V].copy_from_slice(&row[..8 * V]);
                     }
                     (&*dst, NR)
@@ -392,7 +441,8 @@ macro_rules! lane_tile_fn {
             };
             let quads = kc / 4;
             for q in 0..quads {
-                let av: [f32x4<S>; R] = core::array::from_fn(|r| f32x4::from_slice(simd, &a_rows[r][4 * q..][..4]));
+                let av: [f32x4<S>; R] =
+                    core::array::from_fn(|r| f32x4::from_slice(simd, &a_rows[r][4 * q..][..4]));
                 macro_rules! lane {
                     ($l:literal) => {{
                         let bv = brow(4 * q + $l);
@@ -536,7 +586,8 @@ fn stream_pass<S: Simd, const R: usize, const P: usize>(
     use fearless_simd::prelude::*;
     let n = d.n;
     let vecs = n / 8;
-    let s: [[f32; P]; R] = core::array::from_fn(|r| core::array::from_fn(|i| d.alpha * a[r * d.lda + p + i]));
+    let s: [[f32; P]; R] =
+        core::array::from_fn(|r| core::array::from_fn(|i| d.alpha * a[r * d.lda + p + i]));
     let sv = s.map(|row| row.map(|x| f32x8::splat(simd, x)));
     let br: [&[f32]; P] = core::array::from_fn(|i| &b[(p + i) * d.ldb..][..n]);
     let mut c_rows = c.chunks_mut(d.ldc);
@@ -545,8 +596,13 @@ fn stream_pass<S: Simd, const R: usize, const P: usize>(
     let bv: [&[[f32; 8]]; P] = br.map(|row| &row.as_chunks::<8>().0[..vecs]);
     let cv = cr.map(|row| &mut row.as_chunks_mut::<8>().0[..vecs]);
     for j in 0..vecs {
-        let mut acc: [f32x8<S>; R] =
-            core::array::from_fn(|r| if first { f32x8::splat(simd, 0.0) } else { f32x8::from_slice(simd, &cv[r][j]) });
+        let mut acc: [f32x8<S>; R] = core::array::from_fn(|r| {
+            if first {
+                f32x8::splat(simd, 0.0)
+            } else {
+                f32x8::from_slice(simd, &cv[r][j])
+            }
+        });
         for i in 0..P {
             let b = f32x8::from_slice(simd, &bv[i][j]);
             for r in 0..R {
@@ -565,4 +621,3 @@ fn stream_pass<S: Simd, const R: usize, const P: usize>(
         }
     }
 }
-

@@ -87,7 +87,7 @@ where
     /// Efficiently convert to any lifetime without copying borrowed data.
     /// If data is `Cow::Borrowed` (from workspace/weights), zero-copy via raw pointer.
     /// If data is `Cow::Owned`, copies the data. Shape is always copied (tiny).
-    /// 
+    ///
     /// # Safety
     /// When data is borrowed, the caller must ensure the underlying storage outlives `'b`.
     pub unsafe fn detach_or_own<'b>(&self) -> TensorView<'b, T> {

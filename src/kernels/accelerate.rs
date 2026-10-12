@@ -23,7 +23,8 @@ unsafe extern "C" {
         c: *mut f32,
         ldc: i32,
     );
-    fn setenv(name: *const std::ffi::c_char, value: *const std::ffi::c_char, overwrite: i32) -> i32;
+    fn setenv(name: *const std::ffi::c_char, value: *const std::ffi::c_char, overwrite: i32)
+    -> i32;
 }
 
 /// Keeps Accelerate on one thread, set before its first call: the products

@@ -312,7 +312,10 @@ pub fn need_regenerate_with_model(
         println!("cargo:rerun-if-changed={}", src.display());
         if let Ok(src_time) = fs::metadata(src).and_then(|m| m.modified()) {
             if src_time > rs_meta {
-                println!("cargo:warning=Source file {:?} is newer than generated code, need regenerate", src);
+                println!(
+                    "cargo:warning=Source file {:?} is newer than generated code, need regenerate",
+                    src
+                );
                 return true;
             }
         }

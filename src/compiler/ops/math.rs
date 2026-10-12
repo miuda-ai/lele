@@ -61,7 +61,17 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                     writeln!(
                         w,
                         "{}let {} = self.mat_mul_integer_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {});",
-                        tab, outputs[0], inputs[0], *o, *l, k, n, *dt == 3, a_zp, b_zp, buf_expr
+                        tab,
+                        outputs[0],
+                        inputs[0],
+                        *o,
+                        *l,
+                        k,
+                        n,
+                        *dt == 3,
+                        a_zp,
+                        b_zp,
+                        buf_expr
                     )?;
                 } else {
                     writeln!(
@@ -158,9 +168,17 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 let a_is_weight_f32 = inputs[0].contains("weight_f32");
                 let b_is_weight_f32 = inputs.len() > 1 && inputs[1].contains("weight_f32");
                 let raw_a = sanitize_name(&ctx.node.input[0]);
-                let type_a = ctx.var_types.get(&raw_a).map(|s| s.as_str()).unwrap_or("f32");
+                let type_a = ctx
+                    .var_types
+                    .get(&raw_a)
+                    .map(|s| s.as_str())
+                    .unwrap_or("f32");
                 if b_is_weight_f32 {
-                    let func = if type_a == "i64" { "equal_i64_f32_r_i64" } else { "equal_i64_f32_r" };
+                    let func = if type_a == "i64" {
+                        "equal_i64_f32_r_i64"
+                    } else {
+                        "equal_i64_f32_r"
+                    };
                     writeln!(
                         w,
                         "{}let {} = lele::kernels::{}(&{}, &{}, {});",
@@ -172,7 +190,14 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                         "{}let {} = lele::kernels::equal_i64_f32_lhs(&{}, &{}, {});",
                         tab, outputs[0], inputs[0], inputs[1], buf_expr
                     )?;
-                } else if type_a == "f32" && (inputs[1].contains("weight_i64") || ctx.var_types.get(&sanitize_name(&ctx.node.input[1])).map(|t| t == "i64").unwrap_or(false)) {
+                } else if type_a == "f32"
+                    && (inputs[1].contains("weight_i64")
+                        || ctx
+                            .var_types
+                            .get(&sanitize_name(&ctx.node.input[1]))
+                            .map(|t| t == "i64")
+                            .unwrap_or(false))
+                {
                     writeln!(
                         w,
                         "{}let {} = lele::kernels::equal_i64_f32_lhs(&{}, &{}, {});",

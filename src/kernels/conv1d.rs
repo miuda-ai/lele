@@ -3,10 +3,10 @@ use crate::kernels::conv1d_direct::{
     Depthwise, Kernel3, SingleChannel, depthwise, kernel3, single_channel,
 };
 use crate::kernels::conv2d::Activation;
-use crate::kernels::utils;
-use fearless_simd::Level;
 use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul};
+use crate::kernels::utils;
 use crate::tensor::TensorView;
+use fearless_simd::Level;
 
 /// Adds `bias[oc]` to every `[oc, ..]` row of `out` (laid out `[batch, out_channels, len]`)
 /// and applies ReLU if asked.
@@ -17,7 +17,11 @@ fn bias_relu_rows(
     out_channels: usize,
     len: usize,
 ) {
-    let act = if relu { Activation::Relu } else { Activation::None };
+    let act = if relu {
+        Activation::Relu
+    } else {
+        Activation::None
+    };
     match bias {
         Some(bias) => {
             for (i, row) in out.chunks_exact_mut(len).enumerate() {
@@ -554,8 +558,8 @@ mod tests {
 
     /// The textbook definition, in f64: padding contributes zeros.
     fn reference(c: &Case, x: &[f32], w: &[f32], bias: Option<&[f32]>, relu: bool) -> Vec<f64> {
-        let out_len = (c.len + c.pads[0] + c.pads[1] - c.dilation * (c.kernel - 1) - 1) / c.stride
-            + 1;
+        let out_len =
+            (c.len + c.pads[0] + c.pads[1] - c.dilation * (c.kernel - 1) - 1) / c.stride + 1;
         let (icg, ocg) = (c.in_ch / c.group, c.out_ch / c.group);
         let mut out = Vec::new();
         for b in 0..c.batch {

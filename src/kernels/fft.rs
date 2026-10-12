@@ -58,12 +58,20 @@ impl Rfft {
         let mut s = 1;
         while s < m {
             let per_p = if s < LANES { s } else { 1 };
-            let (re, im) = (0..m / (2 * s) * per_p).map(|i| twiddle(i / per_p * s, m)).unzip();
+            let (re, im) = (0..m / (2 * s) * per_p)
+                .map(|i| twiddle(i / per_p * s, m))
+                .unzip();
             stages.push(Stage { s, re, im });
             s *= 2;
         }
         let (post_re, post_im) = (0..m).map(|k| twiddle(k, n)).unzip();
-        Self { n, level: Level::new(), stages, post_re, post_im }
+        Self {
+            n,
+            level: Level::new(),
+            stages,
+            post_re,
+            post_im,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -84,13 +92,21 @@ impl Rfft {
     /// stores to another (4K aliasing).
     fn split_scratch<'s>(&self, scratch: &'s mut [f32]) -> [&'s mut [f32]; 4] {
         let m = self.n / 2;
-        let mut parts = scratch[..self.scratch_len()].chunks_exact_mut(m + SCRATCH_GAP).map(|c| &mut c[..m]);
+        let mut parts = scratch[..self.scratch_len()]
+            .chunks_exact_mut(m + SCRATCH_GAP)
+            .map(|c| &mut c[..m]);
         std::array::from_fn(|_| parts.next().expect("four buffers"))
     }
 
     /// Bins `0..=n/2` of the DFT of `input` into `out_re` and `out_im`.
     /// `scratch` needs `scratch_len()` floats, of any content.
-    pub fn forward(&self, input: &[f32], scratch: &mut [f32], out_re: &mut [f32], out_im: &mut [f32]) {
+    pub fn forward(
+        &self,
+        input: &[f32],
+        scratch: &mut [f32],
+        out_re: &mut [f32],
+        out_im: &mut [f32],
+    ) {
         self.forward_at(self.level, input, scratch, out_re, out_im)
     }
 
@@ -136,7 +152,13 @@ fn unpack_ends(zr: &[f32], zi: &[f32], out_re: &mut [f32], out_im: &mut [f32]) {
 
 /// Lengths too short for `rfft_simd`, which needs `m / 2` to be a whole
 /// number of vectors.
-fn rfft_scalar(fft: &Rfft, input: &[f32], scratch: &mut [f32], out_re: &mut [f32], out_im: &mut [f32]) {
+fn rfft_scalar(
+    fft: &Rfft,
+    input: &[f32],
+    scratch: &mut [f32],
+    out_re: &mut [f32],
+    out_im: &mut [f32],
+) {
     let m = fft.n / 2;
     let [mut xr, mut xi, mut yr, mut yi] = fft.split_scratch(scratch);
     for (j, pair) in input.chunks_exact(2).enumerate() {
@@ -186,13 +208,19 @@ fn butterfly<S: Simd>(
     (wr, wi): (f32x16<S>, f32x16<S>),
 ) -> ((f32x16<S>, f32x16<S>), (f32x16<S>, f32x16<S>)) {
     let (dr, di) = (ar - br, ai - bi);
-    ((ar + br, ai + bi), (dr.mul_sub(wr, di * wi), dr.mul_add(wi, di * wr)))
+    (
+        (ar + br, ai + bi),
+        (dr.mul_sub(wr, di * wi), dr.mul_add(wi, di * wr)),
+    )
 }
 
 /// `a` and `b` interleaved in blocks of `B` lanes: `a`'s first block, `b`'s
 /// first, `a`'s second, and so on.
 #[inline(always)]
-fn interleave_blocks<S: Simd, const B: usize>(a: f32x16<S>, b: f32x16<S>) -> (f32x16<S>, f32x16<S>) {
+fn interleave_blocks<S: Simd, const B: usize>(
+    a: f32x16<S>,
+    b: f32x16<S>,
+) -> (f32x16<S>, f32x16<S>) {
     match B {
         1 => a.interleave(b),
         2 => {
@@ -203,7 +231,10 @@ fn interleave_blocks<S: Simd, const B: usize>(a: f32x16<S>, b: f32x16<S>) -> (f3
             let ((a01, a23), (b01, b23)) = (a.split(), b.split());
             let ((a0, a1), (a2, a3)) = (a01.split(), a23.split());
             let ((b0, b1), (b2, b3)) = (b01.split(), b23.split());
-            (a0.combine(b0).combine(a1.combine(b1)), a2.combine(b2).combine(a3.combine(b3)))
+            (
+                a0.combine(b0).combine(a1.combine(b1)),
+                a2.combine(b2).combine(a3.combine(b3)),
+            )
         }
         8 => {
             let ((a0, a1), (b0, b1)) = (a.split(), b.split());
@@ -239,7 +270,12 @@ fn narrow_stage<S: Simd, const B: usize>(
 
 /// A stage with stride `s >= LANES`: runs of whole vectors share a twiddle.
 #[inline(always)]
-fn wide_stage<S: Simd>(simd: S, st: &Stage, (xr, xi): (&[f32], &[f32]), (yr, yi): (&mut [f32], &mut [f32])) {
+fn wide_stage<S: Simd>(
+    simd: S,
+    st: &Stage,
+    (xr, xi): (&[f32], &[f32]),
+    (yr, yi): (&mut [f32], &mut [f32]),
+) {
     let (s, half) = (st.s, xr.len() / 2);
     for (p, (&wr, &wi)) in st.re.iter().zip(&st.im).enumerate() {
         let w = (f32x16::splat(simd, wr), f32x16::splat(simd, wi));
@@ -257,11 +293,19 @@ fn wide_stage<S: Simd>(simd: S, st: &Stage, (xr, xi): (&[f32], &[f32]), (yr, yi)
 
 /// `m / 2` a whole number of vectors, at least one.
 #[simd]
-fn rfft_simd<S: Simd>(simd: S, fft: &Rfft, input: &[f32], scratch: &mut [f32], out_re: &mut [f32], out_im: &mut [f32]) {
+fn rfft_simd<S: Simd>(
+    simd: S,
+    fft: &Rfft,
+    input: &[f32],
+    scratch: &mut [f32],
+    out_re: &mut [f32],
+    out_im: &mut [f32],
+) {
     let m = fft.n / 2;
     let [mut xr, mut xi, mut yr, mut yi] = fft.split_scratch(scratch);
     for j in (0..m).step_by(LANES) {
-        let (even, odd) = simd.deinterleave_f32x16(load(simd, input, 2 * j), load(simd, input, 2 * j + LANES));
+        let (even, odd) =
+            simd.deinterleave_f32x16(load(simd, input, 2 * j), load(simd, input, 2 * j + LANES));
         store(even, xr, j);
         store(odd, xi, j);
     }
@@ -287,7 +331,10 @@ fn rfft_simd<S: Simd>(simd: S, fft: &Rfft, input: &[f32], scratch: &mut [f32], o
     while k < m {
         let k0 = k.min(m - LANES);
         let (ar, ai) = (load(simd, xr, k0), load(simd, xi, k0));
-        let (cr, ci) = (load(simd, xr, m - k0 - (LANES - 1)).reverse(), load(simd, xi, m - k0 - (LANES - 1)).reverse());
+        let (cr, ci) = (
+            load(simd, xr, m - k0 - (LANES - 1)).reverse(),
+            load(simd, xi, m - k0 - (LANES - 1)).reverse(),
+        );
         let (er, ei) = ((ar + cr) * half, (ai - ci) * half);
         let (or, oi) = ((ai + ci) * half, (cr - ar) * half);
         let (wr, wi) = (load(simd, &fft.post_re, k0), load(simd, &fft.post_im, k0));
@@ -317,7 +364,12 @@ mod tests {
 
     /// Largest error over all bins, relative to the largest bin magnitude.
     fn relative_error(got: (&[f32], &[f32]), want: (&[f64], &[f64])) -> f64 {
-        let scale = want.0.iter().zip(want.1).map(|(r, i)| r.hypot(*i)).fold(1e-30, f64::max);
+        let scale = want
+            .0
+            .iter()
+            .zip(want.1)
+            .map(|(r, i)| r.hypot(*i))
+            .fold(1e-30, f64::max);
         let err = (0..want.0.len())
             .map(|k| (got.0[k] as f64 - want.0[k]).hypot(got.1[k] as f64 - want.1[k]))
             .fold(0.0, f64::max);
@@ -346,12 +398,19 @@ mod tests {
     #[test]
     fn test_rfft_of_tone_has_one_bin() {
         let n = 512;
-        let x: Vec<f32> = (0..n).map(|j| (2.0 * std::f32::consts::PI * 5.0 * j as f32 / n as f32).cos()).collect();
+        let x: Vec<f32> = (0..n)
+            .map(|j| (2.0 * std::f32::consts::PI * 5.0 * j as f32 / n as f32).cos())
+            .collect();
         let (mut re, mut im) = (vec![0.0; n / 2 + 1], vec![0.0; n / 2 + 1]);
         rfft_forward_f32(&x, &mut re, &mut im);
         for k in 0..=n / 2 {
             let want = if k == 5 { n as f32 / 2.0 } else { 0.0 };
-            assert!((re[k] - want).abs() < 1e-3 && im[k].abs() < 1e-3, "bin {k}: {} {}", re[k], im[k]);
+            assert!(
+                (re[k] - want).abs() < 1e-3 && im[k].abs() < 1e-3,
+                "bin {k}: {} {}",
+                re[k],
+                im[k]
+            );
         }
     }
 

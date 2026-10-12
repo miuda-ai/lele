@@ -95,7 +95,10 @@ pub(crate) fn pack(
         for j in 0..n {
             let c = code(kk * n + j);
             let b = c - shift;
-            assert!((-128..=127).contains(&b), "code {c} does not shift into i8 by {shift}");
+            assert!(
+                (-128..=127).contains(&b),
+                "code {c} does not shift into i8 by {shift}"
+            );
             let slot = &mut data[((j / nr) * quads + kk / 4) * nr + j % nr];
             *slot |= ((b as i8 as u8) as i32) << (8 * (kk % 4));
             col_sums[j] += c - zero_point(j);
@@ -108,7 +111,15 @@ pub(crate) fn pack(
         *f = shift - zero_point(j);
     }
     let row_term = row_sum_factor.iter().any(|&f| f != 0);
-    QuadWeights { dot, quads, data, row_sum_factor, col_sums, dot_bias, row_term }
+    QuadWeights {
+        dot,
+        quads,
+        data,
+        row_sum_factor,
+        col_sums,
+        dot_bias,
+        row_term,
+    }
 }
 
 /// Rows of A for `dot`: `m` rows of `quads` quads of `u8` codes
@@ -129,8 +140,15 @@ pub(crate) fn quantize_rows(
     // Every quad and sum is written, so the buffers are not filled first.
     crate::kernels::utils::ensure_capacity(dst, m * k.div_ceil(4));
     crate::kernels::utils::ensure_capacity(row_sums, m);
-    let flip = if dot == Dot::Sdot { 0x8080_8080u32 as i32 } else { 0 };
-    crate::kernels::simd::simd_call!(level, quantize_rows_simd(src, m, k, scale, zero_point, flip, dst, row_sums))
+    let flip = if dot == Dot::Sdot {
+        0x8080_8080u32 as i32
+    } else {
+        0
+    };
+    crate::kernels::simd::simd_call!(
+        level,
+        quantize_rows_simd(src, m, k, scale, zero_point, flip, dst, row_sums)
+    )
 }
 
 #[simd]
@@ -148,7 +166,9 @@ fn quantize_rows_simd<S: Simd>(
     use fearless_simd::prelude::*;
     let quads = k.div_ceil(4);
     let code = |x: f32| {
-        let q = (x / scale).round_ties_even().clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+        let q = (x / scale)
+            .round_ties_even()
+            .clamp(i32::MIN as f32, i32::MAX as f32) as i32;
         q.saturating_add(zero_point).clamp(0, 255)
     };
     let sv = f32x16::splat(simd, scale);
@@ -161,7 +181,12 @@ fn quantize_rows_simd<S: Simd>(
     let flipv = i32x16::splat(simd, flip);
     // Codes to bytes, in order, by two truncating narrows (they fit).
     let bytes = |q: [i32x16<S>; 4]| -> i32x16<S> {
-        let b: i32x16<S> = simd.narrow_i16x32(simd.narrow_i32x16(q[0], q[1]), simd.narrow_i32x16(q[2], q[3])).bitcast();
+        let b: i32x16<S> = simd
+            .narrow_i16x32(
+                simd.narrow_i32x16(q[0], q[1]),
+                simd.narrow_i32x16(q[2], q[3]),
+            )
+            .bitcast();
         b ^ flipv
     };
     let zero = i32x16::splat(simd, 0);
@@ -214,10 +239,15 @@ pub(crate) fn qgemm(
     e: &Epilogue,
     c: &mut [f32],
 ) {
-    assert!(lda >= w.quads && a.len() >= m.saturating_sub(1) * lda + w.quads && row_sums.len() >= m);
+    assert!(
+        lda >= w.quads && a.len() >= m.saturating_sub(1) * lda + w.quads && row_sums.len() >= m
+    );
     assert!(c.len() >= m * n && col_scale.len() >= n.div_ceil(NR) * NR);
     assert!(e.bias.is_none_or(|b| b.len() >= n));
-    crate::kernels::simd::simd_call!(level, qgemm_simd(a, row_sums, m, lda, za, w, n, col_scale, e, c))
+    crate::kernels::simd::simd_call!(
+        level,
+        qgemm_simd(a, row_sums, m, lda, za, w, n, col_scale, e, c)
+    )
 }
 
 #[simd]
@@ -242,10 +272,13 @@ fn qgemm_simd<S: Simd>(
         // (depth 312) building them per tile cost several percent.
         // (Only the panel's `width` entries are set: with 16-column panels, building all of
         // `NR` doubled the time of a 1-row product.)
-        let (mut scale, mut col_term, mut bias, mut factor) = ([0.0f32; NR], [0i32; NR], [0.0f32; NR], [0i32; NR]);
+        let (mut scale, mut col_term, mut bias, mut factor) =
+            ([0.0f32; NR], [0i32; NR], [0.0f32; NR], [0i32; NR]);
         for v in 0..width {
             scale[v] = e.scale * col_scale[j + v];
-            col_term[v] = za.wrapping_mul(w.col_sums[j + v]).wrapping_add(w.dot_bias[j + v]);
+            col_term[v] = za
+                .wrapping_mul(w.col_sums[j + v])
+                .wrapping_add(w.dot_bias[j + v]);
             factor[v] = w.row_sum_factor[j + v];
         }
         if let Some(b) = e.bias {
@@ -310,14 +343,22 @@ macro_rules! tile_fn {
     ($name:ident, $r:literal, $v:literal, $dot:ident) => {
         #[simd]
         #[inline(never)]
-        fn $name<S: Simd>(simd: S, t: &Tile, a: &[i32], row_sums: &[i32], b: &[i32], c: &mut [f32]) {
+        fn $name<S: Simd>(
+            simd: S,
+            t: &Tile,
+            a: &[i32],
+            row_sums: &[i32],
+            b: &[i32],
+            c: &mut [f32],
+        ) {
             use fearless_simd::prelude::*;
             const R: usize = $r;
             const V: usize = $v;
             let a_rows: [&[i32]; R] = core::array::from_fn(|r| &a[r * t.lda..][..t.kq]);
             let mut acc = [[i32x16::splat(simd, 0); V]; R];
             for (q, row) in b.as_chunks::<{ 16 * V }>().0[..t.kq].iter().enumerate() {
-                let bv: [i32x16<S>; V] = core::array::from_fn(|v| i32x16::from_slice(simd, &row[16 * v..][..16]));
+                let bv: [i32x16<S>; V] =
+                    core::array::from_fn(|v| i32x16::from_slice(simd, &row[16 * v..][..16]));
                 for r in 0..R {
                     let av = i32x16::splat(simd, a_rows[r][q]);
                     for v in 0..V {
@@ -354,8 +395,12 @@ fn finish<S: Simd, const R: usize, const V: usize>(
     c: &mut [f32],
 ) {
     use fearless_simd::prelude::*;
-    let vecs = |s: &[f32]| -> [f32x16<S>; V] { core::array::from_fn(|v| f32x16::from_slice(simd, &s[16 * v..][..16])) };
-    let ivecs = |s: &[i32]| -> [i32x16<S>; V] { core::array::from_fn(|v| i32x16::from_slice(simd, &s[16 * v..][..16])) };
+    let vecs = |s: &[f32]| -> [f32x16<S>; V] {
+        core::array::from_fn(|v| f32x16::from_slice(simd, &s[16 * v..][..16]))
+    };
+    let ivecs = |s: &[i32]| -> [i32x16<S>; V] {
+        core::array::from_fn(|v| i32x16::from_slice(simd, &s[16 * v..][..16]))
+    };
     let (scale, col_term, bias) = (vecs(t.scale), ivecs(t.col_term), vecs(t.bias));
     let factor = t.row_sum_factor.map(|f| ivecs(f));
     let zero = f32x16::splat(simd, 0.0);
@@ -411,10 +456,19 @@ fn sdot<S: Simd>(simd: S, acc: i32x16<S>, a: i32x16<S>, b: i32x16<S>) -> i32x16<
         Level::Neon(_) => {
             use core::arch::aarch64::{int32x4x4_t, vdotq_s32, vreinterpretq_s8_s32};
             use fearless_simd::SimdInto;
-            let (acc, a, b): (int32x4x4_t, int32x4x4_t, int32x4x4_t) = (acc.into(), a.into(), b.into());
+            let (acc, a, b): (int32x4x4_t, int32x4x4_t, int32x4x4_t) =
+                (acc.into(), a.into(), b.into());
             // SAFETY: this arm is compiled only when the target has `dotprod`.
-            let d = |acc, a, b| unsafe { vdotq_s32(acc, vreinterpretq_s8_s32(a), vreinterpretq_s8_s32(b)) };
-            int32x4x4_t(d(acc.0, a.0, b.0), d(acc.1, a.1, b.1), d(acc.2, a.2, b.2), d(acc.3, a.3, b.3)).simd_into(simd)
+            let d = |acc, a, b| unsafe {
+                vdotq_s32(acc, vreinterpretq_s8_s32(a), vreinterpretq_s8_s32(b))
+            };
+            int32x4x4_t(
+                d(acc.0, a.0, b.0),
+                d(acc.1, a.1, b.1),
+                d(acc.2, a.2, b.2),
+                d(acc.3, a.3, b.3),
+            )
+            .simd_into(simd)
         }
         #[allow(unreachable_patterns)]
         _ => emulate(simd, acc, a, b, |x| x as i8 as i32),
@@ -423,7 +477,13 @@ fn sdot<S: Simd>(simd: S, acc: i32x16<S>, a: i32x16<S>, b: i32x16<S>) -> i32x16<
 
 /// Four-byte dot products lane by lane, `a`'s bytes read with `a_byte`, `b`'s as `i8`.
 #[inline(always)]
-fn emulate<S: Simd>(simd: S, acc: i32x16<S>, a: i32x16<S>, b: i32x16<S>, a_byte: impl Fn(u8) -> i32) -> i32x16<S> {
+fn emulate<S: Simd>(
+    simd: S,
+    acc: i32x16<S>,
+    a: i32x16<S>,
+    b: i32x16<S>,
+    a_byte: impl Fn(u8) -> i32,
+) -> i32x16<S> {
     use fearless_simd::prelude::*;
     let (acc, a, b) = (acc.as_slice(), a.as_slice(), b.as_slice());
     let out: [i32; 16] = core::array::from_fn(|i| {
