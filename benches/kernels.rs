@@ -544,6 +544,39 @@ fn bench_matmul_fused_add(c: &mut Criterion) {
     group.finish();
 }
 
+// ============================================================================
+// Feature Extraction Benchmarks
+// ============================================================================
+
+fn bench_sensevoice_frontend(c: &mut Criterion) {
+    use lele::features::{FeatureConfig, SenseVoiceFrontend};
+
+    let mut group = c.benchmark_group("sensevoice_frontend");
+    let frontend = SenseVoiceFrontend::new(FeatureConfig::default());
+
+    for secs in [1usize, 10] {
+        let n = 16000 * secs;
+        let pcm: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / 16000.0;
+                0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+                    + 0.05 * ((i * 7919 % 1000) as f32 / 1000.0 - 0.5)
+            })
+            .collect();
+
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(
+            BenchmarkId::new("compute", format!("{}s", secs)),
+            &n,
+            |bencher, _| {
+                bencher.iter(|| black_box(frontend.compute(black_box(&pcm))));
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_gemm,
@@ -556,6 +589,7 @@ criterion_group!(
     bench_leaky_relu,
     bench_matmul_fused_add,
     bench_activations,
+    bench_sensevoice_frontend,
 );
 
 criterion_main!(benches);
