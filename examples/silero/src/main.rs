@@ -53,13 +53,13 @@ fn main() {
     let (audio, sample_rate) = if let Some(wav_path) = env::args().nth(1) {
         println!("Loading audio from: {}", wav_path);
         let (samples, sr) = WavReader::load(&wav_path).expect("Failed to load wav");
-        (samples, sr as u32)
+        (samples, sr)
     } else {
         let default_wav = "fixtures/zh.wav";
         if std::path::Path::new(default_wav).exists() {
             println!("No audio file specified, using default: {}", default_wav);
             let (samples, sr) = WavReader::load(default_wav).expect("Failed to load default wav");
-            (samples, sr as u32)
+            (samples, sr)
         } else {
             println!("No audio file specified and default not found, using synthetic audio");
             (vec![0.0; 16000 * 3], 16000)

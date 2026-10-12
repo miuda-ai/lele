@@ -635,7 +635,7 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     let kw = weight_shape
                         .get(3)
                         .copied()
-                        .unwrap_or(weight_shape.get(2).copied().unwrap_or(1) as usize)
+                        .unwrap_or(weight_shape.get(2).copied().unwrap_or(1))
                         as i64;
                     let pad_total_h = (kh - 1) * dilations[0];
                     let pad_total_w = (kw - 1) * dilations[1];
@@ -852,7 +852,7 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     let kw = weight_shape
                         .get(3)
                         .copied()
-                        .unwrap_or(weight_shape.get(2).copied().unwrap_or(1) as usize)
+                        .unwrap_or(weight_shape.get(2).copied().unwrap_or(1))
                         as i64;
                     let pad_total_h = (kh - 1) * dilations[0];
                     let pad_total_w = (kw - 1) * dilations[1];

@@ -995,8 +995,8 @@ fn conv_transpose_1d<'b, 'a>(
     let in_channels = in_shape[1];
     let l_in = in_shape[2];
 
-    let out_channels_per_group = w_shape[1] as usize;
-    let kernel = w_shape[2] as usize;
+    let out_channels_per_group = w_shape[1];
+    let kernel = w_shape[2];
     let group = group as usize;
     let out_channels = out_channels_per_group * group;
 
@@ -1326,8 +1326,8 @@ fn conv_transpose_inner<'b, 'a>(
     let in_h = in_shape[2];
     let in_w = in_shape[3];
 
-    let kernel_h = w_shape[2] as usize;
-    let kernel_w = w_shape[3] as usize;
+    let kernel_h = w_shape[2];
+    let kernel_w = w_shape[3];
     let out_channels = (w_shape[1] as i64 * group) as usize;
 
     let stride_h = strides.first().copied().unwrap_or(1) as usize;
