@@ -43,6 +43,9 @@ impl Yolo26SegWorkspace {
 pub struct Yolo26Seg<'a> {
     data: &'a [u8],
     _phantom: std::marker::PhantomData<&'a ()>,
+    quantized_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,
+    qweights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize, bool), (std::vec::Vec<f32>, std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,
+    conv_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, bool), (std::vec::Vec<f32>, std::sync::Arc<lele::kernels::ConvWeights>)>>,
 }
 
 impl<'a> Yolo26Seg<'a> {
@@ -50,6 +53,9 @@ impl<'a> Yolo26Seg<'a> {
         Self {
             data,
             _phantom: std::marker::PhantomData,
+            quantized_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            qweights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            conv_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 fn conv1d_relu<'c, 'd>(
@@ -115,6 +121,68 @@ fn linear_quantized_relu<'c, 'd>(
     )
 }
 
+/// Dynamically quantized linear layer (+ ReLU) against an int8 weight packed
+/// once for the integer GEMM.
+fn linear_quantized_packed<'c, 'd>(
+    &self,
+    input: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_k: usize,
+    weight_n: usize,
+    weight_signed: bool,
+    weight_scale: lele::tensor::TensorView<'c, f32>,
+    weight_zero: lele::tensor::TensorView<'c, f32>,
+    bias: lele::tensor::TensorView<'c, f32>,
+    relu: bool,
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let w = self.get_qweights(weight_offset, weight_len, weight_k, weight_n, weight_signed, &weight_zero.data, &weight_scale.data);
+    let bias = (!bias.data.is_empty()).then_some(&bias.data[..]);
+    lele::kernels::qlinear_dynamic(input, &w, bias, relu, output_buf)
+}
+
+/// MatMulInteger against a static weight packed once for the integer GEMM.
+fn mat_mul_integer_packed<'c, 'd>(
+    &self,
+    a: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_k: usize,
+    weight_n: usize,
+    weight_signed: bool,
+    a_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    b_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let zb = b_zero_point.map_or(&[0.0f32][..], |z| &z.data[..]);
+    let w = self.get_qweights(weight_offset, weight_len, weight_k, weight_n, weight_signed, zb, &[1.0]);
+    let za = a_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0) as i32;
+    lele::kernels::mat_mul_integer_qweights(a, za, &w, output_buf)
+}
+
+/// ConvInteger against a static weight prepared once.
+fn conv_integer_packed<'c, 'd>(
+    &self,
+    x: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_shape: [usize; 4],
+    weight_signed: bool,
+    group: i64,
+    x_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    w_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
+    dilations: &[i64],
+    pads: &[i64],
+    strides: &[i64],
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let zw = w_zero_point.filter(|z| !z.data.is_empty()).map_or(&[0.0f32][..], |z| &z.data[..]);
+    let w = self.get_conv_weights(weight_offset, weight_len, weight_shape, group as usize, weight_signed, zw);
+    let zx = x_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0) as i32;
+    lele::kernels::conv_integer_packed(x, &w, zx, dilations, pads, strides, output_buf)
+}
+
 // Helper for pre-quantized inputs (used in attention where input is already quantized)
 #[inline]
 fn linear_quantized_prequant<'c, 'd>(
@@ -142,6 +210,24 @@ fn linear_quantized_prequant<'c, 'd>(
         output_buf,
     )
 }
+/// Static-QDQ matmul: activation already on the quantization grid, weight kept
+/// in int8 so an integer GEMM can run where the hardware supports one.
+fn qmatmul_i8<'c, 'd>(
+    &self,
+    input: &lele::tensor::TensorView<'c, f32>,
+    input_scale: &lele::tensor::TensorView<'c, f32>,
+    input_zero_point: &lele::tensor::TensorView<'c, f32>,
+    weight_offset: usize,
+    weight_len: usize,
+    weight_k: usize,
+    weight_n: usize,
+    weight_scale: &lele::tensor::TensorView<'c, f32>,
+    output_buf: &'d mut Vec<f32>,
+) -> lele::tensor::TensorView<'d, f32> {
+    let qw = self.get_quantized_weight(weight_offset, weight_len, weight_k, weight_n, weight_scale);
+    lele::kernels::qmatmul_i8(input, input_scale, input_zero_point, &qw, output_buf)
+}
+
 fn linear<'c, 'd>(
     &self,
     input: &lele::tensor::TensorView<'c>,
@@ -290,21 +376,21 @@ fn embedding_concat_i64<'c, 'd>(
         let _model_10_m_m_0_attn_Split_output_2 = split_results.swap_remove(2);
         let _model_10_m_m_0_attn_Split_output_1 = split_results.swap_remove(1);
         let _model_10_m_m_0_attn_Split_output_0 = split_results.swap_remove(0);
-        let _model_10_m_m_0_attn_Transpose_output_0 = lele::kernels::transpose(&_model_10_m_m_0_attn_Split_output_0, &[0, 1, 3, 2], &mut ws.buf_10);
+        let _model_10_m_m_0_attn_Mul_output_0 = lele::kernels::mul(&_model_10_m_m_0_attn_Split_output_0, &self.weight_f32(4847264, 4, &[]), &mut ws.buf_10);
         let _model_10_m_m_0_attn_Reshape_2_output_0 = lele::kernels::reshape(&_model_10_m_m_0_attn_Split_output_2, &[1, 128, 20, 20]);
-        let _model_10_m_m_0_attn_MatMul_output_0 = lele::kernels::matmul(&_model_10_m_m_0_attn_Transpose_output_0, &_model_10_m_m_0_attn_Split_output_1, &mut ws.buf_1);
-        let _model_10_m_m_0_attn_pe_conv_Conv_output_0 = lele::kernels::conv2d(&_model_10_m_m_0_attn_Reshape_2_output_0, &self.weight_f32(4847296, 4608, &[128, 1, 3, 3]), Some(&self.weight_f32(4851904, 512, &[128])), &[1, 1], 128, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_2);
-        let _model_10_m_m_0_attn_Mul_output_0 = lele::kernels::mul(&_model_10_m_m_0_attn_MatMul_output_0, &self.weight_f32(4852416, 4, &[]), &mut ws.buf_11);
-        let _model_10_m_m_0_attn_Softmax_output_0 = lele::kernels::softmax(&_model_10_m_m_0_attn_Mul_output_0, -1, &mut ws.buf_0);
+        let _model_10_m_m_0_attn_Transpose_output_0 = lele::kernels::transpose(&_model_10_m_m_0_attn_Mul_output_0, &[0, 1, 3, 2], &mut ws.buf_1);
+        let _model_10_m_m_0_attn_pe_conv_Conv_output_0 = lele::kernels::conv2d(&_model_10_m_m_0_attn_Reshape_2_output_0, &self.weight_f32(4847312, 4608, &[128, 1, 3, 3]), Some(&self.weight_f32(4851920, 512, &[128])), &[1, 1], 128, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_2);
+        let _model_10_m_m_0_attn_MatMul_output_0 = lele::kernels::matmul(&_model_10_m_m_0_attn_Transpose_output_0, &_model_10_m_m_0_attn_Split_output_1, &mut ws.buf_11);
+        let _model_10_m_m_0_attn_Softmax_output_0 = lele::kernels::softmax(&_model_10_m_m_0_attn_MatMul_output_0, -1, &mut ws.buf_0);
         let _model_10_m_m_0_attn_Transpose_1_output_0 = lele::kernels::transpose(&_model_10_m_m_0_attn_Softmax_output_0, &[0, 1, 3, 2], &mut ws.buf_3);
         let _model_10_m_m_0_attn_MatMul_1_output_0 = lele::kernels::matmul(&_model_10_m_m_0_attn_Split_output_2, &_model_10_m_m_0_attn_Transpose_1_output_0, &mut ws.buf_12);
         let _model_10_m_m_0_attn_Reshape_1_output_0 = lele::kernels::reshape(&_model_10_m_m_0_attn_MatMul_1_output_0, &[1, 128, 20, 20]);
-        let _model_10_m_m_0_attn_Add_output_0 = lele::kernels::add(&_model_10_m_m_0_attn_Reshape_1_output_0, &_model_10_m_m_0_attn_pe_conv_Conv_output_0, &mut ws.buf_5);
+        let _model_10_m_m_0_attn_Add_output_0 = lele::kernels::add(&_model_10_m_m_0_attn_Reshape_1_output_0, &_model_10_m_m_0_attn_pe_conv_Conv_output_0, &mut ws.buf_10);
         let _model_10_m_m_0_attn_proj_conv_Conv_output_0 = lele::kernels::conv2d(&_model_10_m_m_0_attn_Add_output_0, &self.weight_f32(4852432, 65536, &[128, 128, 1, 1]), Some(&self.weight_f32(4917968, 512, &[128])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_1);
-        let _model_10_m_m_0_Add_output_0 = lele::kernels::add(&_model_10_Split_output_1, &_model_10_m_m_0_attn_proj_conv_Conv_output_0, &mut ws.buf_10);
+        let _model_10_m_m_0_Add_output_0 = lele::kernels::add(&_model_10_Split_output_1, &_model_10_m_m_0_attn_proj_conv_Conv_output_0, &mut ws.buf_5);
         let _model_10_m_m_0_ffn_ffn_0_act_Mul_output_0 = lele::kernels::conv2d_silu(&_model_10_m_m_0_Add_output_0, &self.weight_f32(4918480, 131072, &[256, 128, 1, 1]), Some(&self.weight_f32(5049552, 1024, &[256])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_9);
         let _model_10_m_m_0_ffn_ffn_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_10_m_m_0_ffn_ffn_0_act_Mul_output_0, &self.weight_f32(5050576, 131072, &[128, 256, 1, 1]), Some(&self.weight_f32(5181648, 512, &[128])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_2);
-        let _model_10_m_m_0_Add_1_output_0 = lele::kernels::add(&_model_10_m_m_0_Add_output_0, &_model_10_m_m_0_ffn_ffn_1_conv_Conv_output_0, &mut ws.buf_5);
+        let _model_10_m_m_0_Add_1_output_0 = lele::kernels::add(&_model_10_m_m_0_Add_output_0, &_model_10_m_m_0_ffn_ffn_1_conv_Conv_output_0, &mut ws.buf_10);
         let _model_10_Concat_output_0 = lele::kernels::concat(&[&_model_10_Split_output_0, &_model_10_m_m_0_Add_1_output_0], 1, &mut ws.buf_1);
         let _model_10_cv2_act_Mul_output_0 = lele::kernels::conv2d_silu(&_model_10_Concat_output_0, &self.weight_f32(5182160, 262144, &[256, 256, 1, 1]), Some(&self.weight_f32(5444304, 1024, &[256])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_0);
         let _model_11_Resize_output_0 = lele::kernels::resize_nearest(&_model_10_cv2_act_Mul_output_0, Some(&self.weight_f32(5445328, 16, &[4]).data), None, "asymmetric", &mut ws.buf_3);
@@ -427,8 +513,8 @@ fn embedding_concat_i64<'c, 'd>(
         let _model_23_one2one_cv2_1_one2one_cv2_1_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv2_1_one2one_cv2_1_0_act_Mul_output_0, &self.weight_f32(7675216, 9216, &[16, 16, 3, 3]), Some(&self.weight_f32(7684432, 64, &[16])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_8);
         let _model_23_one2one_cv3_1_one2one_cv3_1_0_one2one_cv3_1_0_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv3_1_one2one_cv3_1_0_one2one_cv3_1_0_0_act_Mul_output_0, &self.weight_f32(7684496, 40960, &[80, 128, 1, 1]), Some(&self.weight_f32(7725456, 320, &[80])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_5);
         let _model_23_one2one_cv4_1_one2one_cv4_1_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv4_1_one2one_cv4_1_0_act_Mul_output_0, &self.weight_f32(7725776, 36864, &[32, 32, 3, 3]), Some(&self.weight_f32(7762640, 128, &[32])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_4);
-        let _model_23_proto_Resize_output_0 = lele::kernels::resize_nearest(&_model_23_proto_feat_refine_0_act_Mul_output_0, None, Some(&self.weight_i64(7762768, 32, &[4]).data.iter().map(|&v| v as i64).collect::<Vec<_>>()), "asymmetric", &mut ws.buf_1);
-        let _model_22_cv1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_21_Concat_output_0, &self.weight_f32(7762800, 393216, &[256, 384, 1, 1]), Some(&self.weight_f32(8156016, 1024, &[256])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_6);
+        let _model_23_proto_Resize_output_0 = lele::kernels::resize_nearest(&_model_23_proto_feat_refine_0_act_Mul_output_0, Some(&self.weight_f32(5445328, 16, &[4]).data), None, "asymmetric", &mut ws.buf_1);
+        let _model_22_cv1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_21_Concat_output_0, &self.weight_f32(7762768, 393216, &[256, 384, 1, 1]), Some(&self.weight_f32(8155984, 1024, &[256])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_6);
         let _model_23_one2one_cv2_1_one2one_cv2_1_1_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_one2one_cv2_1_one2one_cv2_1_1_conv_Conv_output_0, &mut ws.buf_0);
         let _model_23_one2one_cv3_1_one2one_cv3_1_0_one2one_cv3_1_0_1_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_one2one_cv3_1_one2one_cv3_1_0_one2one_cv3_1_0_1_conv_Conv_output_0, &mut ws.buf_9);
         let _model_23_one2one_cv4_1_one2one_cv4_1_1_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_one2one_cv4_1_one2one_cv4_1_1_conv_Conv_output_0, &mut ws.buf_10);
@@ -438,9 +524,9 @@ fn embedding_concat_i64<'c, 'd>(
         let _model_23_one2one_cv3_1_one2one_cv3_1_0_one2one_cv3_1_0_1_act_Mul_output_0 = lele::kernels::mul(&_model_23_one2one_cv3_1_one2one_cv3_1_0_one2one_cv3_1_0_1_conv_Conv_output_0, &_model_23_one2one_cv3_1_one2one_cv3_1_0_one2one_cv3_1_0_1_act_Sigmoid_output_0, &mut ws.buf_15);
         let _model_23_one2one_cv4_1_one2one_cv4_1_1_act_Mul_output_0 = lele::kernels::mul(&_model_23_one2one_cv4_1_one2one_cv4_1_1_conv_Conv_output_0, &_model_23_one2one_cv4_1_one2one_cv4_1_1_act_Sigmoid_output_0, &mut ws.buf_16);
         let _model_22_cv1_act_Mul_output_0 = lele::kernels::mul(&_model_22_cv1_conv_Conv_output_0, &_model_22_cv1_act_Sigmoid_output_0, &mut ws.buf_17);
-        let _model_23_one2one_cv2_1_one2one_cv2_1_2_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv2_1_one2one_cv2_1_1_act_Mul_output_0, &self.weight_f32(8157040, 256, &[4, 16, 1, 1]), Some(&self.weight_f32(8157296, 16, &[4])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_1);
-        let _model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_0_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv3_1_one2one_cv3_1_0_one2one_cv3_1_0_1_act_Mul_output_0, &self.weight_f32(8157312, 2880, &[80, 1, 3, 3]), Some(&self.weight_f32(8160192, 320, &[80])), &[1, 1], 80, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_7);
-        let _model_23_one2one_cv4_1_one2one_cv4_1_2_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv4_1_one2one_cv4_1_1_act_Mul_output_0, &self.weight_f32(8160512, 4096, &[32, 32, 1, 1]), Some(&self.weight_f32(8164608, 128, &[32])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_0);
+        let _model_23_one2one_cv2_1_one2one_cv2_1_2_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv2_1_one2one_cv2_1_1_act_Mul_output_0, &self.weight_f32(8157008, 256, &[4, 16, 1, 1]), Some(&self.weight_f32(8157264, 16, &[4])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_1);
+        let _model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_0_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv3_1_one2one_cv3_1_0_one2one_cv3_1_0_1_act_Mul_output_0, &self.weight_f32(8157280, 2880, &[80, 1, 3, 3]), Some(&self.weight_f32(8160160, 320, &[80])), &[1, 1], 80, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_7);
+        let _model_23_one2one_cv4_1_one2one_cv4_1_2_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv4_1_one2one_cv4_1_1_act_Mul_output_0, &self.weight_f32(8160480, 4096, &[32, 32, 1, 1]), Some(&self.weight_f32(8164576, 128, &[32])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_0);
         let splits_slice = &[128, 128];
         let mut split_results = lele::kernels::split_owned(&_model_22_cv1_act_Mul_output_0, 1, splits_slice);
         let _model_22_Split_output_1 = split_results.swap_remove(1);
@@ -448,47 +534,47 @@ fn embedding_concat_i64<'c, 'd>(
         let _model_23_Reshape_1_output_0 = lele::kernels::reshape(&_model_23_one2one_cv2_1_one2one_cv2_1_2_Conv_output_0, &[1, 4, -1]);
         let _model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_0_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_0_conv_Conv_output_0, &mut ws.buf_4);
         let _model_23_Reshape_7_output_0 = lele::kernels::reshape(&_model_23_one2one_cv4_1_one2one_cv4_1_2_Conv_output_0, &[1, 32, -1]);
-        let _model_22_m_0_m_0_0_cv1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_Split_output_1, &self.weight_f32(8164736, 294912, &[64, 128, 3, 3]), Some(&self.weight_f32(8459648, 256, &[64])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_6);
+        let _model_22_m_0_m_0_0_cv1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_Split_output_1, &self.weight_f32(8164704, 294912, &[64, 128, 3, 3]), Some(&self.weight_f32(8459616, 256, &[64])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_6);
         let _model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_0_act_Mul_output_0 = lele::kernels::mul(&_model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_0_conv_Conv_output_0, &_model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_0_act_Sigmoid_output_0, &mut ws.buf_9);
         let _model_22_m_0_m_0_0_cv1_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_22_m_0_m_0_0_cv1_conv_Conv_output_0, &mut ws.buf_10);
-        let _model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_0_act_Mul_output_0, &self.weight_f32(8459904, 25600, &[80, 80, 1, 1]), Some(&self.weight_f32(8485504, 320, &[80])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_12);
+        let _model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_0_act_Mul_output_0, &self.weight_f32(8459872, 25600, &[80, 80, 1, 1]), Some(&self.weight_f32(8485472, 320, &[80])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_12);
         let _model_22_m_0_m_0_0_cv1_act_Mul_output_0 = lele::kernels::mul(&_model_22_m_0_m_0_0_cv1_conv_Conv_output_0, &_model_22_m_0_m_0_0_cv1_act_Sigmoid_output_0, &mut ws.buf_14);
         let _model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_1_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_1_conv_Conv_output_0, &mut ws.buf_15);
-        let _model_22_m_0_m_0_0_cv2_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_m_0_m_0_0_cv1_act_Mul_output_0, &self.weight_f32(8485824, 294912, &[128, 64, 3, 3]), Some(&self.weight_f32(8780736, 512, &[128])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_16);
+        let _model_22_m_0_m_0_0_cv2_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_m_0_m_0_0_cv1_act_Mul_output_0, &self.weight_f32(8485792, 294912, &[128, 64, 3, 3]), Some(&self.weight_f32(8780704, 512, &[128])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_16);
         let _model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_1_act_Mul_output_0 = lele::kernels::mul(&_model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_1_conv_Conv_output_0, &_model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_1_act_Sigmoid_output_0, &mut ws.buf_4);
         let _model_22_m_0_m_0_0_cv2_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_22_m_0_m_0_0_cv2_conv_Conv_output_0, &mut ws.buf_7);
-        let _model_23_one2one_cv3_1_one2one_cv3_1_2_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_1_act_Mul_output_0, &self.weight_f32(8781248, 25600, &[80, 80, 1, 1]), Some(&self.weight_f32(8806848, 320, &[80])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_9);
+        let _model_23_one2one_cv3_1_one2one_cv3_1_2_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv3_1_one2one_cv3_1_1_one2one_cv3_1_1_1_act_Mul_output_0, &self.weight_f32(8781216, 25600, &[80, 80, 1, 1]), Some(&self.weight_f32(8806816, 320, &[80])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_9);
         let _model_22_m_0_m_0_0_cv2_act_Mul_output_0 = lele::kernels::mul(&_model_22_m_0_m_0_0_cv2_conv_Conv_output_0, &_model_22_m_0_m_0_0_cv2_act_Sigmoid_output_0, &mut ws.buf_6);
         let _model_23_Reshape_4_output_0 = lele::kernels::reshape(&_model_23_one2one_cv3_1_one2one_cv3_1_2_Conv_output_0, &[1, 80, -1]);
         let _model_22_m_0_m_0_0_Add_output_0 = lele::kernels::add(&_model_22_Split_output_1, &_model_22_m_0_m_0_0_cv2_act_Mul_output_0, &mut ws.buf_10);
-        let _model_22_m_0_m_0_1_attn_qkv_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_m_0_m_0_0_Add_output_0, &self.weight_f32(8807168, 131072, &[256, 128, 1, 1]), Some(&self.weight_f32(8938240, 1024, &[256])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_12);
+        let _model_22_m_0_m_0_1_attn_qkv_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_m_0_m_0_0_Add_output_0, &self.weight_f32(8807136, 131072, &[256, 128, 1, 1]), Some(&self.weight_f32(8938208, 1024, &[256])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_12);
         let _model_22_m_0_m_0_1_attn_Reshape_output_0 = lele::kernels::reshape(&_model_22_m_0_m_0_1_attn_qkv_conv_Conv_output_0, &[1, 2, 128, 400]);
         let splits_slice = &[32, 32, 64];
         let mut split_results = lele::kernels::split_owned(&_model_22_m_0_m_0_1_attn_Reshape_output_0, 2, splits_slice);
         let _model_22_m_0_m_0_1_attn_Split_output_2 = split_results.swap_remove(2);
         let _model_22_m_0_m_0_1_attn_Split_output_1 = split_results.swap_remove(1);
         let _model_22_m_0_m_0_1_attn_Split_output_0 = split_results.swap_remove(0);
-        let _model_22_m_0_m_0_1_attn_Transpose_output_0 = lele::kernels::transpose(&_model_22_m_0_m_0_1_attn_Split_output_0, &[0, 1, 3, 2], &mut ws.buf_7);
+        let _model_22_m_0_m_0_1_attn_Mul_output_0 = lele::kernels::mul(&_model_22_m_0_m_0_1_attn_Split_output_0, &self.weight_f32(4847264, 4, &[]), &mut ws.buf_7);
         let _model_22_m_0_m_0_1_attn_Reshape_2_output_0 = lele::kernels::reshape(&_model_22_m_0_m_0_1_attn_Split_output_2, &[1, 128, 20, 20]);
-        let _model_22_m_0_m_0_1_attn_MatMul_output_0 = lele::kernels::matmul(&_model_22_m_0_m_0_1_attn_Transpose_output_0, &_model_22_m_0_m_0_1_attn_Split_output_1, &mut ws.buf_6);
-        let _model_22_m_0_m_0_1_attn_pe_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_m_0_m_0_1_attn_Reshape_2_output_0, &self.weight_f32(8939264, 4608, &[128, 1, 3, 3]), Some(&self.weight_f32(8943872, 512, &[128])), &[1, 1], 128, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_16);
-        let _model_22_m_0_m_0_1_attn_Mul_output_0 = lele::kernels::mul(&_model_22_m_0_m_0_1_attn_MatMul_output_0, &self.weight_f32(4852416, 4, &[]), &mut ws.buf_17);
-        let _model_22_m_0_m_0_1_attn_Softmax_output_0 = lele::kernels::softmax(&_model_22_m_0_m_0_1_attn_Mul_output_0, -1, &mut ws.buf_12);
+        let _model_22_m_0_m_0_1_attn_Transpose_output_0 = lele::kernels::transpose(&_model_22_m_0_m_0_1_attn_Mul_output_0, &[0, 1, 3, 2], &mut ws.buf_6);
+        let _model_22_m_0_m_0_1_attn_pe_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_m_0_m_0_1_attn_Reshape_2_output_0, &self.weight_f32(8939232, 4608, &[128, 1, 3, 3]), Some(&self.weight_f32(8943840, 512, &[128])), &[1, 1], 128, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_16);
+        let _model_22_m_0_m_0_1_attn_MatMul_output_0 = lele::kernels::matmul(&_model_22_m_0_m_0_1_attn_Transpose_output_0, &_model_22_m_0_m_0_1_attn_Split_output_1, &mut ws.buf_17);
+        let _model_22_m_0_m_0_1_attn_Softmax_output_0 = lele::kernels::softmax(&_model_22_m_0_m_0_1_attn_MatMul_output_0, -1, &mut ws.buf_12);
         let _model_22_m_0_m_0_1_attn_Transpose_1_output_0 = lele::kernels::transpose(&_model_22_m_0_m_0_1_attn_Softmax_output_0, &[0, 1, 3, 2], &mut ws.buf_4);
         let _model_22_m_0_m_0_1_attn_MatMul_1_output_0 = lele::kernels::matmul(&_model_22_m_0_m_0_1_attn_Split_output_2, &_model_22_m_0_m_0_1_attn_Transpose_1_output_0, &mut ws.buf_18);
         let _model_22_m_0_m_0_1_attn_Reshape_1_output_0 = lele::kernels::reshape(&_model_22_m_0_m_0_1_attn_MatMul_1_output_0, &[1, 128, 20, 20]);
         let _model_22_m_0_m_0_1_attn_Add_output_0 = lele::kernels::add(&_model_22_m_0_m_0_1_attn_Reshape_1_output_0, &_model_22_m_0_m_0_1_attn_pe_conv_Conv_output_0, &mut ws.buf_7);
-        let _model_22_m_0_m_0_1_attn_proj_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_m_0_m_0_1_attn_Add_output_0, &self.weight_f32(8944384, 65536, &[128, 128, 1, 1]), Some(&self.weight_f32(9009920, 512, &[128])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_6);
+        let _model_22_m_0_m_0_1_attn_proj_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_m_0_m_0_1_attn_Add_output_0, &self.weight_f32(8944352, 65536, &[128, 128, 1, 1]), Some(&self.weight_f32(9009888, 512, &[128])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_6);
         let _model_22_m_0_m_0_1_Add_output_0 = lele::kernels::add(&_model_22_m_0_m_0_0_Add_output_0, &_model_22_m_0_m_0_1_attn_proj_conv_Conv_output_0, &mut ws.buf_14);
-        let _model_22_m_0_m_0_1_ffn_ffn_0_act_Mul_output_0 = lele::kernels::conv2d_silu(&_model_22_m_0_m_0_1_Add_output_0, &self.weight_f32(9010432, 131072, &[256, 128, 1, 1]), Some(&self.weight_f32(9141504, 1024, &[256])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_15);
-        let _model_22_m_0_m_0_1_ffn_ffn_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_m_0_m_0_1_ffn_ffn_0_act_Mul_output_0, &self.weight_f32(9142528, 131072, &[128, 256, 1, 1]), Some(&self.weight_f32(9273600, 512, &[128])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_16);
+        let _model_22_m_0_m_0_1_ffn_ffn_0_act_Mul_output_0 = lele::kernels::conv2d_silu(&_model_22_m_0_m_0_1_Add_output_0, &self.weight_f32(9010400, 131072, &[256, 128, 1, 1]), Some(&self.weight_f32(9141472, 1024, &[256])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_15);
+        let _model_22_m_0_m_0_1_ffn_ffn_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_m_0_m_0_1_ffn_ffn_0_act_Mul_output_0, &self.weight_f32(9142496, 131072, &[128, 256, 1, 1]), Some(&self.weight_f32(9273568, 512, &[128])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_16);
         let _model_22_m_0_m_0_1_Add_1_output_0 = lele::kernels::add(&_model_22_m_0_m_0_1_Add_output_0, &_model_22_m_0_m_0_1_ffn_ffn_1_conv_Conv_output_0, &mut ws.buf_7);
         let _model_22_Concat_output_0 = lele::kernels::concat(&[&_model_22_Split_output_0, &_model_22_Split_output_1, &_model_22_m_0_m_0_1_Add_1_output_0], 1, &mut ws.buf_6);
-        let _model_22_cv2_act_Mul_output_0 = lele::kernels::conv2d_silu(&_model_22_Concat_output_0, &self.weight_f32(9274112, 393216, &[256, 384, 1, 1]), Some(&self.weight_f32(9667328, 1024, &[256])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_4);
-        let _model_23_one2one_cv2_2_one2one_cv2_2_0_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_cv2_act_Mul_output_0, &self.weight_f32(9668352, 147456, &[16, 256, 3, 3]), Some(&self.weight_f32(9815808, 64, &[16])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_12);
-        let _model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_0_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_cv2_act_Mul_output_0, &self.weight_f32(9815872, 9216, &[256, 1, 3, 3]), Some(&self.weight_f32(9825088, 1024, &[256])), &[1, 1], 256, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_14);
-        let _model_23_one2one_cv4_2_one2one_cv4_2_0_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_cv2_act_Mul_output_0, &self.weight_f32(9826112, 294912, &[32, 256, 3, 3]), Some(&self.weight_f32(10121024, 128, &[32])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_5);
-        let _model_23_proto_feat_refine_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_cv2_act_Mul_output_0, &self.weight_f32(10121152, 65536, &[64, 256, 1, 1]), Some(&self.weight_f32(10186688, 256, &[64])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_6);
+        let _model_22_cv2_act_Mul_output_0 = lele::kernels::conv2d_silu(&_model_22_Concat_output_0, &self.weight_f32(9274080, 393216, &[256, 384, 1, 1]), Some(&self.weight_f32(9667296, 1024, &[256])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_4);
+        let _model_23_one2one_cv2_2_one2one_cv2_2_0_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_cv2_act_Mul_output_0, &self.weight_f32(9668320, 147456, &[16, 256, 3, 3]), Some(&self.weight_f32(9815776, 64, &[16])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_12);
+        let _model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_0_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_cv2_act_Mul_output_0, &self.weight_f32(9815840, 9216, &[256, 1, 3, 3]), Some(&self.weight_f32(9825056, 1024, &[256])), &[1, 1], 256, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_14);
+        let _model_23_one2one_cv4_2_one2one_cv4_2_0_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_cv2_act_Mul_output_0, &self.weight_f32(9826080, 294912, &[32, 256, 3, 3]), Some(&self.weight_f32(10120992, 128, &[32])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_5);
+        let _model_23_proto_feat_refine_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_22_cv2_act_Mul_output_0, &self.weight_f32(10121120, 65536, &[64, 256, 1, 1]), Some(&self.weight_f32(10186656, 256, &[64])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_6);
         let _model_23_one2one_cv2_2_one2one_cv2_2_0_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_one2one_cv2_2_one2one_cv2_2_0_conv_Conv_output_0, &mut ws.buf_7);
         let _model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_0_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_0_conv_Conv_output_0, &mut ws.buf_8);
         let _model_23_one2one_cv4_2_one2one_cv4_2_0_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_one2one_cv4_2_one2one_cv4_2_0_conv_Conv_output_0, &mut ws.buf_10);
@@ -497,10 +583,10 @@ fn embedding_concat_i64<'c, 'd>(
         let _model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_0_act_Mul_output_0 = lele::kernels::mul(&_model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_0_conv_Conv_output_0, &_model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_0_act_Sigmoid_output_0, &mut ws.buf_4);
         let _model_23_one2one_cv4_2_one2one_cv4_2_0_act_Mul_output_0 = lele::kernels::mul(&_model_23_one2one_cv4_2_one2one_cv4_2_0_conv_Conv_output_0, &_model_23_one2one_cv4_2_one2one_cv4_2_0_act_Sigmoid_output_0, &mut ws.buf_17);
         let _model_23_proto_feat_refine_1_act_Mul_output_0 = lele::kernels::mul(&_model_23_proto_feat_refine_1_conv_Conv_output_0, &_model_23_proto_feat_refine_1_act_Sigmoid_output_0, &mut ws.buf_18);
-        let _model_23_one2one_cv2_2_one2one_cv2_2_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv2_2_one2one_cv2_2_0_act_Mul_output_0, &self.weight_f32(10186944, 9216, &[16, 16, 3, 3]), Some(&self.weight_f32(10196160, 64, &[16])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_19);
-        let _model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_0_act_Mul_output_0, &self.weight_f32(10196224, 81920, &[80, 256, 1, 1]), Some(&self.weight_f32(10278144, 320, &[80])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_20);
-        let _model_23_one2one_cv4_2_one2one_cv4_2_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv4_2_one2one_cv4_2_0_act_Mul_output_0, &self.weight_f32(10278464, 36864, &[32, 32, 3, 3]), Some(&self.weight_f32(10315328, 128, &[32])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_7);
-        let _model_23_proto_Resize_1_output_0 = lele::kernels::resize_nearest(&_model_23_proto_feat_refine_1_act_Mul_output_0, None, Some(&self.weight_i64(7762768, 32, &[4]).data.iter().map(|&v| v as i64).collect::<Vec<_>>()), "asymmetric", &mut ws.buf_8);
+        let _model_23_one2one_cv2_2_one2one_cv2_2_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv2_2_one2one_cv2_2_0_act_Mul_output_0, &self.weight_f32(10186912, 9216, &[16, 16, 3, 3]), Some(&self.weight_f32(10196128, 64, &[16])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_19);
+        let _model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_0_act_Mul_output_0, &self.weight_f32(10196192, 81920, &[80, 256, 1, 1]), Some(&self.weight_f32(10278112, 320, &[80])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_20);
+        let _model_23_one2one_cv4_2_one2one_cv4_2_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv4_2_one2one_cv4_2_0_act_Mul_output_0, &self.weight_f32(10278432, 36864, &[32, 32, 3, 3]), Some(&self.weight_f32(10315296, 128, &[32])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_7);
+        let _model_23_proto_Resize_1_output_0 = lele::kernels::resize_nearest(&_model_23_proto_feat_refine_1_act_Mul_output_0, Some(&self.weight_f32(10315424, 16, &[4]).data), None, "asymmetric", &mut ws.buf_8);
         let _model_23_one2one_cv2_2_one2one_cv2_2_1_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_one2one_cv2_2_one2one_cv2_2_1_conv_Conv_output_0, &mut ws.buf_5);
         let _model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_1_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_1_conv_Conv_output_0, &mut ws.buf_6);
         let _model_23_one2one_cv4_2_one2one_cv4_2_1_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_one2one_cv4_2_one2one_cv4_2_1_conv_Conv_output_0, &mut ws.buf_10);
@@ -508,10 +594,10 @@ fn embedding_concat_i64<'c, 'd>(
         let _model_23_one2one_cv2_2_one2one_cv2_2_1_act_Mul_output_0 = lele::kernels::mul(&_model_23_one2one_cv2_2_one2one_cv2_2_1_conv_Conv_output_0, &_model_23_one2one_cv2_2_one2one_cv2_2_1_act_Sigmoid_output_0, &mut ws.buf_12);
         let _model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_1_act_Mul_output_0 = lele::kernels::mul(&_model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_1_conv_Conv_output_0, &_model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_1_act_Sigmoid_output_0, &mut ws.buf_14);
         let _model_23_one2one_cv4_2_one2one_cv4_2_1_act_Mul_output_0 = lele::kernels::mul(&_model_23_one2one_cv4_2_one2one_cv4_2_1_conv_Conv_output_0, &_model_23_one2one_cv4_2_one2one_cv4_2_1_act_Sigmoid_output_0, &mut ws.buf_15);
-        let _model_23_proto_feat_fuse_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_proto_Add_1_output_0, &self.weight_f32(10315456, 147456, &[64, 64, 3, 3]), Some(&self.weight_f32(10462912, 256, &[64])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_16);
-        let _model_23_one2one_cv2_2_one2one_cv2_2_2_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv2_2_one2one_cv2_2_1_act_Mul_output_0, &self.weight_f32(10463168, 256, &[4, 16, 1, 1]), Some(&self.weight_f32(10463424, 16, &[4])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_17);
-        let _model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_0_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_1_act_Mul_output_0, &self.weight_f32(10463440, 2880, &[80, 1, 3, 3]), Some(&self.weight_f32(10466320, 320, &[80])), &[1, 1], 80, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_8);
-        let _model_23_one2one_cv4_2_one2one_cv4_2_2_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv4_2_one2one_cv4_2_1_act_Mul_output_0, &self.weight_f32(10466640, 4096, &[32, 32, 1, 1]), Some(&self.weight_f32(10470736, 128, &[32])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_5);
+        let _model_23_proto_feat_fuse_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_proto_Add_1_output_0, &self.weight_f32(10315440, 147456, &[64, 64, 3, 3]), Some(&self.weight_f32(10462896, 256, &[64])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_16);
+        let _model_23_one2one_cv2_2_one2one_cv2_2_2_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv2_2_one2one_cv2_2_1_act_Mul_output_0, &self.weight_f32(10463152, 256, &[4, 16, 1, 1]), Some(&self.weight_f32(10463408, 16, &[4])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_17);
+        let _model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_0_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv3_2_one2one_cv3_2_0_one2one_cv3_2_0_1_act_Mul_output_0, &self.weight_f32(10463424, 2880, &[80, 1, 3, 3]), Some(&self.weight_f32(10466304, 320, &[80])), &[1, 1], 80, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_8);
+        let _model_23_one2one_cv4_2_one2one_cv4_2_2_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv4_2_one2one_cv4_2_1_act_Mul_output_0, &self.weight_f32(10466624, 4096, &[32, 32, 1, 1]), Some(&self.weight_f32(10470720, 128, &[32])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_5);
         let _model_23_proto_feat_fuse_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_proto_feat_fuse_conv_Conv_output_0, &mut ws.buf_6);
         let _model_23_Reshape_2_output_0 = lele::kernels::reshape(&_model_23_one2one_cv2_2_one2one_cv2_2_2_Conv_output_0, &[1, 4, -1]);
         let _model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_0_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_0_conv_Conv_output_0, &mut ws.buf_4);
@@ -520,91 +606,134 @@ fn embedding_concat_i64<'c, 'd>(
         let _model_23_Concat_output_0 = lele::kernels::concat(&[&_model_23_Reshape_output_0, &_model_23_Reshape_1_output_0, &_model_23_Reshape_2_output_0], -1, &mut ws.buf_10);
         let _model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_0_act_Mul_output_0 = lele::kernels::mul(&_model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_0_conv_Conv_output_0, &_model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_0_act_Sigmoid_output_0, &mut ws.buf_11);
         let _model_23_Concat_2_output_0 = lele::kernels::concat(&[&_model_23_Reshape_6_output_0, &_model_23_Reshape_7_output_0, &_model_23_Reshape_8_output_0], 2, &mut ws.buf_12);
-        let _model_23_proto_cv1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_proto_feat_fuse_act_Mul_output_0, &self.weight_f32(10470864, 147456, &[64, 64, 3, 3]), Some(&self.weight_f32(10618320, 256, &[64])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_14);
-        let _model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_0_act_Mul_output_0, &self.weight_f32(10618576, 25600, &[80, 80, 1, 1]), Some(&self.weight_f32(10644176, 320, &[80])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_15);
+        let _model_23_proto_cv1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_proto_feat_fuse_act_Mul_output_0, &self.weight_f32(10470848, 147456, &[64, 64, 3, 3]), Some(&self.weight_f32(10618304, 256, &[64])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_14);
+        let _model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_1_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_0_act_Mul_output_0, &self.weight_f32(10618560, 25600, &[80, 80, 1, 1]), Some(&self.weight_f32(10644160, 320, &[80])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_15);
         let _model_23_proto_cv1_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_proto_cv1_conv_Conv_output_0, &mut ws.buf_6);
         let _model_23_Slice_output_0 = lele::kernels::slice(&_model_23_Concat_output_0, &[0], &[2], &[1], &[], &mut ws.buf_1);
         let _model_23_Slice_1_output_0 = lele::kernels::slice(&_model_23_Concat_output_0, &[2], &[4], &[1], &[], &mut ws.buf_4);
         let _model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_1_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_1_conv_Conv_output_0, &mut ws.buf_0);
         let _model_23_proto_cv1_act_Mul_output_0 = lele::kernels::mul(&_model_23_proto_cv1_conv_Conv_output_0, &_model_23_proto_cv1_act_Sigmoid_output_0, &mut ws.buf_3);
-        let _model_23_Sub_output_0 = lele::kernels::sub(&self.weight_f32(10644560, 67200, &[1, 2, 8400]), &_model_23_Slice_output_0, &mut ws.buf_5);
-        let _model_23_Add_1_output_0 = lele::kernels::add(&self.weight_f32(10644560, 67200, &[1, 2, 8400]), &_model_23_Slice_1_output_0, &mut ws.buf_7);
+        let _model_23_Sub_output_0 = lele::kernels::sub(&self.weight_f32(10644544, 67200, &[1, 2, 8400]), &_model_23_Slice_output_0, &mut ws.buf_5);
+        let _model_23_Add_1_output_0 = lele::kernels::add(&self.weight_f32(10644544, 67200, &[1, 2, 8400]), &_model_23_Slice_1_output_0, &mut ws.buf_7);
         let _model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_1_act_Mul_output_0 = lele::kernels::mul(&_model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_1_conv_Conv_output_0, &_model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_1_act_Sigmoid_output_0, &mut ws.buf_8);
-        let _model_23_proto_upsample_ConvTranspose_output_0 = lele::kernels::conv_transpose(&_model_23_proto_cv1_act_Mul_output_0, &self.weight_f32(10711760, 65536, &[64, 64, 2, 2]), Some(&self.weight_f32(10777296, 256, &[64])), &[1, 1], 1, &[0, 0, 0, 0], &[2, 2], &mut ws.buf_10);
+        let _model_23_proto_upsample_ConvTranspose_output_0 = lele::kernels::conv_transpose(&_model_23_proto_cv1_act_Mul_output_0, &self.weight_f32(10711744, 65536, &[64, 64, 2, 2]), Some(&self.weight_f32(10777280, 256, &[64])), &[1, 1], 1, &[0, 0, 0, 0], &[2, 2], &mut ws.buf_10);
         let _model_23_Concat_3_output_0 = lele::kernels::concat(&[&_model_23_Sub_output_0, &_model_23_Add_1_output_0], 1, &mut ws.buf_11);
-        let _model_23_one2one_cv3_2_one2one_cv3_2_2_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_1_act_Mul_output_0, &self.weight_f32(10777552, 25600, &[80, 80, 1, 1]), Some(&self.weight_f32(10803152, 320, &[80])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_6);
-        let _model_23_proto_cv2_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_proto_upsample_ConvTranspose_output_0, &self.weight_f32(10803472, 147456, &[64, 64, 3, 3]), Some(&self.weight_f32(10950928, 256, &[64])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_1);
-        let _model_23_Mul_2_output_0 = lele::kernels::mul(&_model_23_Concat_3_output_0, &self.weight_f32(10951184, 33600, &[1, 8400]), &mut ws.buf_4);
+        let _model_23_one2one_cv3_2_one2one_cv3_2_2_Conv_output_0 = lele::kernels::conv2d(&_model_23_one2one_cv3_2_one2one_cv3_2_1_one2one_cv3_2_1_1_act_Mul_output_0, &self.weight_f32(10777536, 25600, &[80, 80, 1, 1]), Some(&self.weight_f32(10803136, 320, &[80])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_6);
+        let _model_23_proto_cv2_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_proto_upsample_ConvTranspose_output_0, &self.weight_f32(10803456, 147456, &[64, 64, 3, 3]), Some(&self.weight_f32(10950912, 256, &[64])), &[1, 1], 1, &[1, 1, 1, 1], &[1, 1], &mut ws.buf_1);
+        let _model_23_Mul_2_output_0 = lele::kernels::mul(&_model_23_Concat_3_output_0, &self.weight_f32(10951168, 33600, &[1, 8400]), &mut ws.buf_4);
         let _model_23_Reshape_5_output_0 = lele::kernels::reshape(&_model_23_one2one_cv3_2_one2one_cv3_2_2_Conv_output_0, &[1, 80, -1]);
         let _model_23_proto_cv2_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_proto_cv2_conv_Conv_output_0, &mut ws.buf_0);
         let _model_23_Concat_1_output_0 = lele::kernels::concat(&[&_model_23_Reshape_3_output_0, &_model_23_Reshape_4_output_0, &_model_23_Reshape_5_output_0], -1, &mut ws.buf_3);
         let _model_23_proto_cv2_act_Mul_output_0 = lele::kernels::mul(&_model_23_proto_cv2_conv_Conv_output_0, &_model_23_proto_cv2_act_Sigmoid_output_0, &mut ws.buf_5);
         let _model_23_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_Concat_1_output_0, &mut ws.buf_7);
-        let _model_23_proto_cv3_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_proto_cv2_act_Mul_output_0, &self.weight_f32(10984784, 8192, &[32, 64, 1, 1]), Some(&self.weight_f32(10992976, 128, &[32])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_8);
-        let _model_23_Concat_4_output_0 = lele::kernels::concat(&[&_model_23_Mul_2_output_0, &_model_23_Sigmoid_output_0, &_model_23_Concat_2_output_0], 1, &mut ws.buf_10);
-        let _model_23_proto_cv3_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_proto_cv3_conv_Conv_output_0, &mut ws.buf_11);
-        let _model_23_Transpose_output_0 = lele::kernels::transpose(&_model_23_Concat_4_output_0, &[0, 2, 1], &mut ws.buf_2);
-        let output1 = lele::kernels::mul(&_model_23_proto_cv3_conv_Conv_output_0, &_model_23_proto_cv3_act_Sigmoid_output_0, &mut ws.buf_0);
-        let splits_slice = &[4, 80, 32];
-        let mut split_results = lele::kernels::split_owned(&_model_23_Transpose_output_0, -1, splits_slice);
-        let _model_23_Split_output_2 = split_results.swap_remove(2);
-        let _model_23_Split_output_1 = split_results.swap_remove(1);
-        let _model_23_Split_output_0 = split_results.swap_remove(0);
-        let _model_23_ReduceMax_output_0 = lele::kernels::reduce_max(&_model_23_Split_output_1, &[-1], false, &mut ws.buf_5);
+        let _model_23_proto_cv3_conv_Conv_output_0 = lele::kernels::conv2d(&_model_23_proto_cv2_act_Mul_output_0, &self.weight_f32(10984768, 8192, &[32, 64, 1, 1]), Some(&self.weight_f32(10992960, 128, &[32])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_8);
+        let _model_23_proto_cv3_act_Sigmoid_output_0 = lele::kernels::sigmoid(&_model_23_proto_cv3_conv_Conv_output_0, &mut ws.buf_10);
+        let _model_23_Concat_4_output_0 = lele::kernels::concat(&[&_model_23_Mul_2_output_0, &_model_23_Sigmoid_output_0, &_model_23_Concat_2_output_0], 1, &mut ws.buf_11);
+        let output1 = lele::kernels::mul(&_model_23_proto_cv3_conv_Conv_output_0, &_model_23_proto_cv3_act_Sigmoid_output_0, &mut ws.buf_2);
+        let _model_23_Transpose_output_0 = lele::kernels::transpose(&_model_23_Concat_4_output_0, &[0, 2, 1], &mut ws.buf_0);
+        let _model_23_Slice_2_output_0 = lele::kernels::slice(&_model_23_Transpose_output_0, &[0], &[4], &[-1], &[], &mut ws.buf_1);
+        let _model_23_Slice_3_output_0 = lele::kernels::slice(&_model_23_Transpose_output_0, &[4], &[84], &[-1], &[], &mut ws.buf_3);
+        let _model_23_Slice_4_output_0 = lele::kernels::slice(&_model_23_Transpose_output_0, &[84], &[116], &[-1], &[], &mut ws.buf_5);
+        let _model_23_ReduceMax_output_0 = lele::kernels::reduce_max(&_model_23_Slice_3_output_0, &[-1], false, &mut ws.buf_4);
         let mut buf__model_23_TopK_output_0_values = Vec::<f32>::new();
         let mut buf__model_23_TopK_output_0_indices = Vec::<f32>::new();
-        let (_model_23_TopK_output_0, _model_23_TopK_output_1) = lele::kernels::topk(&_model_23_ReduceMax_output_0, self.weight_i64(10993152, 8, &[1]).data[0] as usize, -1, true, true, &mut buf__model_23_TopK_output_0_values, &mut buf__model_23_TopK_output_0_indices);
-        let _model_23_Expand_output_0 = lele::kernels::unsqueeze(&_model_23_TopK_output_1, &[-1]);
-        let _model_23_Flatten_1_output_0 = lele::kernels::flatten(&_model_23_Expand_output_0, 2);
-        let _model_23_Tile_output_0 = lele::kernels::tile(&_model_23_Expand_output_0, &[1, 1, 80], &mut ws.buf_8);
-        let _model_23_GatherElements_output_0 = lele::kernels::gather_elements(&_model_23_Split_output_1, &_model_23_Tile_output_0, 1, &mut ws.buf_2);
+        let (_model_23_TopK_output_0, _model_23_TopK_output_1) = lele::kernels::topk(&_model_23_ReduceMax_output_0, self.weight_i64(10993136, 8, &[1]).data[0] as usize, 1, true, true, &mut buf__model_23_TopK_output_0_values, &mut buf__model_23_TopK_output_0_indices);
+        let _model_23_Unsqueeze_output_0 = lele::kernels::unsqueeze(&_model_23_TopK_output_1, &[2]);
+        let _model_23_Expand_output_0 = lele::kernels::expand(&_model_23_Unsqueeze_output_0, &[1, 1, 80], &mut ws.buf_8);
+        let _model_23_GatherElements_output_0 = lele::kernels::gather_elements(&_model_23_Slice_3_output_0, &_model_23_Expand_output_0, 1, &mut ws.buf_9);
         let _model_23_Flatten_output_0 = lele::kernels::flatten(&_model_23_GatherElements_output_0, 1);
         let mut buf__model_23_TopK_1_output_0_values = Vec::<f32>::new();
         let mut buf__model_23_TopK_1_output_0_indices = Vec::<f32>::new();
-        let (_model_23_TopK_1_output_0, _model_23_TopK_1_output_1) = lele::kernels::topk(&_model_23_Flatten_output_0, self.weight_i64(10993152, 8, &[1]).data[0] as usize, -1, true, true, &mut buf__model_23_TopK_1_output_0_values, &mut buf__model_23_TopK_1_output_0_indices);
-        let _model_23_Add_2_output_0 = lele::kernels::div(&_model_23_TopK_1_output_1, &self.weight_i64_f32(10993200, 8, &[]), &mut ws.buf_11);
+        let (_model_23_TopK_1_output_0, _model_23_TopK_1_output_1) = lele::kernels::topk(&_model_23_Flatten_output_0, self.weight_i64(10993136, 8, &[1]).data[0] as usize, 1, true, true, &mut buf__model_23_TopK_1_output_0_values, &mut buf__model_23_TopK_1_output_0_indices);
         let _model_23_Unsqueeze_1_output_0 = lele::kernels::unsqueeze(&_model_23_TopK_1_output_0, &[2]);
-        let _model_23_Mod_output_0 = lele::kernels::mod_f32(&_model_23_TopK_1_output_1, &self.weight_i64_f32(10993200, 8, &[]), &mut ws.buf_12);
+        let _model_23_Mod_output_0 = lele::kernels::mod_f32(&_model_23_TopK_1_output_1, &self.weight_i64_f32(10993184, 8, &[]), &mut ws.buf_4);
+        let _model_23_Cast_2_output_0 = lele::kernels::div_trunc(&_model_23_TopK_1_output_1, &self.weight_i64_f32(10993184, 8, &[]), &mut ws.buf_11);
         let _model_23_Unsqueeze_2_output_0 = lele::kernels::unsqueeze(&_model_23_Mod_output_0, &[2]);
-        let _model_23_Expand_2_output_0 = lele::kernels::gather(&_model_23_Flatten_1_output_0, &_model_23_Add_2_output_0, 0, &mut ws.buf_3);
-        let _model_23_Cast_2_output_0 = _model_23_Unsqueeze_2_output_0.clone(); // Cast f32->f32 is no-op
-        let _model_23_Tile_1_output_0 = lele::kernels::tile(&_model_23_Expand_2_output_0, &[1, 1, 4], &mut ws.buf_7);
-        let _model_23_Tile_2_output_0 = lele::kernels::tile(&_model_23_Expand_2_output_0, &[1, 1, 32], &mut ws.buf_8);
-        let _model_23_GatherElements_1_output_0 = lele::kernels::gather_elements(&_model_23_Split_output_0, &_model_23_Tile_1_output_0, 1, &mut ws.buf_10);
-        let _model_23_GatherElements_2_output_0 = lele::kernels::gather_elements(&_model_23_Split_output_2, &_model_23_Tile_2_output_0, 1, &mut ws.buf_13);
-        let output0 = lele::kernels::concat(&[&_model_23_GatherElements_1_output_0, &_model_23_Unsqueeze_1_output_0, &_model_23_Cast_2_output_0, &_model_23_GatherElements_2_output_0], -1, &mut ws.buf_9);
-        (output0.to_owned(), output1.to_owned())
+        let _model_23_GatherElements_1_output_0 = lele::kernels::gather_elements(&_model_23_TopK_output_1, &_model_23_Cast_2_output_0, 1, &mut ws.buf_3);
+        let _model_23_Cast_output_0 = _model_23_Unsqueeze_2_output_0.clone(); // Cast f32->f32 is no-op
+        let _model_23_Unsqueeze_3_output_0 = lele::kernels::unsqueeze(&_model_23_GatherElements_1_output_0, &[2]);
+        let _model_23_Expand_1_output_0 = lele::kernels::expand(&_model_23_Unsqueeze_3_output_0, &[1, 1, 4], &mut ws.buf_9);
+        let _model_23_Expand_2_output_0 = lele::kernels::expand(&_model_23_Unsqueeze_3_output_0, &[1, 1, 32], &mut ws.buf_10);
+        let _model_23_GatherElements_2_output_0 = lele::kernels::gather_elements(&_model_23_Slice_2_output_0, &_model_23_Expand_1_output_0, 1, &mut ws.buf_12);
+        let _model_23_GatherElements_3_output_0 = lele::kernels::gather_elements(&_model_23_Slice_4_output_0, &_model_23_Expand_2_output_0, 1, &mut ws.buf_7);
+        let output0 = lele::kernels::concat(&[&_model_23_GatherElements_2_output_0, &_model_23_Unsqueeze_1_output_0, &_model_23_Cast_output_0, &_model_23_GatherElements_3_output_0], -1, &mut ws.buf_11);
+        (unsafe { output0.detach_or_own() }, unsafe { output1.detach_or_own() })
     }
 
 
-    fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {
+    fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &lele::tensor::TensorView<f32>) -> std::sync::Arc<lele::kernels::QWeights> {
+        // Distinct initializers can share identical bytes, and one initializer can sit behind several DequantizeLinear nodes carrying different scales, so the key must include the shape and the cached entry must match the exact scale.
+        let key = (offset, len, k, n);
+        {
+            let cache = self.quantized_weights_cache.borrow();
+            if let Some((cached_scale, qw)) = cache.get(&key) {
+                if cached_scale.len() == scale.data.len() && cached_scale.iter().zip(scale.data.iter()).all(|(a, b)| a.to_bits() == b.to_bits()) {
+                    return qw.clone();
+                }
+            }
+        }
+        let raw = &self.data[offset..offset+len];
+        let qw = std::sync::Arc::new(lele::kernels::prepare_quantized_weights(raw, k, n, &scale.data));
+        self.quantized_weights_cache.borrow_mut().insert(key, (scale.data.to_vec(), qw.clone()));
+        qw
+    }
+    #[allow(dead_code)]
+    fn get_qweights(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool, zero_point: &[f32], scale: &[f32]) -> std::sync::Arc<lele::kernels::QWeights> {
+        let key = (offset, len, k, n, signed);
+        if let Some((z, s, w)) = self.qweights_cache.borrow().get(&key) {
+            if z.as_slice() == zero_point && s.as_slice() == scale {
+                return w.clone();
+            }
+        }
+        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();
+        let w = std::sync::Arc::new(lele::kernels::QWeights::new(&self.data[offset..offset + len], k, n, signed, &zp, scale));
+        self.qweights_cache.borrow_mut().insert(key, (zero_point.to_vec(), scale.to_vec(), w.clone()));
+        w
+    }
+    #[allow(dead_code)]
+    fn get_conv_weights(&self, offset: usize, len: usize, shape: [usize; 4], groups: usize, signed: bool, zero_point: &[f32]) -> std::sync::Arc<lele::kernels::ConvWeights> {
+        let key = (offset, len, groups, signed);
+        if let Some((z, w)) = self.conv_weights_cache.borrow().get(&key) {
+            if z.as_slice() == zero_point {
+                return w.clone();
+            }
+        }
+        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();
+        let w = std::sync::Arc::new(lele::kernels::ConvWeights::new(&self.data[offset..offset + len], &shape, groups, signed, &zp));
+        self.conv_weights_cache.borrow_mut().insert(key, (zero_point.to_vec(), w.clone()));
+        w
+    }
+    pub fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {
         TensorView::from_bytes_f32(&self.data[offset..offset+len], shape)
     }
-    fn weight_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
+    pub fn weight_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
         TensorView::from_bytes_i64(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_i32_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
+    pub fn weight_i32_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
         TensorView::from_bytes_i32_as_i64(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_i32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i32> {
+    pub fn weight_bool_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {
+        TensorView::from_bytes_bool_as_i64(&self.data[offset..offset+len], shape.to_vec())
+    }
+    pub fn weight_i32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i32> {
         TensorView::from_bytes_i32(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_i64_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
+    pub fn weight_i64_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
         TensorView::from_bytes_i64_as_f32(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_i32_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
+    pub fn weight_i32_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
         TensorView::from_bytes_i32_as_f32(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_u8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
+    pub fn weight_u8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
         TensorView::from_bytes_u8(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_i8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
+    pub fn weight_i8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
         TensorView::from_bytes_i8(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_f16(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
+    pub fn weight_f16(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
         TensorView::from_bytes_f16(&self.data[offset..offset+len], shape.to_vec())
     }
-    fn weight_u8_raw(&self, offset: usize, len: usize) -> &'a [u8] {
+    pub fn weight_u8_raw(&self, offset: usize, len: usize) -> &'a [u8] {
         &self.data[offset..offset+len]
     }
 

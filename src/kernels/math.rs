@@ -857,6 +857,16 @@ pub fn div<'b, 'a, T: Clone + Copy + std::ops::Div<Output = T> + std::fmt::Debug
     _r
 }
 
+/// `a / b` rounded toward zero: ONNX integer division carried out on
+/// integer-valued f32 tensors.
+pub fn div_trunc<'b, 'a>(
+    a: &TensorView<'b>,
+    b: &TensorView<'b>,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    broadcast_binary_op(a, b, out, |x, y| (x / y).trunc())
+}
+
 /// Modulo operation: a % b (floating point)
 pub fn mod_f32<'b, 'a, T: ElementOps>(
     a: &TensorView<'b, T>,
@@ -2355,6 +2365,15 @@ mod tests {
         let (min_val, max_val) = min_max(&t, &mut buf);
         assert_eq!(min_val, -5.0);
         assert_eq!(max_val, 10.0);
+    }
+
+    #[test]
+    fn test_div_trunc_rounds_toward_zero() {
+        let a = TensorView::from_slice(&[8399.0, 80.0, 79.0, -7.0, 0.0], vec![5]);
+        let b = TensorView::from_slice(&[80.0], vec![]);
+        let mut out = Vec::new();
+        let res = div_trunc(&a, &b, &mut out);
+        assert_eq!(res.data.as_ref(), &[104.0, 1.0, 0.0, -0.0, 0.0]);
     }
 
     #[test]

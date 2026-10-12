@@ -25,11 +25,23 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             "{}let {} = lele::kernels::mul(&{}, &{}, {});",
             tab, outputs[0], inputs[0], inputs[1], buf_expr
         )?,
-        "Div" => writeln!(
-            w,
-            "{}let {} = lele::kernels::div(&{}, &{}, {});",
-            tab, outputs[0], inputs[0], inputs[1], buf_expr
-        )?,
+        "Div" => {
+            // ONNX Div takes operands of one type, so an integer initializer
+            // makes it an integer division. When it runs in f32 (e.g. on the
+            // f32 indices of TopK) the quotient still has to be truncated.
+            let integer_in_f32 = ctx.var_types.get(&outputs[0]).map(|t| t.as_str()) != Some("i64")
+                && ctx.node.input.iter().any(|name| {
+                    ctx.known_weights
+                        .get(&sanitize_name(name))
+                        .is_some_and(|w| matches!(w.3, 6 | 7))
+                });
+            let kernel = if integer_in_f32 { "div_trunc" } else { "div" };
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::{}(&{}, &{}, {});",
+                tab, outputs[0], kernel, inputs[0], inputs[1], buf_expr
+            )?
+        }
         "Mod" => writeln!(
             w,
             "{}let {} = lele::kernels::mod_f32(&{}, &{}, {});",

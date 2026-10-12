@@ -240,8 +240,10 @@ pub(crate) fn infer_variable_types(
                         }
                     }
                 }
-                "Conv" | "ConvInteger" | "Gemm" | "BatchNormalization" | "LayerNormalization" => {
+                "Conv" | "ConvInteger" | "Gemm" | "BatchNormalization" | "LayerNormalization"
+                | "TopK" => {
                     // These ops always produce f32 output regardless of input types
+                    // (`topk` returns its indices as f32 too)
                     for out in &node.output {
                         if !out.is_empty() {
                             let name = sanitize_name(out);
@@ -1154,6 +1156,51 @@ mod tests {
         let result = String::from_utf8(output).unwrap();
         assert!(result.contains("// Custom implementation for output1"));
         assert!(result.contains("let output1 = custom_kernel(&input1);"));
+    }
+
+    /// yolo26n-seg splits the flat TopK indices into (anchor, class) with an
+    /// integer Div by an i64 constant (#28). `topk` returns its indices as f32,
+    /// so the Div has to run in f32 on the constant cast to f32, and truncate.
+    #[test]
+    fn test_integer_div_of_topk_indices_runs_in_f32() {
+        let node = |op: &str, input: &[&str], output: &[&str]| NodeProto {
+            input: input.iter().map(|s| s.to_string()).collect(),
+            output: output.iter().map(|s| s.to_string()).collect(),
+            op_type: op.to_string(),
+            ..Default::default()
+        };
+        let topk = node("TopK", &["scores", "k"], &["values", "indices"]);
+        let div = node("Div", &["indices", "classes"], &["anchor"]);
+        let nodes = [&topk, &div];
+        let mut known_weights = HashMap::new();
+        known_weights.insert("k".to_string(), (0, 8, vec![1], 7));
+        known_weights.insert("classes".to_string(), (8, 8, vec![], 7));
+        let int64_map = HashMap::new();
+        let var_types = infer_variable_types(&nodes, &int64_map, &[], &known_weights);
+        assert_eq!(var_types["indices"], "f32");
+        assert_eq!(var_types["anchor"], "f32");
+
+        let mut output = Vec::new();
+        generate_nodes(
+            &[&div],
+            &mut output,
+            0,
+            &known_weights,
+            &int64_map,
+            None,
+            None,
+            &mut 0,
+            &Compiler::new(),
+            &var_types,
+        )
+        .unwrap();
+        let result = String::from_utf8(output).unwrap();
+        assert!(
+            result.contains(
+                "let anchor = lele::kernels::div_trunc(&indices, &self.weight_i64_f32(8, 8, &[]), &mut buf_anchor);"
+            ),
+            "{result}"
+        );
     }
 
     #[test]
