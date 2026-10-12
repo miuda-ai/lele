@@ -228,30 +228,12 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, output_name)?;
                 let buf_expr = format!("&mut buf_{}", output_name);
 
-                // Check if we can use ARM prepared weights path
+                // A static weight is packed once for the integer GEMM.
                 let weight_name = sanitize_name(&nodes[2].input[1]);
                 if let Some((o, l, sh, dt)) = weights.get(&weight_name) {
                     if (*dt == 3 || *dt == 2) && sh.len() == 2 {
                         let k = sh[0];
                         let n = sh[1];
-                        writeln!(w, "{}#[cfg(target_arch = \"aarch64\")]", tab)?;
-                        writeln!(
-                            w,
-                            "{}let {} = self.linear_quantized_relu_arm(&{}, {}, {}, {}, {}, {}, {}, {}, {}, {});",
-                            tab,
-                            output_name,
-                            input,
-                            *o,
-                            *l,
-                            k,
-                            n,
-                            *dt == 3,
-                            weight_scale,
-                            weight_zero,
-                            bias,
-                            buf_expr
-                        )?;
-                        writeln!(w, "{}#[cfg(not(target_arch = \"aarch64\"))]", tab)?;
                         writeln!(
                             w,
                             "{}let {} = self.linear_quantized_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {}, true, {});",
@@ -387,31 +369,12 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     format!("&mut buf_{}", output_name)
                 };
 
-                // Check if we can use ARM prepared weights path
+                // A static weight is packed once for the integer GEMM.
                 let weight_name = sanitize_name(&nodes[2].input[1]);
                 if let Some((o, l, sh, dt)) = weights.get(&weight_name) {
                     if (*dt == 3 || *dt == 2) && sh.len() == 2 {
-                        // ARM-optimized path: use pre-packed weights
                         let k = sh[0];
                         let n = sh[1];
-                        writeln!(w, "{}#[cfg(target_arch = \"aarch64\")]", tab)?;
-                        writeln!(
-                            w,
-                            "{}let {} = self.linear_quantized_arm(&{}, {}, {}, {}, {}, {}, {}, {}, {}, {});",
-                            tab,
-                            output_name,
-                            input,
-                            *o,
-                            *l,
-                            k,
-                            n,
-                            *dt == 3,
-                            weight_scale,
-                            weight_zero,
-                            bias,
-                            buf_expr
-                        )?;
-                        writeln!(w, "{}#[cfg(not(target_arch = \"aarch64\"))]", tab)?;
                         writeln!(
                             w,
                             "{}let {} = self.linear_quantized_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {}, false, {});",

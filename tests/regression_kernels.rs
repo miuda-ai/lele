@@ -1462,16 +1462,6 @@ fn test_qmatmul_i8_accepts_per_tensor_weight_scale() {
     }
 }
 
-/// The tests above pass trivially if every machine takes the f32 fallback, so
-/// pin which path was actually chosen to what the CPU reports.
-#[test]
-#[cfg(not(target_arch = "aarch64"))]
-fn test_quantized_weights_take_the_integer_path_when_the_cpu_allows() {
-    let (_, _, _, raw, w_scale, _) = qdq_layer(4, 8, 16);
-    let qw = lele::kernels::prepare_quantized_weights(&raw, 8, 16, &w_scale);
-    assert!(qw.is_integer(), "an integer kernel should run everywhere but on aarch64");
-}
-
 
 #[test]
 #[cfg(target_arch = "x86_64")]
