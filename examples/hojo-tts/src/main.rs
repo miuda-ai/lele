@@ -5,9 +5,7 @@
 //!   (prompt tokens) -> [LLM autoregressive] -> speech token codes
 //!   codes -> [Decoder] -> 24kHz waveform
 //!
-//! The three ONNX sub-models are AOT-compiled to Rust by `build.rs`; if any of
-//! them fails to compile the crate still builds (a stub panics with a clear
-//! message at runtime), so `cargo build` always succeeds.
+//! The three ONNX sub-models are AOT-compiled to Rust by `build.rs`.
 
 mod audio;
 mod decoder;
