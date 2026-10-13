@@ -257,6 +257,14 @@ impl<'a> TensorView<'a, i64> {
         }
     }
 
+    /// Create a TensorView<i64> from a bool byte slice, one byte per element.
+    /// `from_bytes_i64` can only guess at bools from a length that is not a
+    /// multiple of 8, which misreads a 400-element mask as 50 integers.
+    pub fn from_bytes_bool_as_i64(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, i64> {
+        let i64_vec: Vec<i64> = bytes.iter().map(|&b| (b != 0) as i64).collect();
+        TensorView::from_owned(i64_vec, shape)
+    }
+
     /// Create a TensorView<i64> from i32 byte slice (cast to i64)
     pub fn from_bytes_i32_as_i64(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, i64> {
         let mut i64_vec = Vec::with_capacity(bytes.len() / 4);
