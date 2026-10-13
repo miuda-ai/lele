@@ -54,7 +54,13 @@ impl MatRef<f32> {
         rs: isize,
         cs: isize,
     ) -> Self {
-        Self { ptr, nrows, ncols, rs, cs }
+        Self {
+            ptr,
+            nrows,
+            ncols,
+            rs,
+            cs,
+        }
     }
 
     /// The elements the strides address, from the first to the last.
@@ -87,7 +93,13 @@ impl MatMut<f32> {
         rs: isize,
         cs: isize,
     ) -> Self {
-        Self { ptr, nrows, ncols, rs, cs }
+        Self {
+            ptr,
+            nrows,
+            ncols,
+            rs,
+            cs,
+        }
     }
 
     fn data(&mut self) -> &mut [f32] {
@@ -99,7 +111,10 @@ impl MatMut<f32> {
 
 /// Number of elements from the first to the last one a matrix addresses.
 fn extent(nrows: usize, ncols: usize, rs: isize, cs: isize) -> usize {
-    assert!(rs >= 0 && cs >= 0, "matmul: negative strides are not supported");
+    assert!(
+        rs >= 0 && cs >= 0,
+        "matmul: negative strides are not supported"
+    );
     if nrows == 0 || ncols == 0 {
         return 0;
     }
@@ -112,6 +127,9 @@ fn row_major(nrows: usize, ncols: usize, rs: isize, cs: isize) -> Option<usize> 
 }
 
 /// `C = alpha * A * B` (`Accum::Replace`) or `C += alpha * A * B` (`Accum::Add`).
+///
+/// On macOS (aarch64) this goes to Accelerate whenever A and B are each
+/// row- or column-major and C is row-major.
 pub fn matmul(
     dst: MatMut<f32>,
     accum: Accum,
@@ -120,7 +138,62 @@ pub fn matmul(
     alpha: f32,
     _par: Par,
 ) {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if matmul_accelerate(&dst, &accum, &a, &b, alpha) {
+        return;
+    }
     matmul_at(Level::new(), dst, accum, a, b, alpha)
+}
+
+/// The product through Accelerate, if its layouts are ones `cblas_sgemm`
+/// takes; returns whether it ran.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn matmul_accelerate(
+    dst: &MatMut<f32>,
+    accum: &Accum,
+    a: &MatRef<f32>,
+    b: &MatRef<f32>,
+    alpha: f32,
+) -> bool {
+    let (m, k, n) = (a.nrows, a.ncols, b.ncols);
+    assert_eq!(b.nrows, k, "matmul: inner dimensions differ");
+    assert_eq!((dst.nrows, dst.ncols), (m, n), "matmul: output shape");
+    let strides = [a.rs, a.cs, b.rs, b.cs, dst.rs, dst.cs];
+    if m == 0 || n == 0 || k == 0 || strides.iter().any(|&s| s < 0) {
+        return false;
+    }
+    // Row-major, or column-major and so transposed for BLAS.
+    let layout = |nrows, ncols, rs, cs| {
+        row_major(nrows, ncols, rs, cs)
+            .map(|ld| (false, ld))
+            .or_else(|| row_major(ncols, nrows, cs, rs).map(|ld| (true, ld)))
+    };
+    let (Some((ta, lda)), Some((tb, ldb)), Some(ldc)) = (
+        layout(m, k, a.rs, a.cs),
+        layout(k, n, b.rs, b.cs),
+        row_major(m, n, dst.rs, dst.cs),
+    ) else {
+        return false;
+    };
+    let beta = if matches!(accum, Accum::Add) {
+        1.0
+    } else {
+        0.0
+    };
+    // SAFETY: `from_raw_parts` promised every element the strides address is
+    // valid, and these are the same matrices with the same strides.
+    unsafe {
+        crate::kernels::accelerate::sgemm(
+            (ta, tb),
+            (m, n, k),
+            alpha,
+            (a.ptr, lda),
+            (b.ptr, ldb),
+            beta,
+            (dst.ptr, ldc),
+        );
+    }
+    true
 }
 
 pub(crate) fn matmul_at(
@@ -181,7 +254,17 @@ pub(crate) fn matmul_at(
     };
     let run = |c: &mut [f32], ldc: usize| match operand {
         BOperand::Rows(b, ldb) => {
-            let dims = Dims { m, n, k, lda, ldb, ldc, alpha, add, b_cols: false };
+            let dims = Dims {
+                m,
+                n,
+                k,
+                lda,
+                ldb,
+                ldc,
+                alpha,
+                add,
+                b_cols: false,
+            };
             if m <= SMALL_M {
                 gemm_small_m(level, &dims, a_data, b, c)
             } else {
@@ -189,12 +272,35 @@ pub(crate) fn matmul_at(
             }
         }
         // Few rows or columns of C: dot products. Otherwise the columns are packed.
-        BOperand::Columns(bt, ldbt) if n <= DOT_MAX_N || m <= SMALL_M => {
-            gemm_dot(level, &DotDims { m, n, k, lda, ldbt, ldc, alpha, add }, a_data, bt, c)
-        }
+        BOperand::Columns(bt, ldbt) if n <= DOT_MAX_N || m <= SMALL_M => gemm_dot(
+            level,
+            &DotDims {
+                m,
+                n,
+                k,
+                lda,
+                ldbt,
+                ldc,
+                alpha,
+                add,
+            },
+            a_data,
+            bt,
+            c,
+        ),
         BOperand::Columns(bt, ldb) => gemm_nn(
             level,
-            &Dims { m, n, k, lda, ldb, ldc, alpha, add, b_cols: true },
+            &Dims {
+                m,
+                n,
+                k,
+                lda,
+                ldb,
+                ldc,
+                alpha,
+                add,
+                b_cols: true,
+            },
             a_data,
             bt,
             c,
@@ -244,16 +350,20 @@ fn gather(data: &[f32], rows: usize, cols: usize, rs: usize, cs: usize) -> Vec<f
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::test_util::{assert_close, levels, Rng};
+    use crate::kernels::test_util::{Rng, assert_close, levels};
 
     /// `C (+)= alpha * A B` in f64 over strided operands.
     #[allow(clippy::too_many_arguments)]
     fn reference(
         (m, n, k): (usize, usize, usize),
-        a: &[f32], (rsa, csa): (isize, isize),
-        b: &[f32], (rsb, csb): (isize, isize),
-        c: &[f32], (rsc, csc): (isize, isize),
-        alpha: f32, add: bool,
+        a: &[f32],
+        (rsa, csa): (isize, isize),
+        b: &[f32],
+        (rsb, csb): (isize, isize),
+        c: &[f32],
+        (rsc, csc): (isize, isize),
+        alpha: f32,
+        add: bool,
     ) -> Vec<f64> {
         let mut out = Vec::new();
         for i in 0..m {
@@ -274,16 +384,39 @@ mod tests {
     fn test_matmul_matches_reference_at_every_level() {
         let mut rng = Rng::new(3);
         let sizes = [
-            (1, 1, 1), (1, 16, 8), (6, 16, 4), (7, 17, 5), (12, 33, 9), (5, 10, 384),
-            (13, 5, 40), (100, 31, 257), (97, 130, 300), (2, 200, 513), (64, 64, 64),
-            (1, 77, 130), (3, 40, 50), (4, 37, 70), (4, 100, 9), (9, 1, 33), (20, 12, 40), (20, 13, 40),
+            (1, 1, 1),
+            (1, 16, 8),
+            (6, 16, 4),
+            (7, 17, 5),
+            (12, 33, 9),
+            (5, 10, 384),
+            (13, 5, 40),
+            (100, 31, 257),
+            (97, 130, 300),
+            (2, 200, 513),
+            (64, 64, 64),
+            (1, 77, 130),
+            (3, 40, 50),
+            (4, 37, 70),
+            (4, 100, 9),
+            (9, 1, 33),
+            (20, 12, 40),
+            (20, 13, 40),
             // Several depth blocks, column blocks and row groups, at and past the packing threshold.
-            (33, 200, 1100), (40, 30, 700), (35, 220, 1030),
+            (33, 200, 1100),
+            (40, 30, 700),
+            (35, 220, 1030),
         ];
         for level in levels() {
             for &(m, n, k) in &sizes {
                 // Row-major, then each operand transposed, then C column-major.
-                for (ta, tb, tc) in [(false, false, false), (true, false, false), (false, true, false), (false, false, true), (true, true, true)] {
+                for (ta, tb, tc) in [
+                    (false, false, false),
+                    (true, false, false),
+                    (false, true, false),
+                    (false, false, true),
+                    (true, true, true),
+                ] {
                     for (alpha, add) in [(1.0, false), (0.5, false), (1.0, true), (-1.5, true)] {
                         let a = rng.vec(m * k, -1.0, 1.0);
                         let b = rng.vec(k * n, -1.0, 1.0);
@@ -307,8 +440,71 @@ mod tests {
                             .flat_map(|i| (0..n).map(move |j| (i, j)))
                             .map(|(i, j)| c[(i as isize * sc.0 + j as isize * sc.1) as usize])
                             .collect();
-                        assert_close(&got, &want, 1e-4, &format!("{level:?} {m}x{n}x{k} t={ta}{tb}{tc} alpha {alpha} add {add}"));
+                        assert_close(
+                            &got,
+                            &want,
+                            1e-4,
+                            &format!(
+                                "{level:?} {m}x{n}x{k} t={ta}{tb}{tc} alpha {alpha} add {add}"
+                            ),
+                        );
                     }
+                }
+            }
+        }
+    }
+
+    /// The public entry, which on macOS hands every layout `cblas_sgemm`
+    /// takes (row- or column-major A and B, padded rows, row-major C) to
+    /// Accelerate and the rest to the kernels here.
+    #[test]
+    fn test_public_matmul_matches_reference_for_every_layout() {
+        let mut rng = Rng::new(4);
+        for &(m, n, k) in &[(1, 1, 1), (7, 17, 5), (33, 200, 70), (4, 9, 100)] {
+            // (A transposed, B transposed, C column-major, padding after each row of A and B)
+            for (ta, tb, tc, pad) in [
+                (false, false, false, 0),
+                (true, false, false, 0),
+                (false, true, false, 0),
+                (true, true, false, 3),
+                (false, false, true, 0),
+                (false, false, false, 5),
+            ] {
+                for (alpha, add) in [(1.0, false), (-1.5, true)] {
+                    let (lda, ldb) = (if ta { m } else { k } + pad, if tb { k } else { n } + pad);
+                    let a = rng.vec(if ta { k * lda } else { m * lda }, -1.0, 1.0);
+                    let b = rng.vec(if tb { n * ldb } else { k * ldb }, -1.0, 1.0);
+                    let c0 = rng.vec(m * n, -1.0, 1.0);
+                    let sa = if ta {
+                        (1, lda as isize)
+                    } else {
+                        (lda as isize, 1)
+                    };
+                    let sb = if tb {
+                        (1, ldb as isize)
+                    } else {
+                        (ldb as isize, 1)
+                    };
+                    let sc = if tc { (1, m as isize) } else { (n as isize, 1) };
+                    let want = reference((m, n, k), &a, sa, &b, sb, &c0, sc, alpha, add);
+                    let mut c = c0.clone();
+                    unsafe {
+                        matmul(
+                            MatMut::from_raw_parts_mut(c.as_mut_ptr(), m, n, sc.0, sc.1),
+                            if add { Accum::Add } else { Accum::Replace },
+                            MatRef::from_raw_parts(a.as_ptr(), m, k, sa.0, sa.1),
+                            MatRef::from_raw_parts(b.as_ptr(), k, n, sb.0, sb.1),
+                            alpha,
+                            Par::Seq,
+                        );
+                    }
+                    let got: Vec<f32> = (0..m)
+                        .flat_map(|i| (0..n).map(move |j| (i, j)))
+                        .map(|(i, j)| c[(i as isize * sc.0 + j as isize * sc.1) as usize])
+                        .collect();
+                    let what =
+                        format!("{m}x{n}x{k} t={ta}{tb}{tc} pad {pad} alpha {alpha} add {add}");
+                    assert_close(&got, &want, 1e-4, &what);
                 }
             }
         }
@@ -323,7 +519,17 @@ mod tests {
         let b = rng.vec(k * ldb, -1.0, 1.0);
         let c0 = rng.vec(m * ldc, -1.0, 1.0);
         for level in levels() {
-            let want = reference((m, n, k), &a, (lda as isize, 1), &b, (ldb as isize, 1), &c0, (ldc as isize, 1), 1.0, true);
+            let want = reference(
+                (m, n, k),
+                &a,
+                (lda as isize, 1),
+                &b,
+                (ldb as isize, 1),
+                &c0,
+                (ldc as isize, 1),
+                1.0,
+                true,
+            );
             let mut c = c0.clone();
             unsafe {
                 matmul_at(
@@ -335,11 +541,18 @@ mod tests {
                     1.0,
                 );
             }
-            let got: Vec<f32> = (0..m).flat_map(|i| (0..n).map(move |j| (i, j))).map(|(i, j)| c[i * ldc + j]).collect();
+            let got: Vec<f32> = (0..m)
+                .flat_map(|i| (0..n).map(move |j| (i, j)))
+                .map(|(i, j)| c[i * ldc + j])
+                .collect();
             assert_close(&got, &want, 1e-4, &format!("{level:?} padded"));
             // Columns past `n` are left alone.
             for i in 0..m {
-                assert_eq!(c[i * ldc + n..(i + 1) * ldc], c0[i * ldc + n..(i + 1) * ldc], "{level:?} row {i}");
+                assert_eq!(
+                    c[i * ldc + n..(i + 1) * ldc],
+                    c0[i * ldc + n..(i + 1) * ldc],
+                    "{level:?} row {i}"
+                );
             }
         }
     }
