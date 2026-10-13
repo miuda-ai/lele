@@ -1,3 +1,7 @@
 models/
 *.py
 *.pyc
+src/codecdecodefull.rs
+src/decodestep.rs
+src/localfixedsampledframe.rs
+src/prefill.rs
