@@ -1,6 +1,31 @@
 use super::{Pattern, sanitize_name};
 use crate::model::onnx_proto::NodeProto;
 
+/// A Conv node's `strides`, `dilations`, `group`, `pads` and `auto_pad`.
+/// Strides and dilations come out with one entry per spatial axis of a 2D
+/// convolution (a single value covers both); each axis keeps its own, so a
+/// stride of `[2, 1]` stays `[2, 1]`.
+fn conv_attributes(conv: &NodeProto) -> (Vec<i64>, Vec<i64>, usize, Vec<i64>, String) {
+    let per_axis = |ints: &[i64]| match ints {
+        [] => vec![1, 1],
+        [v] => vec![*v, *v],
+        _ => ints.to_vec(),
+    };
+    let (mut strides, mut dilations) = (vec![1, 1], vec![1, 1]);
+    let (mut groups, mut pads, mut auto_pad) = (1, Vec::new(), String::new());
+    for attr in &conv.attribute {
+        match attr.name.as_str() {
+            "strides" => strides = per_axis(&attr.ints),
+            "dilations" => dilations = per_axis(&attr.ints),
+            "group" => groups = attr.i as usize,
+            "pads" => pads = attr.ints.clone(),
+            "auto_pad" => auto_pad = String::from_utf8_lossy(&attr.s).to_string(),
+            _ => {}
+        }
+    }
+    (strides, dilations, groups, pads, auto_pad)
+}
+
 pub fn get_default_patterns() -> Vec<Pattern> {
     vec![
         Pattern {
@@ -228,48 +253,31 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, output_name)?;
                 let buf_expr = format!("&mut buf_{}", output_name);
 
-                // Check if we can use ARM prepared weights path
+                // A static weight is packed once for the integer GEMM.
                 let weight_name = sanitize_name(&nodes[2].input[1]);
-                if let Some((o, l, sh, dt)) = weights.get(&weight_name) {
-                    if (*dt == 3 || *dt == 2) && sh.len() == 2 {
-                        let k = sh[0];
-                        let n = sh[1];
-                        writeln!(w, "{}#[cfg(target_arch = \"aarch64\")]", tab)?;
-                        writeln!(
-                            w,
-                            "{}let {} = self.linear_quantized_relu_arm(&{}, {}, {}, {}, {}, {}, {}, {}, {}, {});",
-                            tab,
-                            output_name,
-                            input,
-                            *o,
-                            *l,
-                            k,
-                            n,
-                            *dt == 3,
-                            weight_scale,
-                            weight_zero,
-                            bias,
-                            buf_expr
-                        )?;
-                        writeln!(w, "{}#[cfg(not(target_arch = \"aarch64\"))]", tab)?;
-                        writeln!(
-                            w,
-                            "{}let {} = self.linear_quantized_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {}, true, {});",
-                            tab,
-                            output_name,
-                            input,
-                            *o,
-                            *l,
-                            k,
-                            n,
-                            *dt == 3,
-                            weight_scale,
-                            weight_zero,
-                            bias,
-                            buf_expr
-                        )?;
-                        return Ok(());
-                    }
+                if let Some((o, l, sh, dt)) = weights.get(&weight_name)
+                    && (*dt == 3 || *dt == 2)
+                    && sh.len() == 2
+                {
+                    let k = sh[0];
+                    let n = sh[1];
+                    writeln!(
+                        w,
+                        "{}let {} = self.linear_quantized_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {}, true, {});",
+                        tab,
+                        output_name,
+                        input,
+                        *o,
+                        *l,
+                        k,
+                        n,
+                        *dt == 3,
+                        weight_scale,
+                        weight_zero,
+                        bias,
+                        buf_expr
+                    )?;
+                    return Ok(());
                 }
 
                 writeln!(
@@ -387,49 +395,31 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     format!("&mut buf_{}", output_name)
                 };
 
-                // Check if we can use ARM prepared weights path
+                // A static weight is packed once for the integer GEMM.
                 let weight_name = sanitize_name(&nodes[2].input[1]);
-                if let Some((o, l, sh, dt)) = weights.get(&weight_name) {
-                    if (*dt == 3 || *dt == 2) && sh.len() == 2 {
-                        // ARM-optimized path: use pre-packed weights
-                        let k = sh[0];
-                        let n = sh[1];
-                        writeln!(w, "{}#[cfg(target_arch = \"aarch64\")]", tab)?;
-                        writeln!(
-                            w,
-                            "{}let {} = self.linear_quantized_arm(&{}, {}, {}, {}, {}, {}, {}, {}, {}, {});",
-                            tab,
-                            output_name,
-                            input,
-                            *o,
-                            *l,
-                            k,
-                            n,
-                            *dt == 3,
-                            weight_scale,
-                            weight_zero,
-                            bias,
-                            buf_expr
-                        )?;
-                        writeln!(w, "{}#[cfg(not(target_arch = \"aarch64\"))]", tab)?;
-                        writeln!(
-                            w,
-                            "{}let {} = self.linear_quantized_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {}, false, {});",
-                            tab,
-                            output_name,
-                            input,
-                            *o,
-                            *l,
-                            k,
-                            n,
-                            *dt == 3,
-                            weight_scale,
-                            weight_zero,
-                            bias,
-                            buf_expr
-                        )?;
-                        return Ok(());
-                    }
+                if let Some((o, l, sh, dt)) = weights.get(&weight_name)
+                    && (*dt == 3 || *dt == 2)
+                    && sh.len() == 2
+                {
+                    let k = sh[0];
+                    let n = sh[1];
+                    writeln!(
+                        w,
+                        "{}let {} = self.linear_quantized_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {}, false, {});",
+                        tab,
+                        output_name,
+                        input,
+                        *o,
+                        *l,
+                        k,
+                        n,
+                        *dt == 3,
+                        weight_scale,
+                        weight_zero,
+                        bias,
+                        buf_expr
+                    )?;
+                    return Ok(());
                 }
 
                 writeln!(
@@ -584,7 +574,7 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     Some(o) => o,
                     None => return None,
                 };
-                let in0_match = n1.input.get(0).map(|s| s == conv_out).unwrap_or(false);
+                let in0_match = n1.input.first().map(|s| s == conv_out).unwrap_or(false);
                 let in1_match = n1.input.get(1).map(|s| s == conv_out).unwrap_or(false);
                 if !in0_match && !in1_match {
                     return None;
@@ -613,20 +603,25 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 } else {
                     input_s
                 };
-                let (weight_expr, weight_rank, weight_shape) = if let Some((o, l, s, dt)) = weights.get(&weight_s) {
-                    let loader = match *dt {
-                        1 => "weight_f32",
-                        2 => "weight_u8",
-                        3 => "weight_i8",
-                        6 => "weight_i32",
-                        7 => "weight_i64",
-                        10 => "weight_f16",
-                        _ => "weight_f32",
+                let (weight_expr, weight_rank, weight_shape) =
+                    if let Some((o, l, s, dt)) = weights.get(&weight_s) {
+                        let loader = match *dt {
+                            1 => "weight_f32",
+                            2 => "weight_u8",
+                            3 => "weight_i8",
+                            6 => "weight_i32",
+                            7 => "weight_i64",
+                            10 => "weight_f16",
+                            _ => "weight_f32",
+                        };
+                        (
+                            format!("self.{}({}, {}, &{:?})", loader, o, l, s),
+                            s.len(),
+                            s.to_vec(),
+                        )
+                    } else {
+                        (weight_s, 3, vec![3usize, 3, 3, 3])
                     };
-                    (format!("self.{}({}, {}, &{:?})", loader, o, l, s), s.len(), s.to_vec())
-                } else {
-                    (weight_s, 3, vec![3usize, 3, 3, 3])
-                };
                 let conv_out = &conv.output[0];
                 let bias_name_raw = if &add.input[0] == conv_out {
                     &add.input[1]
@@ -634,38 +629,16 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     &add.input[0]
                 };
                 let bias_s = sanitize_name(bias_name_raw);
-                let mut stride = 1;
-                let mut dilation = 1;
-                let mut groups = 1;
-                let mut pads_vec: Vec<i64> = vec![];
-                let mut auto_pad = String::new();
-                for attr in &conv.attribute {
-                    match attr.name.as_str() {
-                        "strides" => {
-                            if !attr.ints.is_empty() {
-                                stride = attr.ints[0] as usize;
-                            }
-                        }
-                        "dilations" => {
-                            if !attr.ints.is_empty() {
-                                dilation = attr.ints[0] as usize;
-                            }
-                        }
-                        "group" => groups = attr.i as usize,
-                        "pads" => {
-                            pads_vec = attr.ints.clone();
-                        }
-                        "auto_pad" => {
-                            auto_pad = String::from_utf8_lossy(&attr.s).to_string();
-                        }
-                        _ => {}
-                    }
-                }
+                let (strides, dilations, groups, mut pads_vec, auto_pad) = conv_attributes(conv);
                 if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") && pads_vec.is_empty() {
                     let kh = weight_shape.get(2).copied().unwrap_or(1) as i64;
-                    let kw = weight_shape.get(3).copied().unwrap_or(weight_shape.get(2).copied().unwrap_or(1) as usize) as i64;
-                    let pad_total_h = (kh - 1) * dilation as i64;
-                    let pad_total_w = (kw - 1) * dilation as i64;
+                    let kw = weight_shape
+                        .get(3)
+                        .copied()
+                        .unwrap_or(weight_shape.get(2).copied().unwrap_or(1))
+                        as i64;
+                    let pad_total_h = (kh - 1) * dilations[0];
+                    let pad_total_w = (kw - 1) * dilations[1];
                     let (pt, pb) = if auto_pad == "SAME_LOWER" {
                         (pad_total_h - pad_total_h / 2, pad_total_h / 2)
                     } else {
@@ -710,15 +683,31 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         writeln!(
                             w,
                             "{}let {} = lele::kernels::conv2d(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
-                            tab, output_name, input_expr, weight_expr, bias_expr,
-                            [dilation as i64; 2], groups, padding_arr.as_slice(), [stride as i64; 2], buf_expr
+                            tab,
+                            output_name,
+                            input_expr,
+                            weight_expr,
+                            bias_expr,
+                            dilations,
+                            groups,
+                            padding_arr.as_slice(),
+                            strides,
+                            buf_expr
                         )?;
                     } else {
                         writeln!(
                             w,
                             "{}let {} = lele::kernels::conv1d(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
-                            tab, output_name, input_expr, weight_expr, bias_expr,
-                            [dilation as i64], groups, &padding_arr[..2], [stride as i64], buf_expr
+                            tab,
+                            output_name,
+                            input_expr,
+                            weight_expr,
+                            bias_expr,
+                            [dilations[0]],
+                            groups,
+                            &padding_arr[..2],
+                            [strides[0]],
+                            buf_expr
                         )?;
                     }
                 } else {
@@ -727,26 +716,48 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         if let Some(&idx) = alloc.tensor_to_buffer.get(conv_out as &str) {
                             format!("&mut ws.buf_{}", idx)
                         } else {
-                            writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, conv_out_name)?;
+                            writeln!(
+                                w,
+                                "{}let mut buf_{} = Vec::<f32>::new();",
+                                tab, conv_out_name
+                            )?;
                             format!("&mut buf_{}", conv_out_name)
                         }
                     } else {
-                        writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, conv_out_name)?;
+                        writeln!(
+                            w,
+                            "{}let mut buf_{} = Vec::<f32>::new();",
+                            tab, conv_out_name
+                        )?;
                         format!("&mut buf_{}", conv_out_name)
                     };
                     if weight_rank >= 4 {
                         writeln!(
                             w,
                             "{}let {} = lele::kernels::conv2d(&{}, &{}, None, &{:?}, {}, &{:?}, &{:?}, {});",
-                            tab, conv_out_name, input_expr, weight_expr,
-                            [dilation as i64; 2], groups, padding_arr.as_slice(), [stride as i64; 2], conv_buf
+                            tab,
+                            conv_out_name,
+                            input_expr,
+                            weight_expr,
+                            dilations,
+                            groups,
+                            padding_arr.as_slice(),
+                            strides,
+                            conv_buf
                         )?;
                     } else {
                         writeln!(
                             w,
                             "{}let {} = lele::kernels::conv1d(&{}, &{}, None, &{:?}, {}, &{:?}, &{:?}, {});",
-                            tab, conv_out_name, input_expr, weight_expr,
-                            [dilation as i64], groups, &padding_arr[..2], [stride as i64], conv_buf
+                            tab,
+                            conv_out_name,
+                            input_expr,
+                            weight_expr,
+                            [dilations[0]],
+                            groups,
+                            &padding_arr[..2],
+                            [strides[0]],
+                            conv_buf
                         )?;
                     }
                     writeln!(
@@ -805,7 +816,11 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         10 => "weight_f16",
                         _ => "weight_f32",
                     };
-                    (format!("self.{}({}, {}, &{:?})", loader, o, l, s), s.len(), s.to_vec())
+                    (
+                        format!("self.{}({}, {}, &{:?})", loader, o, l, s),
+                        s.len(),
+                        s.to_vec(),
+                    )
                 } else {
                     (weight_s, 3, vec![3usize, 3, 3, 3])
                 };
@@ -830,39 +845,17 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 } else {
                     "None".to_string()
                 };
-                let mut stride = 1;
-                let mut dilation = 1;
-                let mut groups = 1;
-                let mut pads_vec: Vec<i64> = vec![];
-                let mut auto_pad = String::new();
-                for attr in &conv.attribute {
-                    match attr.name.as_str() {
-                        "strides" => {
-                            if !attr.ints.is_empty() {
-                                stride = attr.ints[0] as usize;
-                            }
-                        }
-                        "dilations" => {
-                            if !attr.ints.is_empty() {
-                                dilation = attr.ints[0] as usize;
-                            }
-                        }
-                        "group" => groups = attr.i as usize,
-                        "pads" => {
-                            pads_vec = attr.ints.clone();
-                        }
-                        "auto_pad" => {
-                            auto_pad = String::from_utf8_lossy(&attr.s).to_string();
-                        }
-                        _ => {}
-                    }
-                }
+                let (strides, dilations, groups, mut pads_vec, auto_pad) = conv_attributes(conv);
                 // Compute SAME padding if auto_pad is set
                 if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") && pads_vec.is_empty() {
                     let kh = weight_shape.get(2).copied().unwrap_or(1) as i64;
-                    let kw = weight_shape.get(3).copied().unwrap_or(weight_shape.get(2).copied().unwrap_or(1) as usize) as i64;
-                    let pad_total_h = (kh - 1) * dilation as i64;
-                    let pad_total_w = (kw - 1) * dilation as i64;
+                    let kw = weight_shape
+                        .get(3)
+                        .copied()
+                        .unwrap_or(weight_shape.get(2).copied().unwrap_or(1))
+                        as i64;
+                    let pad_total_h = (kh - 1) * dilations[0];
+                    let pad_total_w = (kw - 1) * dilations[1];
                     let (pt, pb) = if auto_pad == "SAME_LOWER" {
                         (pad_total_h - pad_total_h / 2, pad_total_h / 2)
                     } else {
@@ -901,10 +894,10 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         input_expr,
                         weight_expr,
                         bias,
-                        [dilation as i64; 2],
+                        dilations,
                         groups,
                         padding_arr.as_slice(),
-                        [stride as i64; 2],
+                        strides,
                         buf_expr
                     )?;
                 } else {
@@ -916,8 +909,8 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         input_expr,
                         weight_expr,
                         bias,
-                        stride,
-                        dilation,
+                        strides[0],
+                        dilations[0],
                         groups,
                         padding_arr[0] as usize,
                         buf_expr
@@ -957,9 +950,9 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 }
                 let sig_out = &n1.output[0];
                 // Mul must take conv_out and sigmoid_out (SiLU = x * sigmoid(x))
-                let is_silu = (n2.input.get(0) == Some(conv_out)
+                let is_silu = (n2.input.first() == Some(conv_out)
                     && n2.input.get(1) == Some(sig_out))
-                    || (n2.input.get(0) == Some(sig_out) && n2.input.get(1) == Some(conv_out));
+                    || (n2.input.first() == Some(sig_out) && n2.input.get(1) == Some(conv_out));
                 if !is_silu {
                     return None;
                 }
@@ -1086,8 +1079,8 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 let check_silu = |sig: &NodeProto, mul: &NodeProto| -> bool {
                     let sig_in = &sig.input[0];
                     let sig_out = &sig.output[0];
-                    (mul.input.get(0) == Some(sig_in) && mul.input.get(1) == Some(sig_out))
-                        || (mul.input.get(0) == Some(sig_out) && mul.input.get(1) == Some(sig_in))
+                    (mul.input.first() == Some(sig_in) && mul.input.get(1) == Some(sig_out))
+                        || (mul.input.first() == Some(sig_out) && mul.input.get(1) == Some(sig_in))
                 };
                 if check_silu(n0, n3) && check_silu(n1, n4) && check_silu(n2, n5) {
                     Some(6)
@@ -1120,10 +1113,10 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                                w: &mut dyn std::io::Write,
                                allocator: Option<&super::Allocator>|
                  -> std::io::Result<String> {
-                    if let Some(alloc) = allocator {
-                        if let Some(&idx) = alloc.tensor_to_buffer.get(out_key) {
-                            return Ok(format!("&mut ws.buf_{}", idx));
-                        }
+                    if let Some(alloc) = allocator
+                        && let Some(&idx) = alloc.tensor_to_buffer.get(out_key)
+                    {
+                        return Ok(format!("&mut ws.buf_{}", idx));
                     }
                     writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, name)?;
                     Ok(format!("&mut buf_{}", name))
@@ -1163,13 +1156,13 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 let sig_b_in = &n1.input[0];
                 let sig_b_out = &n1.output[0];
                 // Mul(A, sig_A)
-                let mul_a_ok = (n2.input.get(0) == Some(sig_a_in)
+                let mul_a_ok = (n2.input.first() == Some(sig_a_in)
                     && n2.input.get(1) == Some(sig_a_out))
-                    || (n2.input.get(0) == Some(sig_a_out) && n2.input.get(1) == Some(sig_a_in));
+                    || (n2.input.first() == Some(sig_a_out) && n2.input.get(1) == Some(sig_a_in));
                 // Mul(B, sig_B)
-                let mul_b_ok = (n3.input.get(0) == Some(sig_b_in)
+                let mul_b_ok = (n3.input.first() == Some(sig_b_in)
                     && n3.input.get(1) == Some(sig_b_out))
-                    || (n3.input.get(0) == Some(sig_b_out) && n3.input.get(1) == Some(sig_b_in));
+                    || (n3.input.first() == Some(sig_b_out) && n3.input.get(1) == Some(sig_b_in));
                 if mul_a_ok && mul_b_ok { Some(4) } else { None }
             }),
             generator: Box::new(|nodes, weights, allocator, w, indent| {
@@ -1197,10 +1190,10 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                                w: &mut dyn std::io::Write,
                                allocator: Option<&super::Allocator>|
                  -> std::io::Result<String> {
-                    if let Some(alloc) = allocator {
-                        if let Some(&idx) = alloc.tensor_to_buffer.get(out_key) {
-                            return Ok(format!("&mut ws.buf_{}", idx));
-                        }
+                    if let Some(alloc) = allocator
+                        && let Some(&idx) = alloc.tensor_to_buffer.get(out_key)
+                    {
+                        return Ok(format!("&mut ws.buf_{}", idx));
                     }
                     writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, name)?;
                     Ok(format!("&mut buf_{}", name))
@@ -1242,9 +1235,9 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 let sig_input = &n0.input[0];
                 let sig_out = &n0.output[0];
                 // Mul must take original input and sigmoid output
-                let is_silu = (n1.input.get(0) == Some(sig_input)
+                let is_silu = (n1.input.first() == Some(sig_input)
                     && n1.input.get(1) == Some(sig_out))
-                    || (n1.input.get(0) == Some(sig_out) && n1.input.get(1) == Some(sig_input));
+                    || (n1.input.first() == Some(sig_out) && n1.input.get(1) == Some(sig_input));
                 if !is_silu {
                     return None;
                 }
@@ -1353,30 +1346,52 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 if nodes.len() < 5 {
                     return None;
                 }
-                if nodes[0].op_type != "Div" { return None; }
-                if nodes[1].op_type != "Erf" { return None; }
-                if nodes[2].op_type != "Add" { return None; }
-                if nodes[3].op_type != "Mul" { return None; }
-                if nodes[4].op_type != "Mul" { return None; }
+                if nodes[0].op_type != "Div" {
+                    return None;
+                }
+                if nodes[1].op_type != "Erf" {
+                    return None;
+                }
+                if nodes[2].op_type != "Add" {
+                    return None;
+                }
+                if nodes[3].op_type != "Mul" {
+                    return None;
+                }
+                if nodes[4].op_type != "Mul" {
+                    return None;
+                }
                 let gelu_input = &nodes[0].input[0];
                 let div_out = &nodes[0].output[0];
-                if nodes[1].input[0] != *div_out { return None; }
+                if nodes[1].input[0] != *div_out {
+                    return None;
+                }
                 let erf_out = &nodes[1].output[0];
                 let add_out = &nodes[2].output[0];
                 let uses_erf = nodes[2].input[0] == *erf_out || nodes[2].input[1] == *erf_out;
-                if !uses_erf { return None; }
+                if !uses_erf {
+                    return None;
+                }
                 let mul1_out = &nodes[3].output[0];
                 let uses_add = nodes[3].input[0] == *add_out || nodes[3].input[1] == *add_out;
-                if !uses_add { return None; }
+                if !uses_add {
+                    return None;
+                }
                 let chains = nodes[4].input[0] == *mul1_out || nodes[4].input[1] == *mul1_out;
-                if !chains { return None; }
+                if !chains {
+                    return None;
+                }
                 // The two Muls apply the GELU input and the 0.5 scale in either
                 // order: `(x * (1 + erf)) * 0.5` or `x * (0.5 * (1 + erf))`.
                 // Exactly one of them must take the input; the other takes the
                 // constant.
-                let mul1_uses_input = nodes[3].input[0] == *gelu_input || nodes[3].input[1] == *gelu_input;
-                let mul2_uses_input = nodes[4].input[0] == *gelu_input || nodes[4].input[1] == *gelu_input;
-                if mul1_uses_input == mul2_uses_input { return None; }
+                let mul1_uses_input =
+                    nodes[3].input[0] == *gelu_input || nodes[3].input[1] == *gelu_input;
+                let mul2_uses_input =
+                    nodes[4].input[0] == *gelu_input || nodes[4].input[1] == *gelu_input;
+                if mul1_uses_input == mul2_uses_input {
+                    return None;
+                }
                 Some(5)
             }),
             generator: Box::new(|nodes, _weights, allocator, w, indent| {

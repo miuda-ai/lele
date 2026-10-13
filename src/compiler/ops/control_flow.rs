@@ -40,13 +40,13 @@ pub(crate) fn handle_control_flow_ops(
             if cond_is_i64 {
                 writeln!(
                     w,
-                    "{}let ({}) = if {}.data.get(0).map(|v| *v != 0).unwrap_or(false) {{",
+                    "{}let ({}) = if {}.data.first().is_some_and(|&v| v != 0) {{",
                     tab, out_vars, cond
                 )?;
             } else {
                 writeln!(
                     w,
-                    "{}let ({}) = if {}.data.get(0).map(|v| *v != 0.0).unwrap_or(false) {{",
+                    "{}let ({}) = if {}.data.first().is_some_and(|&v| v != 0.0) {{",
                     tab, out_vars, cond
                 )?;
             }

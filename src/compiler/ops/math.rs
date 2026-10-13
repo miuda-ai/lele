@@ -25,11 +25,23 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             "{}let {} = lele::kernels::mul(&{}, &{}, {});",
             tab, outputs[0], inputs[0], inputs[1], buf_expr
         )?,
-        "Div" => writeln!(
-            w,
-            "{}let {} = lele::kernels::div(&{}, &{}, {});",
-            tab, outputs[0], inputs[0], inputs[1], buf_expr
-        )?,
+        "Div" => {
+            // ONNX Div takes operands of one type, so an integer initializer
+            // makes it an integer division. When it runs in f32 (e.g. on the
+            // f32 indices of TopK) the quotient still has to be truncated.
+            let integer_in_f32 = ctx.var_types.get(&outputs[0]).map(|t| t.as_str()) != Some("i64")
+                && ctx.node.input.iter().any(|name| {
+                    ctx.known_weights
+                        .get(&sanitize_name(name))
+                        .is_some_and(|w| matches!(w.3, 6 | 7))
+                });
+            let kernel = if integer_in_f32 { "div_trunc" } else { "div" };
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::{}(&{}, &{}, {});",
+                tab, outputs[0], kernel, inputs[0], inputs[1], buf_expr
+            )?
+        }
         "Mod" => writeln!(
             w,
             "{}let {} = lele::kernels::mod_f32(&{}, &{}, {});",
@@ -52,7 +64,7 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             } else {
                 "None".to_string()
             };
-            // Check if B is a static weight — use cached ARM path
+            // A static B is packed once for the integer GEMM.
             let b_weight_name = super::super::sanitize_name(&ctx.node.input[1]);
             if let Some((o, l, sh, dt)) = ctx.known_weights.get(&b_weight_name) {
                 if (*dt == 2 || *dt == 3) && sh.len() == 2 {
@@ -60,23 +72,18 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                     let n = sh[1];
                     writeln!(
                         w,
-                        "{}#[cfg(target_arch = \"aarch64\")]",
-                        tab
-                    )?;
-                    writeln!(
-                        w,
-                        "{}let {} = self.mat_mul_integer_arm(&{}, {}, {}, {}, {}, {}, {}, {}, {});",
-                        tab, outputs[0], inputs[0], *o, *l, k, n, *dt == 3, a_zp, b_zp, buf_expr
-                    )?;
-                    writeln!(
-                        w,
-                        "{}#[cfg(not(target_arch = \"aarch64\"))]",
-                        tab
-                    )?;
-                    writeln!(
-                        w,
                         "{}let {} = self.mat_mul_integer_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {});",
-                        tab, outputs[0], inputs[0], *o, *l, k, n, *dt == 3, a_zp, b_zp, buf_expr
+                        tab,
+                        outputs[0],
+                        inputs[0],
+                        *o,
+                        *l,
+                        k,
+                        n,
+                        *dt == 3,
+                        a_zp,
+                        b_zp,
+                        buf_expr
                     )?;
                 } else {
                     writeln!(
@@ -173,9 +180,17 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 let a_is_weight_f32 = inputs[0].contains("weight_f32");
                 let b_is_weight_f32 = inputs.len() > 1 && inputs[1].contains("weight_f32");
                 let raw_a = sanitize_name(&ctx.node.input[0]);
-                let type_a = ctx.var_types.get(&raw_a).map(|s| s.as_str()).unwrap_or("f32");
+                let type_a = ctx
+                    .var_types
+                    .get(&raw_a)
+                    .map(|s| s.as_str())
+                    .unwrap_or("f32");
                 if b_is_weight_f32 {
-                    let func = if type_a == "i64" { "equal_i64_f32_r_i64" } else { "equal_i64_f32_r" };
+                    let func = if type_a == "i64" {
+                        "equal_i64_f32_r_i64"
+                    } else {
+                        "equal_i64_f32_r"
+                    };
                     writeln!(
                         w,
                         "{}let {} = lele::kernels::{}(&{}, &{}, {});",
@@ -187,7 +202,14 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                         "{}let {} = lele::kernels::equal_i64_f32_lhs(&{}, &{}, {});",
                         tab, outputs[0], inputs[0], inputs[1], buf_expr
                     )?;
-                } else if type_a == "f32" && (inputs[1].contains("weight_i64") || ctx.var_types.get(&sanitize_name(&ctx.node.input[1])).map(|t| t == "i64").unwrap_or(false)) {
+                } else if type_a == "f32"
+                    && (inputs[1].contains("weight_i64")
+                        || ctx
+                            .var_types
+                            .get(&sanitize_name(&ctx.node.input[1]))
+                            .map(|t| t == "i64")
+                            .unwrap_or(false))
+                {
                     writeln!(
                         w,
                         "{}let {} = lele::kernels::equal_i64_f32_lhs(&{}, &{}, {});",
@@ -373,10 +395,12 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 .map(|a| a.ints.clone())
                 .unwrap_or(vec![]);
             // If axes attribute is empty, check second input
-            if axes.is_empty() && inputs.len() > 1 && !ctx.node.input[1].is_empty() {
-                if let Some((data, _shape)) = ctx.int64_map.get(&ctx.node.input[1]) {
-                    axes = data.clone();
-                }
+            if axes.is_empty()
+                && inputs.len() > 1
+                && !ctx.node.input[1].is_empty()
+                && let Some((data, _shape)) = ctx.int64_map.get(&ctx.node.input[1])
+            {
+                axes = data.clone();
             }
             let keepdims = ctx
                 .node
@@ -401,10 +425,12 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 .map(|a| a.ints.clone())
                 .unwrap_or(vec![]);
             // If axes attribute is empty, check second input
-            if axes.is_empty() && inputs.len() > 1 && !ctx.node.input[1].is_empty() {
-                if let Some((data, _shape)) = ctx.int64_map.get(&ctx.node.input[1]) {
-                    axes = data.clone();
-                }
+            if axes.is_empty()
+                && inputs.len() > 1
+                && !ctx.node.input[1].is_empty()
+                && let Some((data, _shape)) = ctx.int64_map.get(&ctx.node.input[1])
+            {
+                axes = data.clone();
             }
             let keepdims = ctx
                 .node
