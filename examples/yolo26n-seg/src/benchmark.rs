@@ -1,3 +1,4 @@
+#[rustfmt::skip]
 mod yolo26seg;
 
 use lele::tensor::TensorView;

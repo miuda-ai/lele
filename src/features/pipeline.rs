@@ -1,8 +1,9 @@
-use crate::features::fft::Complex;
-use crate::features::{Lfr, LfrConfig, RealFft, SparseMelBank, hann_window, log_compress};
+use crate::features::{Lfr, LfrConfig, SparseMelBank, hann_window, log_compress};
+use crate::kernels::fft::Rfft;
+use crate::kernels::simd::simd_call;
 use crate::tensor::TensorView;
-#[cfg(nightly_build)]
-use std::simd::prelude::*;
+use fearless_simd::{Level, Simd, f32x8};
+use fearless_simd_macros::simd;
 
 #[derive(Debug, Clone)]
 pub struct FeatureConfig {
@@ -28,11 +29,12 @@ impl Default for FeatureConfig {
 pub struct SenseVoiceFrontend {
     config: FeatureConfig,
     window: Vec<f32>,
-    fft: RealFft,
+    fft: Rfft,
     mel_bank: SparseMelBank,
     fft_len: usize,
     hop_len: usize,
     lfr: Lfr,
+    level: Level,
 }
 impl SenseVoiceFrontend {
     pub fn new(config: FeatureConfig) -> Self {
@@ -41,7 +43,7 @@ impl SenseVoiceFrontend {
         let fft_len = n_fft;
         let hop_len = (config.sample_rate as f32 * config.frame_shift_ms / 1000.0) as usize;
         let window = hann_window(frame_len);
-        let fft = RealFft::new(fft_len);
+        let fft = Rfft::new(fft_len);
         let mel_bank = SparseMelBank::new(
             config.sample_rate as f32,
             fft_len,
@@ -61,6 +63,7 @@ impl SenseVoiceFrontend {
             fft_len,
             hop_len,
             lfr,
+            level: Level::new(),
         }
     }
 
@@ -72,113 +75,33 @@ impl SenseVoiceFrontend {
         }
         let num_frames = (pcm.len() - frame_len) / hop_len + 1;
 
+        let n_bins = self.fft_len / 2 + 1;
         let mut mel_output = vec![0.0; num_frames * self.config.n_mels];
+        // Samples past `frame_len` stay zero: the frame is zero-padded to the FFT length.
         let mut frame_buf = vec![0.0; self.fft_len];
-        let mut raw_frame = vec![0.0; frame_len];
-        let mut fft_out = vec![Complex { re: 0.0, im: 0.0 }; self.fft_len];
-        let mut power_spec = vec![0.0; self.fft_len / 2 + 1];
-        let mut fft_scratch = vec![Complex { re: 0.0, im: 0.0 }; self.fft.scratch_len()];
-
-        let scale = 32768.0;
-        let preemph_coeff = 0.97f32;
+        let mut fft_scratch = vec![0.0; self.fft.scratch_len()];
+        let (mut fft_re, mut fft_im) = (vec![0.0; n_bins], vec![0.0; n_bins]);
+        let mut power_spec = vec![0.0; n_bins];
 
         for i in 0..num_frames {
             let start = i * hop_len;
             let end = start + frame_len;
 
-            // 1. Scale and Copy
-            let pcm_slice = &pcm[start..end];
-            #[cfg(nightly_build)]
-            {
-                let (prefix, middle, _suffix) = pcm_slice.as_simd::<8>();
-                let offset = prefix.len();
-                for j in 0..offset {
-                    raw_frame[j] = pcm_slice[j] * scale;
-                }
-                let scale_vec = f32x8::splat(scale);
-                for j in 0..middle.len() {
-                    let res = middle[j] * scale_vec;
-                    res.copy_to_slice(&mut raw_frame[offset + j * 8..]);
-                }
-                for j in (offset + middle.len() * 8)..frame_len {
-                    raw_frame[j] = pcm_slice[j] * scale;
-                }
-            }
-            #[cfg(not(nightly_build))]
-            {
-                for j in 0..frame_len {
-                    raw_frame[j] = pcm_slice[j] * scale;
-                }
-            }
-
-            // 2. Mean Subtraction
-            let sum: f32 = raw_frame.iter().sum();
-            let mean = sum / frame_len as f32;
-            #[cfg(nightly_build)]
-            {
-                let mean_vec = f32x8::splat(mean);
-
-                let (prefix, middle, suffix) = raw_frame.as_simd_mut::<8>();
-                for x in prefix {
-                    *x -= mean;
-                }
-                for x_vec in middle {
-                    *x_vec -= mean_vec;
-                }
-                for x in suffix {
-                    *x -= mean;
-                }
-            }
-            #[cfg(not(nightly_build))]
-            {
-                for x in &mut raw_frame {
-                    *x -= mean;
-                }
-            }
-
-            // 3. Pre-emphasis (inherently sequential)
-            for j in (1..frame_len).rev() {
-                raw_frame[j] -= preemph_coeff * raw_frame[j - 1];
-            }
-
-            // 4. Windowing
-            #[cfg(nightly_build)]
-            {
-                let (prefix, middle, _suffix) = raw_frame.as_simd::<8>();
-                let offset = prefix.len();
-                for j in 0..offset {
-                    frame_buf[j] = raw_frame[j] * self.window[j];
-                }
-                for j in 0..middle.len() {
-                    let idx = offset + j * 8;
-                    let w = f32x8::from_slice(&self.window[idx..idx + 8]);
-                    let res = middle[j] * w;
-                    res.copy_to_slice(&mut frame_buf[idx..idx + 8]);
-                }
-                for j in (offset + middle.len() * 8)..frame_len {
-                    frame_buf[j] = raw_frame[j] * self.window[j];
-                }
-            }
-            #[cfg(not(nightly_build))]
-            {
-                for j in 0..frame_len {
-                    frame_buf[j] = raw_frame[j] * self.window[j];
-                }
-            }
-
-            for j in frame_len..self.fft_len {
-                frame_buf[j] = 0.0;
-            }
+            // 1-4. Scale, mean subtraction, pre-emphasis and windowing
+            prepare_frame(
+                self.level,
+                &pcm[start..end],
+                &self.window,
+                &mut frame_buf[..frame_len],
+            );
 
             // 5. FFT
             self.fft
-                .process_with_scratch(&frame_buf, &mut fft_out, &mut fft_scratch);
+                .forward(&frame_buf, &mut fft_scratch, &mut fft_re, &mut fft_im);
 
             // 6. Power Spectrum
-            for j in 0..power_spec.len() {
-                let re = fft_out[j].re;
-                let im = fft_out[j].im;
-                power_spec[j] = re * re + im * im;
+            for ((p, &re), &im) in power_spec.iter_mut().zip(&fft_re).zip(&fft_im) {
+                *p = re * re + im * im;
             }
 
             // 7. Mel Filterbank
@@ -190,5 +113,159 @@ impl SenseVoiceFrontend {
         }
         let mel_tensor = TensorView::from_owned(mel_output, vec![num_frames, self.config.n_mels]);
         self.lfr.compute(&mel_tensor)
+    }
+}
+
+/// Scale from [-1, 1] samples to the 16-bit range the model was trained on.
+const PCM_SCALE: f32 = 32768.0;
+const PREEMPH_COEFF: f32 = 0.97;
+
+/// Writes the windowed frame of `pcm` to `out`: samples scaled by
+/// `PCM_SCALE`, minus their mean, pre-emphasized, times `window`.
+///
+/// Pre-emphasis subtracts the previous mean-subtracted sample, not the
+/// previous pre-emphasized one, so every output depends only on two inputs and
+/// the whole chain runs in one vector pass. Each step rounds as it would one
+/// step at a time, so the result matches running them in sequence bit for bit.
+fn prepare_frame(level: Level, pcm: &[f32], window: &[f32], out: &mut [f32]) {
+    let n = pcm.len();
+    assert!(window.len() >= n && out.len() >= n);
+    if n == 0 {
+        return;
+    }
+    // Summed in order: a vector sum would round differently.
+    let mean = pcm.iter().map(|&x| x * PCM_SCALE).sum::<f32>() / n as f32;
+    simd_call!(level, prepare_frame_simd(pcm, mean, window, out))
+}
+
+#[simd]
+fn prepare_frame_simd<S: Simd>(simd: S, pcm: &[f32], mean: f32, window: &[f32], out: &mut [f32]) {
+    use fearless_simd::prelude::*;
+    let n = pcm.len();
+    let centered = |x: f32| x * PCM_SCALE - mean;
+    out[0] = centered(pcm[0]) * window[0];
+
+    let (scale, mean_v, coeff) = (
+        f32x8::splat(simd, PCM_SCALE),
+        f32x8::splat(simd, mean),
+        f32x8::splat(simd, PREEMPH_COEFF),
+    );
+    let (cur, cur_rest) = pcm[1..].as_chunks::<8>();
+    let (prev, prev_rest) = pcm[..n - 1].as_chunks::<8>();
+    let (win, win_rest) = window[1..n].as_chunks::<8>();
+    let (dst, dst_rest) = out[1..n].as_chunks_mut::<8>();
+    for (((x, p), w), y) in cur.iter().zip(prev).zip(win).zip(dst) {
+        let x = f32x8::from_slice(simd, x) * scale - mean_v;
+        let p = f32x8::from_slice(simd, p) * scale - mean_v;
+        ((x - coeff * p) * f32x8::from_slice(simd, w)).store_slice(y);
+    }
+    let tail = cur_rest.iter().zip(prev_rest).zip(win_rest).zip(dst_rest);
+    for (((&x, &p), &w), y) in tail {
+        *y = (centered(x) - PREEMPH_COEFF * centered(p)) * w;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::features::RealFft;
+    use crate::features::fft::Complex;
+    use crate::kernels::test_util::levels;
+
+    /// The frame preparation as separate passes over a buffer.
+    fn prepare_frame_reference(pcm: &[f32], window: &[f32], out: &mut [f32]) {
+        let mut raw: Vec<f32> = pcm.iter().map(|&x| x * PCM_SCALE).collect();
+        let mean = raw.iter().sum::<f32>() / raw.len() as f32;
+        for x in &mut raw {
+            *x -= mean;
+        }
+        for j in (1..raw.len()).rev() {
+            raw[j] -= PREEMPH_COEFF * raw[j - 1];
+        }
+        for ((y, &x), &w) in out.iter_mut().zip(&raw).zip(window) {
+            *y = x * w;
+        }
+    }
+
+    fn pcm(n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / 16000.0;
+                0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+                    + 0.05 * ((i * 7919 % 1000) as f32 / 1000.0 - 0.5)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_prepare_frame_matches_separate_passes() {
+        let sizes = (1..=40).chain([400, 401, 1023]);
+        for n in sizes {
+            let pcm = pcm(n);
+            let window = hann_window(n);
+            let mut want = vec![0.0; n];
+            prepare_frame_reference(&pcm, &window, &mut want);
+            for level in levels() {
+                let mut got = vec![f32::NAN; n];
+                prepare_frame(level, &pcm, &window, &mut got);
+                for (j, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "n={n} j={j} {level:?}: {g} vs {w}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The frontend as it was before the frame preparation was fused and the
+    /// FFT called directly.
+    fn compute_reference(fe: &SenseVoiceFrontend, pcm: &[f32]) -> Vec<f32> {
+        let frame_len = fe.window.len();
+        let num_frames = (pcm.len() - frame_len) / fe.hop_len + 1;
+        let n_mels = fe.config.n_mels;
+        let fft = RealFft::new(fe.fft_len);
+        let mut mel = vec![0.0; num_frames * n_mels];
+        let mut frame = vec![0.0; fe.fft_len];
+        let mut spectrum = vec![Complex { re: 0.0, im: 0.0 }; fe.fft_len];
+        let mut scratch = vec![Complex { re: 0.0, im: 0.0 }; fft.scratch_len()];
+        let mut power = vec![0.0; fe.fft_len / 2 + 1];
+        for (i, mel_frame) in mel.chunks_exact_mut(n_mels).enumerate() {
+            let start = i * fe.hop_len;
+            prepare_frame_reference(
+                &pcm[start..start + frame_len],
+                &fe.window,
+                &mut frame[..frame_len],
+            );
+            fft.process_with_scratch(&frame, &mut spectrum, &mut scratch);
+            for (p, c) in power.iter_mut().zip(&spectrum) {
+                *p = c.re * c.re + c.im * c.im;
+            }
+            fe.mel_bank.apply(&power, mel_frame);
+            log_compress(mel_frame, 1e-5);
+        }
+        let mel = TensorView::from_owned(mel, vec![num_frames, n_mels]);
+        fe.lfr.compute(&mel).data.into_owned()
+    }
+
+    #[test]
+    fn test_compute_matches_reference() {
+        let fe = SenseVoiceFrontend::new(FeatureConfig::default());
+        for n in [400, 559, 560, 16000, 16123] {
+            let pcm = pcm(n);
+            let got = fe.compute(&pcm);
+            let want = compute_reference(&fe, &pcm);
+            assert_eq!(got.data.len(), want.len(), "n={n}");
+            for (j, (g, w)) in got.data.iter().zip(&want).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "n={n} j={j}: {g} vs {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_compute_short_input_is_empty() {
+        let fe = SenseVoiceFrontend::new(FeatureConfig::default());
+        assert!(fe.compute(&pcm(399)).data.is_empty());
     }
 }
