@@ -146,20 +146,9 @@ fn pair(v: &[i64], default: usize) -> [usize; 2] {
     }
 }
 
-/// `dst[j * rows + i] = src[i * cols + j]` for a row-major `rows x cols` `src`, a block at
-/// a time so both sides stay in cache.
+/// `dst[j * rows + i] = src[i * cols + j]` for a row-major `rows x cols` `src`.
 fn transpose(src: &[f32], rows: usize, cols: usize, dst: &mut [f32]) {
-    const B: usize = 16;
-    let (src, dst) = (&src[..rows * cols], &mut dst[..rows * cols]);
-    for i0 in (0..rows).step_by(B) {
-        for j0 in (0..cols).step_by(B) {
-            for i in i0..(i0 + B).min(rows) {
-                for j in j0..(j0 + B).min(cols) {
-                    dst[j * rows + i] = src[i * cols + j];
-                }
-            }
-        }
-    }
+    crate::kernels::manipulation::transpose_matrix(src, cols, dst, rows, rows, cols);
 }
 
 thread_local! {
@@ -360,11 +349,11 @@ mod tests {
             (1, 4, 3, 3, 3, 3, 3, 1, [1, 1], [0; 4], [1, 1]),
             (1, 4, 9, 8, 6, 3, 3, 1, [1, 2], [1, 2, 1, 0], [1, 1]),
         ];
-        // The GEMM with both layouts at every level (the quads emulate VNNI off the AVX-512
-        // level), then the f32 path wherever its sums are exact.
+        // The GEMM with every layout at every level (the dot layouts emulate their
+        // instructions elsewhere), then the f32 path wherever its sums are exact.
         let runs = levels()
             .into_iter()
-            .flat_map(|l| [(l, Layout::Pairs, 0), (l, Layout::Quads, 0)])
+            .flat_map(|l| Layout::ALL.map(|layout| (l, layout, 0)))
             .chain([(Level::new(), Layout::for_level(Level::new()), EXACT_F32_DEPTH)]);
         for (level, layout, float_depth) in runs {
             for (i, &(n, c, h, wd, oc, kh, kw, groups, d, p, s)) in cases.iter().enumerate() {
