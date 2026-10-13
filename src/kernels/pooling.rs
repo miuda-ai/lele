@@ -6,32 +6,9 @@ pub fn global_average_pool<'b, 'a>(
     input: &TensorView<'b>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let shape = &input.shape;
-    assert!(shape.len() == 4, "GlobalAveragePool: expected rank-4 input");
-    let batch = shape[0];
-    let channels = shape[1];
-    let in_h = shape[2];
-    let in_w = shape[3];
-    let spatial = in_h * in_w;
-    let numel = batch * channels;
-    crate::kernels::utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
-    let data = &input.data;
-    let o_slice = out.as_mut_slice();
-    for nc in 0..numel {
-        let base = nc * spatial;
-        let mut sum = 0.0f32;
-        for i in 0..spatial {
-            sum += data[base + i];
-        }
-        o_slice[nc] = sum / spatial as f32;
-    }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: Cow::Owned(vec![batch, channels, 1, 1]),
-    }
+    assert!(input.shape.len() == 4, "GlobalAveragePool: expected rank-4 input");
+    // The mean of each channel plane, a contiguous run.
+    crate::kernels::reduce_mean(input, &[2, 3], true, out)
 }
 
 /// AveragePool2d for NCHW rank-4 input with optional count_include_pad.
@@ -58,7 +35,11 @@ pub fn average_pool2d<'b, 'a>(
         kh
     };
 
-    let sh = if strides.is_empty() { 1 } else { strides[0] as usize };
+    let sh = if strides.is_empty() {
+        1
+    } else {
+        strides[0] as usize
+    };
     let sw = if strides.len() > 1 {
         strides[1] as usize
     } else {
@@ -89,9 +70,6 @@ pub fn average_pool2d<'b, 'a>(
 
     let total = batch * channels * out_h * out_w;
     crate::kernels::utils::ensure_capacity(out, total);
-    unsafe {
-        out.set_len(total);
-    }
 
     let data = &input.data;
     let o_slice = out.as_mut_slice();
@@ -103,9 +81,7 @@ pub fn average_pool2d<'b, 'a>(
             for oh in 0..out_h {
                 for ow in 0..out_w {
                     let h_start = oh * sh;
-                    let h_end = (h_start + kh).min(in_h + pad_bottom);
                     let w_start = ow * sw;
-                    let w_end = (w_start + kw).min(in_w + pad_right);
                     let mut sum = 0.0f32;
                     let mut count = 0;
                     for kh_i in 0..kh {
@@ -125,11 +101,7 @@ pub fn average_pool2d<'b, 'a>(
                     let denom = if count_include_pad {
                         (kh * kw) as f32
                     } else {
-                        if count > 0 {
-                            count as f32
-                        } else {
-                            1.0
-                        }
+                        if count > 0 { count as f32 } else { 1.0 }
                     };
                     o_slice[out_base + oh * out_w + ow] = sum / denom;
                 }
@@ -171,5 +143,20 @@ pub fn adaptive_avg_pool1d(
             }
             output[out_offset + i] = sum / kernel_len as f32;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_global_average_pool() {
+        let data: Vec<f32> = (0..8).map(|v| v as f32).collect();
+        let t = TensorView::from_owned(data, vec![1, 2, 2, 2]);
+        let mut out = Vec::new();
+        let res = global_average_pool(&t, &mut out);
+        assert_eq!(res.shape.as_ref(), &[1, 2, 1, 1]);
+        assert_eq!(res.data.as_ref(), &[1.5, 5.5]);
     }
 }

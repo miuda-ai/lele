@@ -2,7 +2,6 @@ use crate::llm::Llm;
 
 const D_MODEL: usize = 512;
 const N_HEADS: usize = 4;
-const N_KV_HEADS: usize = 1;
 const D_HEAD: usize = 128;
 const D_FF: usize = 2304;
 const N_LAYERS: usize = 17;
@@ -17,13 +16,27 @@ const ATTN_SCALE_OFFSET: usize = 178790096;
 const LM_HEAD_OFFSET: usize = 160698624;
 const LN_EPS: f32 = 1e-6;
 
-fn layer_q_off(n: usize) -> usize { LAYER0_Q_OFFSET + n * LAYER_STRIDE }
-fn layer_k_off(n: usize) -> usize { layer_q_off(n) + 524288 }
-fn layer_v_off(n: usize) -> usize { layer_k_off(n) + 131072 }
-fn layer_o_off(n: usize) -> usize { layer_v_off(n) + 131072 }
-fn layer_gate_off(n: usize) -> usize { layer_o_off(n) + 524288 }
-fn layer_up_off(n: usize) -> usize { layer_gate_off(n) + 2359296 }
-fn layer_down_off(n: usize) -> usize { layer_up_off(n) + 2359296 }
+fn layer_q_off(n: usize) -> usize {
+    LAYER0_Q_OFFSET + n * LAYER_STRIDE
+}
+fn layer_k_off(n: usize) -> usize {
+    layer_q_off(n) + 524288
+}
+fn layer_v_off(n: usize) -> usize {
+    layer_k_off(n) + 131072
+}
+fn layer_o_off(n: usize) -> usize {
+    layer_v_off(n) + 131072
+}
+fn layer_gate_off(n: usize) -> usize {
+    layer_o_off(n) + 524288
+}
+fn layer_up_off(n: usize) -> usize {
+    layer_gate_off(n) + 2359296
+}
+fn layer_down_off(n: usize) -> usize {
+    layer_up_off(n) + 2359296
+}
 
 pub struct LlmCache {
     pub k_cache: Vec<Vec<f32>>,
@@ -35,8 +48,7 @@ pub struct LlmCache {
 
 impl LlmCache {
     pub fn new(llm: &Llm) -> Self {
-        let inv_freq: Vec<f32> = llm.weight_f32(INV_FREQ_OFFSET, 256, &[64])
-            .data.to_vec();
+        let inv_freq: Vec<f32> = llm.weight_f32(INV_FREQ_OFFSET, 256, &[64]).data.to_vec();
         let attn_scale = llm.weight_f16(ATTN_SCALE_OFFSET, 2, &[]).data[0];
         Self {
             k_cache: vec![Vec::new(); N_LAYERS],
@@ -46,8 +58,6 @@ impl LlmCache {
             seq_len: 0,
         }
     }
-
-    pub fn seq_len(&self) -> usize { self.seq_len }
 }
 
 impl<'a> Llm<'a> {
@@ -89,7 +99,8 @@ impl<'a> Llm<'a> {
         let embed_w = self.weight_f16(EMBED_OFFSET, 17667 * 512 * 2, &[VOCAB, D_MODEL]);
         let mut hidden = vec![0.0f32; seq * D_MODEL];
         for t in 0..seq {
-            let row = &embed_w.data[input_ids[t] as usize * D_MODEL..(input_ids[t] as usize + 1) * D_MODEL];
+            let row = &embed_w.data
+                [input_ids[t] as usize * D_MODEL..(input_ids[t] as usize + 1) * D_MODEL];
             hidden[t * D_MODEL..(t + 1) * D_MODEL].copy_from_slice(row);
         }
 
@@ -100,13 +111,23 @@ impl<'a> Llm<'a> {
 
         for layer in 0..N_LAYERS {
             hidden = self.forward_layer_full(
-                &hidden, seq, layer, norm_w, qk_norm_w,
-                &mut cache.k_cache[layer], &mut cache.v_cache[layer],
-                &cache.inv_freq, cache.attn_scale,
+                &hidden,
+                seq,
+                layer,
+                norm_w,
+                qk_norm_w,
+                &mut cache.k_cache[layer],
+                &mut cache.v_cache[layer],
+                &cache.inv_freq,
+                cache.attn_scale,
             );
         }
 
-        self.rms_norm_inplace(&mut hidden[seq * D_MODEL - D_MODEL..seq * D_MODEL], norm_w, LN_EPS);
+        self.rms_norm_inplace(
+            &mut hidden[seq * D_MODEL - D_MODEL..seq * D_MODEL],
+            norm_w,
+            LN_EPS,
+        );
         let last_row = &hidden[(seq - 1) * D_MODEL..seq * D_MODEL];
         let lm_head = self.weight_f16(LM_HEAD_OFFSET, VOCAB * D_MODEL * 2, &[D_MODEL, VOCAB]);
         let logits = self.matvec(last_row, &lm_head.data, VOCAB, D_MODEL);
@@ -162,7 +183,7 @@ impl<'a> Llm<'a> {
             let mut sin = [0.0f32; D_HEAD];
             for i in 0..(D_HEAD / 2) {
                 let freq = pos * inv_freq[i];
-            let (s, c) = freq.sin_cos();
+                let (s, c) = freq.sin_cos();
                 cos[i] = c;
                 cos[i + D_HEAD / 2] = c;
                 sin[i] = s;
@@ -170,7 +191,8 @@ impl<'a> Llm<'a> {
             }
 
             for h in 0..N_HEADS {
-                let qh = &mut q_all[t * N_HEADS * D_HEAD + h * D_HEAD..t * N_HEADS * D_HEAD + (h + 1) * D_HEAD];
+                let qh = &mut q_all
+                    [t * N_HEADS * D_HEAD + h * D_HEAD..t * N_HEADS * D_HEAD + (h + 1) * D_HEAD];
                 for d in 0..D_HEAD {
                     let qh_orig = q[h * D_HEAD + d];
                     let qh_rot = if d < D_HEAD / 2 {
@@ -199,7 +221,8 @@ impl<'a> Llm<'a> {
         let mut attn_out = vec![0.0f32; seq * D_MODEL];
         for t in 0..seq {
             for h in 0..N_HEADS {
-                let qv = &q_all[t * N_HEADS * D_HEAD + h * D_HEAD..t * N_HEADS * D_HEAD + (h + 1) * D_HEAD];
+                let qv = &q_all
+                    [t * N_HEADS * D_HEAD + h * D_HEAD..t * N_HEADS * D_HEAD + (h + 1) * D_HEAD];
                 let mut scores = vec![0.0f32; t + 1];
                 for tt in 0..=t {
                     let kv = &k_all[tt * D_HEAD..(tt + 1) * D_HEAD];
@@ -270,7 +293,8 @@ impl<'a> Llm<'a> {
         cache.seq_len += 1;
 
         let embed_w = self.weight_f16(EMBED_OFFSET, 17667 * 512 * 2, &[VOCAB, D_MODEL]);
-        let mut hidden: Vec<f32> = embed_w.data[token_id as usize * D_MODEL..(token_id as usize + 1) * D_MODEL].to_vec();
+        let mut hidden: Vec<f32> =
+            embed_w.data[token_id as usize * D_MODEL..(token_id as usize + 1) * D_MODEL].to_vec();
 
         let norm_w = self.weight_f16(NORM_WEIGHT_OFFSET, 1024, &[D_MODEL]);
         let norm_w = &norm_w.data[..D_MODEL];
@@ -291,9 +315,16 @@ impl<'a> Llm<'a> {
 
         for layer in 0..N_LAYERS {
             hidden = self.forward_layer_single(
-                &hidden, pos, layer, norm_w, qk_norm_w,
-                &mut cache.k_cache[layer], &mut cache.v_cache[layer],
-                &cos, &sin, cache.attn_scale,
+                &hidden,
+                pos,
+                layer,
+                norm_w,
+                qk_norm_w,
+                &mut cache.k_cache[layer],
+                &mut cache.v_cache[layer],
+                &cos,
+                &sin,
+                cache.attn_scale,
             );
         }
 
