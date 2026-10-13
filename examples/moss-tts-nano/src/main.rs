@@ -1,9 +1,13 @@
 mod audio;
-mod sentencepiece;
+#[rustfmt::skip]
 mod codecdecodefull;
+#[rustfmt::skip]
 mod decodestep;
+#[rustfmt::skip]
 mod localfixedsampledframe;
+#[rustfmt::skip]
 mod prefill;
+mod sentencepiece;
 
 use anyhow::{Context, Result};
 use audio::WavWriter;
@@ -109,15 +113,30 @@ fn build_request_rows(
         .collect();
 
     let suffix_ids: Vec<i64> = std::iter::once(AUDIO_END_TOKEN_ID)
-        .chain(manifest.prompt_templates.user_prompt_after_reference_token_ids.iter().map(|&v| v as i64))
+        .chain(
+            manifest
+                .prompt_templates
+                .user_prompt_after_reference_token_ids
+                .iter()
+                .map(|&v| v as i64),
+        )
         .chain(text_token_ids.iter().map(|&v| v as i64))
-        .chain(manifest.prompt_templates.assistant_prompt_prefix_token_ids.iter().map(|&v| v as i64))
+        .chain(
+            manifest
+                .prompt_templates
+                .assistant_prompt_prefix_token_ids
+                .iter()
+                .map(|&v| v as i64),
+        )
         .chain(std::iter::once(AUDIO_START_TOKEN_ID))
         .collect();
 
     let mut rows = Vec::new();
     rows.extend(build_text_rows(&prefix_ids));
-    rows.extend(build_audio_prefix_rows(prompt_audio_codes, AUDIO_USER_SLOT_TOKEN_ID));
+    rows.extend(build_audio_prefix_rows(
+        prompt_audio_codes,
+        AUDIO_USER_SLOT_TOKEN_ID,
+    ));
     rows.extend(build_text_rows(&suffix_ids));
     rows
 }
@@ -170,10 +189,17 @@ impl MossTtsNano {
         let frame_weights = std::fs::read(gen_dir.join("localfixedsampledframe_weights.bin"))?;
         let codec_weights = std::fs::read(gen_dir.join("codecdecodefull_weights.bin"))?;
 
-        let prefill = Prefill::new(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&prefill_weights) });
-        let decode_step = DecodeStep::new(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&decode_weights) });
-        let local_frame = LocalFixedSampledFrame::new(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&frame_weights) });
-        let codec = CodecDecodeFull::new(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&codec_weights) });
+        let prefill =
+            Prefill::new(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&prefill_weights) });
+        let decode_step = DecodeStep::new(unsafe {
+            std::mem::transmute::<&[u8], &'static [u8]>(&decode_weights)
+        });
+        let local_frame = LocalFixedSampledFrame::new(unsafe {
+            std::mem::transmute::<&[u8], &'static [u8]>(&frame_weights)
+        });
+        let codec = CodecDecodeFull::new(unsafe {
+            std::mem::transmute::<&[u8], &'static [u8]>(&codec_weights)
+        });
 
         Ok(Self {
             manifest,
@@ -195,7 +221,11 @@ impl MossTtsNano {
     }
 
     pub fn encode_text(&self, text: &str) -> Vec<i32> {
-        self.tokenizer.encode(text).into_iter().map(|id| id as i32).collect()
+        self.tokenizer
+            .encode(text)
+            .into_iter()
+            .map(|id| id as i32)
+            .collect()
     }
 
     pub fn get_voice_codes(&self, voice: &str) -> Result<&Vec<Vec<i32>>> {
@@ -224,23 +254,67 @@ impl MossTtsNano {
 
         // 1. Prefill
         let t0 = Instant::now();
-        let prefill_out = self.prefill.forward_with_workspace(
-            &mut self.prefill_ws,
-            input_ids,
-            attention_mask,
+        let prefill_out =
+            self.prefill
+                .forward_with_workspace(&mut self.prefill_ws, input_ids, attention_mask);
+        eprintln!(
+            "[STAGE] Prefill: {:.2}ms",
+            t0.elapsed().as_secs_f64() * 1000.0
         );
-        eprintln!("[STAGE] Prefill: {:.2}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-        let (global_hidden, pk0, pv0, pk1, pv1, pk2, pv2, pk3, pv3, pk4, pv4,
-             pk5, pv5, pk6, pv6, pk7, pv7, pk8, pv8, pk9, pv9, pk10, pv10, pk11, pv11) = prefill_out;
+        let (
+            global_hidden,
+            pk0,
+            pv0,
+            pk1,
+            pv1,
+            pk2,
+            pv2,
+            pk3,
+            pv3,
+            pk4,
+            pv4,
+            pk5,
+            pv5,
+            pk6,
+            pv6,
+            pk7,
+            pv7,
+            pk8,
+            pv8,
+            pk9,
+            pv9,
+            pk10,
+            pv10,
+            pk11,
+            pv11,
+        ) = prefill_out;
 
         let mut past_kv: Vec<TensorView<'static>> = vec![
-            pk0.to_owned(), pv0.to_owned(), pk1.to_owned(), pv1.to_owned(),
-            pk2.to_owned(), pv2.to_owned(), pk3.to_owned(), pv3.to_owned(),
-            pk4.to_owned(), pv4.to_owned(), pk5.to_owned(), pv5.to_owned(),
-            pk6.to_owned(), pv6.to_owned(), pk7.to_owned(), pv7.to_owned(),
-            pk8.to_owned(), pv8.to_owned(), pk9.to_owned(), pv9.to_owned(),
-            pk10.to_owned(), pv10.to_owned(), pk11.to_owned(), pv11.to_owned(),
+            pk0.to_owned(),
+            pv0.to_owned(),
+            pk1.to_owned(),
+            pv1.to_owned(),
+            pk2.to_owned(),
+            pv2.to_owned(),
+            pk3.to_owned(),
+            pv3.to_owned(),
+            pk4.to_owned(),
+            pv4.to_owned(),
+            pk5.to_owned(),
+            pv5.to_owned(),
+            pk6.to_owned(),
+            pv6.to_owned(),
+            pk7.to_owned(),
+            pv7.to_owned(),
+            pk8.to_owned(),
+            pv8.to_owned(),
+            pk9.to_owned(),
+            pv9.to_owned(),
+            pk10.to_owned(),
+            pv10.to_owned(),
+            pk11.to_owned(),
+            pv11.to_owned(),
         ];
 
         // Extract last hidden state: [1, seq, 768] -> [1, 768]
@@ -250,8 +324,9 @@ impl MossTtsNano {
         let max_frames = self.manifest.generation_defaults.max_new_frames;
 
         let mut generated_frames: Vec<Vec<i64>> = Vec::new();
-        let mut repetition_seen: Vec<std::collections::HashSet<i64>> =
-            (0..N_VQ).map(|_| std::collections::HashSet::new()).collect();
+        let mut repetition_seen: Vec<std::collections::HashSet<i64>> = (0..N_VQ)
+            .map(|_| std::collections::HashSet::new())
+            .collect();
 
         // 2. Autoregressive frame generation
         let t_gen = Instant::now();
@@ -269,7 +344,9 @@ impl MossTtsNano {
 
             // Random numbers for sampling
             let rand_u: f32 = self.rng.r#gen::<f32>().min(0.99999994);
-            let audio_rand: Vec<f32> = (0..N_VQ).map(|_| self.rng.r#gen::<f32>().min(0.99999994)).collect();
+            let audio_rand: Vec<f32> = (0..N_VQ)
+                .map(|_| self.rng.r#gen::<f32>().min(0.99999994))
+                .collect();
             let rand_tv = TensorView::from_owned(vec![rand_u], vec![1]);
             let audio_rand_tv = TensorView::from_owned(audio_rand, vec![1, N_VQ]);
 
@@ -310,33 +387,101 @@ impl MossTtsNano {
                 &mut self.decode_ws,
                 next_ids,
                 pvl_tv,
-                past_kv[0].clone(), past_kv[1].clone(), past_kv[2].clone(), past_kv[3].clone(),
-                past_kv[4].clone(), past_kv[5].clone(), past_kv[6].clone(), past_kv[7].clone(),
-                past_kv[8].clone(), past_kv[9].clone(), past_kv[10].clone(), past_kv[11].clone(),
-                past_kv[12].clone(), past_kv[13].clone(), past_kv[14].clone(), past_kv[15].clone(),
-                past_kv[16].clone(), past_kv[17].clone(), past_kv[18].clone(), past_kv[19].clone(),
-                past_kv[20].clone(), past_kv[21].clone(), past_kv[22].clone(), past_kv[23].clone(),
+                past_kv[0].clone(),
+                past_kv[1].clone(),
+                past_kv[2].clone(),
+                past_kv[3].clone(),
+                past_kv[4].clone(),
+                past_kv[5].clone(),
+                past_kv[6].clone(),
+                past_kv[7].clone(),
+                past_kv[8].clone(),
+                past_kv[9].clone(),
+                past_kv[10].clone(),
+                past_kv[11].clone(),
+                past_kv[12].clone(),
+                past_kv[13].clone(),
+                past_kv[14].clone(),
+                past_kv[15].clone(),
+                past_kv[16].clone(),
+                past_kv[17].clone(),
+                past_kv[18].clone(),
+                past_kv[19].clone(),
+                past_kv[20].clone(),
+                past_kv[21].clone(),
+                past_kv[22].clone(),
+                past_kv[23].clone(),
             );
 
-            let (gh, npk0, npv0, npk1, npv1, npk2, npv2, npk3, npv3, npk4, npv4,
-                 npk5, npv5, npk6, npv6, npk7, npv7, npk8, npv8, npk9, npv9, npk10, npv10, npk11, npv11) = decode_out;
+            let (
+                gh,
+                npk0,
+                npv0,
+                npk1,
+                npv1,
+                npk2,
+                npv2,
+                npk3,
+                npv3,
+                npk4,
+                npv4,
+                npk5,
+                npv5,
+                npk6,
+                npv6,
+                npk7,
+                npv7,
+                npk8,
+                npv8,
+                npk9,
+                npv9,
+                npk10,
+                npv10,
+                npk11,
+                npv11,
+            ) = decode_out;
 
             current_hidden = extract_last_hidden(&gh);
 
             let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
-            eprintln!("[FRAME] {}: local={:.1}ms decode={:.1}ms", step, frame_ms, decode_ms);
+            eprintln!(
+                "[FRAME] {}: local={:.1}ms decode={:.1}ms",
+                step, frame_ms, decode_ms
+            );
 
             past_kv = vec![
-                npk0.to_owned(), npv0.to_owned(), npk1.to_owned(), npv1.to_owned(),
-                npk2.to_owned(), npv2.to_owned(), npk3.to_owned(), npv3.to_owned(),
-                npk4.to_owned(), npv4.to_owned(), npk5.to_owned(), npv5.to_owned(),
-                npk6.to_owned(), npv6.to_owned(), npk7.to_owned(), npv7.to_owned(),
-                npk8.to_owned(), npv8.to_owned(), npk9.to_owned(), npv9.to_owned(),
-                npk10.to_owned(), npv10.to_owned(), npk11.to_owned(), npv11.to_owned(),
+                npk0.to_owned(),
+                npv0.to_owned(),
+                npk1.to_owned(),
+                npv1.to_owned(),
+                npk2.to_owned(),
+                npv2.to_owned(),
+                npk3.to_owned(),
+                npv3.to_owned(),
+                npk4.to_owned(),
+                npv4.to_owned(),
+                npk5.to_owned(),
+                npv5.to_owned(),
+                npk6.to_owned(),
+                npv6.to_owned(),
+                npk7.to_owned(),
+                npv7.to_owned(),
+                npk8.to_owned(),
+                npv8.to_owned(),
+                npk9.to_owned(),
+                npv9.to_owned(),
+                npk10.to_owned(),
+                npv10.to_owned(),
+                npk11.to_owned(),
+                npv11.to_owned(),
             ];
             past_valid_length += 1;
         }
-        eprintln!("[STAGE] Generation: {:.2}s ({} frames)", t_gen.elapsed().as_secs_f64(), generated_frames.len());
+        eprintln!(
+            "[STAGE] Generation: {:.2}s ({} frames)",
+            t_gen.elapsed().as_secs_f64(),
+            generated_frames.len()
+        );
 
         if generated_frames.is_empty() {
             return Ok(Vec::new());
@@ -356,12 +501,13 @@ impl MossTtsNano {
         let lengths_tv = TensorView::<i64>::from_owned(vec![num_frames as i64], vec![1]);
 
         let t_codec_fwd = Instant::now();
-        let (audio_tv, audio_lens_tv) = self.codec.forward_with_workspace(
-            &mut self.codec_ws,
-            codes_tv,
-            lengths_tv,
+        let (audio_tv, audio_lens_tv) =
+            self.codec
+                .forward_with_workspace(&mut self.codec_ws, codes_tv, lengths_tv);
+        eprintln!(
+            "[CODEC] forward: {:.0}ms",
+            t_codec_fwd.elapsed().as_secs_f64() * 1000.0
         );
-        eprintln!("[CODEC] forward: {:.0}ms", t_codec_fwd.elapsed().as_secs_f64() * 1000.0);
 
         let audio_len = audio_lens_tv.data.first().map(|&v| v as usize).unwrap_or(0);
 
@@ -378,7 +524,12 @@ impl MossTtsNano {
             }
         }
         let max_abs = interleaved.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-        eprintln!("[STAGE] Codec decode: {:.2}ms ({} samples, max_abs={:.6})", t_codec.elapsed().as_secs_f64() * 1000.0, audio_len, max_abs);
+        eprintln!(
+            "[STAGE] Codec decode: {:.2}ms ({} samples, max_abs={:.6})",
+            t_codec.elapsed().as_secs_f64() * 1000.0,
+            audio_len,
+            max_abs
+        );
 
         Ok(interleaved)
     }
@@ -402,7 +553,9 @@ fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "Hello, this is a test of MOSS TTS Nano in pure Rust.".to_string());
     let output_path = "output_moss.wav";
-    let voice = std::env::args().nth(2).unwrap_or_else(|| "Junhao".to_string());
+    let voice = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "Junhao".to_string());
 
     println!("=== MOSS-TTS-Nano Pure Rust Inference ===");
     println!("Text: {}", text);
