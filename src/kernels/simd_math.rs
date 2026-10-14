@@ -29,7 +29,9 @@ pub(crate) fn exp<S: Simd>(x: f32x16<S>) -> f32x16<S> {
     ];
 
     let simd = x.simd;
-    let x = x.max(f32x16::splat(simd, -87.3)).min(f32x16::splat(simd, 88.0));
+    let x = x
+        .max(f32x16::splat(simd, -87.3))
+        .min(f32x16::splat(simd, 88.0));
     let n = (x * f32x16::splat(simd, LOG2E)).round_ties_even();
     let r = (-n).mul_add(f32x16::splat(simd, LN2_HI), x);
     let r = (-n).mul_add(f32x16::splat(simd, LN2_LO), r);
@@ -46,6 +48,97 @@ pub(crate) fn exp<S: Simd>(x: f32x16<S>) -> f32x16<S> {
     // n is integral and within [-126, 127], so n + 127 is a normal exponent.
     let bits = (i32x16::truncate_from(n) + i32x16::splat(simd, 127)) << 23;
     y * bits.bitcast::<f32x16<S>>()
+}
+
+/// `sin(x)` for each lane, to about an ulp of the largest of it and 1e-7.
+///
+/// Splits `x = n·π/2 + r` with `|r| <= π/4` (`π/2` in three parts, exact for
+/// `|x| <= 8192`), evaluates the sine or cosine of `r` by Cephes' polynomials
+/// as `n` says, and negates them in the lower half-turn. A lane past 8192,
+/// infinite or NaN is computed in f64 instead.
+#[inline(always)]
+pub(crate) fn sin<S: Simd>(x: f32x16<S>) -> f32x16<S> {
+    sin_quadrants(x, 0)
+}
+
+/// `cos(x)`, as `sin(x + π/2)`: [`sin`] a quadrant on.
+#[inline(always)]
+pub(crate) fn cos<S: Simd>(x: f32x16<S>) -> f32x16<S> {
+    sin_quadrants(x, 1)
+}
+
+/// `sin(x + quarters·π/2)`.
+#[inline(always)]
+fn sin_quadrants<S: Simd>(x: f32x16<S>, quarters: i32) -> f32x16<S> {
+    const LIMIT: f32 = 8192.0;
+    let simd = x.simd;
+    let in_range = x.abs().simd_le(f32x16::splat(simd, LIMIT));
+    if in_range.all_true() {
+        return sin_reduced(x, quarters);
+    }
+    // Lane by lane, so that each result is the same whatever else shares its
+    // vector.
+    let mut lanes = [0.0f32; 16];
+    let mut ys = [0.0f32; 16];
+    x.store_array(&mut lanes);
+    sin_reduced(in_range.select(x, f32x16::splat(simd, 0.0)), quarters).store_array(&mut ys);
+    for (y, &v) in ys.iter_mut().zip(&lanes) {
+        if v.abs() > LIMIT || v.is_nan() {
+            *y = (v as f64 + quarters as f64 * std::f64::consts::FRAC_PI_2).sin() as f32;
+        }
+    }
+    f32x16::from_slice(simd, &ys)
+}
+
+/// [`sin_quadrants`] for lanes no larger than its `LIMIT`.
+#[inline(always)]
+fn sin_reduced<S: Simd>(x: f32x16<S>, quarters: i32) -> f32x16<S> {
+    const FRAC_2_PI: f32 = std::f32::consts::FRAC_2_PI;
+    // π/2 = DP1 + DP2 + DP3; DP1 and DP2 have few enough bits that n·DPi is
+    // exact for the n of |x| <= 8192.
+    const DP1: f32 = 1.5703125;
+    const DP2: f32 = 4.837513e-4;
+    const DP3: f32 = 7.54979e-8;
+    // Cephes `sinf` and `cosf` coefficients on [-π/4, π/4].
+    const S: [f32; 3] = [-1.6666655e-1, 8.332161e-3, -1.9515296e-4];
+    const C: [f32; 3] = [4.1666646e-2, -1.3887316e-3, 2.4433157e-5];
+
+    let simd = x.simd;
+    // Below 2^-12, sin(r) rounds to r and cos(r) to 1. Such lanes are zeroed
+    // before any arithmetic and their results set at the end: their powers
+    // (and a subnormal x itself) would be subnormal, which x86 multiplies by
+    // microcode, many times slower.
+    let tiny = f32x16::splat(simd, 1.0 / 4096.0);
+    let zero = f32x16::splat(simd, 0.0);
+    let small_x = x.abs().simd_lt(tiny);
+    let x0 = small_x.select(zero, x);
+    let n = (x0 * f32x16::splat(simd, FRAC_2_PI)).round_ties_even();
+    let r = (-n).mul_add(f32x16::splat(simd, DP1), x0);
+    let r = (-n).mul_add(f32x16::splat(simd, DP2), r);
+    let r = (-n).mul_add(f32x16::splat(simd, DP3), r);
+    // (Near a multiple of π/2, r is small but normal; its fourth power need not be.)
+    let small_r = r.abs().simd_lt(tiny);
+    let r_poly = small_r.select(zero, r);
+    let r2 = r_poly * r_poly;
+    // r + r³·(S0 + r²·(S1 + r²·S2))
+    let ps = f32x16::splat(simd, S[2])
+        .mul_add(r2, f32x16::splat(simd, S[1]))
+        .mul_add(r2, f32x16::splat(simd, S[0]));
+    let sin_r = small_r.select(r, (ps * r2).mul_add(r_poly, r_poly));
+    // 1 - r²/2 + r⁴·(C0 + r²·(C1 + r²·C2))
+    let pc = f32x16::splat(simd, C[2])
+        .mul_add(r2, f32x16::splat(simd, C[1]))
+        .mul_add(r2, f32x16::splat(simd, C[0]));
+    let cos_r = (pc * r2).mul_add(r2, f32x16::splat(simd, -0.5).mul_add(r2, f32x16::splat(simd, 1.0)));
+    let q = i32x16::truncate_from(n) + i32x16::splat(simd, quarters);
+    let odd = (q & i32x16::splat(simd, 1)).simd_eq(i32x16::splat(simd, 1));
+    let y = odd.select(cos_r, sin_r);
+    // Quadrants 2 and 3 negate: bit 1 of q moved to the sign bit.
+    let sign = (q & i32x16::splat(simd, 2)) << 30;
+    let y = (y.bitcast::<i32x16<S>>() ^ sign).bitcast::<f32x16<S>>();
+    // A small x was taken as 0: cos(0) = 1 came out above; the sine is x itself
+    // (keeping its sign, and exact for a subnormal x).
+    if quarters == 0 { small_x.select(x, y) } else { y }
 }
 
 /// `1 / (1 + exp(-x))`. Saturates to 0 and 1 where `exp(-x)` is clamped.
@@ -77,7 +170,13 @@ pub(crate) fn tanh<S: Simd>(x: f32x16<S>) -> f32x16<S> {
 #[inline(always)]
 pub(crate) fn erf<S: Simd>(x: f32x16<S>) -> f32x16<S> {
     const P: f32 = 0.3275911;
-    const A: [f32; 5] = [0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429];
+    const A: [f32; 5] = [
+        0.254829592,
+        -0.284496736,
+        1.421413741,
+        -1.453152027,
+        1.061405429,
+    ];
 
     let simd = x.simd;
     let one = f32x16::splat(simd, 1.0);
@@ -118,8 +217,8 @@ pub(crate) fn gelu<S: Simd>(x: f32x16<S>) -> f32x16<S> {
 pub(crate) fn fast_gelu<S: Simd>(x: f32x16<S>) -> f32x16<S> {
     let simd = x.simd;
     let x3 = (x * x) * x;
-    let inner = f32x16::splat(simd, 0.7978845608028654)
-        * f32x16::splat(simd, 0.044715).mul_add(x3, x);
+    let inner =
+        f32x16::splat(simd, 0.7978845608028654) * f32x16::splat(simd, 0.044715).mul_add(x3, x);
     (x * f32x16::splat(simd, 0.5)) * (f32x16::splat(simd, 1.0) + tanh(inner))
 }
 
@@ -235,7 +334,10 @@ mod tests {
     #[test]
     fn test_exp_saturates_outside_its_range() {
         for level in levels() {
-            let x = [-1000.0, -200.0, -88.0, -87.3, 88.0, 89.0, 500.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            let x = [
+                -1000.0, -200.0, -88.0, -87.3, 88.0, 89.0, 500.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0,
+            ];
             let got = exp_of(level, &x);
             for (i, &g) in got.iter().enumerate().take(7) {
                 assert!(g.is_finite() && g > 0.0, "{level:?} x={}: got {g}", x[i]);
@@ -243,6 +345,80 @@ mod tests {
             assert!(got[0] < 1e-37, "{level:?}: exp(-1000) = {}", got[0]);
             assert!(got[6] > 1e37, "{level:?}: exp(500) = {}", got[6]);
             assert_eq!(got[7], 1.0, "{level:?}: exp(0)");
+        }
+    }
+
+    #[simd]
+    fn sin_cos_all<S: Simd>(simd: S, x: &[f32; 16], out: &mut [[f32; 16]; 2]) {
+        let x = f32x16::load_array_ref(simd, x);
+        sin(x).store_array(&mut out[0]);
+        cos(x).store_array(&mut out[1]);
+    }
+
+    /// `sin` and `cos` against f64 over [-8192, 8192] (finely near 0, where the
+    /// reduction does nothing, and coarsely out to where it is exact), within
+    /// two ulp of the larger of the result and 1/2; and past that, and at
+    /// infinity and NaN, as `f32::sin` and `cos` (in f64) give.
+    #[test]
+    fn test_sin_cos_are_accurate_at_every_level() {
+        let fine = (-20000..=20000).map(|i| i as f32 * 1e-3);
+        let coarse = (-81920..=81920).map(|i| i as f32 * 0.1 + 0.0123);
+        let xs: Vec<f32> = fine.chain(coarse).chain([8192.0, -8192.0]).collect();
+        for level in levels() {
+            let mut worst = [0.0f64; 2];
+            for chunk in xs.chunks(16) {
+                let mut x = [0.0f32; 16];
+                x[..chunk.len()].copy_from_slice(chunk);
+                let mut got = [[0.0; 16]; 2];
+                simd_call!(level, sin_cos_all(&x, &mut got));
+                for (i, &x) in x.iter().enumerate().take(chunk.len()) {
+                    for (k, want) in [(x as f64).sin(), (x as f64).cos()].into_iter().enumerate() {
+                        let err = (got[k][i] as f64 - want).abs() / want.abs().max(0.5);
+                        worst[k] = worst[k].max(err / f32::EPSILON as f64);
+                    }
+                }
+            }
+            assert!(worst[0] <= 2.0 && worst[1] <= 2.0, "{level:?}: {worst:?} ulp");
+
+            // Below 2^-12, down to subnormals: sin is x (bit for bit, -0 too)
+            // and cos is 1, as rounding the true values gives.
+            let x = [
+                0.0, -0.0, 1e-40, -1e-40, f32::MIN_POSITIVE, -1e-30, 1e-20, 1e-5, -2e-4,
+                1.0 / 4097.0, -1.0 / 4097.0, 3e-38, -5e-39, 1e-10, 2.4e-4, -1e-7,
+            ];
+            let mut got = [[0.0; 16]; 2];
+            simd_call!(level, sin_cos_all(&x, &mut got));
+            for (i, &x) in x.iter().enumerate() {
+                assert_eq!(got[0][i].to_bits(), x.to_bits(), "{level:?}: sin({x:e})");
+                assert_eq!(got[1][i], 1.0, "{level:?}: cos({x:e})");
+            }
+
+            // Lanes out of range take f64; the others in their vector are what
+            // they are in a vector all in range.
+            let x = [
+                1e5, -3e6, f32::INFINITY, f32::NAN, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0,
+                10.0, 11.0, 12.0,
+            ];
+            let mut in_range = x;
+            in_range[..4].fill(0.5);
+            let (mut got, mut alone) = ([[0.0; 16]; 2], [[0.0; 16]; 2]);
+            simd_call!(level, sin_cos_all(&x, &mut got));
+            simd_call!(level, sin_cos_all(&in_range, &mut alone));
+            for (i, &x) in x.iter().enumerate() {
+                let want = if i < 4 {
+                    [(x as f64).sin() as f32, (x as f64).cos() as f32]
+                } else {
+                    [alone[0][i], alone[1][i]]
+                };
+                for k in 0..2 {
+                    assert!(
+                        got[k][i].to_bits() == want[k].to_bits() || got[k][i].is_nan() && want[k].is_nan(),
+                        "{level:?} x={x}: {} vs {}",
+                        got[k][i],
+                        want[k]
+                    );
+                }
+            }
         }
     }
 }
