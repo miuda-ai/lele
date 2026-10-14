@@ -1,10 +1,15 @@
+use super::ir::{Graph, Node, NodeId};
 use super::{Allocator, AnalysisData, Compiler, sanitize_name};
 use crate::model::onnx_proto::{NodeProto, ValueInfoProto};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
 pub(crate) struct OpContext<'a> {
+    /// The node, lowered.
     pub node: &'a NodeProto,
+    /// The graph holding the node, and its id there.
+    pub graph: &'a Graph,
+    pub id: NodeId,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub buf_expr: String,
@@ -24,6 +29,39 @@ impl<'a> OpContext<'a> {
     pub fn tab(&self) -> String {
         "    ".repeat(self.indent)
     }
+
+    /// The node in the IR.
+    pub fn ir(&self) -> &'a Node {
+        self.graph.node(self.id)
+    }
+}
+
+/// Expression reading a weight of ONNX type `data_type` from the weights
+/// file, as `target_type` (`"i64"`, or f32 otherwise).
+pub(crate) fn weight_expr(
+    offset: usize,
+    len: usize,
+    shape: &[usize],
+    data_type: i32,
+    target_type: &str,
+) -> String {
+    let accessor = if target_type == "i64" {
+        match data_type {
+            6 => "weight_i32_i64",
+            9 => "weight_bool_i64",
+            _ => "weight_i64",
+        }
+    } else {
+        match data_type {
+            2 => "weight_u8",
+            3 => "weight_i8",
+            6 => "weight_i32_f32",
+            7 => "weight_i64_f32",
+            10 => "weight_f16",
+            _ => "weight_f32",
+        }
+    };
+    format!("self.{accessor}({offset}, {len}, &{shape:?})")
 }
 
 pub(crate) fn collect_recursive_metrics(
@@ -63,573 +101,135 @@ pub(crate) fn collect_recursive_metrics(
     }
 }
 
-pub(crate) fn infer_variable_types(
-    nodes: &[&NodeProto],
-    int64_map: &HashMap<String, (Vec<i64>, Vec<usize>)>,
-    graph_inputs: &[ValueInfoProto],
-    known_weights: &HashMap<String, (usize, usize, Vec<usize>, i32)>,
-) -> HashMap<String, String> {
-    fn collect_nodes_recursive<'a>(nodes: &[&'a NodeProto], out: &mut Vec<&'a NodeProto>) {
-        for node in nodes {
-            out.push(*node);
-            for attr in &node.attribute {
-                if let Some(g) = &attr.g {
-                    let sub_nodes: Vec<&NodeProto> = g.node.iter().collect();
-                    collect_nodes_recursive(&sub_nodes, out);
-                }
-            }
-        }
-    }
+/// Element type of the `TensorView` holding each value, by sanitized name,
+/// for `g` and its subgraphs: `"i64"` or `"f32"`. Expects
+/// [`infer_dtypes`](super::passes::infer_dtypes) to have run.
+///
+/// int64, int32 and bool tensors are `"i64"`, everything else `"f32"`, with
+/// the exceptions of lele's kernels: 8-bit quantized data is held in f32,
+/// and so are the int32 results of `MatMulInteger` and `ConvInteger`, the
+/// indices `TopK` returns and the result of `Mod`. An operator whose output takes the type of
+/// an input takes its representation too, so these propagate.
+pub(crate) fn variable_types(g: &crate::compiler::ir::Graph) -> HashMap<String, String> {
+    use crate::compiler::ir::{DType, Graph, Op, ValueId};
+    use crate::compiler::passes::follows_input;
 
-    let mut all_nodes: Vec<&NodeProto> = Vec::new();
-    collect_nodes_recursive(nodes, &mut all_nodes);
-
-    let mut producer_map: HashMap<String, &NodeProto> = HashMap::new();
-    for node in &all_nodes {
-        for out in &node.output {
-            if !out.is_empty() {
-                producer_map.insert(out.clone(), *node);
-            }
-        }
-    }
-
-    let constant_of_shape_output_type = |node: &NodeProto| -> String {
-        let mut out_type = "f32".to_string();
-        if let Some(attr) = node.attribute.iter().find(|a| a.name == "value") {
-            if let Some(t) = &attr.t {
-                let dt = t.data_type;
-                if dt == 6 || dt == 7 {
-                    out_type = "i64".to_string();
-                } else if dt == 1 || dt == 10 {
-                    out_type = "f32".to_string();
-                } else if !t.int64_data.is_empty() || !t.int32_data.is_empty() {
-                    out_type = "i64".to_string();
-                } else if !t.float_data.is_empty() {
-                    out_type = "f32".to_string();
-                }
-            }
-        }
-        out_type
+    let of_dtype = |t: DType| match t {
+        DType::I64 | DType::I32 | DType::Bool => "i64",
+        _ => "f32",
     };
-
+    fn walk(
+        g: &Graph,
+        outer: &HashMap<String, &'static str>,
+        of_dtype: &dyn Fn(DType) -> &'static str,
+        out: &mut HashMap<String, String>,
+    ) {
+        let mut repr: HashMap<ValueId, &'static str> = HashMap::new();
+        let captures: HashSet<ValueId> = g.captures().collect();
+        for v in g.value_ids() {
+            let value = g.value(v);
+            if value.producer().is_none() {
+                let r = outer
+                    .get(&value.name)
+                    .filter(|_| captures.contains(&v))
+                    .copied()
+                    .unwrap_or_else(|| of_dtype(value.dtype));
+                repr.insert(v, r);
+            }
+        }
+        for (_, node) in g.nodes() {
+            let subgraphs = node.op.subgraphs();
+            let mut sub_reprs: Vec<HashMap<String, String>> = Vec::new();
+            if !subgraphs.is_empty() {
+                let mut scope = outer.clone();
+                for (&v, &r) in &repr {
+                    scope.insert(g.value(v).name.clone(), r);
+                }
+                for sub in &subgraphs {
+                    let mut sub_out = HashMap::new();
+                    walk(sub, &scope, of_dtype, &mut sub_out);
+                    sub_reprs.push(sub_out.clone());
+                    out.extend(sub_out);
+                }
+            }
+            for (i, v) in node.outputs().iter().enumerate() {
+                let Some(v) = *v else { continue };
+                let f32_kernel = match &node.op {
+                    Op::Onnx { op_type, .. } => {
+                        matches!(
+                            op_type.as_str(),
+                            "MatMulInteger" | "ConvInteger" | "TopK" | "Mod"
+                        )
+                    }
+                    _ => false,
+                };
+                // If and Loop take the representation of their subgraphs'
+                // outputs.
+                let from_subgraph = |sub: &Graph, j: usize, reprs: &HashMap<String, String>| {
+                    sub.outputs
+                        .get(j)
+                        .and_then(|&o| reprs.get(&sanitize_name(&sub.value(o).name)))
+                        .map(|r| if r == "i64" { "i64" } else { "f32" })
+                };
+                let r = if f32_kernel {
+                    "f32"
+                } else if let Op::If { then_branch, .. } = &node.op {
+                    from_subgraph(then_branch, i, &sub_reprs[0])
+                        .unwrap_or_else(|| of_dtype(g.value(v).dtype))
+                } else if let Op::Loop { body } = &node.op {
+                    from_subgraph(body, i + 1, &sub_reprs[0])
+                        .unwrap_or_else(|| of_dtype(g.value(v).dtype))
+                } else {
+                    match follows_input(&node.op, i).and_then(|k| node.input(k)) {
+                        Some(input) => repr[&input],
+                        None => of_dtype(g.value(v).dtype),
+                    }
+                };
+                repr.insert(v, r);
+            }
+        }
+        for (v, r) in repr {
+            out.insert(sanitize_name(&g.value(v).name), r.to_string());
+        }
+    }
     let mut types = HashMap::new();
-    let mut fixed_types = std::collections::HashSet::new();
-
-    // Pre-populate with graph inputs
-    for input in graph_inputs {
-        let name = sanitize_name(&input.name);
-        let mut ty_str = "f32".to_string();
-
-        if let Some(ty) = &input.r#type {
-            if let Some(val) = &ty.value {
-                use crate::model::onnx_proto::type_proto::Value;
-                match val {
-                    Value::TensorType(tt) => {
-                        // 6=INT32, 7=INT64, 9=BOOL
-                        if tt.elem_type == 7 || tt.elem_type == 6 || tt.elem_type == 9 {
-                            ty_str = "i64".to_string();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        types.insert(name.clone(), ty_str);
-        fixed_types.insert(name);
-    }
-
-    // Pre-populate with int64_map constants
-    for name in int64_map.keys() {
-        let sname = sanitize_name(name);
-        types.insert(sname.clone(), "i64".to_string());
-        fixed_types.insert(sname);
-    }
-
-    // Pre-populate with weights
-    for (name, (_, _, _, ty)) in known_weights {
-        if *ty == 7 || *ty == 6 || *ty == 9 {
-            types.insert(name.clone(), "i64".to_string());
-            fixed_types.insert(name.clone());
-        } else if *ty == 1 || *ty == 11 {
-            types.insert(name.clone(), "f32".to_string());
-            fixed_types.insert(name.clone());
-        }
-    }
-
-    // Propagation pass
-    let mut changed = true;
-    let mut passes = 0;
-    while changed && passes < 100 {
-        changed = false;
-        passes += 1;
-        for node in &all_nodes {
-            let op = node.op_type.as_str();
-
-            match op {
-                "ConstantOfShape" => {
-                    // ConstantOfShape output type depends on the "value" attribute.
-                    // Default is float (f32) if not specified.
-                    let mut out_type = "f32".to_string();
-                    if let Some(attr) = node.attribute.iter().find(|a| a.name == "value") {
-                        if let Some(t) = &attr.t {
-                            let dt = t.data_type;
-                            if dt == 6 || dt == 7 || dt == 9 {
-                                out_type = "i64".to_string();
-                            } else if dt == 1 || dt == 10 || dt == 11 {
-                                out_type = "f32".to_string();
-                            } else if !t.int64_data.is_empty() || !t.int32_data.is_empty() {
-                                out_type = "i64".to_string();
-                            } else if !t.float_data.is_empty() {
-                                out_type = "f32".to_string();
-                            }
-                        }
-                    }
-                    for out in &node.output {
-                        if !out.is_empty() {
-                            let name = sanitize_name(out);
-                            if types.get(&name) != Some(&out_type) {
-                                types.insert(name, out_type.clone());
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-                "Shape" | "Size" | "ArgMax" | "NonZero" => {
-                    for out in &node.output {
-                        if !out.is_empty() {
-                            let name = sanitize_name(out);
-                            if types.get(&name) != Some(&"i64".to_string()) {
-                                types.insert(name, "i64".to_string());
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-                "Greater" | "Less" | "Equal" | "And" | "Or" | "Xor" | "Not" | "GreaterOrEqual"
-                | "LessOrEqual" => {
-                    for out in &node.output {
-                        if !out.is_empty() {
-                            let name = sanitize_name(out);
-                            if types.get(&name) != Some(&"i64".to_string()) {
-                                types.insert(name, "i64".to_string());
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-                "Exp" | "Log" | "Sqrt" | "Sin" | "Cos" | "Sigmoid" | "Tanh" | "Softmax" => {
-                    for out in &node.output {
-                        if !out.is_empty() {
-                            let name = sanitize_name(out);
-                            if types.get(&name) != Some(&"f32".to_string()) {
-                                types.insert(name, "f32".to_string());
-                                changed = true;
-                            }
-                        }
-                    }
-                    for inp in &node.input {
-                        if !inp.is_empty() {
-                            let name = sanitize_name(inp);
-                            if !fixed_types.contains(&name)
-                                && types.get(&name) != Some(&"f32".to_string())
-                            {
-                                types.insert(name, "f32".to_string());
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-                "Conv" | "ConvInteger" | "Gemm" | "BatchNormalization" | "LayerNormalization" => {
-                    // These ops always produce f32 output regardless of input types
-                    for out in &node.output {
-                        if !out.is_empty() {
-                            let name = sanitize_name(out);
-                            if types.get(&name) != Some(&"f32".to_string()) {
-                                types.insert(name, "f32".to_string());
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-                "Cast" => {
-                    let to = node.attribute.iter().find(|a| a.name == "to").map(|a| a.i);
-                    let output_type = if to == Some(7) || to == Some(6) || to == Some(9) {
-                        "i64".to_string()
-                    } else {
-                        "f32".to_string()
-                    };
-                    for out in &node.output {
-                        if !out.is_empty() {
-                            let name = sanitize_name(out);
-                            if types.get(&name) != Some(&output_type) {
-                                types.insert(name, output_type.clone());
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-                "Reshape" | "Unsqueeze" | "Squeeze" | "Slice" | "Flatten" | "Transpose"
-                | "Identity" | "Add" | "Sub" | "Mul" | "Div" | "Tile" | "Split" | "Expand"
-                | "Pow" | "Clip" | "PRelu" | "LeakyRelu" | "Range" | "ReduceSum" | "ReduceMean"
-                | "ReduceMax" | "ReduceProd" | "Pad" | "MaxPool" | "Resize" | "Neg"
-                | "GatherElements" => {
-                    // All data-carrying inputs and outputs share the same type
-                    let relevant_inputs: Vec<String> = if op == "Pad" {
-                        node.input
-                            .iter()
-                            .take(1)
-                            .map(|s| sanitize_name(s))
-                            .collect()
-                    } else {
-                        node.input.iter().map(|s| sanitize_name(s)).collect()
-                    };
-
-                    let mut has_i64 = false;
-                    let mut has_f32 = false;
-
-                    for (i, inp) in relevant_inputs.iter().enumerate() {
-                        if inp.is_empty() {
-                            continue;
-                        }
-                        // Skip metadata inputs
-                        if (op == "Reshape"
-                            || op == "Expand"
-                            || op == "Unsqueeze"
-                            || op == "Squeeze"
-                            || op == "Tile"
-                            || op == "Split")
-                            && i == 1
-                        {
-                            continue;
-                        }
-                        if op == "Slice" && i >= 1 {
-                            continue;
-                        }
-                        // For Pad, only input 0 is data
-                        if op == "Pad" && i >= 1 {
-                            continue;
-                        }
-                        // For the reduce ops, input 1 is the i64 axes tensor
-                        if matches!(op, "ReduceSum" | "ReduceMean" | "ReduceMax" | "ReduceProd")
-                            && i == 1
-                        {
-                            continue;
-                        }
-                        if op == "GatherElements" && i >= 1 {
-                            continue;
-                        }
-
-                        if let Some(t) = types.get(inp) {
-                            if t == "i64" {
-                                has_i64 = true;
-                            }
-                            if t == "f32" {
-                                has_f32 = true;
-                            }
-                        }
-                    }
-
-                    for out in &node.output {
-                        if out.is_empty() {
-                            continue;
-                        }
-                        if let Some(t) = types.get(&sanitize_name(out)) {
-                            if t == "i64" {
-                                has_i64 = true;
-                            }
-                            if t == "f32" {
-                                has_f32 = true;
-                            }
-                        }
-                    }
-
-                    // If any f32 is involved, we prefer f32 to avoid propagating i64 plague
-                    // into float math.
-                    let t_to_prop = if has_f32 {
-                        Some("f32".to_string())
-                    } else if has_i64 {
-                        Some("i64".to_string())
-                    } else {
-                        None
-                    };
-
-                    if let Some(t) = t_to_prop {
-                        for (i, inp) in node.input.iter().enumerate() {
-                            if inp.is_empty() {
-                                continue;
-                            }
-                            if (op == "Reshape"
-                                || op == "Expand"
-                                || op == "Unsqueeze"
-                                || op == "Squeeze"
-                                || op == "Tile"
-                                || op == "Split")
-                                && i == 1
-                            {
-                                continue;
-                            }
-                            if op == "Slice" && i >= 1 {
-                                continue;
-                            }
-                            if op == "Pad" && i >= 1 {
-                                continue;
-                            }
-                            // The reduce ops' axes tensor must keep its i64 type
-                            if matches!(op, "ReduceSum" | "ReduceMean" | "ReduceMax" | "ReduceProd")
-                                && i == 1
-                            {
-                                continue;
-                            }
-                            if op == "GatherElements" && i >= 1 {
-                                continue;
-                            }
-
-                            let name = sanitize_name(inp);
-                            // Avoid overwriting hard-coded types from inputs/weights
-                            if !fixed_types.contains(&name) && types.get(&name) != Some(&t) {
-                                types.insert(name, t.clone());
-                                changed = true;
-                            }
-                        }
-                        for out in &node.output {
-                            if out.is_empty() {
-                                continue;
-                            }
-                            let name = sanitize_name(out);
-                            if types.get(&name) != Some(&t) {
-                                types.insert(name, t.clone());
-                                changed = true;
-                            }
-                        }
-                    }
-
-                    // Metadata inputs are ALWAYS i64
-                    for (i, inp) in node.input.iter().enumerate() {
-                        if inp.is_empty() {
-                            continue;
-                        }
-                        let is_metadata = match op {
-                            "Reshape" | "Expand" | "Unsqueeze" | "Squeeze" | "Tile" | "Split" => {
-                                i == 1
-                            }
-                            "Slice" => i >= 1,
-                            "Pad" => i == 1,
-                            // The reduce ops take the axes as an i64 input tensor
-                            "ReduceSum" | "ReduceMean" | "ReduceMax" | "ReduceProd" => i == 1,
-                            _ => false,
-                        };
-                        if is_metadata {
-                            let name = sanitize_name(inp);
-                            if types.get(&name) != Some(&"i64".to_string()) {
-                                types.insert(name, "i64".to_string());
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-                "Concat" => {
-                    // Concat can have mixed types (e.g., embedding_concat with i64 shape + f32 weight)
-                    // Determine output type from inputs, prefer f32 over i64
-                    let mut has_f32 = false;
-                    let mut has_i64 = false;
-
-                    // Special-case ConstantOfShape + Concat pattern: output should be f32 when ConstantOfShape value is float
-                    let mut has_const_of_shape_f32 = false;
-                    for inp in &node.input {
-                        if inp.is_empty() {
-                            continue;
-                        }
-                        if let Some(prod) = producer_map.get(inp) {
-                            if prod.op_type == "ConstantOfShape" {
-                                if constant_of_shape_output_type(prod) == "f32" {
-                                    has_const_of_shape_f32 = true;
-                                }
-                            }
-                        }
-                    }
-
-                    for inp in &node.input {
-                        if inp.is_empty() {
-                            continue;
-                        }
-                        let name = sanitize_name(inp);
-                        if let Some(t) = types.get(&name) {
-                            if t == "f32" {
-                                has_f32 = true;
-                            } else if t == "i64" {
-                                has_i64 = true;
-                            }
-                        }
-                    }
-
-                    let t = if has_const_of_shape_f32 || has_f32 {
-                        "f32".to_string()
-                    } else if has_i64 {
-                        "i64".to_string()
-                    } else {
-                        "f32".to_string()
-                    };
-
-                    for out in &node.output {
-                        if out.is_empty() {
-                            continue;
-                        }
-                        let name = sanitize_name(out);
-                        if types.get(&name) != Some(&t) {
-                            types.insert(name, t.clone());
-                            changed = true;
-                        }
-                    }
-                }
-                "Gather" | "GatherND" => {
-                    // Input 0 and output share type. Input 1 (indices) is i64.
-                    let mut has_f32 = false;
-                    let mut has_i64 = false;
-                    if !node.input.is_empty() && !node.input[0].is_empty() {
-                        if let Some(t) = types.get(&sanitize_name(&node.input[0])) {
-                            if t == "f32" {
-                                has_f32 = true;
-                            }
-                            if t == "i64" {
-                                has_i64 = true;
-                            }
-                        }
-                    }
-                    if !node.output.is_empty() && !node.output[0].is_empty() {
-                        if let Some(t) = types.get(&sanitize_name(&node.output[0])) {
-                            if t == "f32" {
-                                has_f32 = true;
-                            }
-                            if t == "i64" {
-                                has_i64 = true;
-                            }
-                        }
-                    }
-
-                    let t_to_prop = if has_f32 {
-                        Some("f32".to_string())
-                    } else if has_i64 {
-                        Some("i64".to_string())
-                    } else {
-                        None
-                    };
-
-                    if let Some(t) = t_to_prop {
-                        if !node.input.is_empty() && !node.input[0].is_empty() {
-                            let name = sanitize_name(&node.input[0]);
-                            if !fixed_types.contains(&name) && types.get(&name) != Some(&t) {
-                                types.insert(name, t.clone());
-                                changed = true;
-                            }
-                        }
-                        if !node.output.is_empty() && !node.output[0].is_empty() {
-                            let name = sanitize_name(&node.output[0]);
-                            if types.get(&name) != Some(&t) {
-                                types.insert(name, t.clone());
-                                changed = true;
-                            }
-                        }
-                    }
-                    if node.input.len() >= 2 && !node.input[1].is_empty() {
-                        let name = sanitize_name(&node.input[1]);
-                        if types.get(&name) != Some(&"i64".to_string()) {
-                            types.insert(name, "i64".to_string());
-                            changed = true;
-                        }
-                    }
-                }
-                "Where" => {
-                    // Inputs 1, 2 and output share type. Input 0 is condition (typically i64).
-                    let mut has_f32 = false;
-                    let mut has_i64 = false;
-                    for idx in [1, 2] {
-                        if node.input.len() > idx && !node.input[idx].is_empty() {
-                            if let Some(t) = types.get(&sanitize_name(&node.input[idx])) {
-                                if t == "f32" {
-                                    has_f32 = true;
-                                }
-                                if t == "i64" {
-                                    has_i64 = true;
-                                }
-                            }
-                        }
-                    }
-                    if !node.output.is_empty() && !node.output[0].is_empty() {
-                        if let Some(t) = types.get(&sanitize_name(&node.output[0])) {
-                            if t == "f32" {
-                                has_f32 = true;
-                            }
-                            if t == "i64" {
-                                has_i64 = true;
-                            }
-                        }
-                    }
-
-                    let t_to_prop = if has_f32 {
-                        Some("f32".to_string())
-                    } else if has_i64 {
-                        Some("i64".to_string())
-                    } else {
-                        None
-                    };
-
-                    if let Some(t) = t_to_prop {
-                        for idx in [1, 2] {
-                            if node.input.len() > idx && !node.input[idx].is_empty() {
-                                let name = sanitize_name(&node.input[idx]);
-                                if !fixed_types.contains(&name) && types.get(&name) != Some(&t) {
-                                    types.insert(name, t.clone());
-                                    changed = true;
-                                }
-                            }
-                        }
-                        if !node.output.is_empty() && !node.output[0].is_empty() {
-                            let name = sanitize_name(&node.output[0]);
-                            if types.get(&name) != Some(&t) {
-                                types.insert(name, t.clone());
-                                changed = true;
-                            }
-                        }
-                    }
-
-                    // Input 0 is condition. Only set to i64 if NOT already typed as f32.
-                    if !node.input.is_empty() && !node.input[0].is_empty() {
-                        let name = sanitize_name(&node.input[0]);
-                        if types.get(&name).is_none() {
-                            types.insert(name, "i64".to_string());
-                            changed = true;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // Default everything else to f32
-    for node in nodes {
-        for out in &node.output {
-            if !out.is_empty() {
-                let name = sanitize_name(out);
-                if !types.contains_key(&name) {
-                    types.insert(name, "f32".to_string());
-                }
-            }
-        }
-        for inp in &node.input {
-            if !inp.is_empty() {
-                let name = sanitize_name(inp);
-                if !types.contains_key(&name) {
-                    types.insert(name, "f32".to_string());
-                }
-            }
-        }
-    }
+    walk(g, &HashMap::new(), &of_dtype, &mut types);
     types
 }
 
+/// A run of nodes of one IR graph to generate code for, in execution order:
+/// their ids and their lowered protos, which overrides and patterns see.
+#[derive(Clone, Copy)]
+pub(crate) struct Nodes<'a> {
+    pub graph: &'a Graph,
+    pub ids: &'a [NodeId],
+    pub protos: &'a [&'a NodeProto],
+}
+
+impl<'a> Nodes<'a> {
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    fn slice(&self, range: std::ops::Range<usize>) -> Nodes<'a> {
+        Nodes {
+            graph: self.graph,
+            ids: &self.ids[range.clone()],
+            protos: &self.protos[range],
+        }
+    }
+}
+
+/// The ids and lowered protos of `g`'s nodes, for [`Nodes`].
+pub(crate) fn lower_nodes(g: &Graph) -> (Vec<NodeId>, Vec<NodeProto>) {
+    let ids = g.node_ids();
+    let protos = ids.iter().map(|&id| g.node_proto(id)).collect();
+    (ids, protos)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_partitioned_graph<W: Write>(
-    nodes: &[&NodeProto],           // Top level nodes
+    nodes: Nodes<'_>,               // Top level nodes
     chunk_writer: &mut Vec<String>, // Function definitions
     body_writer: &mut W,            // Forward body calls
     indent: usize,
@@ -641,10 +241,10 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
     compiler: &Compiler,
     graph_inputs: &[ValueInfoProto],
     graph_outputs: &[ValueInfoProto],
-) -> std::io::Result<HashMap<String, String>> {
+    var_types: &HashMap<String, String>,
+) -> std::io::Result<()> {
     let chunk_size = 500;
     let total_nodes = nodes.len();
-    let var_types = infer_variable_types(nodes, int64_map, graph_inputs, known_weights);
     let mut i = 0;
     let mut chunk_idx = 0;
     let mut available_vars: HashMap<String, String> = HashMap::new();
@@ -655,7 +255,8 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
     }
     while i < total_nodes {
         let end = std::cmp::min(i + chunk_size, total_nodes);
-        let chunk_nodes = &nodes[i..end];
+        let chunk = nodes.slice(i..end);
+        let chunk_nodes = chunk.protos;
         let nodes_count = chunk_nodes.len();
         // 1. Identify Inputs: Used in chunk, defined BEFORE chunk (or global)
         let mut chunk_inputs_set = HashSet::new();
@@ -754,7 +355,7 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
         )?;
         // Generate body
         generate_nodes(
-            chunk_nodes,
+            chunk,
             &mut f,
             2,
             known_weights,
@@ -763,7 +364,7 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
             analysis,
             current_id,
             compiler,
-            &var_types,
+            var_types,
         )?;
         // Return — detach_or_own (zero-copy) for f32 views of the workspace or the weights,
         // which outlive the chunk; to_owned for everything else, i64 and views of buffers
@@ -827,7 +428,7 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
         i += nodes_count;
         chunk_idx += 1;
     }
-    Ok(var_types)
+    Ok(())
 }
 
 /// Whether chunk output `var` may leave the chunk as a borrowed view, decided from the
@@ -841,6 +442,16 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
 /// returned as a copy.
 fn outlives_chunk(body: &str, var: &str, depth: usize) -> bool {
     if depth > 64 {
+        return false;
+    }
+    // Multi-output kernels (`let (a, b) = topk(..)`, `split`, ...) write
+    // buffers local to the chunk.
+    let in_tuple = body.lines().map(str::trim_start).any(|l| {
+        l.strip_prefix("let (")
+            .and_then(|l| l.split_once(") ="))
+            .is_some_and(|(names, _)| names.split(',').any(|n| n.trim() == var))
+    });
+    if in_tuple {
         return false;
     }
     let prefix = format!("let {var} = ");
@@ -869,8 +480,9 @@ fn outlives_chunk(body: &str, var: &str, depth: usize) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_nodes(
-    nodes: &[&NodeProto],
+    ir_nodes: Nodes<'_>,
     w: &mut dyn Write,
     indent: usize,
     known_weights: &HashMap<String, (usize, usize, Vec<usize>, i32)>,
@@ -882,6 +494,7 @@ pub(crate) fn generate_nodes(
     var_types: &HashMap<String, String>,
 ) -> std::io::Result<()> {
     let tab = "    ".repeat(indent);
+    let nodes = ir_nodes.protos;
     let mut idx = 0;
     while idx < nodes.len() {
         // Try to match patterns first
@@ -902,6 +515,7 @@ pub(crate) fn generate_nodes(
             continue;
         }
         let node = nodes[idx];
+        let id = ir_nodes.ids[idx];
         idx += 1;
         *current_id += 1;
         let op = node.op_type.as_str();
@@ -913,7 +527,7 @@ pub(crate) fn generate_nodes(
         // Check if Div/Mod output is i64 (e.g. integer division for shape computation)
         let div_mod_output_is_i64 = if matches!(op, "Div" | "Mod") {
             outputs
-                .get(0)
+                .first()
                 .and_then(|out| var_types.get(out))
                 .map(|t| t == "i64")
                 .unwrap_or(false)
@@ -938,6 +552,7 @@ pub(crate) fn generate_nodes(
                         match data_type {
                             7 => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape),
                             6 => format!("self.weight_i32_i64({}, {}, &{:?})", offset, len, shape),
+                            9 => format!("self.weight_bool_i64({}, {}, &{:?})", offset, len, shape),
                             _ => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape), // fallback
                         }
                     } else {
@@ -986,7 +601,7 @@ pub(crate) fn generate_nodes(
             false
         } else {
             outputs
-                .get(0)
+                .first()
                 .and_then(|out| var_types.get(out))
                 .map(|t| t == "i64")
                 .unwrap_or(false)
@@ -1029,6 +644,8 @@ pub(crate) fn generate_nodes(
         }
         let mut ctx = OpContext {
             node,
+            graph: ir_nodes.graph,
+            id,
             inputs: inputs.clone(),
             outputs: outputs.clone(),
             buf_expr,
@@ -1093,8 +710,13 @@ mod tests {
         let z = lele::kernels::add(&a, &b, &mut ws.buf_4);
         #[cfg(not(target_arch = \"aarch64\"))]
         let z = lele::kernels::add(&a, &b, &mut buf_z);
+        let (values, indices) = lele::kernels::topk(&x, 5, 1, true, true, &mut buf_v, &mut buf_i);
+        let picked = lele::kernels::squeeze(&indices, None);
 ";
         for (var, safe) in [
+            ("values", false),
+            ("indices", false),
+            ("picked", false),
             ("m", false),
             ("m2", false),
             ("m3", false),
@@ -1107,6 +729,41 @@ mod tests {
         ] {
             assert_eq!(outlives_chunk(body, var, 0), safe, "{var}");
         }
+    }
+
+    /// Code generated for `node` alone.
+    fn generate_one(
+        node: &NodeProto,
+        known_weights: &HashMap<String, (usize, usize, Vec<usize>, i32)>,
+        compiler: &Compiler,
+        var_types: &HashMap<String, String>,
+    ) -> String {
+        let g = Graph::from_onnx(crate::model::onnx_proto::GraphProto {
+            node: vec![node.clone()],
+            ..Default::default()
+        });
+        let (ids, protos) = lower_nodes(&g);
+        let protos: Vec<&NodeProto> = protos.iter().collect();
+        let nodes = Nodes {
+            graph: &g,
+            ids: &ids,
+            protos: &protos,
+        };
+        let mut output = Vec::new();
+        generate_nodes(
+            nodes,
+            &mut output,
+            0,
+            known_weights,
+            &HashMap::new(),
+            None,
+            None,
+            &mut 0,
+            compiler,
+            var_types,
+        )
+        .unwrap();
+        String::from_utf8(output).unwrap()
     }
 
     #[test]
@@ -1129,29 +786,51 @@ mod tests {
             ..Default::default()
         };
 
-        let mut output = Vec::new();
-        let mut current_id = 0;
-        let known_weights = HashMap::new();
-        let int64_map = HashMap::new();
-        let var_types = HashMap::new();
-
-        generate_nodes(
-            &[&node],
-            &mut output,
-            0,
-            &known_weights,
-            &int64_map,
-            None,
-            None,
-            &mut current_id,
-            &compiler,
-            &var_types,
-        )
-        .unwrap();
-
-        let result = String::from_utf8(output).unwrap();
+        let result = generate_one(&node, &HashMap::new(), &compiler, &HashMap::new());
         assert!(result.contains("// Custom implementation for output1"));
         assert!(result.contains("let output1 = custom_kernel(&input1);"));
+    }
+
+    /// yolo26n-seg splits the flat TopK indices into (anchor, class) with an
+    /// integer Div by an i64 constant (#28). `topk` returns its indices as f32,
+    /// so the Div has to run in f32 on the constant cast to f32, and truncate.
+    #[test]
+    fn test_integer_div_of_topk_indices_runs_in_f32() {
+        let node = |op: &str, input: &[&str], output: &[&str]| NodeProto {
+            input: input.iter().map(|s| s.to_string()).collect(),
+            output: output.iter().map(|s| s.to_string()).collect(),
+            op_type: op.to_string(),
+            ..Default::default()
+        };
+        let topk = node("TopK", &["scores", "k"], &["values", "indices"]);
+        let div = node("Div", &["indices", "classes"], &["anchor"]);
+        let int64 = |name: &str, v: i64| crate::model::onnx_proto::TensorProto {
+            name: name.to_string(),
+            data_type: 7,
+            int64_data: vec![v],
+            ..Default::default()
+        };
+        let graph = crate::model::onnx_proto::GraphProto {
+            node: vec![topk, div.clone()],
+            initializer: vec![int64("k", 5), int64("classes", 80)],
+            ..Default::default()
+        };
+        let mut ir = crate::compiler::ir::Graph::from_onnx(graph);
+        crate::compiler::passes::infer_dtypes(&mut ir);
+        let var_types = variable_types(&ir);
+        let mut known_weights = HashMap::new();
+        known_weights.insert("k".to_string(), (0, 8, vec![1], 7));
+        known_weights.insert("classes".to_string(), (8, 8, vec![], 7));
+        assert_eq!(var_types["indices"], "f32");
+        assert_eq!(var_types["anchor"], "f32");
+
+        let result = generate_one(&div, &known_weights, &Compiler::new(), &var_types);
+        assert!(
+            result.contains(
+                "let anchor = lele::kernels::div_trunc(&indices, &self.weight_i64_f32(8, 8, &[]), &mut buf_anchor);"
+            ),
+            "{result}"
+        );
     }
 
     #[test]
@@ -1164,28 +843,62 @@ mod tests {
             ..Default::default()
         };
 
-        let mut output = Vec::new();
-        let mut current_id = 0;
-        let known_weights = HashMap::new();
-        let int64_map = HashMap::new();
-        let var_types = HashMap::new();
-
-        generate_nodes(
-            &[&node],
-            &mut output,
-            0,
-            &known_weights,
-            &int64_map,
-            None,
-            None,
-            &mut current_id,
-            &compiler,
-            &var_types,
-        )
-        .unwrap();
-
-        let result = String::from_utf8(output).unwrap();
+        let result = generate_one(&node, &HashMap::new(), &compiler, &HashMap::new());
         assert!(result.contains("let mut buf_c = Vec::<f32>::new();"));
         assert!(result.contains("let c = lele::kernels::add(&a, &b, &mut buf_c);"));
+    }
+
+    /// An `If` branch that returns one of its initializers reads it through
+    /// the weight accessor of its type; it used to call a nonexistent
+    /// `self.weight`.
+    #[test]
+    fn test_if_branch_returning_a_weight() {
+        use crate::model::onnx_proto::{AttributeProto, GraphProto, TensorProto, ValueInfoProto};
+        let info = |name: &str| ValueInfoProto {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let branch = |name: &str, data_type: i32, raw: Vec<u8>| GraphProto {
+            initializer: vec![TensorProto {
+                name: name.to_string(),
+                data_type,
+                dims: vec![2],
+                raw_data: raw,
+                ..Default::default()
+            }],
+            output: vec![info(name)],
+            ..Default::default()
+        };
+        let graph = GraphProto {
+            node: vec![NodeProto {
+                op_type: "If".to_string(),
+                input: vec!["cond".to_string()],
+                output: vec!["r".to_string()],
+                attribute: vec![
+                    AttributeProto {
+                        name: "then_branch".to_string(),
+                        g: Some(branch(
+                            "w_f32",
+                            1,
+                            [1.0f32, 2.0].map(f32::to_le_bytes).concat(),
+                        )),
+                        ..Default::default()
+                    },
+                    AttributeProto {
+                        name: "else_branch".to_string(),
+                        g: Some(branch("w_i8", 3, vec![3, 4])),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            input: vec![info("cond")],
+            output: vec![info("r")],
+            ..Default::default()
+        };
+        let code = Compiler::new().compile(&graph).unwrap().code;
+        assert!(!code.contains("self.weight("), "{code}");
+        assert!(code.contains("self.weight_f32("), "{code}");
+        assert!(code.contains("self.weight_i8("), "{code}");
     }
 }

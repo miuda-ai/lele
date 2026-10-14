@@ -1,4 +1,7 @@
-use super::super::generate::OpContext;
+use super::super::{
+    generate::OpContext,
+    ir::{DType, Op},
+};
 use std::io::Write;
 
 pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<bool> {
@@ -87,13 +90,17 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             let shape_raw = resolve_i64_with_temp(1, ctx, w, &tab)?;
             // Replace 0 with -1 in reshape targets (ONNX 0 means "copy from source",
             // but in static compilation -1/infer is more robust)
-            let shape = if shape_raw.starts_with('&') && shape_raw.contains(" 0,") || shape_raw.contains("[0,") || shape_raw.contains("[0]") || shape_raw.contains(", 0]") || shape_raw.contains(", 0,") {
+            let shape = if shape_raw.starts_with('&') && shape_raw.contains(" 0,")
+                || shape_raw.contains("[0,")
+                || shape_raw.contains("[0]")
+                || shape_raw.contains(", 0]")
+                || shape_raw.contains(", 0,")
+            {
                 // Replace standalone 0 values (not 10, 100, etc.) with -1
                 let s = shape_raw;
                 // Use regex-free approach: split on known patterns
                 let s = s.replace("[0,", "[-1,").replace("[0]", "[-1]");
-                let s = s.replace(", 0,", ", -1,").replace(", 0]", ", -1]");
-                s
+                s.replace(", 0,", ", -1,").replace(", 0]", ", -1]")
             } else {
                 shape_raw
             };
@@ -120,17 +127,10 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             )?;
         }
         "Unsqueeze" => {
-            let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
-                resolve_i64_with_temp(1, ctx, w, &tab)?
-            } else {
-                let axes_attr = ctx
-                    .node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "axes")
-                    .map(|a| a.ints.clone())
-                    .unwrap_or(vec![]);
-                format!("&{:?}", axes_attr)
+            let axes = match &ctx.ir().op {
+                _ if ctx.ir().input(1).is_some() => resolve_i64_with_temp(1, ctx, w, &tab)?,
+                Op::Unsqueeze { axes } => format!("&{:?}", axes.clone().unwrap_or_default()),
+                _ => "&[]".to_string(),
             };
             writeln!(
                 w,
@@ -139,20 +139,10 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             )?;
         }
         "Squeeze" => {
-            let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
-                resolve_i64_opt_with_temp(1, ctx, w, &tab)?
-            } else {
-                let axes_attr = ctx
-                    .node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "axes")
-                    .map(|a| a.ints.clone());
-                if let Some(a) = axes_attr {
-                    format!("Some(&{:?})", a)
-                } else {
-                    "None".to_string()
-                }
+            let axes = match &ctx.ir().op {
+                _ if ctx.ir().input(1).is_some() => resolve_i64_opt_with_temp(1, ctx, w, &tab)?,
+                Op::Squeeze { axes: Some(axes) } => format!("Some(&{axes:?})"),
+                _ => "None".to_string(),
             };
             writeln!(
                 w,
@@ -161,13 +151,10 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             )?;
         }
         "Concat" => {
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(0);
+            let axis = match ctx.ir().op {
+                Op::Concat { axis } => axis,
+                _ => 0,
+            };
             let args = inputs
                 .iter()
                 .map(|s| format!("&{}", s))
@@ -201,14 +188,10 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             )?;
         }
         "Shape" => {
-            let attr = |name: &str| {
-                ctx.node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == name)
-                    .map(|a| a.i)
+            let (start, end) = match ctx.ir().op {
+                Op::Shape { start, end } => (start, end),
+                _ => (None, None),
             };
-            let (start, end) = (attr("start"), attr("end"));
             if start.is_none() && end.is_none() {
                 writeln!(
                     w,
@@ -233,12 +216,10 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             tab, outputs[0], inputs[0]
         )?,
         "Cast" => {
-            let to = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "to")
-                .map(|a| a.i);
+            let to = match ctx.ir().op {
+                Op::Cast { to } => Some(to.to_onnx() as i64),
+                _ => None,
+            };
 
             // Always use a temporary buffer for Cast to avoid borrow conflicts
             // Cast operations typically convert between types, and reusing buffers
@@ -295,17 +276,16 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 .get(&ctx.outputs[0])
                 .map(|s| s == "i64")
                 .unwrap_or(false);
-            let val = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "value")
-                .and_then(|a| a.t.as_ref())
+            let value = match &ctx.ir().op {
+                Op::ConstantOfShape { value } => value.as_ref(),
+                _ => None,
+            };
+            let val = value
                 .map(|t| {
-                    if let Ok((data, _)) = crate::model::tensor_to_array(t) {
-                        if !data.is_empty() {
-                            return data[0];
-                        }
+                    if let Ok((data, _)) = crate::model::tensor_to_array(t)
+                        && !data.is_empty()
+                    {
+                        return data[0];
                     }
                     0.0
                 })
@@ -439,19 +419,16 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             )?;
         }
         "QuantizeLinear" | "DequantizeLinear" | "FakeQuantizeLinear" => {
-            let attr_i = |name: &str, default: i64| {
-                ctx.node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == name)
-                    .map(|a| a.i)
-                    .unwrap_or(default)
+            let node = ctx.ir();
+            let attrs = match &node.op {
+                Op::QuantizeLinear(a) | Op::DequantizeLinear(a) | Op::FakeQuantizeLinear(a) => a,
+                _ => panic!("{op} '{}' outside the default domain", ctx.node.name),
             };
-            let axis = attr_i("axis", 1);
-            let block_size = attr_i("block_size", 0);
-            let zp_expr = match inputs.get(2) {
-                Some(zp) if !ctx.node.input[2].is_empty() => format!("Some(&{})", zp),
-                _ => "None".to_string(),
+            let (axis, block_size) = (attrs.axis, attrs.block_size);
+            let zero_point = node.input(2);
+            let zp_expr = match zero_point {
+                Some(_) => format!("Some(&{})", inputs[2]),
+                None => "None".to_string(),
             };
             if op == "DequantizeLinear" {
                 writeln!(
@@ -462,33 +439,23 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             } else {
                 // Saturation bounds come from `output_dtype` (opset 21+) or the
                 // zero-point dtype; ONNX defaults to uint8 when neither is given.
-                let zp_input = ctx.node.input.get(2).filter(|s| !s.is_empty());
-                let zp_dt = zp_input
-                    .and_then(|zp| ctx.known_weights.get(&crate::compiler::sanitize_name(zp)))
-                    .map(|w| w.3);
-                let out_dt = ctx
-                    .node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "output_dtype")
-                    .map(|a| a.i as i32)
-                    .or(zp_dt)
-                    // No zero point at all: the ONNX uint8 default applies.
-                    .or(if zp_input.is_none() { Some(2) } else { None });
-                // A zero point that is not an initializer hides its dtype.
-                // Guessing uint8 would silently clamp every negative code to 0
-                // on an int8 model, so refuse to compile instead.
-                if out_dt.is_none() {
-                    panic!(
-                        "QuantizeLinear '{}': zero point '{}' is not an initializer and no \
+                let zp_dt = zero_point
+                    .map(|zp| ctx.graph.value(zp).dtype)
+                    .filter(|&t| t != DType::Undefined);
+                let out_dt = match (attrs.output_dtype, zp_dt, zero_point) {
+                    (Some(t), _, _) | (None, Some(t), _) => t.to_onnx(),
+                    (None, None, None) => 2,
+                    // Guessing uint8 would silently clamp every negative code
+                    // to 0 on an int8 model, so refuse to compile instead.
+                    (None, None, Some(zp)) => panic!(
+                        "QuantizeLinear '{}': the type of zero point '{}' is unknown and no \
                          output_dtype attribute is present; add output_dtype so the saturation \
                          bounds are known",
                         ctx.node.name,
-                        zp_input.unwrap_or(&String::new())
-                    );
-                }
-                let (qmin, qmax) =
-                    crate::kernels::quant_range(out_dt.unwrap()).unwrap_or((0.0, 255.0));
+                        ctx.graph.value(zp).name
+                    ),
+                };
+                let (qmin, qmax) = crate::kernels::quant_range(out_dt).unwrap_or((0.0, 255.0));
                 let kernel = if op == "FakeQuantizeLinear" {
                     "fake_quantize_linear"
                 } else {
@@ -602,12 +569,10 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 writeln!(w, "{}let {} = {}.clone();", tab, outputs[0], inputs[0])?;
             } else {
                 // More complex Constant logic
-                let val = ctx
-                    .node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "value")
-                    .and_then(|a| a.t.as_ref());
+                let val = match &ctx.ir().op {
+                    Op::Constant { value } => Some(value),
+                    _ => None,
+                };
                 if let Some(t) = val {
                     if !t.float_data.is_empty() {
                         if t.float_data.len() > 100 {

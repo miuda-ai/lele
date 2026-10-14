@@ -3,10 +3,10 @@ use crate::kernels::conv1d_direct::{
     Depthwise, Kernel3, SingleChannel, depthwise, kernel3, single_channel,
 };
 use crate::kernels::conv2d::Activation;
-use crate::kernels::utils;
-use fearless_simd::Level;
 use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul};
+use crate::kernels::utils;
 use crate::tensor::TensorView;
+use fearless_simd::Level;
 
 /// Adds `bias[oc]` to every `[oc, ..]` row of `out` (laid out `[batch, out_channels, len]`)
 /// and applies ReLU if asked.
@@ -17,7 +17,11 @@ fn bias_relu_rows(
     out_channels: usize,
     len: usize,
 ) {
-    let act = if relu { Activation::Relu } else { Activation::None };
+    let act = if relu {
+        Activation::Relu
+    } else {
+        Activation::None
+    };
     match bias {
         Some(bias) => {
             for (i, row) in out.chunks_exact_mut(len).enumerate() {
@@ -110,9 +114,6 @@ fn conv1d_fused_at<'b, 'a>(
         (input_len + pad_left + pad_right - dilation * (kernel_size - 1) - 1) / stride + 1;
     let total_output_size = batch_size * out_channels * output_len;
     utils::ensure_capacity(out, total_output_size);
-    unsafe {
-        out.set_len(total_output_size);
-    }
     let in_channels_per_group = in_channels / group as usize;
     let out_channels_per_group = out_channels / group as usize;
     let unfolded_rows = in_channels_per_group * kernel_size;
@@ -207,26 +208,6 @@ fn conv1d_fused_at<'b, 'a>(
             let a_offset = b * out_channels * output_len;
             let in_offset = b * in_channels * input_len;
 
-            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-            unsafe {
-                // Use Apple Accelerate AMX for pointwise conv
-                crate::kernels::gemm::accelerate_init();
-                crate::kernels::gemm::accelerate_sgemm(
-                    out_channels as i32,
-                    output_len as i32,
-                    in_channels as i32,
-                    1.0,
-                    weights.data.as_ptr(),
-                    in_channels as i32,
-                    input.data.as_ptr().add(in_offset),
-                    output_len as i32,
-                    0.0,
-                    out_slice.as_mut_ptr().add(a_offset),
-                    output_len as i32,
-                );
-            }
-
-            #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
             unsafe {
                 let a = MatRef::<f32>::from_raw_parts(
                     weights.data.as_ptr(),
@@ -577,8 +558,8 @@ mod tests {
 
     /// The textbook definition, in f64: padding contributes zeros.
     fn reference(c: &Case, x: &[f32], w: &[f32], bias: Option<&[f32]>, relu: bool) -> Vec<f64> {
-        let out_len = (c.len + c.pads[0] + c.pads[1] - c.dilation * (c.kernel - 1) - 1) / c.stride
-            + 1;
+        let out_len =
+            (c.len + c.pads[0] + c.pads[1] - c.dilation * (c.kernel - 1) - 1) / c.stride + 1;
         let (icg, ocg) = (c.in_ch / c.group, c.out_ch / c.group);
         let mut out = Vec::new();
         for b in 0..c.batch {
