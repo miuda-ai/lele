@@ -53,13 +53,13 @@ fn main() {
     let (audio, sample_rate) = if let Some(wav_path) = env::args().nth(1) {
         println!("Loading audio from: {}", wav_path);
         let (samples, sr) = WavReader::load(&wav_path).expect("Failed to load wav");
-        (samples, sr as u32)
+        (samples, sr)
     } else {
         let default_wav = "fixtures/zh.wav";
         if std::path::Path::new(default_wav).exists() {
             println!("No audio file specified, using default: {}", default_wav);
             let (samples, sr) = WavReader::load(default_wav).expect("Failed to load default wav");
-            (samples, sr as u32)
+            (samples, sr)
         } else {
             println!("No audio file specified and default not found, using synthetic audio");
             (vec![0.0; 16000 * 3], 16000)
@@ -95,12 +95,15 @@ fn main() {
 
     // Warmup run
     {
-        let input_data: Vec<f32> = padded_audio[..chunk_size].iter().map(|&x| x * 32768.0).collect();
+        let input_data: Vec<f32> = padded_audio[..chunk_size]
+            .iter()
+            .map(|&x| x * 32768.0)
+            .collect();
         let input = TensorView::from_owned(input_data, vec![1, chunk_size]);
         let state = TensorView::from_owned(state_data.clone(), vec![2, 1, 128]);
         let sr = TensorView::from_slice(&sr_data, vec![1]);
         let (output, new_state) = model.forward_with_workspace(&mut ws, input, state, sr);
-        if let Some(&prob) = output.data.get(0) {
+        if let Some(&prob) = output.data.first() {
             all_outputs.push(prob);
         }
         state_data = new_state.data.to_vec();
@@ -121,7 +124,7 @@ fn main() {
         let (output, new_state) = model.forward_with_workspace(&mut ws, input, state, sr);
 
         // Output is [1, 1] probability
-        if let Some(&prob) = output.data.get(0) {
+        if let Some(&prob) = output.data.first() {
             all_outputs.push(prob);
         }
 
@@ -142,7 +145,11 @@ fn main() {
         infer_elapsed.as_secs_f64() * 1000.0,
         num_chunks - 1,
     );
-    println!("✓ Avg per chunk: {:.2}µs ({:.4}ms)", avg_chunk_us, avg_chunk_us / 1000.0);
+    println!(
+        "✓ Avg per chunk: {:.2}µs ({:.4}ms)",
+        avg_chunk_us,
+        avg_chunk_us / 1000.0
+    );
     println!("✓ RTF: {:.4} (Audio: {:.2}s)", rtf, audio_duration);
 
     let max_prob = all_outputs.iter().cloned().fold(0.0f32, f32::max);

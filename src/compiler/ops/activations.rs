@@ -1,103 +1,47 @@
-use super::super::generate::OpContext;
+//! Code generation for activations with parameters, softmax and argmax. The
+//! plain ones (`Relu`, `Sigmoid`, ...) are [`Unary`](super::super::ir::Unary)
+//! operators.
+
+use super::super::{generate::OpContext, ir::Op};
 use std::io::Write;
 
-pub(crate) fn handle_activation_ops(
-    ctx: &mut OpContext,
-    w: &mut dyn Write,
-) -> std::io::Result<bool> {
-    let op = ctx.node.op_type.as_str();
+pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<()> {
     let tab = ctx.tab();
     let inputs = &ctx.inputs;
     let outputs = &ctx.outputs;
     let buf_expr = &ctx.buf_expr;
 
-    match op {
-        "Relu" => writeln!(
+    match ctx.ir().op {
+        Op::LeakyRelu { alpha } => writeln!(
             w,
-            "{}let {} = lele::kernels::relu(&{}, {});",
-            tab, outputs[0], inputs[0], buf_expr
+            "{}let {} = lele::kernels::leaky_relu(&{}, {}, {});",
+            tab, outputs[0], inputs[0], alpha, buf_expr
         )?,
-        "LeakyRelu" => {
-            let alpha = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "alpha")
-                .map(|a| a.f)
-                .unwrap_or(0.01);
+        Op::Softmax { axis } | Op::LogSoftmax { axis } => {
+            // The opset 13+ default; before 13 it was 1.
+            let axis = axis.unwrap_or(-1);
+            let kernel = if let Op::Softmax { .. } = ctx.ir().op {
+                "softmax"
+            } else {
+                "log_softmax"
+            };
             writeln!(
                 w,
-                "{}let {} = lele::kernels::leaky_relu(&{}, {}, {});",
-                tab, outputs[0], inputs[0], alpha, buf_expr
+                "{}let {} = lele::kernels::{}(&{}, {}, {});",
+                tab, outputs[0], kernel, inputs[0], axis, buf_expr
             )?;
         }
-        "Sigmoid" => writeln!(
+        Op::ArgMax { axis, keepdims } => writeln!(
             w,
-            "{}let {} = lele::kernels::sigmoid(&{}, {});",
-            tab, outputs[0], inputs[0], buf_expr
+            "{}let {} = lele::kernels::argmax(&{}, {}, {}, {});",
+            tab, outputs[0], inputs[0], axis, keepdims as i64, buf_expr
         )?,
-        "Softmax" => {
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(-1);
-            writeln!(
-                w,
-                "{}let {} = lele::kernels::softmax(&{}, {}, {});",
-                tab, outputs[0], inputs[0], axis, buf_expr
-            )?;
-        }
-        "ArgMax" => {
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(0);
-            let keepdims = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "keepdims")
-                .map(|a| a.i)
-                .unwrap_or(1);
-            writeln!(
-                w,
-                "{}let {} = lele::kernels::argmax(&{}, {}, {}, {});",
-                tab, outputs[0], inputs[0], axis, keepdims, buf_expr
-            )?;
-        }
-        "Tanh" => writeln!(
+        Op::HardSigmoid { alpha, beta } => writeln!(
             w,
-            "{}let {} = lele::kernels::tanh_kernel(&{}, {});",
-            tab, outputs[0], inputs[0], buf_expr
+            "{}let {} = lele::kernels::hard_sigmoid(&{}, {:?}, {:?}, {});",
+            tab, outputs[0], inputs[0], alpha, beta, buf_expr
         )?,
-        "HardSigmoid" => {
-            let alpha = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "alpha")
-                .map(|a| a.f)
-                .unwrap_or(0.2);
-            let beta = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "beta")
-                .map(|a| a.f)
-                .unwrap_or(0.5);
-            writeln!(
-                w,
-                "{}let {} = lele::kernels::hard_sigmoid(&{}, {:?}, {:?}, {});",
-                tab, outputs[0], inputs[0], alpha, beta, buf_expr
-            )?;
-        }
-        _ => return Ok(false),
+        ref op => unreachable!("{} is not an activation", op.op_type()),
     }
-    Ok(true)
+    Ok(())
 }

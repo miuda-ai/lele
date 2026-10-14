@@ -4,6 +4,7 @@ members = [
     "crates/lele-build",
     "examples/sensevoice",
     "examples/silero",
+    "examples/tone",
     "examples/supertonic",
     "examples/supertonic3",
     "examples/yolo26",
@@ -22,7 +23,6 @@ resolver = "2"
 [workspace.dependencies]
 lele = { path = "." }
 lele-build = { path = "crates/lele-build" }
-toml = "1.1.2"
 anyhow = "1.0"
 
 [package]
@@ -53,14 +53,11 @@ exclude = [
 ]
 [features]
 default = ["compiler"]
-compiler = ["dep:prost", "dep:prost-types"]
+compiler = ["dep:prost", "dep:thiserror"]
 
 [dependencies]
 prost = { version = "0.14.3", optional = true }
-prost-types = { version = "0.14.3", optional = true }
-thiserror = "2"
-byteorder = "1.5"
-libm = "0.2"
+thiserror = { version = "2", optional = true }
 half = "2.7.1"
 fearless_simd = "1.1"
 fearless_simd_macros = "0.1"
@@ -68,8 +65,8 @@ fearless_simd_macros = "0.1"
 [dev-dependencies]
 approx = "0.5"
 test-log = "0.2"
-unicode-normalization = "0.1"
 criterion = "0.8.2"
+libm = "0.2"
 # Lets tests run kernels at the scalar level too, on targets whose baseline has SIMD.
 fearless_simd = { version = "1.1", features = ["force_support_fallback"] }
 
