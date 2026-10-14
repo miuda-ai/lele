@@ -33,7 +33,11 @@ pub(crate) fn depthwise(
     // Each channel is copied into `padded` between zeros, so no tap needs a
     // bounds test and a vector load never runs off the end. Stride 2 also
     // keeps the even and the odd entries of the row apart, after the copy.
-    let phases = if shape.stride == 2 { padded_row_len(shape) } else { 0 };
+    let phases = if shape.stride == 2 {
+        padded_row_len(shape)
+    } else {
+        0
+    };
     DEPTHWISE_PADDED.with_borrow_mut(|padded| {
         padded.clear();
         padded.resize(padded_row_len(shape) + phases, 0.0);
@@ -69,10 +73,8 @@ fn depthwise_simd<S: Simd>(
     let (even, odd) = phases.split_at_mut(phases.len() / 2);
     // With no padding on either side and a whole vector of outputs, every tap
     // of every vector lies inside the row, which can be read in place.
-    let in_place = s.pad_left == 0
-        && stride == 1
-        && out_len >= 8
-        && out_len + (k - 1) * s.dilation <= len;
+    let in_place =
+        s.pad_left == 0 && stride == 1 && out_len >= 8 && out_len + (k - 1) * s.dilation <= len;
     for c in 0..s.batch * s.channels {
         if !in_place {
             // Only the row's own span changes between channels; the zeros around it stay.
@@ -86,10 +88,14 @@ fn depthwise_simd<S: Simd>(
                 dst.copy_from_slice(src);
             }
         }
-        let x = if in_place { &input[c * len..][..len] } else { &*padded };
+        let x = if in_place {
+            &input[c * len..][..len]
+        } else {
+            &*padded
+        };
         if stride == 2 {
-            for ((e, o), pair) in even.iter_mut().zip(odd.iter_mut()).zip(x.chunks_exact(2)) {
-                (*e, *o) = (pair[0], pair[1]);
+            for ((e, o), &[x0, x1]) in even.iter_mut().zip(odd.iter_mut()).zip(x.as_chunks().0) {
+                (*e, *o) = (x0, x1);
             }
         }
         let phase: [&[f32]; 2] = [&*even, &*odd];
@@ -172,7 +178,11 @@ macro_rules! depthwise_at {
                 acc = $v::splat(simd, w0).mul_add(x0, acc);
             }
             acc = acc + acc2;
-            if relu { acc.max($v::splat(simd, 0.0)) } else { acc }
+            if relu {
+                acc.max($v::splat(simd, 0.0))
+            } else {
+                acc
+            }
         }
     };
 }
@@ -202,7 +212,11 @@ pub(crate) fn kernel3(
     // A row too short for a vector is padded out to one, and its outputs are
     // computed into a vector-wide tile per channel and copied.
     let row = shape.len.max(8) + 2;
-    let tile = if shape.len < 8 { shape.out_channels * 8 } else { 0 };
+    let tile = if shape.len < 8 {
+        shape.out_channels * 8
+    } else {
+        0
+    };
     // The shortest rows lay out their taps instead.
     let size = (shape.in_channels * row + tile).max(shape.len * shape.in_channels * 3);
     PADDED.with_borrow_mut(|padded| {
@@ -239,12 +253,10 @@ macro_rules! kernel3_tile {
         ) {
             use fearless_simd::prelude::*;
             let ic = s.in_channels;
-            let w: [&[[f32; 3]]; OC] = core::array::from_fn(|j| {
-                weights[(oc + j) * ic * 3..][..ic * 3].as_chunks::<3>().0
-            });
-            let mut acc: [$v<S>; OC] = core::array::from_fn(|j| {
-                $v::splat(simd, s.bias.map_or(0.0, |b| b[oc + j]))
-            });
+            let w: [&[[f32; 3]]; OC] =
+                core::array::from_fn(|j| weights[(oc + j) * ic * 3..][..ic * 3].as_chunks::<3>().0);
+            let mut acc: [$v<S>; OC] =
+                core::array::from_fn(|j| $v::splat(simd, s.bias.map_or(0.0, |b| b[oc + j])));
             for (c, row) in padded.chunks_exact(s.len.max(8) + 2).take(ic).enumerate() {
                 // Taps 0, 1 and 2 of outputs `t..` read the input at `t - 1 + k`,
                 // which sits at `t + k` in the padded row.
@@ -306,15 +318,24 @@ fn kernel3_cols_simd<S: Simd>(
             let x = &input[b * ic * len..][..ic * len];
             let out = &mut out[b * s.out_channels * len..][..s.out_channels * len];
             for (t, col) in cols.chunks_exact_mut(ic3).enumerate() {
-                for (c, taps) in col.chunks_exact_mut(3).enumerate() {
+                for (c, taps) in col.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                     for (k, tap) in taps.iter_mut().enumerate() {
                         // Input `t + k - 1`, zero outside the row.
-                        *tap = (t + k).checked_sub(1).filter(|&i| i < len).map_or(0.0, |i| x[c * len + i]);
+                        *tap = (t + k)
+                            .checked_sub(1)
+                            .filter(|&i| i < len)
+                            .map_or(0.0, |i| x[c * len + i]);
                     }
                 }
             }
             let cols = &*cols;
-            let finish = |sum: f32, bias: f32| if s.relu { (sum + bias).max(0.0) } else { sum + bias };
+            let finish = |sum: f32, bias: f32| {
+                if s.relu {
+                    (sum + bias).max(0.0)
+                } else {
+                    sum + bias
+                }
+            };
             let mut oc = 0;
             while oc + 4 <= s.out_channels {
                 let ws: [&[f32]; 4] = core::array::from_fn(|j| &weights[(oc + j) * ic3..][..ic3]);
@@ -354,7 +375,10 @@ fn kernel3_simd<S: Simd>(
     for b in 0..s.batch {
         let x = &input[b * s.in_channels * len..][..s.in_channels * len];
         let out = &mut out[b * s.out_channels * len..][..s.out_channels * len];
-        for (row, src) in padded.chunks_exact_mut(len.max(8) + 2).zip(x.chunks_exact(len)) {
+        for (row, src) in padded
+            .chunks_exact_mut(len.max(8) + 2)
+            .zip(x.chunks_exact(len))
+        {
             row[1..=len].copy_from_slice(src);
         }
         let padded = &*padded;
@@ -388,7 +412,7 @@ fn kernel3_simd<S: Simd>(
                 kernel3_tile8::<S, 1>(simd, s, padded, weights, tile, oc, 0);
                 oc += 1;
             }
-            for (y, t) in out.chunks_exact_mut(len).zip(tile.chunks_exact(8)) {
+            for (y, t) in out.chunks_exact_mut(len).zip(tile.as_chunks::<8>().0) {
                 y.copy_from_slice(&t[..len]);
             }
         }
@@ -454,7 +478,13 @@ fn pack_weights(weights: &[f32], out_channels: usize, kernel: usize, packed: &mu
 }
 
 #[simd]
-fn single_channel_lanes<S: Simd>(simd: S, s: &SingleChannel, input: &[f32], packed: &[f32], out: &mut [f32]) {
+fn single_channel_lanes<S: Simd>(
+    simd: S,
+    s: &SingleChannel,
+    input: &[f32],
+    packed: &[f32],
+    out: &mut [f32],
+) {
     let blocks = s.out_channels.div_ceil(LANES);
     for b in 0..s.batch {
         let x = &input[b * s.input_len..][..s.input_len];
