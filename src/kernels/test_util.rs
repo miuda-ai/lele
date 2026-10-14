@@ -7,8 +7,8 @@ use fearless_simd::Level;
 /// Lengths on both sides of each vector width (4, 8, 16) and of the unrolled
 /// steps built from them, so main loops, vector tails and scalar tails all run.
 pub const AWKWARD_LENS: &[usize] = &[
-    1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257,
-    1000, 1027,
+    1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1000,
+    1027,
 ];
 
 /// xorshift64*: deterministic, so a failure reproduces.
