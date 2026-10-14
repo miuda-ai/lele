@@ -64,17 +64,22 @@ lele is not an interpreter. It **compiles ONNX graphs into Rust source code** at
 The `Compiler` builder lets you customize code generation for any model:
 
 ```rust
-use lele::compiler::Compiler;
+use lele::compiler::{Compiler, Optimizations};
 
 let compiler = Compiler::new()
     .with_name("MyModel")           // Set generated struct name
-    .with_default_optimizations()   // Load fusion patterns + helper methods
-    .with_constant_folding(true)    // Enable compile-time folding
+    .with_default_optimizations()   // Enable every optimization
     .with_override("MyCustomOp", |node, inputs, outputs, buf, w, indent| {
         // Generate custom Rust code for any operator
         Ok(())
     })
     .with_pattern("MyFusion", my_matcher, my_generator);  // Custom fusion
+
+// Or pick optimizations one by one:
+let compiler = Compiler::new().with_optimizations(Optimizations {
+    operator_fusion: false,
+    ..Optimizations::all()
+});
 ```
 
 ### Runtime / Compiler Split
@@ -180,17 +185,14 @@ class_name = "MyModel"
 
 ```rust
 // build.rs
-use lele_build::{config::ModelConfig, *};
-
-fn main() {
-    let cfg = ModelConfig::load("model.toml").unwrap();
-    if need_regenerate_with_model("MyModel", "src/gen", "model.toml", None) {
-        // Download + generate
-    }
+fn main() -> lele_build::Result {
+    // Downloads the model and writes src/mymodel.rs and src/mymodel_weights.bin,
+    // unless they are newer than model.toml and the model.
+    lele_build::build_model("model.toml", "src")
 }
 ```
 
-Set `HF_ENDPOINT` to use a mirror. Set `LELE_SKIP_MODEL_GEN=1` to skip generation. If download fails, a compiling stub is generated so `cargo build` always succeeds.
+`build_models` does the same for several models listed in one `model.toml`. Set `HF_ENDPOINT` to use a mirror, `LELE_SKIP_MODEL_GEN=1` to skip generation, and `LELE_FORCE_REGEN=1` to regenerate. If a download or the code generation fails, the build fails with the error.
 
 ### Running Examples
 
@@ -204,6 +206,10 @@ Set `HF_ENDPOINT` to use a mirror. Set `LELE_SKIP_MODEL_GEN=1` to skip generatio
 ./run_hojo_tts.sh "text"     # Hojo-TTS-Light voice cloning
 cd examples/moss-tts-nano && cargo run --release -- "text"  # MOSS-TTS-Nano
 cd examples/ppocr && cargo run --release -- image.png      # PP-OCRv6 OCR
+cargo run --release -p tone-example --bin tone -- in.wav    # T-one ASR (8 kHz WAV)
+cargo run --release -p tone-example --bin tone-live         # T-one, live from the microphone
+cargo run --release -p whisper-example --bin whisper -- in.wav [--lang en]  # Whisper ASR (16 kHz WAV)
+cargo run --release -p whisper-example --bin whisper-live [-- --lang en]    # Whisper, live from the microphone
 ```
 
 ## Supported Models
@@ -212,6 +218,8 @@ cd examples/ppocr && cargo run --release -- image.png      # PP-OCRv6 OCR
 |-------|------|---------|
 | **SenseVoiceSmall** | ASR | Multilingual speech recognition |
 | **Silero VAD** | VAD | Streaming voice activity detection |
+| **T-one** | ASR | Streaming Russian telephony speech recognition (8 kHz, CTC) |
+| **Whisper** (base, int8) | ASR | Multilingual speech recognition with language detection; encoder and decoder with a key/value cache |
 | **Supertonic 2** | TTS | 5 languages |
 | **Supertonic 3** | TTS | 31 languages, expression tags (`<laugh>`, `<breath>`, `<sigh>`) |
 | **Hojo-TTS-Light** | TTS | 0.08B bilingual ZH/EN, voice cloning (encoder → AR-LLM → decoder) |

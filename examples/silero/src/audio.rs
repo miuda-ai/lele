@@ -52,8 +52,8 @@ impl WavReader {
         let samples = match bits_per_sample {
             16 => {
                 let mut samples = Vec::with_capacity(audio_data.len() / 2);
-                for chunk in audio_data.chunks_exact(2) {
-                    let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+                for &chunk in audio_data.as_chunks::<2>().0 {
+                    let sample = i16::from_le_bytes(chunk);
                     samples.push(sample as f32 / 32768.0);
                 }
                 samples
