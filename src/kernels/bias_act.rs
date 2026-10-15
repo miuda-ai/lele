@@ -67,6 +67,46 @@ macro_rules! map_inplace {
             $f(last + vbias).store_array(out_last);
         }
     }};
+    // `$f(x)`, with no bias added: adding a zero would turn -0 into +0.
+    ($simd:expr, $data:expr, $f:path) => {{
+        use fearless_simd::prelude::*;
+        let (simd, data): (_, &mut [f32]) = ($simd, $data);
+        let last = fearless_simd::f32x16::load_array_ref(simd, data.last_chunk::<16>().unwrap());
+        let (chunks, tail) = data.as_chunks_mut::<16>();
+        let (pairs, single) = chunks.as_chunks_mut::<2>();
+        for [a, b] in pairs {
+            let ya = $f(fearless_simd::f32x16::load_array_ref(simd, a));
+            let yb = $f(fearless_simd::f32x16::load_array_ref(simd, b));
+            ya.store_array(a);
+            yb.store_array(b);
+        }
+        for c in single {
+            $f(fearless_simd::f32x16::load_array_ref(simd, c)).store_array(c);
+        }
+        if !tail.is_empty() {
+            let out_last = data.last_chunk_mut::<16>().unwrap();
+            $f(last).store_array(out_last);
+        }
+    }};
+}
+
+/// `data[i] = silu(data[i])`, element for element as
+/// [`silu`](crate::kernels::silu) computes it.
+pub(crate) fn silu_inplace(data: &mut [f32]) {
+    let level = Level::new();
+    if data.len() < 16 {
+        let mut padded = [0.0f32; 16];
+        padded[..data.len()].copy_from_slice(data);
+        simd_call!(level, max = Avx2, silu_simd(&mut padded));
+        data.copy_from_slice(&padded[..data.len()]);
+    } else {
+        simd_call!(level, max = Avx2, silu_simd(data));
+    }
+}
+
+#[simd]
+fn silu_simd<S: Simd>(simd: S, data: &mut [f32]) {
+    map_inplace!(simd, data, vm::silu)
 }
 
 #[inline(always)]
@@ -92,7 +132,7 @@ fn bias_silu_simd<S: Simd>(simd: S, data: &mut [f32], bias: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::test_util::{assert_close, levels, Rng, AWKWARD_LENS};
+    use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_close, levels};
 
     fn reference(x: f32, bias: f32, act: Activation) -> f64 {
         let v = x as f64 + bias as f64;

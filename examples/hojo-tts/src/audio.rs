@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 
@@ -73,12 +73,7 @@ impl WavReader {
             if id == b"fmt " {
                 // PCM fmt chunk: audioFormat(2) channels(2) sampleRate(4) ...
                 num_channels = u16::from_le_bytes([payload[2], payload[3]]);
-                sample_rate = u32::from_le_bytes([
-                    payload[4],
-                    payload[5],
-                    payload[6],
-                    payload[7],
-                ]);
+                sample_rate = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
                 bits_per_sample = u16::from_le_bytes([payload[14], payload[15]]);
             } else if id == b"data" {
                 data = payload;
@@ -169,7 +164,9 @@ pub fn resample_sinc(samples: &[f32], from_sr: u32, to_sr: u32) -> Vec<f32> {
             let mut t = -(phase as f32) / new_freq as f32 + idx_val;
             t *= base_freq;
             t = t.clamp(-lowpass_filter_width, lowpass_filter_width);
-            let window = (t * std::f32::consts::PI / lowpass_filter_width / 2.0).cos().powi(2);
+            let window = (t * std::f32::consts::PI / lowpass_filter_width / 2.0)
+                .cos()
+                .powi(2);
             t *= std::f32::consts::PI;
             let sinc = if t == 0.0 { 1.0 } else { t.sin() / t };
             kernel[phase * num_taps + k] = sinc * window * scale;
@@ -177,8 +174,7 @@ pub fn resample_sinc(samples: &[f32], from_sr: u32, to_sr: u32) -> Vec<f32> {
     }
 
     let length = samples.len();
-    let target_length =
-        ((new_freq as f64 * length as f64) / orig_freq as f64).ceil() as usize;
+    let target_length = ((new_freq as f64 * length as f64) / orig_freq as f64).ceil() as usize;
 
     let pad_left = width;
     let pad_right = width + orig_freq as usize;
