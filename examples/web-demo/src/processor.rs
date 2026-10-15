@@ -1,8 +1,7 @@
+use rand_distr::{Distribution, Normal};
 /// Text processor for Supertonic TTS (WASM-compatible, no filesystem).
-
 use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
-use rand_distr::{Distribution, Normal};
 
 pub const AVAILABLE_LANGS: &[&str] = &["en", "ko", "es", "pt", "fr", "zh"];
 

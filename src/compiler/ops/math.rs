@@ -1,426 +1,116 @@
-use super::super::generate::OpContext;
-use super::super::sanitize_name;
+//! Code generation for elementwise arithmetic, comparisons, reductions and
+//! the other numeric operators.
+
+use super::super::generate::{ElemType, OpContext};
+use super::super::ir::{Binary, DType, Op, Reduction, Unary};
 use std::io::Write;
 
-pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<bool> {
-    let op = ctx.node.op_type.as_str();
+pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<()> {
     let tab = ctx.tab();
     let inputs = &ctx.inputs;
     let outputs = &ctx.outputs;
     let buf_expr = &ctx.buf_expr;
 
-    match op {
-        "Add" => writeln!(
+    match &ctx.ir().op {
+        Op::Unary(unary) => writeln!(
             w,
-            "{}let {} = lele::kernels::add(&{}, &{}, {});",
-            tab, outputs[0], inputs[0], inputs[1], buf_expr
+            "{}let {} = lele::kernels::{}(&{}, {});",
+            tab,
+            outputs[0],
+            unary_kernel(*unary),
+            inputs[0],
+            buf_expr
         )?,
-        "Sub" => writeln!(
+        Op::Binary(binary) => generate_binary(ctx, *binary, w)?,
+        Op::IsNaN => writeln!(
             w,
-            "{}let {} = lele::kernels::sub(&{}, &{}, {});",
-            tab, outputs[0], inputs[0], inputs[1], buf_expr
+            "{}let {} = lele::kernels::is_nan(&{}, {});",
+            tab, outputs[0], inputs[0], buf_expr
         )?,
-        "Mul" => writeln!(
-            w,
-            "{}let {} = lele::kernels::mul(&{}, &{}, {});",
-            tab, outputs[0], inputs[0], inputs[1], buf_expr
-        )?,
-        "Div" => writeln!(
-            w,
-            "{}let {} = lele::kernels::div(&{}, &{}, {});",
-            tab, outputs[0], inputs[0], inputs[1], buf_expr
-        )?,
-        "Mod" => writeln!(
-            w,
-            "{}let {} = lele::kernels::mod_f32(&{}, &{}, {});",
-            tab, outputs[0], inputs[0], inputs[1], buf_expr
-        )?,
-        "MatMul" => writeln!(
+        Op::MatMul => writeln!(
             w,
             "{}let {} = lele::kernels::matmul(&{}, &{}, {});",
-            tab, outputs[0], inputs[0], inputs[1], buf_expr
+            tab,
+            outputs[0],
+            inputs[0],
+            ctx.matmul_weight(1),
+            buf_expr
         )?,
-        "MatMulInteger" => {
+        Op::MatMulInteger => {
             // MatMulInteger expects u8 inputs.
-            let a_zp = if inputs.len() > 2 {
-                format!("Some(&{})", inputs[2])
-            } else {
-                "None".to_string()
+            // Zero points are optional, and may be given as empty names.
+            let zero_point = |i: usize| match ctx.node.input.get(i) {
+                Some(name) if !name.is_empty() => format!("Some(&{})", inputs[i]),
+                _ => "None".to_string(),
             };
-            let b_zp = if inputs.len() > 3 {
-                format!("Some(&{})", inputs[3])
-            } else {
-                "None".to_string()
-            };
-            // Check if B is a static weight — use cached ARM path
-            let b_weight_name = super::super::sanitize_name(&ctx.node.input[1]);
-            if let Some((o, l, sh, dt)) = ctx.known_weights.get(&b_weight_name) {
-                if (*dt == 2 || *dt == 3) && sh.len() == 2 {
-                    let k = sh[0];
-                    let n = sh[1];
+            let (a_zp, b_zp) = (zero_point(2), zero_point(3));
+            // A static B with static zero points is packed for the integer
+            // GEMM when the model is created.
+            let zero_point = ctx.weight_at_load(3, "lele::scalar(0.0f32)");
+            match (ctx.weight(1), zero_point) {
+                (Some(b), Some(zero_point))
+                    if matches!(b.dtype, DType::U8 | DType::I8) && b.shape.len() == 2 =>
+                {
+                    let n = ctx.weights.qweights(format!(
+                        "weights.pack_qweights({}, {}, {}, {}, {}, &{zero_point}, &lele::scalar(1.0f32))",
+                        b.offset,
+                        b.len,
+                        b.shape[0],
+                        b.shape[1],
+                        b.dtype == DType::I8,
+                    ));
                     writeln!(
                         w,
-                        "{}#[cfg(target_arch = \"aarch64\")]",
-                        tab
-                    )?;
-                    writeln!(
-                        w,
-                        "{}let {} = self.mat_mul_integer_arm(&{}, {}, {}, {}, {}, {}, {}, {}, {});",
-                        tab, outputs[0], inputs[0], *o, *l, k, n, *dt == 3, a_zp, b_zp, buf_expr
-                    )?;
-                    writeln!(
-                        w,
-                        "{}#[cfg(not(target_arch = \"aarch64\"))]",
-                        tab
-                    )?;
-                    writeln!(
-                        w,
-                        "{}let {} = self.mat_mul_integer_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {});",
-                        tab, outputs[0], inputs[0], *o, *l, k, n, *dt == 3, a_zp, b_zp, buf_expr
-                    )?;
-                } else {
-                    writeln!(
-                        w,
-                        "{}let {} = lele::kernels::mat_mul_integer(&{}, &{}, {}, {}, {});",
-                        tab, outputs[0], inputs[0], inputs[1], a_zp, b_zp, buf_expr
+                        "{tab}let {} = self.mat_mul_integer_packed(&{}, self.qweights({n}), {a_zp}, {buf_expr});",
+                        outputs[0], inputs[0],
                     )?;
                 }
-            } else {
-                writeln!(
+                _ => writeln!(
                     w,
                     "{}let {} = lele::kernels::mat_mul_integer(&{}, &{}, {}, {}, {});",
                     tab, outputs[0], inputs[0], inputs[1], a_zp, b_zp, buf_expr
-                )?;
+                )?,
             }
         }
-        "Pow" => writeln!(
-            w,
-            "{}let {} = lele::kernels::pow(&{}, &{}, {});",
-            tab, outputs[0], inputs[0], inputs[1], buf_expr
-        )?,
-        "Sqrt" => writeln!(
-            w,
-            "{}let {} = lele::kernels::sqrt(&{}, {});",
-            tab, outputs[0], inputs[0], buf_expr
-        )?,
-        "Neg" => writeln!(
-            w,
-            "{}let {} = lele::kernels::neg(&{}, {});",
-            tab, outputs[0], inputs[0], buf_expr
-        )?,
-        "Reciprocal" => writeln!(
-            w,
-            "{}let {} = lele::kernels::reciprocal(&{}, {});",
-            tab, outputs[0], inputs[0], buf_expr
-        )?,
-        "Erf" => writeln!(
-            w,
-            "{}let {} = lele::kernels::erf(&{}, {});",
-            tab, outputs[0], inputs[0], buf_expr
-        )?,
-        "Softplus" => writeln!(
-            w,
-            "{}let {} = lele::kernels::softplus(&{}, {});",
-            tab, outputs[0], inputs[0], buf_expr
-        )?,
-        "Exp" => writeln!(
-            w,
-            "{}let {} = lele::kernels::exp(&{}, {});",
-            tab, outputs[0], inputs[0], buf_expr
-        )?,
-        "Log" => writeln!(
-            w,
-            "{}let {} = lele::kernels::log(&{}, {});",
-            tab, outputs[0], inputs[0], buf_expr
-        )?,
-        "Sin" => writeln!(
-            w,
-            "{}let {} = lele::kernels::sin(&{}, {});",
-            tab, outputs[0], inputs[0], buf_expr
-        )?,
-        "Cos" => writeln!(
-            w,
-            "{}let {} = lele::kernels::cos(&{}, {});",
-            tab, outputs[0], inputs[0], buf_expr
-        )?,
-        "Round" => writeln!(
-            w,
-            "{}let {} = lele::kernels::round(&{}, {});",
-            tab, outputs[0], inputs[0], buf_expr
-        )?,
-        "Floor" => writeln!(
-            w,
-            "{}let {} = lele::kernels::floor(&{}, {});",
-            tab, outputs[0], inputs[0], buf_expr
-        )?,
-        "Ceil" => writeln!(
-            w,
-            "{}let {} = lele::kernels::ceil(&{}, {});",
-            tab, outputs[0], inputs[0], buf_expr
-        )?,
-        "Equal" => {
-            let is_i64 = ctx
-                .var_types
-                .get(&ctx.outputs[0])
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&ctx.inputs[0])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
-            if is_i64 {
-                let a_is_weight_f32 = inputs[0].contains("weight_f32");
-                let b_is_weight_f32 = inputs.len() > 1 && inputs[1].contains("weight_f32");
-                let raw_a = sanitize_name(&ctx.node.input[0]);
-                let type_a = ctx.var_types.get(&raw_a).map(|s| s.as_str()).unwrap_or("f32");
-                if b_is_weight_f32 {
-                    let func = if type_a == "i64" { "equal_i64_f32_r_i64" } else { "equal_i64_f32_r" };
-                    writeln!(
-                        w,
-                        "{}let {} = lele::kernels::{}(&{}, &{}, {});",
-                        tab, outputs[0], func, inputs[0], inputs[1], buf_expr
-                    )?;
-                } else if a_is_weight_f32 {
-                    writeln!(
-                        w,
-                        "{}let {} = lele::kernels::equal_i64_f32_lhs(&{}, &{}, {});",
-                        tab, outputs[0], inputs[0], inputs[1], buf_expr
-                    )?;
-                } else if type_a == "f32" && (inputs[1].contains("weight_i64") || ctx.var_types.get(&sanitize_name(&ctx.node.input[1])).map(|t| t == "i64").unwrap_or(false)) {
-                    writeln!(
-                        w,
-                        "{}let {} = lele::kernels::equal_i64_f32_lhs(&{}, &{}, {});",
-                        tab, outputs[0], inputs[0], inputs[1], buf_expr
-                    )?;
-                } else {
-                    writeln!(
-                        w,
-                        "{}let {} = lele::kernels::equal_i64(&{}, &{}, {});",
-                        tab, outputs[0], inputs[0], inputs[1], buf_expr
-                    )?;
+        Op::Reduce {
+            reduction,
+            axes,
+            keepdims,
+        } => {
+            let attr_axes = format!("&{:?}", axes.as_deref().unwrap_or_default());
+            let axes = match reduction {
+                // These kernels take computed axes too.
+                Reduction::Sum | Reduction::Prod | Reduction::Max => {
+                    if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
+                        match ctx.ints(1) {
+                            Some(ints) => format!("&{:?}", ints),
+                            None => format!("&lele::kernels::to_i64_vec(&{})", inputs[1]),
+                        }
+                    } else {
+                        attr_axes
+                    }
                 }
-            } else {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::equal(&{}, &{}, {});",
-                    tab, outputs[0], inputs[0], inputs[1], buf_expr
-                )?;
-            }
-        }
-        "Less" => {
-            let is_i64 = ctx
-                .var_types
-                .get(&inputs[0])
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&inputs[1])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
-            if is_i64 {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::less_i64(&{}, &{}, {});",
-                    tab, outputs[0], inputs[0], inputs[1], buf_expr
-                )?;
-            } else {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::less(&{}, &{}, {});",
-                    tab, outputs[0], inputs[0], inputs[1], buf_expr
-                )?;
-            }
-        }
-        "LessOrEqual" => {
-            let is_i64 = ctx
-                .var_types
-                .get(&inputs[0])
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&inputs[1])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
-            if is_i64 {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::less_or_equal_i64(&{}, &{}, {});",
-                    tab, outputs[0], inputs[0], inputs[1], buf_expr
-                )?;
-            } else {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::less_or_equal(&{}, &{}, {});",
-                    tab, outputs[0], inputs[0], inputs[1], buf_expr
-                )?;
-            }
-        }
-        "Not" => writeln!(
-            w,
-            "{}let {} = lele::kernels::not(&{}, {});",
-            tab, outputs[0], inputs[0], buf_expr
-        )?,
-        "PRelu" => writeln!(
-            w,
-            "{}let {} = lele::kernels::prelu(&{}, &{}, {});",
-            tab, outputs[0], inputs[0], inputs[1], buf_expr
-        )?,
-        "ReduceSum" => {
-            let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
-                let name = &ctx.node.input[1];
-                if let Some((ints, _)) = ctx.int64_map.get(name) {
-                    format!("&{:?}", ints)
-                } else {
-                    format!("&lele::kernels::to_i64_vec(&{})", inputs[1])
-                }
-            } else {
-                let axes_attr = ctx
-                    .node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "axes")
-                    .map(|a| a.ints.clone())
-                    .unwrap_or(vec![]);
-                format!("&{:?}", axes_attr)
+                Reduction::Mean | Reduction::L2 => match ctx.ints(1) {
+                    Some(ints) if axes.as_ref().is_none_or(|a| a.is_empty()) => {
+                        format!("&{:?}", ints)
+                    }
+                    _ => attr_axes,
+                },
             };
-            let keepdims = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "keepdims")
-                .map(|a| a.i)
-                .unwrap_or(1)
-                != 0;
-            writeln!(
-                w,
-                "{}let {} = lele::kernels::reduce_sum(&{}, {}, {}, {});",
-                tab, outputs[0], inputs[0], axes, keepdims, buf_expr
-            )?;
-        }
-        "ReduceProd" => {
-            let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
-                let name = &ctx.node.input[1];
-                if let Some((ints, _)) = ctx.int64_map.get(name) {
-                    format!("&{:?}", ints)
-                } else {
-                    format!("&lele::kernels::to_i64_vec(&{})", inputs[1])
-                }
-            } else {
-                let axes_attr = ctx
-                    .node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "axes")
-                    .map(|a| a.ints.clone())
-                    .unwrap_or(vec![]);
-                format!("&{:?}", axes_attr)
+            let kernel = match reduction {
+                Reduction::L2 => "reduce_l2",
+                Reduction::Max => "reduce_max",
+                Reduction::Mean => "reduce_mean",
+                Reduction::Prod => "reduce_prod",
+                Reduction::Sum => "reduce_sum",
             };
-            let keepdims = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "keepdims")
-                .map(|a| a.i)
-                .unwrap_or(1)
-                != 0;
             writeln!(
                 w,
-                "{}let {} = lele::kernels::reduce_prod(&{}, {}, {}, {});",
-                tab, outputs[0], inputs[0], axes, keepdims, buf_expr
+                "{}let {} = lele::kernels::{}(&{}, {}, {}, {});",
+                tab, outputs[0], kernel, inputs[0], axes, keepdims, buf_expr
             )?;
         }
-        "ReduceMax" => {
-            let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
-                let name = &ctx.node.input[1];
-                if let Some((ints, _)) = ctx.int64_map.get(name) {
-                    format!("&{:?}", ints)
-                } else {
-                    format!("&lele::kernels::to_i64_vec(&{})", inputs[1])
-                }
-            } else {
-                let axes_attr = ctx
-                    .node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "axes")
-                    .map(|a| a.ints.clone())
-                    .unwrap_or(vec![]);
-                format!("&{:?}", axes_attr)
-            };
-            let keepdims = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "keepdims")
-                .map(|a| a.i)
-                .unwrap_or(1)
-                != 0;
-            writeln!(
-                w,
-                "{}let {} = lele::kernels::reduce_max(&{}, {}, {}, {});",
-                tab, outputs[0], inputs[0], axes, keepdims, buf_expr
-            )?;
-        }
-        "ReduceMean" => {
-            let mut axes = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axes")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
-            // If axes attribute is empty, check second input
-            if axes.is_empty() && inputs.len() > 1 && !ctx.node.input[1].is_empty() {
-                if let Some((data, _shape)) = ctx.int64_map.get(&ctx.node.input[1]) {
-                    axes = data.clone();
-                }
-            }
-            let keepdims = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "keepdims")
-                .map(|a| a.i)
-                .unwrap_or(1)
-                != 0;
-            writeln!(
-                w,
-                "{}let {} = lele::kernels::reduce_mean(&{}, &{:?}, {}, {});",
-                tab, outputs[0], inputs[0], axes, keepdims, buf_expr
-            )?;
-        }
-        "ReduceL2" => {
-            let mut axes = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axes")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
-            // If axes attribute is empty, check second input
-            if axes.is_empty() && inputs.len() > 1 && !ctx.node.input[1].is_empty() {
-                if let Some((data, _shape)) = ctx.int64_map.get(&ctx.node.input[1]) {
-                    axes = data.clone();
-                }
-            }
-            let keepdims = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "keepdims")
-                .map(|a| a.i)
-                .unwrap_or(1)
-                != 0;
-            writeln!(
-                w,
-                "{}let {} = lele::kernels::reduce_l2(&{}, &{:?}, {}, {});",
-                tab, outputs[0], inputs[0], axes, keepdims, buf_expr
-            )?;
-        }
-        "Max" => {
+        Op::Max => {
             // ONNX Max: element-wise maximum of two or more inputs
             if inputs.len() == 2 {
                 writeln!(
@@ -450,28 +140,13 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 }
             }
         }
-        "Range" => {
-            let is_i64 = ctx
-                .var_types
-                .get(&inputs[0])
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&inputs[1])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&inputs[2])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
+        Op::Range => {
+            let is_i64 = (0..3).any(|i| ctx.input_type(i) == ElemType::I64);
             if is_i64 {
-                writeln!(w, "{}let mut buf_{} = Vec::<i64>::new();", tab, outputs[0])?;
                 writeln!(
                     w,
-                    "{}let {} = lele::kernels::range_i64(&{}, &{}, &{}, &mut buf_{});",
-                    tab, outputs[0], inputs[0], inputs[1], inputs[2], outputs[0]
+                    "{}let {} = lele::kernels::range_i64(&{}, &{}, &{}, {});",
+                    tab, outputs[0], inputs[0], inputs[1], inputs[2], buf_expr
                 )?;
             } else {
                 writeln!(
@@ -481,7 +156,7 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 )?;
             }
         }
-        "Clip" => {
+        Op::Clip => {
             let min = if inputs.len() > 1 && !inputs[1].is_empty() {
                 format!("Some(&{})", inputs[1])
             } else {
@@ -498,54 +173,13 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 tab, outputs[0], inputs[0], min, max, buf_expr
             )?;
         }
-        "Greater" => {
-            let is_i64 = ctx
-                .var_types
-                .get(&inputs[0])
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&inputs[1])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
-            if is_i64 {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::less_i64(&{}, &{}, {});",
-                    tab, outputs[0], inputs[1], inputs[0], buf_expr
-                )?;
-            } else {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::less(&{}, &{}, {});",
-                    tab, outputs[0], inputs[1], inputs[0], buf_expr
-                )?;
-            }
-        }
-        "STFT" => {
+        Op::Stft => {
             // ONNX STFT: inputs[0]=signal, inputs[1]=frame_step, inputs[2]=window, inputs[3]=frame_length
-            let frame_step = if ctx.node.input.len() > 1 {
-                if let Some((ints, _)) = ctx.int64_map.get(&ctx.node.input[1]) {
-                    ints[0] as usize
-                } else {
-                    160
-                }
-            } else {
-                160
-            };
-            let n_fft = if ctx.node.input.len() > 3 && !ctx.node.input[3].is_empty() {
-                if let Some((ints, _)) = ctx.int64_map.get(&ctx.node.input[3]) {
-                    ints[0] as usize
-                } else {
-                    512
-                }
-            } else {
-                512
-            };
+            let frame_step = ctx.ints(1).map_or(160, |ints| ints[0] as usize);
+            let n_fft = ctx.ints(3).map_or(512, |ints| ints[0] as usize);
             let window = if ctx.node.input.len() > 2 && !ctx.node.input[2].is_empty() {
-                let wname = sanitize_name(&ctx.node.input[2]);
-                if let Some((o, l, s, _dt)) = ctx.known_weights.get(&wname) {
+                if let Some(window) = ctx.weight(2) {
+                    let (o, l, s) = (window.offset, window.len, &window.shape);
                     format!("Some(&self.weight_f32({}, {}, &{:?}))", o, l, s)
                 } else {
                     format!("Some(&{})", inputs[2])
@@ -559,110 +193,119 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 tab, outputs[0], inputs[0], n_fft, frame_step, n_fft, window, buf_expr
             )?;
         }
-        "And" => writeln!(
-            w,
-            "{}let {} = lele::kernels::logical_and(&{}, &{}, {});",
-            tab, outputs[0], inputs[0], inputs[1], buf_expr
-        )?,
-        "Or" => writeln!(
-            w,
-            "{}let {} = lele::kernels::logical_or(&{}, &{}, {});",
-            tab, outputs[0], inputs[0], inputs[1], buf_expr
-        )?,
-        "Xor" => writeln!(
-            w,
-            "{}let {} = lele::kernels::logical_xor(&{}, &{}, {});",
-            tab, outputs[0], inputs[0], inputs[1], buf_expr
-        )?,
-        "GreaterOrEqual" => {
-            let is_i64 = ctx
-                .var_types
-                .get(&inputs[0])
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&inputs[1])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
-            if is_i64 {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::greater_or_equal_i64(&{}, &{}, {});",
-                    tab, outputs[0], inputs[0], inputs[1], buf_expr
-                )?;
-            } else {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::greater_or_equal(&{}, &{}, {});",
-                    tab, outputs[0], inputs[0], inputs[1], buf_expr
-                )?;
-            }
-        }
-        "CumSum" => {
-            let axis = if !ctx.node.input.is_empty() && ctx.node.input.len() > 1 {
-                let name = &ctx.node.input[1];
-                if let Some((ints, _)) = ctx.int64_map.get(name) {
-                    ints[0]
-                } else {
-                    0
-                }
-            } else {
-                ctx.node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "axis")
-                    .map(|a| a.i)
-                    .unwrap_or(0)
-            };
-            let exclusive = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "exclusive")
-                .map(|a| a.i != 0)
-                .unwrap_or(false);
-            let reverse = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "reverse")
-                .map(|a| a.i != 0)
-                .unwrap_or(false);
+        Op::CumSum { exclusive, reverse } => {
+            let axis = ctx.ints(1).map_or(0, |ints| ints[0]);
             writeln!(
                 w,
                 "{}let {} = lele::kernels::cumsum(&{}, {}, {}, {}, {});",
                 tab, outputs[0], inputs[0], axis, exclusive, reverse, buf_expr
             )?;
         }
-        "Einsum" => {
-            let equation = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "equation")
-                .map(|a| String::from_utf8_lossy(&a.s).to_string())
-                .unwrap_or_default();
+        Op::Einsum { equation } => {
             let normalized = equation.replace(' ', "");
-            match normalized.as_str() {
-                "bs,d->bsd" => {
-                    writeln!(
-                        w,
-                        "{}let {} = lele::kernels::einsum_bs_d_bsd(&{}, &{}, {});",
-                        tab, outputs[0], inputs[0], inputs[1], buf_expr
-                    )?;
-                }
-                other => {
-                    writeln!(w, "{}// Unsupported Einsum: {}", tab, other)?;
-                    writeln!(
-                        w,
-                        "{}let {} = lele::kernels::einsum_bs_d_bsd(&{}, &{}, {});",
-                        tab, outputs[0], inputs[0], inputs[1], buf_expr
-                    )?;
+            if normalized != "bs,d->bsd" {
+                writeln!(w, "{}// Unsupported Einsum: {}", tab, normalized)?;
+            }
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::einsum_bs_d_bsd(&{}, &{}, {});",
+                tab, outputs[0], inputs[0], inputs[1], buf_expr
+            )?;
+        }
+        op => unreachable!("{} is not a math operator", op.op_type()),
+    }
+    Ok(())
+}
+
+/// The kernel computing `op`, which takes the operand and the output buffer.
+fn unary_kernel(op: Unary) -> &'static str {
+    match op {
+        Unary::Ceil => "ceil",
+        Unary::Cos => "cos",
+        Unary::Erf => "erf",
+        Unary::Exp => "exp",
+        Unary::Floor => "floor",
+        Unary::Log => "log",
+        Unary::Neg => "neg",
+        Unary::Not => "not",
+        Unary::Reciprocal => "reciprocal",
+        Unary::Relu => "relu",
+        Unary::Round => "round",
+        Unary::Sigmoid => "sigmoid",
+        Unary::Sin => "sin",
+        Unary::Softplus => "softplus",
+        Unary::Sqrt => "sqrt",
+        Unary::Tanh => "tanh_kernel",
+    }
+}
+
+fn generate_binary(ctx: &OpContext, op: Binary, w: &mut dyn Write) -> std::io::Result<()> {
+    let tab = ctx.tab();
+    let (a, b) = (&ctx.inputs[0], &ctx.inputs[1]);
+    let (out, buf_expr) = (&ctx.outputs[0], &ctx.buf_expr);
+    let types = ctx.var_types;
+    let any_i64 = ctx.input_type(0) == ElemType::I64 || ctx.input_type(1) == ElemType::I64;
+    let kernel = match op {
+        Binary::Add => "add",
+        Binary::And => "logical_and",
+        Binary::Mod if types.is_i64(out) => "mod_i64",
+        Binary::Mod => "mod_f32",
+        Binary::Mul => "mul",
+        Binary::Or => "logical_or",
+        Binary::Pow => "pow",
+        Binary::PRelu => "prelu",
+        Binary::Sub => "sub",
+        Binary::Xor => "logical_xor",
+        Binary::Div => {
+            // ONNX Div takes operands of one type, so an integer initializer
+            // makes it an integer division. When it runs in f32 (e.g. on the
+            // f32 indices of TopK) the quotient still has to be truncated.
+            let integer_in_f32 = !types.is_i64(out)
+                && (0..ctx.node.input.len()).any(|i| {
+                    ctx.weight(i)
+                        .is_some_and(|w| matches!(w.dtype, DType::I32 | DType::I64))
+                });
+            if integer_in_f32 { "div_trunc" } else { "div" }
+        }
+        Binary::Less if any_i64 => "less_i64",
+        Binary::Less => "less",
+        Binary::LessOrEqual if any_i64 => "less_or_equal_i64",
+        Binary::LessOrEqual => "less_or_equal",
+        Binary::GreaterOrEqual if any_i64 => "greater_or_equal_i64",
+        Binary::GreaterOrEqual => "greater_or_equal",
+        // a > b is b < a.
+        Binary::Greater => {
+            let kernel = if any_i64 { "less_i64" } else { "less" };
+            return writeln!(
+                w,
+                "{}let {} = lele::kernels::{}(&{}, &{}, {});",
+                tab, out, kernel, b, a, buf_expr
+            );
+        }
+        Binary::Equal => {
+            let (type_a, type_b) = (ctx.input_type(0), ctx.input_type(1));
+            if !(types.is_i64(out) || type_a == ElemType::I64) {
+                "equal"
+            } else {
+                let a_is_weight_f32 = a.contains("weight_f32");
+                let b_is_weight_f32 = b.contains("weight_f32");
+                if b_is_weight_f32 {
+                    if type_a == ElemType::I64 {
+                        "equal_i64_f32_r_i64"
+                    } else {
+                        "equal_i64_f32_r"
+                    }
+                } else if a_is_weight_f32 || type_a == ElemType::F32 && type_b == ElemType::I64 {
+                    "equal_i64_f32_lhs"
+                } else {
+                    "equal_i64"
                 }
             }
         }
-        _ => return Ok(false),
-    }
-    Ok(true)
+    };
+    writeln!(
+        w,
+        "{}let {} = lele::kernels::{}(&{}, &{}, {});",
+        tab, out, kernel, a, b, buf_expr
+    )
 }
