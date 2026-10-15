@@ -1,4 +1,5 @@
-onnx/*.json
+**/onnx/*.json
+/crates/*/voice_styles/
 /web/models/
 /web/pkg/
 gen/

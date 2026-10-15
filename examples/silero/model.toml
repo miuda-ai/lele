@@ -1,10 +1,20 @@
+# Silero VAD v6.2 from the upstream repository, pinned to the commit that added it.
 [model]
-source = "local"
+source = "url"
 
 [[model.files]]
-path = "model.onnx"
+url = "https://raw.githubusercontent.com/snakers4/silero-vad/bfdc0193023f121ea5b3cc7b176dbed570a68a59/src/silero_vad/data/silero_vad.onnx"
+dest = "model.onnx"
 
 [codegen]
 class_name = "SileroVad"
 model_file = "model.onnx"
 custom_methods = []
+
+# One stream of 16 kHz audio, in chunks of 512 samples.
+[codegen.shapes]
+input = [1, 512]
+state = [2, 1, 128]
+
+[codegen.values]
+sr = 16000
