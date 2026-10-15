@@ -5,6 +5,7 @@ Cargo.lock
 /scripts/
 /*.md
 *.onnx
+*.part
 *.bin
 *.out
 *.tokens.txt

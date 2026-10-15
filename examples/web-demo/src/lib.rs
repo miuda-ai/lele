@@ -16,10 +16,10 @@ mod sensevoice;
 #[path = "gen/yolo26.rs"]
 mod yolo26;
 // Supertonic TTS models
-#[path = "gen/textencoder.rs"]
-mod textencoder;
 #[path = "gen/durationpredictor.rs"]
 mod durationpredictor;
+#[path = "gen/textencoder.rs"]
+mod textencoder;
 #[path = "gen/vectorestimator.rs"]
 mod vectorestimator;
 #[path = "gen/vocoder.rs"]
@@ -49,8 +49,7 @@ impl SenseVoiceEngine {
         // Leak weights to get 'static lifetime (loaded once, lives forever)
         let leaked: &'static [u8] = Box::leak(weights.to_vec().into_boxed_slice());
         let model = sensevoice::SenseVoice::new(leaked);
-        let tokenizer = tokenizer::Tokenizer::from_string(tokens)
-            .map_err(|e| JsError::new(&e))?;
+        let tokenizer = tokenizer::Tokenizer::from_string(tokens).map_err(|e| JsError::new(&e))?;
         Ok(SenseVoiceEngine { model, tokenizer })
     }
 
@@ -106,9 +105,9 @@ impl SenseVoiceEngine {
         let time_steps = output.size(1);
         let vocab_size = output.size(2);
 
-        let texts =
-            self.tokenizer
-                .decode_greedy(&output.data, batch_size, time_steps, vocab_size);
+        let texts = self
+            .tokenizer
+            .decode_greedy(&output.data, batch_size, time_steps, vocab_size);
 
         Ok(texts.into_iter().next().unwrap_or_default())
     }
@@ -153,7 +152,9 @@ impl Yolo26Engine {
         let input_data = img.preprocess();
 
         let input = TensorView::from_owned(input_data, vec![1, 3, 640, 640]);
-        let (logits, pred_boxes) = self.model.forward_with_workspace(&mut self.workspace, input);
+        let (logits, pred_boxes) = self
+            .model
+            .forward_with_workspace(&mut self.workspace, input);
         let logits: TensorView<'static> = logits.to_owned();
         let pred_boxes: TensorView<'static> = pred_boxes.to_owned();
 
@@ -317,7 +318,7 @@ impl SupertonicEngine {
             let max_len = text_ids_vec[0].len();
             let mut text_ids_i64 = vec![0i64; max_len];
             for (i, &id) in text_ids_vec[0].iter().enumerate() {
-                text_ids_i64[i] = id as i64;
+                text_ids_i64[i] = id;
             }
 
             let text_ids_shape = [bsz, max_len];
@@ -417,9 +418,7 @@ pub fn decode_wav(wav_bytes: &[u8]) -> Result<JsValue, JsError> {
         "samples": samples,
         "sampleRate": sample_rate,
     });
-    Ok(JsValue::from_str(
-        &serde_json::to_string(&result).unwrap(),
-    ))
+    Ok(JsValue::from_str(&serde_json::to_string(&result).unwrap()))
 }
 
 /// Encode f32 samples to WAV bytes.

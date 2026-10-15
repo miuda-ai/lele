@@ -5,15 +5,15 @@
 //!   (prompt tokens) -> [LLM autoregressive] -> speech token codes
 //!   codes -> [Decoder] -> 24kHz waveform
 //!
-//! The three ONNX sub-models are AOT-compiled to Rust by `build.rs`; if any of
-//! them fails to compile the crate still builds (a stub panics with a clear
-//! message at runtime), so `cargo build` always succeeds.
+//! `build.rs` AOT-compiles the encoder and decoder to Rust. The LLM runs by
+//! hand with a KV cache (`llm_cache`), on weights `build.rs` extracts from
+//! its ONNX model.
 
 mod audio;
 mod decoder;
 mod encoder;
-mod llm;
 mod llm_cache;
+mod llm_layout;
 mod tokenizer;
 
 use anyhow::{Context, Result, bail};
@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use crate::decoder::Decoder;
 use crate::encoder::Encoder;
-use crate::llm::Llm;
+use crate::llm_cache::Llm;
 use crate::tokenizer::HojoTokenizer;
 
 const CODEC_SAMPLE_RATE: u32 = 16000;
@@ -80,19 +80,30 @@ fn parse_args() -> GenArgs {
             "--prompt-text" => a.prompt_text = args.next().unwrap_or(a.prompt_text.clone()),
             "--output" => a.output = args.next().unwrap_or(a.output.clone()),
             "--temperature" => {
-                a.temperature = args.next().and_then(|s| s.parse().ok()).unwrap_or(a.temperature)
+                a.temperature = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(a.temperature)
             }
             "--top-p" => a.top_p = args.next().and_then(|s| s.parse().ok()).unwrap_or(a.top_p),
             "--top-k" => a.top_k = args.next().and_then(|s| s.parse().ok()).unwrap_or(a.top_k),
             "--max-new-tokens" => {
-                a.max_new_tokens = args.next().and_then(|s| s.parse().ok()).unwrap_or(a.max_new_tokens)
+                a.max_new_tokens = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(a.max_new_tokens)
             }
             "--min-new-tokens" => {
-                a.min_new_tokens = args.next().and_then(|s| s.parse().ok()).unwrap_or(a.min_new_tokens)
+                a.min_new_tokens = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(a.min_new_tokens)
             }
             "--repetition-penalty" => {
-                a.repetition_penalty =
-                    args.next().and_then(|s| s.parse().ok()).unwrap_or(a.repetition_penalty)
+                a.repetition_penalty = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(a.repetition_penalty)
             }
             "--seed" => a.seed = args.next().and_then(|s| s.parse().ok()).unwrap_or(a.seed),
             _ => a.text = arg,
@@ -149,7 +160,12 @@ fn resolve_gen_tokens(tk: &HojoTokenizer, unk_id: i64) -> GenTokens {
     }
 }
 
-fn build_prompt(g: &GenTokens, ref_text: &str, target_text: &str, speech_tokens_str: &str) -> String {
+fn build_prompt(
+    g: &GenTokens,
+    ref_text: &str,
+    target_text: &str,
+    speech_tokens_str: &str,
+) -> String {
     format!(
         "{rs}{ref_text}{re} {tts}{target_text}{tte}{rss}{speech}{rse}{tss}",
         rs = g.ref_text_start,
@@ -169,10 +185,10 @@ fn build_prompt(g: &GenTokens, ref_text: &str, target_text: &str, speech_tokens_
 fn build_id_to_code(tk: &HojoTokenizer) -> HashMap<i64, i64> {
     let mut map = HashMap::new();
     for id in 0..(tk.vocab_size() as u32) {
-        if let Some(s) = tk.id_to_token_str(id) {
-            if let Some(code) = parse_speech_token(s) {
-                map.insert(id as i64, code);
-            }
+        if let Some(s) = tk.id_to_token_str(id)
+            && let Some(code) = parse_speech_token(s)
+        {
+            map.insert(id as i64, code);
         }
     }
     map
@@ -234,7 +250,11 @@ fn sample_next(
 
     if top_k > 0 && top_k < n {
         let mut idx: Vec<usize> = (0..n).collect();
-        idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal));
+        idx.sort_by(|&a, &b| {
+            logits[b]
+                .partial_cmp(&logits[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let keep: std::collections::HashSet<usize> = idx.iter().take(top_k).copied().collect();
         for (i, l) in logits.iter_mut().enumerate() {
             if !keep.contains(&i) {
@@ -256,7 +276,11 @@ fn sample_next(
 
     if (0.0..1.0).contains(&top_p) {
         let mut idx: Vec<usize> = (0..n).collect();
-        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
+        idx.sort_by(|&a, &b| {
+            probs[b]
+                .partial_cmp(&probs[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut cum = 0.0;
         let mut keep = vec![false; n];
         for (rank, &i) in idx.iter().enumerate() {
@@ -324,11 +348,11 @@ fn main() -> Result<()> {
         .context("speech_end token missing from vocab")? as i64;
 
     println!("Loading compiled weights...");
-    let enc_weights = std::fs::read(gen_dir.join("encoder_weights.bin"))
-        .context("encoder_weights.bin")?;
+    let enc_weights =
+        std::fs::read(gen_dir.join("encoder_weights.bin")).context("encoder_weights.bin")?;
     let llm_weights = std::fs::read(gen_dir.join("llm_weights.bin")).context("llm_weights.bin")?;
-    let dec_weights = std::fs::read(gen_dir.join("decoder_weights.bin"))
-        .context("decoder_weights.bin")?;
+    let dec_weights =
+        std::fs::read(gen_dir.join("decoder_weights.bin")).context("decoder_weights.bin")?;
 
     let encoder = Encoder::new(&enc_weights);
     let llm = Llm::new(&llm_weights);
@@ -372,10 +396,7 @@ fn main() -> Result<()> {
     }
 
     // 3. Build prompt token string + encode.
-    let speech_tokens_str: String = prompt_codes
-        .iter()
-        .map(|c| format!("[{}]", c))
-        .collect();
+    let speech_tokens_str: String = prompt_codes.iter().map(|c| format!("[{}]", c)).collect();
     let prompt_str = build_prompt(
         &gen_tokens,
         &args.prompt_text,
@@ -402,7 +423,6 @@ fn main() -> Result<()> {
     let mut cache = llm_cache::LlmCache::new(&llm);
     let logits = llm.forward_prompt(&mut cache, &cur);
 
-    let vocab = logits.len();
     let row = &logits[..];
 
     let mut next_id = sample_next(
@@ -465,7 +485,11 @@ fn main() -> Result<()> {
         let path2 = format!("{}/audio_codes.bin", dir);
         let bytes2: Vec<u8> = audio_codes.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(&path2, &bytes2).ok();
-        eprintln!("[DUMP] generated+audio_codes -> {} vals + {} vals", generated.len(), audio_codes.len());
+        eprintln!(
+            "[DUMP] generated+audio_codes -> {} vals + {} vals",
+            generated.len(),
+            audio_codes.len()
+        );
     }
 
     if audio_codes.is_empty() {
@@ -499,7 +523,10 @@ fn main() -> Result<()> {
     } else {
         0.0
     };
-    println!("Synthesized {:.2}s of audio in {:.2}s (RTF {:.4})", audio_duration, elapsed, rtf);
+    println!(
+        "Synthesized {:.2}s of audio in {:.2}s (RTF {:.4})",
+        audio_duration, elapsed, rtf
+    );
 
     audio::WavWriter::save(&args.output, &samples, OUTPUT_SAMPLE_RATE)
         .with_context(|| format!("save output {}", args.output))?;
