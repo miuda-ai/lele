@@ -37,18 +37,25 @@ impl OnnxModel {
     }
 
     fn load_external_data(graph: &mut GraphProto, model_dir: &Path) -> Result<(), ModelError> {
-        let mut data_cache: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+        let mut data_cache: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
         for init in &mut graph.initializer {
             if init.data_location == 1 && init.raw_data.is_empty() {
-                let location = init.external_data.iter()
+                let location = init
+                    .external_data
+                    .iter()
                     .find(|e| e.key == "location")
                     .map(|e| e.value.as_str())
                     .unwrap_or("");
-                let offset: usize = init.external_data.iter()
+                let offset: usize = init
+                    .external_data
+                    .iter()
                     .find(|e| e.key == "offset")
                     .and_then(|e| e.value.parse().ok())
                     .unwrap_or(0);
-                let length: usize = init.external_data.iter()
+                let length: usize = init
+                    .external_data
+                    .iter()
                     .find(|e| e.key == "length")
                     .and_then(|e| e.value.parse().ok())
                     .unwrap_or(0);
@@ -92,34 +99,32 @@ pub fn tensor_to_array(tensor: &TensorProto) -> Result<(Vec<f32>, Vec<usize>), M
         match tensor.data_type {
             1 => tensor
                 .raw_data
-                .chunks_exact(4)
-                .map(|chunk| {
-                    let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                    f32::from_le_bytes(bytes)
-                })
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&chunk| f32::from_le_bytes(chunk))
                 .collect(),
             2 => tensor.raw_data.iter().map(|&x| x as f32).collect(),
             3 => tensor.raw_data.iter().map(|&x| (x as i8) as f32).collect(),
             6 => tensor
                 .raw_data
-                .chunks_exact(4)
-                .map(|chunk| {
-                    let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                    i32::from_le_bytes(bytes) as f32
-                })
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&chunk| i32::from_le_bytes(chunk) as f32)
                 .collect(),
             7 => tensor
                 .raw_data
-                .chunks_exact(8)
-                .map(|chunk| {
-                    let bytes = [
-                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
-                        chunk[7],
-                    ];
-                    i64::from_le_bytes(bytes) as f32
-                })
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&chunk| i64::from_le_bytes(chunk) as f32)
                 .collect(),
-            9 => tensor.raw_data.iter().map(|&x| if x != 0 { 1.0 } else { 0.0 }).collect(),
+            9 => tensor
+                .raw_data
+                .iter()
+                .map(|&x| if x != 0 { 1.0 } else { 0.0 })
+                .collect(),
             _ => Vec::new(),
         }
     } else {

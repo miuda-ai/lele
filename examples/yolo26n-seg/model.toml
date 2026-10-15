@@ -1,3 +1,7 @@
+# Ultralytics publishes no ONNX for this model. Export the end-to-end variant
+# (TopK in the graph, output0 = [1, 300, 38]) into this directory with:
+#   uv run --with ultralytics --with onnx --with onnxslim \
+#     yolo export model=yolo26n-seg.pt format=onnx end2end=True opset=17
 [model]
 source = "local"
 
