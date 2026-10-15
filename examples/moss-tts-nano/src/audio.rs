@@ -5,7 +5,12 @@ use std::io::{BufWriter, Write};
 pub struct WavWriter;
 
 impl WavWriter {
-    pub fn save_stereo(path: &str, samples: &[f32], num_channels: usize, sample_rate: u32) -> Result<()> {
+    pub fn save_stereo(
+        path: &str,
+        samples: &[f32],
+        num_channels: usize,
+        sample_rate: u32,
+    ) -> Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
 

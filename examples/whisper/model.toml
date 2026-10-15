@@ -1,0 +1,55 @@
+# Whisper, exported to ONNX by Optimum: the encoder, the decoder for the first
+# step, and the decoder for the steps after it, which reads the first one's
+# key/value caches. https://huggingface.co/onnx-community
+#
+# These are the dynamically quantized (`_int8`) exports, which compile to about
+# a third of the weights of the f32 ones and run about 1.6 times as fast: drop
+# the `_int8` from the three model files to use those.
+#
+# Change `repo` to pick a size: whisper-tiny, whisper-base, whisper-small
+# (delete the downloaded files, `src/*.rs`, `src/*.bin` and `src/glue.rs` to
+# regenerate). The encoder always reads 30 seconds, so a transcript costs about
+# the same whatever its length, more for a larger model.
+[model]
+source = "hf-hub"
+repo = "onnx-community/whisper-base"
+revision = "main"
+
+[[model.files]]
+file = "onnx/encoder_model_int8.onnx"
+dest = "encoder_model.onnx"
+
+[[model.files]]
+file = "onnx/decoder_model_int8.onnx"
+dest = "decoder_model.onnx"
+
+[[model.files]]
+file = "onnx/decoder_with_past_model_int8.onnx"
+dest = "decoder_with_past_model.onnx"
+
+[[model.files]]
+file = "vocab.json"
+dest = "vocab.json"
+
+[[model.files]]
+file = "generation_config.json"
+dest = "generation_config.json"
+
+[[model.files]]
+file = "config.json"
+dest = "config.json"
+
+[codegen]
+class_name = "WhisperEncoder"
+model_file = "encoder_model.onnx"
+custom_methods = []
+
+# One transcript at a time, of 30 seconds of 80 mel bins, which the encoder
+# turns into 1500 frames.
+[codegen.shapes]
+input_features = [1, 80, 3000]
+
+[codegen.dims]
+batch_size = 1
+"encoder_sequence_length / 2" = 1500
+encoder_sequence_length_out = 1500
