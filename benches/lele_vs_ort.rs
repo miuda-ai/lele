@@ -2,9 +2,10 @@
 //!
 //! Run with: cargo bench --bench lele_vs_ort
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use lele::tensor::TensorView;
 use std::borrow::Cow;
+use std::hint::black_box;
 
 // ============================================================================
 // MatMul Benchmark
@@ -28,8 +29,14 @@ fn bench_matmul(c: &mut Criterion) {
 
         let a_shape = vec![m, k];
         let b_shape = vec![k, n];
-        let a = TensorView { data: Cow::Borrowed(&a_data), shape: Cow::Borrowed(&a_shape) };
-        let b = TensorView { data: Cow::Borrowed(&b_data), shape: Cow::Borrowed(&b_shape) };
+        let a = TensorView {
+            data: Cow::Borrowed(&a_data),
+            shape: Cow::Borrowed(&a_shape),
+        };
+        let b = TensorView {
+            data: Cow::Borrowed(&b_data),
+            shape: Cow::Borrowed(&b_shape),
+        };
 
         group.throughput(Throughput::Elements((m * k * n) as u64));
 
@@ -38,11 +45,7 @@ fn bench_matmul(c: &mut Criterion) {
             &(m, k, n),
             |bencher, _| {
                 bencher.iter(|| {
-                    let _ = lele::kernels::gemm::matmul(
-                        black_box(&a),
-                        black_box(&b),
-                        &mut out_buf,
-                    );
+                    let _ = lele::kernels::gemm::matmul(black_box(&a), black_box(&b), &mut out_buf);
                 });
             },
         );
@@ -58,12 +61,7 @@ fn bench_matmul(c: &mut Criterion) {
 fn bench_softmax(c: &mut Criterion) {
     let mut group = c.benchmark_group("softmax");
 
-    let sizes = [
-        (1, 512),
-        (4, 512),
-        (16, 256),
-        (64, 128),
-    ];
+    let sizes = [(1, 512), (4, 512), (16, 256), (64, 128)];
 
     for &(batch, size) in &sizes {
         let input_data: Vec<f32> = (0..batch * size)
@@ -72,7 +70,10 @@ fn bench_softmax(c: &mut Criterion) {
         let mut out_buf = vec![0.0f32; batch * size];
 
         let input_shape = vec![batch, size];
-        let input = TensorView { data: Cow::Borrowed(&input_data), shape: Cow::Borrowed(&input_shape) };
+        let input = TensorView {
+            data: Cow::Borrowed(&input_data),
+            shape: Cow::Borrowed(&input_shape),
+        };
 
         group.throughput(Throughput::Elements((batch * size) as u64));
 
@@ -84,7 +85,7 @@ fn bench_softmax(c: &mut Criterion) {
                     let _ = lele::kernels::norm::softmax(
                         black_box(&input),
                         black_box(-1),
-                        &mut out_buf
+                        &mut out_buf,
                     );
                 });
             },
@@ -101,26 +102,32 @@ fn bench_softmax(c: &mut Criterion) {
 fn bench_layernorm(c: &mut Criterion) {
     let mut group = c.benchmark_group("layernorm");
 
-    let sizes = [
-        (1, 512),
-        (4, 512),
-        (16, 256),
-        (128, 512),
-    ];
+    let sizes = [(1, 512), (4, 512), (16, 256), (128, 512)];
 
     for &(outer, norm_size) in &sizes {
         let input_data: Vec<f32> = (0..outer * norm_size)
             .map(|i| ((i % 20) as f32 - 10.0) * 0.1)
             .collect();
-        let scale_data: Vec<f32> = (0..norm_size).map(|i| 1.0 + ((i % 5) as f32) * 0.1).collect();
+        let scale_data: Vec<f32> = (0..norm_size)
+            .map(|i| 1.0 + ((i % 5) as f32) * 0.1)
+            .collect();
         let bias_data: Vec<f32> = (0..norm_size).map(|i| ((i % 5) as f32) * 0.01).collect();
         let mut out_buf = vec![0.0f32; outer * norm_size];
 
         let input_shape = vec![outer, norm_size];
         let scale_shape = vec![norm_size];
-        let input = TensorView { data: Cow::Borrowed(&input_data), shape: Cow::Borrowed(&input_shape) };
-        let scale = TensorView { data: Cow::Borrowed(&scale_data), shape: Cow::Borrowed(&scale_shape) };
-        let bias = TensorView { data: Cow::Borrowed(&bias_data), shape: Cow::Borrowed(&scale_shape) };
+        let input = TensorView {
+            data: Cow::Borrowed(&input_data),
+            shape: Cow::Borrowed(&input_shape),
+        };
+        let scale = TensorView {
+            data: Cow::Borrowed(&scale_data),
+            shape: Cow::Borrowed(&scale_shape),
+        };
+        let bias = TensorView {
+            data: Cow::Borrowed(&bias_data),
+            shape: Cow::Borrowed(&scale_shape),
+        };
 
         group.throughput(Throughput::Elements((outer * norm_size) as u64));
 
@@ -135,7 +142,7 @@ fn bench_layernorm(c: &mut Criterion) {
                         black_box(&bias),
                         black_box(-1),
                         1e-5,
-                        &mut out_buf
+                        &mut out_buf,
                     );
                 });
             },
@@ -152,12 +159,7 @@ fn bench_layernorm(c: &mut Criterion) {
 fn bench_rmsnorm(c: &mut Criterion) {
     let mut group = c.benchmark_group("rmsnorm");
 
-    let sizes = [
-        (1, 4096),
-        (1, 2048),
-        (4, 1024),
-        (16, 512),
-    ];
+    let sizes = [(1, 4096), (1, 2048), (4, 1024), (16, 512)];
 
     for &(batch, hidden) in &sizes {
         let input_data: Vec<f32> = (0..batch * hidden)
@@ -168,8 +170,14 @@ fn bench_rmsnorm(c: &mut Criterion) {
 
         let input_shape = vec![batch, hidden];
         let weight_shape = vec![hidden];
-        let input = TensorView { data: Cow::Borrowed(&input_data), shape: Cow::Borrowed(&input_shape) };
-        let weight = TensorView { data: Cow::Borrowed(&weight_data), shape: Cow::Borrowed(&weight_shape) };
+        let input = TensorView {
+            data: Cow::Borrowed(&input_data),
+            shape: Cow::Borrowed(&input_shape),
+        };
+        let weight = TensorView {
+            data: Cow::Borrowed(&weight_data),
+            shape: Cow::Borrowed(&weight_shape),
+        };
 
         group.throughput(Throughput::Elements((batch * hidden) as u64));
 
@@ -183,7 +191,7 @@ fn bench_rmsnorm(c: &mut Criterion) {
                         black_box(&weight),
                         black_box(-1),
                         1e-5,
-                        &mut out_buf
+                        &mut out_buf,
                     );
                 });
             },
@@ -200,11 +208,7 @@ fn bench_rmsnorm(c: &mut Criterion) {
 fn bench_gemm_fused(c: &mut Criterion) {
     let mut group = c.benchmark_group("gemm_fused");
 
-    let sizes = [
-        (1, 512, 512),
-        (4, 512, 512),
-        (1, 512, 2048),
-    ];
+    let sizes = [(1, 512, 512), (4, 512, 512), (1, 512, 2048)];
 
     for &(m, k, n) in &sizes {
         let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 % 10.0) * 0.1).collect();
@@ -215,9 +219,18 @@ fn bench_gemm_fused(c: &mut Criterion) {
         let a_shape = vec![m, k];
         let b_shape = vec![k, n];
         let bias_shape = vec![n];
-        let a = TensorView { data: Cow::Borrowed(&a_data), shape: Cow::Borrowed(&a_shape) };
-        let b = TensorView { data: Cow::Borrowed(&b_data), shape: Cow::Borrowed(&b_shape) };
-        let bias = TensorView { data: Cow::Borrowed(&bias_data), shape: Cow::Borrowed(&bias_shape) };
+        let a = TensorView {
+            data: Cow::Borrowed(&a_data),
+            shape: Cow::Borrowed(&a_shape),
+        };
+        let b = TensorView {
+            data: Cow::Borrowed(&b_data),
+            shape: Cow::Borrowed(&b_shape),
+        };
+        let bias = TensorView {
+            data: Cow::Borrowed(&bias_data),
+            shape: Cow::Borrowed(&bias_shape),
+        };
 
         group.throughput(Throughput::Elements((m * k * n + m * n) as u64));
 
@@ -230,7 +243,7 @@ fn bench_gemm_fused(c: &mut Criterion) {
                         black_box(&a),
                         black_box(&b),
                         black_box(&bias),
-                        &mut out_buf
+                        &mut out_buf,
                     );
                 });
             },

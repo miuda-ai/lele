@@ -14,7 +14,10 @@ pub fn reshape<'a, T: Clone + std::fmt::Debug>(
     }
 
     // Second pass: replace 0 with -1 (infer) and retry
-    let fixed: Vec<i64> = target_shape_raw.iter().map(|&d| if d == 0 { -1 } else { d }).collect();
+    let fixed: Vec<i64> = target_shape_raw
+        .iter()
+        .map(|&d| if d == 0 { -1 } else { d })
+        .collect();
     if let Some(shape) = try_reshape_with_zeros(input, &fixed, total_elements) {
         return TensorView {
             data: input.data.clone(),
@@ -29,7 +32,11 @@ pub fn reshape<'a, T: Clone + std::fmt::Debug>(
         // Keep first dim, infer middle, keep last (source_rank - 1) dims
         let mut collapsed: Vec<i64> = Vec::new();
         // First dim from target
-        let first = if target_shape_raw[0] > 0 { target_shape_raw[0] } else { -1 };
+        let first = if target_shape_raw[0] > 0 {
+            target_shape_raw[0]
+        } else {
+            -1
+        };
         collapsed.push(first);
         // -1 for inferred
         collapsed.push(-1);
@@ -52,11 +59,15 @@ pub fn reshape<'a, T: Clone + std::fmt::Debug>(
         // from the middle, keeping first and last dims
         let target_len = target_shape_raw.len();
         let source_rank = input.dim();
-        
+
         // Try keeping only source_rank dimensions, with -1 for inference
         if target_len > source_rank {
             let mut trial: Vec<i64> = Vec::new();
-            let non_zero: Vec<i64> = target_shape_raw.iter().copied().filter(|&d| d > 0).collect();
+            let non_zero: Vec<i64> = target_shape_raw
+                .iter()
+                .copied()
+                .filter(|&d| d > 0)
+                .collect();
             if non_zero.len() >= source_rank {
                 // Use the last source_rank non-zero dims
                 let start = non_zero.len() - source_rank;
@@ -80,7 +91,7 @@ pub fn reshape<'a, T: Clone + std::fmt::Debug>(
                 };
             }
         }
-        
+
         // Last resort: use target rank but infer everything possible
         let mut last_resort: Vec<i64> = Vec::new();
         let mut has_infer = false;
@@ -239,10 +250,18 @@ where
     T: crate::kernels::utils::AsI64 + Copy + std::fmt::Debug,
 {
     let shape: Vec<usize> = input.data.iter().map(|&x| x.as_i64() as usize).collect();
+    full(&shape, value, out)
+}
+/// A tensor of shape `shape` with every element `value`.
+pub fn full<'b, V: Clone + std::fmt::Debug>(
+    shape: &[usize],
+    value: V,
+    out: &'b mut Vec<V>,
+) -> TensorView<'b, V> {
     let size: usize = shape.iter().product();
     out.clear();
     out.resize(size, value);
-    TensorView::from_slice(out, shape)
+    TensorView::from_slice(out, shape.to_vec())
 }
 pub fn unsqueeze<'a, T: Clone + std::fmt::Debug>(
     input: &TensorView<'a, T>,

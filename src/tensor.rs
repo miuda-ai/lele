@@ -19,6 +19,16 @@ pub type TensorViewI64<'a> = TensorView<'a, i64>;
 pub type TensorViewF16<'a> = TensorView<'a, f16>;
 pub type TensorViewBF16<'a> = TensorView<'a, bf16>;
 
+/// A rank-0 tensor holding `value`: how generated code reads integer scalar
+/// weights.
+pub fn scalar<T>(value: T) -> TensorView<'static, T>
+where
+    T: Clone + std::fmt::Debug,
+    [T]: ToOwned<Owned = Vec<T>>,
+{
+    TensorView::from_owned(vec![value], Vec::new())
+}
+
 impl<'a, T> TensorView<'a, T>
 where
     T: Clone + std::fmt::Debug,
@@ -87,19 +97,43 @@ where
     /// Efficiently convert to any lifetime without copying borrowed data.
     /// If data is `Cow::Borrowed` (from workspace/weights), zero-copy via raw pointer.
     /// If data is `Cow::Owned`, copies the data. Shape is always copied (tiny).
-    /// 
+    ///
     /// # Safety
     /// When data is borrowed, the caller must ensure the underlying storage outlives `'b`.
     pub unsafe fn detach_or_own<'b>(&self) -> TensorView<'b, T> {
         match &self.data {
             Cow::Borrowed(slice) => {
-                let data_slice = std::slice::from_raw_parts(slice.as_ptr(), slice.len());
+                // SAFETY: the caller guarantees the storage outlives `'b`.
+                let data_slice = unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) };
                 TensorView {
                     data: Cow::Borrowed(data_slice),
                     shape: Cow::Owned(self.shape.to_vec()),
                 }
             }
             Cow::Owned(vec) => TensorView::from_owned(vec.clone(), self.shape.to_vec()),
+        }
+    }
+
+    /// [`Self::detach_or_own`] that moves owned data rather than copying it.
+    ///
+    /// # Safety
+    /// When data is borrowed, the caller must ensure the underlying storage outlives `'b`.
+    pub unsafe fn detach_or_move<'b>(self) -> TensorView<'b, T> {
+        match self.data {
+            Cow::Borrowed(_) => unsafe { self.detach_or_own() },
+            Cow::Owned(vec) => TensorView {
+                data: Cow::Owned(vec),
+                shape: Cow::Owned(self.shape.into_owned()),
+            },
+        }
+    }
+
+    /// The tensor owning its data: moved if it owns it already, copied
+    /// otherwise.
+    pub fn into_owned(self) -> TensorView<'static, T> {
+        TensorView {
+            data: Cow::Owned(self.data.into_owned()),
+            shape: Cow::Owned(self.shape.into_owned()),
         }
     }
 }
@@ -157,9 +191,8 @@ impl<'a> TensorView<'a, f32> {
         } else {
             // Fallback for unaligned data
             let mut f32_vec = Vec::with_capacity(bytes.len() / 4);
-            for chunk in bytes.chunks_exact(4) {
-                let bytes_arr: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                f32_vec.push(f32::from_le_bytes(bytes_arr));
+            for &chunk in bytes.as_chunks::<4>().0 {
+                f32_vec.push(f32::from_le_bytes(chunk));
             }
             unsafe { std::mem::transmute(TensorView::from_owned(f32_vec, shape.to_vec())) }
         }
@@ -167,48 +200,19 @@ impl<'a> TensorView<'a, f32> {
 
     /// Create a TensorView<f32> from u8 byte slice (cast each byte to f32)
     pub fn from_bytes_u8(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, f32> {
-        use std::cell::RefCell;
-        use std::collections::HashMap;
-        thread_local! {
-            static CACHE: RefCell<HashMap<usize, Vec<f32>>> = RefCell::new(HashMap::new());
-        }
-        CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let key = bytes.as_ptr() as usize;
-            let vec = cache
-                .entry(key)
-                .or_insert_with(|| bytes.iter().map(|&x| x as f32).collect());
-            let data: &'static [f32] =
-                unsafe { std::slice::from_raw_parts(vec.as_ptr(), vec.len()) };
-            TensorView::from_slice(data, shape)
-        })
+        TensorView::from_owned(bytes.iter().map(|&x| x as f32).collect(), shape)
     }
 
     /// Create a TensorView<f32> from i8 byte slice (cast each byte to i8 then f32)
     pub fn from_bytes_i8(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, f32> {
-        use std::cell::RefCell;
-        use std::collections::HashMap;
-        thread_local! {
-            static CACHE: RefCell<HashMap<usize, Vec<f32>>> = RefCell::new(HashMap::new());
-        }
-        CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let key = bytes.as_ptr() as usize;
-            let vec = cache
-                .entry(key)
-                .or_insert_with(|| bytes.iter().map(|&x| x as i8 as f32).collect());
-            let data: &'static [f32] =
-                unsafe { std::slice::from_raw_parts(vec.as_ptr(), vec.len()) };
-            TensorView::from_slice(data, shape)
-        })
+        TensorView::from_owned(bytes.iter().map(|&x| x as i8 as f32).collect(), shape)
     }
 
     /// Create a TensorView<f32> from f16 byte slice
     pub fn from_bytes_f16(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, f32> {
         let mut f16_vec = Vec::with_capacity(bytes.len() / 2);
-        for chunk in bytes.chunks_exact(2) {
-            let bytes_arr: [u8; 2] = [chunk[0], chunk[1]];
-            f16_vec.push(f16::from_bits(u16::from_le_bytes(bytes_arr)));
+        for &chunk in bytes.as_chunks::<2>().0 {
+            f16_vec.push(f16::from_le_bytes(chunk));
         }
         let f32_vec: Vec<f32> = f16_vec.iter().map(|&x| x.to_f32()).collect();
         TensorView::from_owned(f32_vec, shape)
@@ -217,11 +221,8 @@ impl<'a> TensorView<'a, f32> {
     /// Create a TensorView<f32> from i64 byte slice (cast to f32)
     pub fn from_bytes_i64_as_f32(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, f32> {
         let mut i64_vec = Vec::with_capacity(bytes.len() / 8);
-        for chunk in bytes.chunks_exact(8) {
-            let bytes_arr: [u8; 8] = [
-                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-            ];
-            i64_vec.push(i64::from_le_bytes(bytes_arr));
+        for &chunk in bytes.as_chunks::<8>().0 {
+            i64_vec.push(i64::from_le_bytes(chunk));
         }
         let f32_vec: Vec<f32> = i64_vec.iter().map(|&x| x as f32).collect();
         TensorView::from_owned(f32_vec, shape)
@@ -230,9 +231,8 @@ impl<'a> TensorView<'a, f32> {
     /// Create a TensorView<f32> from i32 byte slice (cast to f32)
     pub fn from_bytes_i32_as_f32(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, f32> {
         let mut i32_vec = Vec::with_capacity(bytes.len() / 4);
-        for chunk in bytes.chunks_exact(4) {
-            let bytes_arr: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
-            i32_vec.push(i32::from_le_bytes(bytes_arr));
+        for &chunk in bytes.as_chunks::<4>().0 {
+            i32_vec.push(i32::from_le_bytes(chunk));
         }
         let f32_vec: Vec<f32> = i32_vec.iter().map(|&x| x as f32).collect();
         TensorView::from_owned(f32_vec, shape)
@@ -244,11 +244,8 @@ impl<'a> TensorView<'a, i64> {
     pub fn from_bytes_i64(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, i64> {
         if bytes.len() >= 8 && bytes.len() % 8 == 0 {
             let mut i64_vec = Vec::with_capacity(bytes.len() / 8);
-            for chunk in bytes.chunks_exact(8) {
-                let bytes_arr: [u8; 8] = [
-                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-                ];
-                i64_vec.push(i64::from_le_bytes(bytes_arr));
+            for &chunk in bytes.as_chunks::<8>().0 {
+                i64_vec.push(i64::from_le_bytes(chunk));
             }
             TensorView::from_owned(i64_vec, shape)
         } else {
@@ -257,12 +254,19 @@ impl<'a> TensorView<'a, i64> {
         }
     }
 
+    /// Create a TensorView<i64> from a bool byte slice, one byte per element.
+    /// `from_bytes_i64` can only guess at bools from a length that is not a
+    /// multiple of 8, which misreads a 400-element mask as 50 integers.
+    pub fn from_bytes_bool_as_i64(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, i64> {
+        let i64_vec: Vec<i64> = bytes.iter().map(|&b| (b != 0) as i64).collect();
+        TensorView::from_owned(i64_vec, shape)
+    }
+
     /// Create a TensorView<i64> from i32 byte slice (cast to i64)
     pub fn from_bytes_i32_as_i64(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, i64> {
         let mut i64_vec = Vec::with_capacity(bytes.len() / 4);
-        for chunk in bytes.chunks_exact(4) {
-            let bytes_arr: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
-            i64_vec.push(i32::from_le_bytes(bytes_arr) as i64);
+        for &chunk in bytes.as_chunks::<4>().0 {
+            i64_vec.push(i32::from_le_bytes(chunk) as i64);
         }
         TensorView::from_owned(i64_vec, shape)
     }
@@ -272,10 +276,31 @@ impl<'a> TensorView<'a, i32> {
     /// Create a TensorView<i32> from byte slice
     pub fn from_bytes_i32(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, i32> {
         let mut i32_vec = Vec::with_capacity(bytes.len() / 4);
-        for chunk in bytes.chunks_exact(4) {
-            let bytes_arr: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
-            i32_vec.push(i32::from_le_bytes(bytes_arr));
+        for &chunk in bytes.as_chunks::<4>().0 {
+            i32_vec.push(i32::from_le_bytes(chunk));
         }
         TensorView::from_owned(i32_vec, shape)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_data_moves_and_borrowed_data_is_copied_or_shared() {
+        let owned = TensorView::from_owned(vec![1.0f32, 2.0], vec![2]);
+        let at = owned.data.as_ptr();
+        let moved = unsafe { owned.detach_or_move::<'static>() };
+        assert_eq!(moved.data.as_ptr(), at);
+        assert_eq!(moved.into_owned().data.as_ptr(), at);
+
+        let elems = [3.0f32, 4.0];
+        let borrowed = TensorView::from_slice(&elems, vec![2]);
+        let shared = unsafe { borrowed.clone().detach_or_move::<'static>() };
+        assert_eq!(shared.data.as_ptr(), elems.as_ptr());
+        let copy = borrowed.into_owned();
+        assert_ne!(copy.data.as_ptr(), elems.as_ptr());
+        assert_eq!((&copy.data[..], &copy.shape[..]), (&elems[..], &[2][..]));
     }
 }

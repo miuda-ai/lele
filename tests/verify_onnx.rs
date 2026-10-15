@@ -1,3 +1,5 @@
+#![cfg(feature = "compiler")]
+
 use lele::model::onnx_proto::{GraphProto, ModelProto, NodeProto};
 use prost::Message;
 
