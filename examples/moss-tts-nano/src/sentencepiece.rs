@@ -144,14 +144,6 @@ impl SentencePiece {
         self.pieces.len()
     }
 
-    pub fn debug_lookup(&self, s: &str) {
-        if let Some(&id) = self.piece_to_id.get(s) {
-            eprintln!("[SP] '{}' -> id={}, score={:.2}", s, id, self.pieces[id as usize].score);
-        } else {
-            eprintln!("[SP] '{}' -> NOT FOUND", s);
-        }
-    }
-
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let nfkc: String = text.nfkc().collect();
         let escaped = nfkc.replace(' ', "\u{2581}");
@@ -206,7 +198,11 @@ impl SentencePiece {
         while pos > 0 {
             let prev = best_prev[pos] as usize;
             let substring: String = chars[prev..pos].iter().collect();
-            let id = self.piece_to_id.get(&substring).copied().unwrap_or(self.unk_id);
+            let id = self
+                .piece_to_id
+                .get(&substring)
+                .copied()
+                .unwrap_or(self.unk_id);
             tokens.push(id);
             pos = prev;
         }
