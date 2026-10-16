@@ -23,11 +23,8 @@ fn elapsed_ms(start: u64, end: u64) -> f64 {
 
 /// Generate deterministic data
 fn gen_data(n: usize) -> Vec<f32> {
-    let mut v = vec![0.0f32; n];
-    for i in 0..n {
-        v[i] = ((i as f32 * 0.001) % 2.0) - 1.0; // values in [-1, 1]
-    }
-    v
+    // values in [-1, 1]
+    (0..n).map(|i| ((i as f32 * 0.001) % 2.0) - 1.0).collect()
 }
 
 fn bench_matmul_nn(m: usize, k: usize, n: usize, iters: usize) -> f64 {
@@ -257,11 +254,11 @@ fn bench_int8_linear(m: usize, k: usize, n: usize, iters: usize) -> f64 {
     let mut out = Vec::new();
 
     // Warmup
-    let _ = fused_quantized_linear(&input, &weight, &scale, &zero, &bias, false, &mut out);
+    let _ = fused_quantized_linear(&input, &weight, &scale, &zero, &bias, None, &mut out);
 
     let start = now_ns();
     for _ in 0..iters {
-        let _ = fused_quantized_linear(&input, &weight, &scale, &zero, &bias, false, &mut out);
+        let _ = fused_quantized_linear(&input, &weight, &scale, &zero, &bias, None, &mut out);
     }
     let end = now_ns();
     elapsed_ms(start, end) / iters as f64
@@ -322,14 +319,8 @@ fn test_matmul_integer_correctness() -> bool {
 
     for &(m, k, n) in &test_shapes {
         // Generate deterministic u8-range data
-        let mut a_data = vec![0.0f32; m * k];
-        let mut b_data = vec![0.0f32; k * n];
-        for i in 0..a_data.len() {
-            a_data[i] = ((i * 7 + 13) % 256) as f32;
-        }
-        for i in 0..b_data.len() {
-            b_data[i] = ((i * 11 + 3) % 256) as f32;
-        }
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i * 7 + 13) % 256) as f32).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i * 11 + 3) % 256) as f32).collect();
 
         // Reference result
         let ref_c = ref_mat_mul_integer(&a_data, &b_data, m, k, n, zp_a, zp_b);
@@ -418,20 +409,19 @@ fn test_conv_integer_correctness() -> bool {
         let spatial = h * w;
 
         // Create input data (quantized-like f32 values)
-        let mut input_data = vec![0.0f32; 1 * in_c * h * w];
-        for i in 0..input_data.len() {
-            input_data[i] = ((i % 256) as f32) - 128.0; // int8-like values
-        }
+        // int8-like values
+        let input_data: Vec<f32> = (0..in_c * h * w)
+            .map(|i| ((i % 256) as f32) - 128.0)
+            .collect();
         let input = TensorView {
             data: Cow::Borrowed(&input_data),
             shape: Cow::Owned(vec![1, in_c, h, w]),
         };
 
         // Create weight data
-        let mut weight_data = vec![0.0f32; out_c * in_c * 1 * 1];
-        for i in 0..weight_data.len() {
-            weight_data[i] = ((i % 256) as f32) - 128.0;
-        }
+        let weight_data: Vec<f32> = (0..out_c * in_c)
+            .map(|i| ((i % 256) as f32) - 128.0)
+            .collect();
         let weights = TensorView {
             data: Cow::Borrowed(&weight_data),
             shape: Cow::Owned(vec![out_c, in_c, 1, 1]),
@@ -503,19 +493,17 @@ fn test_conv_integer_correctness() -> bool {
         let h = 8usize;
         let w = 8usize;
 
-        let mut input_data = vec![0.0f32; 1 * in_c * h * w];
-        for i in 0..input_data.len() {
-            input_data[i] = ((i * 7 + 3) % 256) as f32 - 128.0;
-        }
+        let input_data: Vec<f32> = (0..in_c * h * w)
+            .map(|i| ((i * 7 + 3) % 256) as f32 - 128.0)
+            .collect();
         let input = TensorView {
             data: Cow::Borrowed(&input_data),
             shape: Cow::Owned(vec![1, in_c, h, w]),
         };
 
-        let mut weight_data = vec![0.0f32; out_c * in_c * 3 * 3];
-        for i in 0..weight_data.len() {
-            weight_data[i] = ((i * 13 + 5) % 256) as f32 - 128.0;
-        }
+        let weight_data: Vec<f32> = (0..out_c * in_c * 3 * 3)
+            .map(|i| ((i * 13 + 5) % 256) as f32 - 128.0)
+            .collect();
         let weights = TensorView {
             data: Cow::Borrowed(&weight_data),
             shape: Cow::Owned(vec![out_c, in_c, 3, 3]),
@@ -569,19 +557,16 @@ fn test_conv_integer_correctness() -> bool {
         let h = 4usize;
         let w = 4usize;
 
-        let mut input_data = vec![0.0f32; 1 * in_c * h * w];
-        for i in 0..input_data.len() {
-            input_data[i] = (i % 256) as f32; // unsigned-like [0..255]
-        }
+        // unsigned-like [0..255]
+        let input_data: Vec<f32> = (0..in_c * h * w).map(|i| (i % 256) as f32).collect();
         let input = TensorView {
             data: Cow::Borrowed(&input_data),
             shape: Cow::Owned(vec![1, in_c, h, w]),
         };
 
-        let mut weight_data = vec![0.0f32; out_c * in_c];
-        for i in 0..weight_data.len() {
-            weight_data[i] = ((i * 11 + 7) % 256) as f32 - 128.0;
-        }
+        let weight_data: Vec<f32> = (0..out_c * in_c)
+            .map(|i| ((i * 11 + 7) % 256) as f32 - 128.0)
+            .collect();
         let weights = TensorView {
             data: Cow::Borrowed(&weight_data),
             shape: Cow::Owned(vec![out_c, in_c, 1, 1]),

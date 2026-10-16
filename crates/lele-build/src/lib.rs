@@ -1,9 +1,50 @@
+use std::fmt;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// What a build script fails with.
+///
+/// `Debug` prints the message alone, so a `main` that returns this reports
+/// `Error: <message>` rather than a quoted string or a struct dump.
+pub struct Error(String);
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<E: std::error::Error> From<E> for Error {
+    fn from(e: E) -> Self {
+        Error(e.to_string())
+    }
+}
+
+pub type Result<T = (), E = Error> = std::result::Result<T, E>;
+
+/// Says what was being done when an error happened.
+pub trait Context<T> {
+    fn context(self, what: impl FnOnce() -> String) -> Result<T>;
+}
+
+impl<T, E: fmt::Display> Context<T> for std::result::Result<T, E> {
+    fn context(self, what: impl FnOnce() -> String) -> Result<T> {
+        self.map_err(|e| Error(format!("{}: {}", what(), e)))
+    }
+}
+
 pub mod config {
+    use lele::compiler::Compiler;
+    use lele::model::onnx_proto::{GraphProto, ValueInfoProto, tensor_shape_proto, type_proto};
     use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
     use std::path::Path;
 
     #[derive(Debug, Deserialize, Serialize)]
@@ -56,14 +97,149 @@ pub mod config {
         pub class_name: String,
         #[serde(default)]
         pub model_file: Option<String>,
+        /// The inputs the model is compiled for.
+        #[serde(flatten)]
+        pub inputs: InputConfig,
+    }
+
+    /// The inputs a model is compiled for, in `[codegen]`; see
+    /// `lele::compiler::Compiler::with_input_shape`, `with_dim` and
+    /// `with_input_value`. With several models in one config, each setting
+    /// applies to the models that have the input or dimension it names.
+    ///
+    /// ```toml
+    /// [codegen.shapes]
+    /// input = [1, 512]
+    /// [codegen.dims]
+    /// batch_size = 1
+    /// [codegen.values]
+    /// sr = 16000
+    /// ```
+    #[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq)]
+    pub struct InputConfig {
+        /// Input shapes, by input name.
         #[serde(default)]
-        pub custom_methods: Vec<String>,
+        pub shapes: BTreeMap<String, Vec<usize>>,
+        /// Values of named symbolic dimensions (`dim_param`s).
+        #[serde(default)]
+        pub dims: BTreeMap<String, usize>,
+        /// Input values compiled in, by input name: a number or a list of
+        /// the input's elements.
+        #[serde(default)]
+        pub values: BTreeMap<String, InputValue>,
+    }
+
+    /// The value of an input compiled in.
+    #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+    #[serde(untagged)]
+    pub enum InputValue {
+        Int(i64),
+        Float(f64),
+        Ints(Vec<i64>),
+        Floats(Vec<f64>),
+    }
+
+    impl From<&InputValue> for lele::compiler::InputValue {
+        fn from(v: &InputValue) -> Self {
+            match v {
+                InputValue::Int(x) => Self::Ints(vec![*x]),
+                InputValue::Float(x) => Self::Floats(vec![*x]),
+                InputValue::Ints(v) => Self::Ints(v.clone()),
+                InputValue::Floats(v) => Self::Floats(v.clone()),
+            }
+        }
+    }
+
+    impl InputConfig {
+        /// `compiler`, compiled for these inputs.
+        pub fn apply(&self, mut compiler: Compiler) -> Compiler {
+            for (name, shape) in &self.shapes {
+                compiler = compiler.with_input_shape(name, shape);
+            }
+            for (name, &value) in &self.dims {
+                compiler = compiler.with_dim(name, value);
+            }
+            for (name, value) in &self.values {
+                compiler = compiler.with_input_value(name, value);
+            }
+            compiler
+        }
+
+        /// The settings that apply to `graph`: those naming one of its
+        /// inputs, or a dimension one of its inputs has.
+        pub fn for_graph(&self, graph: &GraphProto) -> Self {
+            let weights: Vec<&str> = graph.initializer.iter().map(|t| t.name.as_str()).collect();
+            let inputs: Vec<&ValueInfoProto> = graph
+                .input
+                .iter()
+                .filter(|i| !weights.contains(&i.name.as_str()))
+                .collect();
+            let has_input = |name: &String| inputs.iter().any(|i| &i.name == name);
+            let has_dim = |name: &String| {
+                inputs.iter().any(|i| {
+                    let Some(type_proto::Value::TensorType(t)) =
+                        i.r#type.as_ref().and_then(|t| t.value.as_ref())
+                    else {
+                        return false;
+                    };
+                    t.shape.iter().flat_map(|s| &s.dim).any(|d| {
+                        matches!(&d.value, Some(tensor_shape_proto::dimension::Value::DimParam(p)) if p == name)
+                    })
+                })
+            };
+            Self {
+                shapes: self
+                    .shapes
+                    .clone()
+                    .into_iter()
+                    .filter(|(n, _)| has_input(n))
+                    .collect(),
+                dims: self
+                    .dims
+                    .clone()
+                    .into_iter()
+                    .filter(|(n, _)| has_dim(n))
+                    .collect(),
+                values: self
+                    .values
+                    .clone()
+                    .into_iter()
+                    .filter(|(n, _)| has_input(n))
+                    .collect(),
+            }
+        }
+
+        /// The settings of `self` that are not in any of `applied`, as they
+        /// would be written in the config.
+        pub fn unused(&self, applied: &[Self]) -> Vec<String> {
+            let used = |f: &dyn Fn(&Self) -> bool| applied.iter().any(f);
+            let shapes = self
+                .shapes
+                .keys()
+                .filter(|n| !used(&|a| a.shapes.contains_key(*n)));
+            let dims = self
+                .dims
+                .keys()
+                .filter(|n| !used(&|a| a.dims.contains_key(*n)));
+            let values = self
+                .values
+                .keys()
+                .filter(|n| !used(&|a| a.values.contains_key(*n)));
+            shapes
+                .map(|n| format!("shapes.{n}"))
+                .chain(dims.map(|n| format!("dims.{n}")))
+                .chain(values.map(|n| format!("values.{n}")))
+                .collect()
+        }
     }
 
     impl ModelConfig {
-        pub fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
-            let content = std::fs::read_to_string(path)?;
-            Ok(toml::from_str(&content)?)
+        pub fn load(path: impl AsRef<Path>) -> crate::Result<Self> {
+            use crate::Context;
+            let path = path.as_ref();
+            let content =
+                std::fs::read_to_string(path).context(|| format!("reading {}", path.display()))?;
+            toml::from_str(&content).context(|| format!("parsing {}", path.display()))
         }
     }
 }
@@ -74,7 +250,7 @@ pub fn download_from_hf_hub(
     file: &str,
     revision: Option<&str>,
     cache_dir: Option<&Path>,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
+) -> Result<PathBuf> {
     let base =
         std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
     if std::env::var("HF_ENDPOINT").is_ok() {
@@ -102,19 +278,18 @@ pub fn download_from_hf_hub(
 }
 
 /// Download file from URL
-pub fn download_from_url(url: &str, dest: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+///
+/// The body goes to `<dest>.part` first and is renamed once complete: an
+/// interrupted download would otherwise leave a truncated `dest`, which every
+/// later build would take for the finished file.
+pub fn download_from_url(url: &str, dest: &Path) -> Result<PathBuf> {
     println!("cargo:warning=Downloading from URL: {}", url);
 
     let config = ureq::config::Config::builder()
         .timeout_global(Some(std::time::Duration::from_secs(1200)))
         .build();
     let agent = ureq::Agent::new_with_config(config);
-    let response = agent.get(url).call()?;
-
-    println!("cargo:warning=Response status: {}", response.status());
-    if !response.status().is_success() {
-        return Err(format!("Download failed with status: {}", response.status()).into());
-    }
+    let response = agent.get(url).call().context(|| format!("GET {url}"))?;
 
     let content_len = response
         .headers()
@@ -126,12 +301,91 @@ pub fn download_from_url(url: &str, dest: &Path) -> Result<PathBuf, Box<dyn std:
         println!("cargo:warning=Downloading {} bytes...", len);
     }
 
-    let mut file = File::create(dest)?;
+    let part = PathBuf::from(format!("{}.part", dest.display()));
+    let mut file = File::create(&part).context(|| format!("creating {}", part.display()))?;
     let mut reader = response.into_body().into_reader();
-    std::io::copy(&mut reader, &mut file)?;
+    std::io::copy(&mut reader, &mut file).context(|| format!("downloading {url}"))?;
+    drop(file);
+    fs::rename(&part, dest).context(|| format!("moving {} into place", part.display()))?;
 
     println!("cargo:warning=Downloaded to: {}", dest.display());
     Ok(dest.to_path_buf())
+}
+
+/// Puts `file` of the Hugging Face repo `repo` at `dest`, unless it is already
+/// there and no regeneration is forced.
+pub fn fetch_from_hf_hub(repo: &str, file: &str, revision: Option<&str>, dest: &Path) -> Result {
+    if dest.exists() && !should_force_regenerate() {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let what = || format!("fetching {file} from Hugging Face repo {repo}");
+    let cached =
+        download_from_hf_hub(repo, file, revision, Some(&get_model_cache_dir())).context(what)?;
+    if cached != dest {
+        fs::copy(&cached, dest).context(|| format!("copying to {}", dest.display()))?;
+    }
+    Ok(())
+}
+
+/// Puts the file at `url` at `dest`, unless it is already there and no
+/// regeneration is forced.
+pub fn fetch_from_url(url: &str, dest: &Path) -> Result {
+    if dest.exists() && !should_force_regenerate() {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    download_from_url(url, dest)?;
+    Ok(())
+}
+
+/// Puts every file `source` lists at its destination in the current crate:
+/// downloads the remote ones that are missing, and copies the local ones,
+/// whose paths are relative to `config_dir`, the directory of the model.toml.
+pub fn fetch_model_files(source: &config::ModelSource, config_dir: &Path) -> Result {
+    use config::ModelSource;
+    match source {
+        ModelSource::Local { files } => {
+            for spec in files {
+                let path = config_dir.join(&spec.path);
+                if !path.exists() {
+                    return Err(Error(format!(
+                        "model file {} not found: its model.toml lists it as a local file, \
+                         so it has to be put there by hand",
+                        path.display()
+                    )));
+                }
+                let dest = Path::new(spec.dest.as_deref().unwrap_or(&spec.path));
+                if dest != path && (!dest.exists() || should_force_regenerate()) {
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::copy(&path, dest)
+                        .context(|| format!("copying {} to {}", path.display(), dest.display()))?;
+                }
+            }
+        }
+        ModelSource::HuggingFaceHub {
+            repo,
+            revision,
+            files,
+        } => {
+            for spec in files {
+                let dest = spec.dest.as_deref().unwrap_or(&spec.file);
+                fetch_from_hf_hub(repo, &spec.file, revision.as_deref(), Path::new(dest))?;
+            }
+        }
+        ModelSource::Url { files } => {
+            for spec in files {
+                fetch_from_url(&spec.url, Path::new(&spec.dest))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Get model cache directory
@@ -154,22 +408,56 @@ pub fn generate_model_code(
     model_path: impl AsRef<Path>,
     class_name: &str,
     output_dir: impl AsRef<Path>,
-    _custom_methods: &[String],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result {
+    generate_model_code_for(model_path, class_name, output_dir, &Default::default())
+}
+
+/// [`generate_model_code`] compiling the model for `inputs`, which must all
+/// apply to it.
+pub fn generate_model_code_for(
+    model_path: impl AsRef<Path>,
+    class_name: &str,
+    output_dir: impl AsRef<Path>,
+    inputs: &config::InputConfig,
+) -> Result {
+    let model_path = model_path.as_ref();
+    println!("cargo:warning=Generating code for {}...", class_name);
+    compile_model(model_path, class_name, output_dir.as_ref(), |_| {
+        inputs.clone()
+    })
+    .map(|_| ())
+    .context(|| {
+        format!(
+            "generating code for {} from {}",
+            class_name,
+            model_path.display()
+        )
+    })
+}
+
+/// Compiles the model at `model_path` for the inputs `inputs` gives for its
+/// graph, which it returns.
+fn compile_model(
+    model_path: &Path,
+    class_name: &str,
+    output_dir: &Path,
+    inputs: impl FnOnce(&lele::model::onnx_proto::GraphProto) -> config::InputConfig,
+) -> std::result::Result<config::InputConfig, Box<dyn std::error::Error>> {
     use lele::compiler::Compiler;
     use lele::model::OnnxModel;
 
-    let model = OnnxModel::load(model_path.as_ref())?;
+    let model = OnnxModel::load(model_path)?;
     let graph = model.graph().ok_or("Missing graph in ONNX model")?;
 
-    let compiler = Compiler::new()
-        .with_name(class_name)
-        .with_default_optimizations()
-        .with_constant_folding(true);
+    let inputs = inputs(graph);
+    let compiler = inputs.apply(
+        Compiler::new()
+            .with_name(class_name)
+            .with_default_optimizations(),
+    );
 
     let result = compiler.compile(graph)?;
 
-    let output_dir = output_dir.as_ref();
     fs::create_dir_all(output_dir)?;
 
     // Write weights binary
@@ -186,48 +474,89 @@ pub fn generate_model_code(
     rs_file.write_all(result.code.as_bytes())?;
     rs_file.flush()?;
 
+    Ok(inputs)
+}
+
+/// Builds the model `model_toml` describes: fetches its files into the
+/// current crate and generates `<output_dir>/<class>.rs` and its weights,
+/// unless they are newer than both the config and the model.
+pub fn build_model(model_toml: &str, output_dir: impl AsRef<Path>) -> Result {
+    println!("cargo:rerun-if-changed={}", model_toml);
+    if should_skip_codegen() {
+        println!("cargo:warning=Skipping model code generation (LELE_SKIP_MODEL_GEN=1)");
+        return Ok(());
+    }
+
+    let config = config::ModelConfig::load(model_toml)?;
+    let codegen = &config.codegen;
+    let model_file = Path::new(codegen.model_file.as_deref().unwrap_or("model.onnx"));
+    let output_dir = output_dir.as_ref();
+    if !need_regenerate_with_model(
+        &codegen.class_name,
+        output_dir,
+        model_toml,
+        Some(model_file),
+    ) {
+        println!("cargo:warning=Generated files are up to date, skipping regeneration");
+        return Ok(());
+    }
+
+    fetch_model_files(&config.model, config_dir(model_toml))?;
+    generate_model_code_for(model_file, &codegen.class_name, output_dir, &codegen.inputs)
+}
+
+/// Builds several models from the files `model_toml` lists: fetches them into
+/// the current crate and generates `<output_dir>/<class>.rs` and its weights
+/// for each `(onnx file, class name)` of `models` whose generated files are
+/// older than the config or the model. Each model is compiled for the
+/// settings of `[codegen]` that apply to it; one that applies to none of the
+/// models generated is an error.
+pub fn build_models(
+    model_toml: &str,
+    output_dir: impl AsRef<Path>,
+    models: &[(&str, &str)],
+) -> Result {
+    println!("cargo:rerun-if-changed={}", model_toml);
+    if should_skip_codegen() {
+        println!("cargo:warning=Skipping model code generation (LELE_SKIP_MODEL_GEN=1)");
+        return Ok(());
+    }
+
+    let output_dir = output_dir.as_ref();
+    let stale: Vec<_> = models
+        .iter()
+        .filter(|(onnx, class_name)| {
+            need_regenerate_with_model(class_name, output_dir, model_toml, Some(Path::new(onnx)))
+        })
+        .collect();
+    if stale.is_empty() {
+        println!("cargo:warning=Generated files are up to date, skipping regeneration");
+        return Ok(());
+    }
+
+    let config = config::ModelConfig::load(model_toml)?;
+    fetch_model_files(&config.model, config_dir(model_toml))?;
+    let inputs = &config.codegen.inputs;
+    let mut applied = Vec::new();
+    for (onnx, class_name) in stale {
+        println!("cargo:warning=Generating code for {}...", class_name);
+        let model = Path::new(onnx);
+        let used = compile_model(model, class_name, output_dir, |g| inputs.for_graph(g))
+            .context(|| format!("generating code for {class_name} from {onnx}"))?;
+        applied.push(used);
+    }
+    let unused = inputs.unused(&applied);
+    if !unused.is_empty() {
+        return Err(Error(format!(
+            "{model_toml}: no model has what {} name",
+            unused.join(", ")
+        )));
+    }
     Ok(())
 }
 
-/// Generate a stub implementation when model download or generation fails
-pub fn generate_stub(
-    class_name: &str,
-    output_dir: impl AsRef<Path>,
-    error_msg: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let output_dir = output_dir.as_ref();
-    fs::create_dir_all(output_dir)?;
-
-    let rs_filename = format!("{}.rs", class_name.to_lowercase());
-    let rs_path = output_dir.join(&rs_filename);
-
-    let stub_code = format!(
-        r#"// Auto-generated stub (model generation failed)
-// Error: {}
-
-#[allow(dead_code)]
-pub struct {}<'a> {{
-    _marker: std::marker::PhantomData<&'a ()>,
-}}
-
-#[allow(dead_code)]
-impl<'a> {}<'a> {{
-    pub fn new(_weights: &'a [u8]) -> Self {{
-        panic!("Model is not available: {}")
-    }}
-}}
-"#,
-        error_msg, class_name, class_name, error_msg
-    );
-
-    fs::write(rs_path, stub_code)?;
-
-    // Create empty weights file
-    let weights_filename = format!("{}_weights.bin", class_name.to_lowercase());
-    let bin_path = output_dir.join(&weights_filename);
-    fs::write(bin_path, &[])?;
-
-    Ok(())
+fn config_dir(model_toml: &str) -> &Path {
+    Path::new(model_toml).parent().unwrap_or(Path::new(""))
 }
 
 /// Check if code generation should be skipped
@@ -310,13 +639,113 @@ pub fn need_regenerate_with_model(
     };
     for src in &sources {
         println!("cargo:rerun-if-changed={}", src.display());
-        if let Ok(src_time) = fs::metadata(src).and_then(|m| m.modified()) {
-            if src_time > rs_meta {
-                println!("cargo:warning=Source file {:?} is newer than generated code, need regenerate", src);
-                return true;
-            }
+        if let Ok(src_time) = fs::metadata(src).and_then(|m| m.modified())
+            && src_time > rs_meta
+        {
+            println!(
+                "cargo:warning=Source file {:?} is newer than generated code, need regenerate",
+                src
+            );
+            return true;
         }
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::config::{InputConfig, InputValue, ModelConfig};
+    use lele::model::onnx_proto::{
+        GraphProto, TensorProto, TensorShapeProto, TypeProto, ValueInfoProto, tensor_shape_proto,
+        type_proto,
+    };
+
+    #[test]
+    fn codegen_states_the_inputs_a_model_is_compiled_for() {
+        let config: ModelConfig = toml::from_str(
+            r#"
+            [model]
+            source = "local"
+            [codegen]
+            class_name = "M"
+            [codegen.shapes]
+            input = [1, 512]
+            [codegen.dims]
+            batch_size = 1
+            [codegen.values]
+            sr = 16000
+            scale = 0.5
+            ids = [1, 2]
+            gains = [0.5, 2.0]
+            "#,
+        )
+        .unwrap();
+        let inputs = &config.codegen.inputs;
+        assert_eq!(inputs.shapes["input"], [1, 512]);
+        assert_eq!(inputs.dims["batch_size"], 1);
+        assert_eq!(inputs.values["sr"], InputValue::Int(16000));
+        assert_eq!(inputs.values["scale"], InputValue::Float(0.5));
+        assert_eq!(inputs.values["ids"], InputValue::Ints(vec![1, 2]));
+        assert_eq!(inputs.values["gains"], InputValue::Floats(vec![0.5, 2.0]));
+        let bare: ModelConfig =
+            toml::from_str("[model]\nsource = \"local\"\n[codegen]\nclass_name = \"M\"").unwrap();
+        assert_eq!(bare.codegen.inputs, InputConfig::default());
+    }
+
+    /// Each model of a config takes the settings naming its inputs and their
+    /// dimensions; a setting no model takes is reported.
+    #[test]
+    fn settings_apply_to_the_models_that_have_what_they_name() {
+        let input = |name: &str, dims: &[&str]| ValueInfoProto {
+            name: name.to_string(),
+            r#type: Some(TypeProto {
+                value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                    elem_type: 1,
+                    shape: Some(TensorShapeProto {
+                        dim: dims
+                            .iter()
+                            .map(|d| tensor_shape_proto::Dimension {
+                                value: Some(tensor_shape_proto::dimension::Value::DimParam(
+                                    d.to_string(),
+                                )),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    }),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let encoder = GraphProto {
+            input: vec![input("audio", &["batch", "time"]), input("w", &["n"])],
+            initializer: vec![TensorProto {
+                name: "w".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let decoder = GraphProto {
+            input: vec![input("tokens", &["batch", "len"]), input("sr", &[])],
+            ..Default::default()
+        };
+        let all = InputConfig {
+            shapes: [
+                ("audio".to_string(), vec![1, 16000]),
+                ("x".to_string(), vec![1]),
+            ]
+            .into(),
+            dims: [("batch".to_string(), 1), ("n".to_string(), 3)].into(),
+            values: [("sr".to_string(), InputValue::Int(16000))].into(),
+        };
+        let (enc, dec) = (all.for_graph(&encoder), all.for_graph(&decoder));
+        assert_eq!(enc.shapes.keys().collect::<Vec<_>>(), ["audio"]);
+        assert_eq!(enc.dims.keys().collect::<Vec<_>>(), ["batch"]);
+        assert!(enc.values.is_empty());
+        assert!(dec.shapes.is_empty());
+        assert_eq!(dec.dims.keys().collect::<Vec<_>>(), ["batch"]);
+        assert_eq!(dec.values.keys().collect::<Vec<_>>(), ["sr"]);
+        assert_eq!(all.unused(&[enc, dec]), ["shapes.x", "dims.n"]);
+    }
 }

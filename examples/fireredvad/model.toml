@@ -1,0 +1,25 @@
+# FireRedVAD Stream-VAD: streaming voice activity detection (DFSMN, 0.6M
+# parameters, 16 kHz). An ONNX export of the official weights, with each FSMN
+# block's lookback cache as an input and an output.
+# https://github.com/FireRedTeam/FireRedVAD
+[model]
+source = "hf-hub"
+repo = "Mazino0/fire-red-streaming-vad-onnx"
+revision = "e6aa50a817e8788a0cbfaf06ca8922469edde506"
+
+[[model.files]]
+file = "firered_vad.onnx"
+dest = "model.onnx"
+
+[[model.files]]
+file = "cmvn.json"
+dest = "cmvn.json"
+
+[codegen]
+class_name = "FireRedVad"
+model_file = "model.onnx"
+
+# Each block remembers the last 19 frames it saw: its lookback filter is 20
+# frames long. Zeros are what the model sees before the first frame.
+[codegen.dims]
+cache_len = 19

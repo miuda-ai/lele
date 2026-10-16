@@ -10,4 +10,3 @@ dest = "yolo26.onnx"
 [codegen]
 class_name = "Yolo26"
 model_file = "yolo26.onnx"
-custom_methods = []

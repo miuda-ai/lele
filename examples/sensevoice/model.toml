@@ -1,10 +1,17 @@
+# SenseVoice Small, int8 export from sherpa-onnx.
 [model]
-source = "local"
+source = "hf-hub"
+repo = "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+revision = "2365baeacb507f821a0c8120fcee3d484dba7a07"
 
 [[model.files]]
-path = "sensevoice.int8.onnx"
+file = "model.int8.onnx"
+dest = "sensevoice.int8.onnx"
+
+[[model.files]]
+file = "tokens.txt"
+dest = "sensevoice.int8.tokens.txt"
 
 [codegen]
 class_name = "SenseVoice"
 model_file = "sensevoice.int8.onnx"
-custom_methods = ["embedding_concat"]

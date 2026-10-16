@@ -25,9 +25,7 @@ dest = "rec_inference.yml"
 [codegen.det]
 class_name = "PpocrDet"
 model_file = "det.onnx"
-custom_methods = []
 
 [codegen.rec]
 class_name = "PpocrRec"
 model_file = "rec.onnx"
-custom_methods = []
