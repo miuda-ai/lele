@@ -11,6 +11,7 @@ pub fn softmax<'b, 'a>(
     axis: i32,
     out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
+    crate::kernels::enable_flush_denormals();
     let ndim = input.shape.len();
     let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
     assert!(axis < ndim);
@@ -165,6 +166,7 @@ pub fn layer_norm<'b, 'a>(
     epsilon: f32,
     out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
+    crate::kernels::enable_flush_denormals();
     let ndim = input.shape.len();
     let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
     let outer_size: usize = input.shape[..axis].iter().product();

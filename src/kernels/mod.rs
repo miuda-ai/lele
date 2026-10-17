@@ -1,6 +1,47 @@
 pub mod activations;
 #[cfg(target_arch = "x86_64")]
 pub mod avx;
+
+/// Denormals are the smallest `f32`s (below ~1.2e-38) and show up naturally in
+/// long-tail data like softmax probabilities. On x86 a multiply-add with a
+/// denormal operand takes a microcode assist, which costs ~100 cycles: the same
+/// GEMM runs 100x+ slower. ARM evaluates them in hardware, so this is an x86-only
+/// cliff. Every BLAS and ONNX Runtime flushes them; `FTZ` (results) and `DAZ`
+/// (operands) in `MXCSR` do the same here.
+///
+/// `MXCSR` is per-thread, so the flag is checked once per thread. The numerical
+/// effect is confined to values below the normal `f32` range, which are zeroed;
+/// set `LELE_FLUSH_DENORMALS=0` to keep them.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn enable_flush_denormals() {
+    use std::cell::Cell;
+    use std::sync::OnceLock;
+
+    static WANTED: OnceLock<bool> = OnceLock::new();
+    let wanted = *WANTED.get_or_init(|| {
+        std::env::var_os("LELE_FLUSH_DENORMALS").is_none_or(|v| v != "0")
+    });
+    if !wanted {
+        return;
+    }
+
+    thread_local! {
+        static DONE: Cell<bool> = const { Cell::new(false) };
+    }
+    DONE.with(|done| {
+        if !done.get() {
+            use core::arch::x86_64::{_mm_getcsr, _mm_setcsr};
+            // SAFETY: reading and writing MXCSR needs no memory safety.
+            unsafe { _mm_setcsr(_mm_getcsr() | (1 << 15) | (1 << 6)) };
+            done.set(true);
+        }
+    });
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub fn enable_flush_denormals() {}
 pub(crate) mod bias_act;
 pub(crate) mod binary;
 pub mod conv1d;

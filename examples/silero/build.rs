@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let dest_path = Path::new(dest_name);
 
                 // Skip if file already exists
-                if dest_path.exists() && !should_force_regenerate() {
+                if dest_path.exists() {
                     println!("cargo:warning=File already exists, skipping: {}", dest_name);
                     continue;
                 }
@@ -114,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let dest_path = Path::new(&file_spec.dest);
 
                 // Skip if file already exists
-                if dest_path.exists() && !should_force_regenerate() {
+                if dest_path.exists() {
                     println!(
                         "cargo:warning=File already exists, skipping: {}",
                         file_spec.dest

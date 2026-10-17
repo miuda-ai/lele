@@ -1,5 +1,31 @@
+//! Build script for the MOSS-TTS-Nano example.
+//!
+//! Two things happen on top of a plain code generation:
+//!
+//! 1. **Shared prefill/decode weights.** `moss_tts_prefill.onnx` and
+//!    `moss_tts_decode_step.onnx` are two graphs over the *same* transformer
+//!    (both reference `moss_tts_global_shared.data`). Generating them
+//!    independently stores those ~440 MB twice. `DecodeStep` is compiled on top
+//!    of the `Prefill` blob instead, so identical tensors keep their offsets and
+//!    only the handful of graph-specific scalars are appended: one
+//!    `tts_shared_weights.bin` feeds both modules.
+//!
+//! 2. **Weight-only int8 quantization** (via `quantize.py`), which shrinks the
+//!    MatMul weights ~4x. See the caveat below.
+//!
+//! `MOSS_QUANTIZE=0` forces the f32 weights; the quantized models are cached as
+//! `*.int8.onnx` next to the downloads and only rebuilt when missing.
+//!
+//! Caveat: on macOS-aarch64 the int8 GEMM path (`fused_dq_gemm_prepared_arm`)
+//! dequantizes the weights back to f32 for Apple Accelerate/AMX and caches that
+//! copy, so at runtime int8 costs extra memory instead of saving it (measured:
+//! +1.4 GB peak RSS for this example, with no speed change). It is still worth
+//! it when the goal is the size of the shipped artifacts. On aarch64 Linux the
+//! NEON UDOT path is used instead and keeps the u8 weights as-is.
+
 use lele_build::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn generate_custom_stub(
     class_name: &str,
@@ -63,8 +89,60 @@ fn download_model_files(
     }
 }
 
+/// Path of the int8 variant of an ONNX file: `foo.onnx` -> `foo.int8.onnx`.
+fn quantized_path(onnx: &Path) -> PathBuf {
+    let stem = onnx.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+    onnx.with_file_name(format!("{stem}.int8.onnx"))
+}
+
+/// Weight-only int8 quantization via `quantize.py`.
+///
+/// Returns the int8 model path when it already exists or can be produced, or
+/// `None` to fall back to the f32 model (no python/onnxruntime, or disabled by
+/// `MOSS_QUANTIZE=0`). The result is cached next to the source model.
+fn quantized_or_none(onnx: &Path) -> Option<PathBuf> {
+    if std::env::var("MOSS_QUANTIZE").is_ok_and(|v| v == "0") {
+        return None;
+    }
+    let out = quantized_path(onnx);
+    if out.exists() {
+        return Some(out);
+    }
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("quantize.py");
+    if !script.exists() {
+        println!("cargo:warning=quantize.py not found; using f32 weights");
+        return None;
+    }
+
+    let status = Command::new("python3")
+        .arg(&script)
+        .arg(onnx)
+        .arg(&out)
+        .status();
+    match status {
+        Ok(s) if s.success() && out.exists() => Some(out),
+        Ok(_) => {
+            println!(
+                "cargo:warning=quantize.py failed for {}; using f32 weights",
+                onnx.display()
+            );
+            None
+        }
+        Err(e) => {
+            println!(
+                "cargo:warning=could not run python3 ({}); using f32 weights",
+                e
+            );
+            None
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=model.toml");
+    println!("cargo:rerun-if-changed=quantize.py");
+    println!("cargo:rerun-if-env-changed=MOSS_QUANTIZE");
 
     if should_skip_codegen() {
         println!("cargo:warning=Skipping model code generation (LELE_SKIP_MODEL_GEN=1)");
@@ -108,24 +186,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let output_dir = Path::new("src");
 
-    // Models to generate code for
-    let models = [
-        ("moss_tts_prefill.onnx", &tts_dir, "Prefill"),
-        ("moss_tts_decode_step.onnx", &tts_dir, "DecodeStep"),
-        ("moss_tts_local_fixed_sampled_frame.onnx", &tts_dir, "LocalFixedSampledFrame"),
-        ("moss_audio_tokenizer_decode_full.onnx", &codec_dir, "CodecDecodeFull"),
-    ];
+    // Pick the int8 weight file when we can produce it, otherwise the f32 one.
+    let prefill_onnx = tts_dir.join("moss_tts_prefill.onnx");
+    let decode_onnx = tts_dir.join("moss_tts_decode_step.onnx");
+    let local_onnx = tts_dir.join("moss_tts_local_fixed_sampled_frame.onnx");
+    let codec_onnx = codec_dir.join("moss_audio_tokenizer_decode_full.onnx");
 
-    for (onnx_name, dir, class_name) in models {
-        let onnx_path = dir.join(onnx_name);
-        if !onnx_path.exists() {
-            println!("cargo:warning=ONNX file not found: {}", onnx_path.display());
-            generate_custom_stub(class_name, output_dir, &format!("{} not found", onnx_path.display()))?;
+    let prefill_src = quantized_or_none(&prefill_onnx).unwrap_or(prefill_onnx.clone());
+    let decode_src = quantized_or_none(&decode_onnx).unwrap_or(decode_onnx.clone());
+    let local_src = quantized_or_none(&local_onnx).unwrap_or(local_onnx.clone());
+    let codec_src = quantized_or_none(&codec_onnx).unwrap_or(codec_onnx.clone());
+    let quantized = prefill_src != prefill_onnx;
+
+    println!("cargo:warning=Weights: {}", if quantized { "int8 (weight-only)" } else { "f32" });
+
+    // --- TTS: local frame + prefill + decode step -------------------------
+    //
+    // `moss_tts_prefill` and `moss_tts_decode_step` are two graphs over the *same*
+    // transformer weights. Compiling them independently stores those weights
+    // twice; building the decode step on top of the prefill blob makes it reuse
+    // every identical tensor and append only its own, so both modules load one
+    // file.
+    if !prefill_src.exists() || !decode_src.exists() {
+        generate_custom_stub("Prefill", output_dir, "prefill onnx not found")?;
+        generate_custom_stub("DecodeStep", output_dir, "decode_step onnx not found")?;
+    } else {
+        println!("cargo:warning=Generating code for Prefill...");
+        let prefill = compile_model(&prefill_src, "Prefill", None)?;
+        println!("cargo:warning=Generating code for DecodeStep...");
+        let decode = compile_model(
+            &decode_src,
+            "DecodeStep",
+            Some(SharedWeights::from_result(&prefill)),
+        )?;
+
+        write_model_code(output_dir, "Prefill", &prefill.code)?;
+        write_model_code(output_dir, "DecodeStep", &decode.code)?;
+
+        let shared = write_shared_weights(output_dir.join("tts_shared_weights.bin"), &decode.weights)?;
+        println!(
+            "cargo:warning=TTS weights: {} ({:.1} MB) serving Prefill ({:.1} MB) + DecodeStep",
+            shared.display(),
+            decode.weights.len() as f64 / 1e6,
+            prefill.weights.len() as f64 / 1e6,
+        );
+    }
+
+    // --- Local frame + codec: independent models --------------------------
+    for (onnx, class_name) in [
+        (local_src.as_path(), "LocalFixedSampledFrame"),
+        (codec_src.as_path(), "CodecDecodeFull"),
+    ] {
+        if !onnx.exists() {
+            println!("cargo:warning=ONNX file not found: {}", onnx.display());
+            generate_custom_stub(class_name, output_dir, &format!("{} not found", onnx.display()))?;
             continue;
         }
-
         println!("cargo:warning=Generating code for {}...", class_name);
-        if let Err(e) = generate_model_code(&onnx_path, class_name, output_dir, &[]) {
+        if let Err(e) = generate_model_code(onnx, class_name, output_dir, &[]) {
             println!("cargo:warning=Failed to generate code for {}: {}", class_name, e);
             generate_custom_stub(class_name, output_dir, &e.to_string())?;
         }

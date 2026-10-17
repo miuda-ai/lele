@@ -113,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|s| s.as_str())
                     .unwrap_or(&file_spec.file);
                 let dest_path = Path::new(dest_name);
-                if dest_path.exists() && !should_force_regenerate() {
+                if dest_path.exists() {
                     println!("cargo:warning=File already exists, skipping: {}", dest_name);
                     continue;
                 }
@@ -141,7 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config::ModelSource::Url { files } => {
             for file_spec in files {
                 let dest_path = Path::new(&file_spec.dest);
-                if dest_path.exists() && !should_force_regenerate() {
+                if dest_path.exists() {
                     continue;
                 }
                 if let Some(parent) = dest_path.parent() {

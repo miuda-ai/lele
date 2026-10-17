@@ -678,6 +678,7 @@ fn quantized_matmul<'a>(
     relu: bool,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
+    crate::kernels::enable_flush_denormals();
     let k = x.shape.last().copied().unwrap_or(1);
     assert_eq!(k, w.k, "depth of {:?} against a {}x{} weight", x.shape, w.k, w.n);
     let m: usize = x.shape[..x.shape.len().saturating_sub(1)].iter().product();

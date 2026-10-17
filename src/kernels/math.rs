@@ -217,6 +217,7 @@ where
     T: Clone + Copy + std::fmt::Debug,
     F: Fn(T, T) -> T,
 {
+    crate::kernels::enable_flush_denormals();
     let out_shape = utils::broadcast_shapes(&a.shape, &b.shape).unwrap_or_else(|| {
         panic!(
             "Shapes not broadcastable: a={:?} b={:?}",

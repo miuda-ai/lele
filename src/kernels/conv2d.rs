@@ -100,6 +100,7 @@ pub fn conv2d<'b, 'a>(
     strides: &[i64],
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
+    crate::kernels::enable_flush_denormals();
     return conv2d_fused(
         input, weights, bias, dilations, group, pads, strides, false, out,
     );
@@ -149,6 +150,7 @@ pub fn conv2d_fused<'b, 'a>(
     relu: bool,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
+    crate::kernels::enable_flush_denormals();
     let act = if relu {
         Activation::Relu
     } else {

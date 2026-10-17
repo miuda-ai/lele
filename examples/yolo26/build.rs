@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or(&file_spec.file);
                 let dest_path = Path::new(dest_name);
 
-                if dest_path.exists() && !should_force_regenerate() {
+                if dest_path.exists() {
                     println!("cargo:warning=File already exists, skipping: {}", dest_name);
                     continue;
                 }
@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for file_spec in files {
                 let dest_path = Path::new(&file_spec.dest);
 
-                if dest_path.exists() && !should_force_regenerate() {
+                if dest_path.exists() {
                     println!(
                         "cargo:warning=File already exists, skipping: {}",
                         file_spec.dest

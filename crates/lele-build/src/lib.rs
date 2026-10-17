@@ -149,6 +149,86 @@ pub fn get_model_cache_dir() -> PathBuf {
     }
 }
 
+pub use lele::compiler::{CompilationResult, SharedWeights};
+
+/// Compile an ONNX model to Rust source plus a weights blob.
+///
+/// When `shared` is given, tensors identical to the ones in that blob keep the
+/// offset they had there and only new tensors are appended, so several models
+/// can be loaded from one file. Pair it with [`write_shared_weights`].
+pub fn compile_model(
+    model_path: impl AsRef<Path>,
+    class_name: &str,
+    shared: Option<SharedWeights>,
+) -> Result<CompilationResult, Box<dyn std::error::Error>> {
+    use lele::compiler::Compiler;
+    use lele::model::OnnxModel;
+
+    let model = OnnxModel::load(model_path.as_ref())?;
+    let graph = model.graph().ok_or("Missing graph in ONNX model")?;
+
+    let mut compiler = Compiler::new()
+        .with_name(class_name)
+        .with_default_optimizations()
+        .with_constant_folding(true);
+    if let Some(shared) = shared {
+        compiler = compiler.with_shared_weights(shared);
+    }
+
+    Ok(compiler.compile(graph)?)
+}
+
+/// Path of the generated Rust module for `class_name`.
+pub fn code_path(output_dir: impl AsRef<Path>, class_name: &str) -> PathBuf {
+    output_dir.as_ref().join(format!("{}.rs", class_name.to_lowercase()))
+}
+
+/// Write the generated Rust module, creating the directory if needed.
+pub fn write_model_code(
+    output_dir: impl AsRef<Path>,
+    class_name: &str,
+    code: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let output_dir = output_dir.as_ref();
+    fs::create_dir_all(output_dir)?;
+    let path = code_path(output_dir, class_name);
+    let mut file = std::io::BufWriter::new(File::create(&path)?);
+    file.write_all(code.as_bytes())?;
+    file.flush()?;
+    Ok(path)
+}
+
+/// Write a weights blob under the conventional `<class>_weights.bin` name.
+pub fn write_model_weights(
+    output_dir: impl AsRef<Path>,
+    class_name: &str,
+    weights: &[u8],
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let output_dir = output_dir.as_ref();
+    fs::create_dir_all(output_dir)?;
+    let path = output_dir.join(format!("{}_weights.bin", class_name.to_lowercase()));
+    let mut file = std::io::BufWriter::new(File::create(&path)?);
+    file.write_all(weights)?;
+    file.flush()?;
+    Ok(path)
+}
+
+/// Write one weights blob that several compiled models share. Every model built
+/// with [`SharedWeights`] chained off the same base can load this single file.
+pub fn write_shared_weights(
+    path: impl AsRef<Path>,
+    weights: &[u8],
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = std::io::BufWriter::new(File::create(path)?);
+    file.write_all(weights)?;
+    file.flush()?;
+    Ok(path.to_path_buf())
+}
+
 /// Generate Rust code and binary weights from ONNX model
 pub fn generate_model_code(
     model_path: impl AsRef<Path>,
@@ -156,36 +236,9 @@ pub fn generate_model_code(
     output_dir: impl AsRef<Path>,
     _custom_methods: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use lele::compiler::Compiler;
-    use lele::model::OnnxModel;
-
-    let model = OnnxModel::load(model_path.as_ref())?;
-    let graph = model.graph().ok_or("Missing graph in ONNX model")?;
-
-    let compiler = Compiler::new()
-        .with_name(class_name)
-        .with_default_optimizations()
-        .with_constant_folding(true);
-
-    let result = compiler.compile(graph)?;
-
-    let output_dir = output_dir.as_ref();
-    fs::create_dir_all(output_dir)?;
-
-    // Write weights binary
-    let weights_filename = format!("{}_weights.bin", class_name.to_lowercase());
-    let bin_path = output_dir.join(&weights_filename);
-    let mut bin_file = std::io::BufWriter::new(File::create(&bin_path)?);
-    bin_file.write_all(&result.weights)?;
-    bin_file.flush()?;
-
-    // Write generated Rust code
-    let rs_filename = format!("{}.rs", class_name.to_lowercase());
-    let rs_path = output_dir.join(&rs_filename);
-    let mut rs_file = std::io::BufWriter::new(File::create(&rs_path)?);
-    rs_file.write_all(result.code.as_bytes())?;
-    rs_file.flush()?;
-
+    let result = compile_model(model_path, class_name, None)?;
+    write_model_weights(output_dir.as_ref(), class_name, &result.weights)?;
+    write_model_code(output_dir.as_ref(), class_name, &result.code)?;
     Ok(())
 }
 

@@ -140,8 +140,9 @@ pub struct MossTtsNano {
     decode_step: DecodeStep<'static>,
     local_frame: LocalFixedSampledFrame<'static>,
     codec: CodecDecodeFull<'static>,
-    _prefill_weights: Vec<u8>,
-    _decode_weights: Vec<u8>,
+    /// Prefill and decode step are two graphs over the same transformer, so they
+    /// are compiled against one shared blob and both borrow from it here.
+    _tts_weights: Vec<u8>,
     _frame_weights: Vec<u8>,
     _codec_weights: Vec<u8>,
     prefill_ws: prefill::PrefillWorkspace,
@@ -165,13 +166,13 @@ impl MossTtsNano {
 
         let gen_dir = Path::new("examples/moss-tts-nano/src");
 
-        let prefill_weights = std::fs::read(gen_dir.join("prefill_weights.bin"))?;
-        let decode_weights = std::fs::read(gen_dir.join("decodestep_weights.bin"))?;
+        let tts_weights = std::fs::read(gen_dir.join("tts_shared_weights.bin"))?;
         let frame_weights = std::fs::read(gen_dir.join("localfixedsampledframe_weights.bin"))?;
         let codec_weights = std::fs::read(gen_dir.join("codecdecodefull_weights.bin"))?;
 
-        let prefill = Prefill::new(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&prefill_weights) });
-        let decode_step = DecodeStep::new(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&decode_weights) });
+        let tts: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&tts_weights) };
+        let prefill = Prefill::new(tts);
+        let decode_step = DecodeStep::new(tts);
         let local_frame = LocalFixedSampledFrame::new(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&frame_weights) });
         let codec = CodecDecodeFull::new(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&codec_weights) });
 
@@ -182,8 +183,7 @@ impl MossTtsNano {
             decode_step,
             local_frame,
             codec,
-            _prefill_weights: prefill_weights,
-            _decode_weights: decode_weights,
+            _tts_weights: tts_weights,
             _frame_weights: frame_weights,
             _codec_weights: codec_weights,
             prefill_ws: prefill::PrefillWorkspace::new(),
@@ -234,14 +234,32 @@ impl MossTtsNano {
         let (global_hidden, pk0, pv0, pk1, pv1, pk2, pv2, pk3, pv3, pk4, pv4,
              pk5, pv5, pk6, pv6, pk7, pv7, pk8, pv8, pk9, pv9, pk10, pv10, pk11, pv11) = prefill_out;
 
-        let mut past_kv: Vec<TensorView<'static>> = vec![
-            pk0.to_owned(), pv0.to_owned(), pk1.to_owned(), pv1.to_owned(),
-            pk2.to_owned(), pv2.to_owned(), pk3.to_owned(), pv3.to_owned(),
-            pk4.to_owned(), pv4.to_owned(), pk5.to_owned(), pv5.to_owned(),
-            pk6.to_owned(), pv6.to_owned(), pk7.to_owned(), pv7.to_owned(),
-            pk8.to_owned(), pv8.to_owned(), pk9.to_owned(), pv9.to_owned(),
-            pk10.to_owned(), pv10.to_owned(), pk11.to_owned(), pv11.to_owned(),
+        // The KV cache is the only thing that grows every frame. Keeping it in
+        // `to_owned` `TensorView`s means a fresh (slightly larger) allocation per
+        // frame, which the allocator cannot reuse, so every frame re-faults pages.
+        // Hold it in plain buffers instead and copy the new cache into them in
+        // place: `clear` + `extend_from_slice` keeps the capacity, so no
+        // allocation happens once they have grown to size.
+        let mut kv_cur: Vec<Vec<f32>> = vec![
+            pk0.data.to_vec(), pv0.data.to_vec(), pk1.data.to_vec(), pv1.data.to_vec(),
+            pk2.data.to_vec(), pv2.data.to_vec(), pk3.data.to_vec(), pv3.data.to_vec(),
+            pk4.data.to_vec(), pv4.data.to_vec(), pk5.data.to_vec(), pv5.data.to_vec(),
+            pk6.data.to_vec(), pv6.data.to_vec(), pk7.data.to_vec(), pv7.data.to_vec(),
+            pk8.data.to_vec(), pv8.data.to_vec(), pk9.data.to_vec(), pv9.data.to_vec(),
+            pk10.data.to_vec(), pv10.data.to_vec(), pk11.data.to_vec(), pv11.data.to_vec(),
         ];
+        let mut kv_shapes: Vec<Vec<usize>> = vec![
+            pk0.shape.to_vec(), pv0.shape.to_vec(), pk1.shape.to_vec(), pv1.shape.to_vec(),
+            pk2.shape.to_vec(), pv2.shape.to_vec(), pk3.shape.to_vec(), pv3.shape.to_vec(),
+            pk4.shape.to_vec(), pv4.shape.to_vec(), pk5.shape.to_vec(), pv5.shape.to_vec(),
+            pk6.shape.to_vec(), pv6.shape.to_vec(), pk7.shape.to_vec(), pv7.shape.to_vec(),
+            pk8.shape.to_vec(), pv8.shape.to_vec(), pk9.shape.to_vec(), pv9.shape.to_vec(),
+            pk10.shape.to_vec(), pv10.shape.to_vec(), pk11.shape.to_vec(), pv11.shape.to_vec(),
+        ];
+        // Double buffer: the step's outputs borrow whatever the inputs borrowed,
+        // so the extended cache is written into the other set and the two swap.
+        // Both sets keep their capacity for the whole run, so no re-allocation.
+        let mut kv_next: Vec<Vec<f32>> = vec![Vec::new(); 24];
 
         // Extract last hidden state: [1, seq, 768] -> [1, 768]
         let mut current_hidden = extract_last_hidden(&global_hidden);
@@ -304,19 +322,49 @@ impl MossTtsNano {
             let next_ids = TensorView::<i64>::from_owned(next_row, vec![1, 1, ROW_WIDTH]);
             let pvl_tv = TensorView::<i64>::from_owned(vec![past_valid_length as i64], vec![1]);
 
-            // Run decode_step with all 24 KV caches
+            // Run decode_step with all 24 KV caches, borrowing them straight out
+            // of the reusable buffers: no copy on the way in.
             let t_decode = Instant::now();
+            let mut kv_it = [
+                TensorView::from_slice(&kv_cur[0], kv_shapes[0].clone()),
+                TensorView::from_slice(&kv_cur[1], kv_shapes[1].clone()),
+                TensorView::from_slice(&kv_cur[2], kv_shapes[2].clone()),
+                TensorView::from_slice(&kv_cur[3], kv_shapes[3].clone()),
+                TensorView::from_slice(&kv_cur[4], kv_shapes[4].clone()),
+                TensorView::from_slice(&kv_cur[5], kv_shapes[5].clone()),
+                TensorView::from_slice(&kv_cur[6], kv_shapes[6].clone()),
+                TensorView::from_slice(&kv_cur[7], kv_shapes[7].clone()),
+                TensorView::from_slice(&kv_cur[8], kv_shapes[8].clone()),
+                TensorView::from_slice(&kv_cur[9], kv_shapes[9].clone()),
+                TensorView::from_slice(&kv_cur[10], kv_shapes[10].clone()),
+                TensorView::from_slice(&kv_cur[11], kv_shapes[11].clone()),
+                TensorView::from_slice(&kv_cur[12], kv_shapes[12].clone()),
+                TensorView::from_slice(&kv_cur[13], kv_shapes[13].clone()),
+                TensorView::from_slice(&kv_cur[14], kv_shapes[14].clone()),
+                TensorView::from_slice(&kv_cur[15], kv_shapes[15].clone()),
+                TensorView::from_slice(&kv_cur[16], kv_shapes[16].clone()),
+                TensorView::from_slice(&kv_cur[17], kv_shapes[17].clone()),
+                TensorView::from_slice(&kv_cur[18], kv_shapes[18].clone()),
+                TensorView::from_slice(&kv_cur[19], kv_shapes[19].clone()),
+                TensorView::from_slice(&kv_cur[20], kv_shapes[20].clone()),
+                TensorView::from_slice(&kv_cur[21], kv_shapes[21].clone()),
+                TensorView::from_slice(&kv_cur[22], kv_shapes[22].clone()),
+                TensorView::from_slice(&kv_cur[23], kv_shapes[23].clone()),
+            ]
+            .into_iter();
             let decode_out = self.decode_step.forward_with_workspace(
                 &mut self.decode_ws,
                 next_ids,
                 pvl_tv,
-                past_kv[0].clone(), past_kv[1].clone(), past_kv[2].clone(), past_kv[3].clone(),
-                past_kv[4].clone(), past_kv[5].clone(), past_kv[6].clone(), past_kv[7].clone(),
-                past_kv[8].clone(), past_kv[9].clone(), past_kv[10].clone(), past_kv[11].clone(),
-                past_kv[12].clone(), past_kv[13].clone(), past_kv[14].clone(), past_kv[15].clone(),
-                past_kv[16].clone(), past_kv[17].clone(), past_kv[18].clone(), past_kv[19].clone(),
-                past_kv[20].clone(), past_kv[21].clone(), past_kv[22].clone(), past_kv[23].clone(),
+                kv_it.next().unwrap(), kv_it.next().unwrap(), kv_it.next().unwrap(), kv_it.next().unwrap(),
+                kv_it.next().unwrap(), kv_it.next().unwrap(), kv_it.next().unwrap(), kv_it.next().unwrap(),
+                kv_it.next().unwrap(), kv_it.next().unwrap(), kv_it.next().unwrap(), kv_it.next().unwrap(),
+                kv_it.next().unwrap(), kv_it.next().unwrap(), kv_it.next().unwrap(), kv_it.next().unwrap(),
+                kv_it.next().unwrap(), kv_it.next().unwrap(), kv_it.next().unwrap(), kv_it.next().unwrap(),
+                kv_it.next().unwrap(), kv_it.next().unwrap(), kv_it.next().unwrap(), kv_it.next().unwrap(),
             );
+            // Release the borrows of `kv_cur` held by the (now empty) iterator.
+            drop(kv_it);
 
             let (gh, npk0, npv0, npk1, npv1, npk2, npv2, npk3, npv3, npk4, npv4,
                  npk5, npv5, npk6, npv6, npk7, npv7, npk8, npv8, npk9, npv9, npk10, npv10, npk11, npv11) = decode_out;
@@ -326,14 +374,21 @@ impl MossTtsNano {
             let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
             eprintln!("[FRAME] {}: local={:.1}ms decode={:.1}ms", step, frame_ms, decode_ms);
 
-            past_kv = vec![
-                npk0.to_owned(), npv0.to_owned(), npk1.to_owned(), npv1.to_owned(),
-                npk2.to_owned(), npv2.to_owned(), npk3.to_owned(), npv3.to_owned(),
-                npk4.to_owned(), npv4.to_owned(), npk5.to_owned(), npv5.to_owned(),
-                npk6.to_owned(), npv6.to_owned(), npk7.to_owned(), npv7.to_owned(),
-                npk8.to_owned(), npv8.to_owned(), npk9.to_owned(), npv9.to_owned(),
-                npk10.to_owned(), npv10.to_owned(), npk11.to_owned(), npv11.to_owned(),
+            // Copy the extended cache back in place (capacity is already there).
+            let extended = [
+                npk0, npv0, npk1, npv1, npk2, npv2, npk3, npv3, npk4, npv4, npk5, npv5,
+                npk6, npv6, npk7, npv7, npk8, npv8, npk9, npv9, npk10, npv10, npk11, npv11,
             ];
+            for ((buf, shape), src) in kv_next
+                .iter_mut()
+                .zip(kv_shapes.iter_mut())
+                .zip(extended)
+            {
+                buf.clear();
+                buf.extend_from_slice(&src.data);
+                *shape = src.shape.to_vec();
+            }
+            std::mem::swap(&mut kv_cur, &mut kv_next);
             past_valid_length += 1;
         }
         eprintln!("[STAGE] Generation: {:.2}s ({} frames)", t_gen.elapsed().as_secs_f64(), generated_frames.len());

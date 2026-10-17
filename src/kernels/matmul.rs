@@ -131,6 +131,7 @@ pub(crate) fn matmul_at(
     b: MatRef<f32>,
     alpha: f32,
 ) {
+    crate::kernels::enable_flush_denormals();
     let (m, k, n) = (a.nrows, a.ncols, b.ncols);
     assert_eq!(b.nrows, k, "matmul: inner dimensions differ");
     assert_eq!((dst.nrows, dst.ncols), (m, n), "matmul: output shape");

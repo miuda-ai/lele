@@ -32,6 +32,27 @@ pub struct Pattern {
 pub struct CompilationResult {
     pub code: String,
     pub weights: Vec<u8>,
+    /// Content hash -> (offset, length) for every distinct weight blob written.
+    /// Feed this back through [`Compiler::with_shared_weights`] so a second model
+    /// that owns the same tensors reuses their bytes instead of duplicating them.
+    pub content_hashes: HashMap<u64, (usize, usize)>,
+}
+
+/// A weights blob plus its content index, used to share tensors between models
+/// (e.g. a prefill and a decode-step graph built from the same transformer).
+pub struct SharedWeights {
+    pub blob: Vec<u8>,
+    pub content_hashes: HashMap<u64, (usize, usize)>,
+}
+
+impl SharedWeights {
+    /// Seed a shared blob from a previously compiled model.
+    pub fn from_result(result: &CompilationResult) -> Self {
+        Self {
+            blob: result.weights.clone(),
+            content_hashes: result.content_hashes.clone(),
+        }
+    }
 }
 pub struct Allocator {
     // Maps tensor name -> Buffer Index
@@ -316,6 +337,9 @@ pub struct Compiler {
     pub(crate) patterns: Vec<Pattern>,
     pub(crate) custom_methods: Vec<String>,
     pub constant_folding: bool,
+    /// Optional weights blob (and content index) reused from an earlier
+    /// compilation, so identical tensors are not stored twice.
+    pub(crate) shared_weights: std::cell::RefCell<Option<SharedWeights>>,
 }
 
 impl Default for Compiler {
@@ -332,7 +356,16 @@ impl Compiler {
             patterns: Vec::new(),
             custom_methods: Vec::new(),
             constant_folding: false,
+            shared_weights: std::cell::RefCell::new(None),
         }
+    }
+    /// Reuse the tensors of an already compiled model. New (or different)
+    /// tensors are appended after the shared blob; identical ones keep the
+    /// offset they had in the shared blob, so several models can be loaded from
+    /// a single weights file.
+    pub fn with_shared_weights(self, shared: SharedWeights) -> Self {
+        *self.shared_weights.borrow_mut() = Some(shared);
+        self
     }
     /// Register a custom code generator for an operator type.
     /// The handler closure will be called instead of the default generation logic.
@@ -1133,11 +1166,20 @@ impl Compiler {
         // Runs after folding so that only the activation pairs are left.
         Self::fuse_qdq(&mut graph_storage);
         let graph = &graph_storage;
-        let mut weights_data = Vec::new();
+        // Start from a previously compiled blob when weights are shared. The
+        // shared bytes stay where they are; anything new is appended after them,
+        // so the resulting file is a superset of the first model's weights.
+        let shared = self.shared_weights.borrow_mut().take();
+        let (mut weights_data, mut content_hash_map, mut current_offset) = match shared
+        {
+            Some(shared) => {
+                let offset = shared.blob.len();
+                (shared.blob, shared.content_hashes, offset)
+            }
+            None => (Vec::new(), HashMap::new(), 0usize),
+        };
         let mut offset_map = Vec::new();
-        let mut current_offset = 0usize;
         let mut int64_map = HashMap::new();
-        let mut content_hash_map = HashMap::new();
         // 1. Collect Weights
         collect_weights(
             graph,
@@ -1440,7 +1482,11 @@ impl Compiler {
         )?;
         writeln!(
             &mut code,
-            "    qweights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize, bool), (std::vec::Vec<f32>, std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>,"
+            // A list per shape key: the same initializer is used by both the
+            // MatMulInteger and the fused dynamic-quantize linear patterns, which
+            // pass different scales. One entry per key would make those two
+            // evict each other and re-pack the weight on every call.
+            "    qweights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize, bool), std::vec::Vec<(std::vec::Vec<f32>, std::vec::Vec<f32>, std::sync::Arc<lele::kernels::QWeights>)>>>,"
         )?;
         writeln!(
             &mut code,
@@ -1578,13 +1624,18 @@ impl Compiler {
         writeln!(&mut code, "        let key = (offset, len, k, n, signed);")?;
         writeln!(
             &mut code,
-            "        if let Some((z, s, w)) = self.qweights_cache.borrow().get(&key) {{"
+            "        if let Some(entries) = self.qweights_cache.borrow().get(&key) {{"
         )?;
         writeln!(
             &mut code,
-            "            if z.as_slice() == zero_point && s.as_slice() == scale {{"
+            "            for (z, s, w) in entries {{"
         )?;
-        writeln!(&mut code, "                return w.clone();")?;
+        writeln!(
+            &mut code,
+            "                if z.as_slice() == zero_point && s.as_slice() == scale {{"
+        )?;
+        writeln!(&mut code, "                    return w.clone();")?;
+        writeln!(&mut code, "                }}")?;
         writeln!(&mut code, "            }}")?;
         writeln!(&mut code, "        }}")?;
         writeln!(
@@ -1597,7 +1648,7 @@ impl Compiler {
         )?;
         writeln!(
             &mut code,
-            "        self.qweights_cache.borrow_mut().insert(key, (zero_point.to_vec(), scale.to_vec(), w.clone()));"
+            "        self.qweights_cache.borrow_mut().entry(key).or_default().push((zero_point.to_vec(), scale.to_vec(), w.clone()));"
         )?;
         writeln!(&mut code, "        w")?;
         writeln!(&mut code, "    }}")?;
@@ -1852,6 +1903,7 @@ impl Compiler {
         Ok(CompilationResult {
             code: String::from_utf8(code).map_err(|e| format!("UTF-8 error: {}", e))?,
             weights: weights_data,
+            content_hashes: content_hash_map,
         })
     }
 }
@@ -2136,7 +2188,7 @@ mod qdq_fusion_tests {
 #[cfg(test)]
 mod codegen_smoke_tests {
     use super::*;
-    use crate::model::onnx_proto::ValueInfoProto;
+    use crate::model::onnx_proto::{TensorProto, ValueInfoProto};
 
     fn graph(nodes: Vec<NodeProto>, inputs: &[&str]) -> GraphProto {
         let last = nodes.last().unwrap().output[0].clone();
@@ -2191,6 +2243,71 @@ mod codegen_smoke_tests {
             !result.code.contains("scale.data.clone()"),
             "weight cache must not clone the Cow<[f32]> scale (does not type-check)"
         );
+    }
+
+    fn f32_weight(name: &str, dims: &[i64], raw: Vec<u8>) -> TensorProto {
+        TensorProto {
+            name: name.to_string(),
+            data_type: 1,
+            dims: dims.to_vec(),
+            raw_data: raw,
+            ..Default::default()
+        }
+    }
+
+    fn relu_graph(weight_name: &str, weight: TensorProto) -> GraphProto {
+        let mut g = graph(
+            vec![NodeProto {
+                op_type: "Relu".to_string(),
+                input: vec![weight_name.to_string()],
+                output: vec!["y".to_string()],
+                ..Default::default()
+            }],
+            &[],
+        );
+        g.initializer.push(weight);
+        g
+    }
+
+    /// Two models sharing a transformer (like MOSS's prefill and decode step)
+    /// must store the identical weights once. `with_shared_weights` keeps their
+    /// offsets and appends only what is new, so one file serves both.
+    #[test]
+    fn shared_weights_are_reused_across_models() {
+        let bytes: Vec<u8> = (0..64u8).collect();
+
+        let first = Compiler::new()
+            .with_name("SharedA")
+            .compile(&relu_graph("w", f32_weight("w", &[8, 8], bytes.clone())))
+            .expect("first model should compile");
+
+        // Same tensor under a different name, plus one genuinely new tensor.
+        let mut second_graph = relu_graph("w2", f32_weight("w2", &[8, 8], bytes.clone()));
+        second_graph
+            .initializer
+            .push(f32_weight("extra", &[4], vec![9, 9, 9, 9]));
+
+        let second = Compiler::new()
+            .with_name("SharedB")
+            .with_shared_weights(SharedWeights::from_result(&first))
+            .compile(&second_graph)
+            .expect("second model should compile");
+
+        assert!(
+            second.weights.starts_with(&first.weights),
+            "the shared blob must be reused as a prefix"
+        );
+        assert!(
+            second.weights.len() > first.weights.len(),
+            "the new tensor must be appended after the shared one"
+        );
+        for (hash, (offset, len)) in &first.content_hashes {
+            assert_eq!(
+                second.content_hashes.get(hash),
+                Some(&(*offset, *len)),
+                "identical content must keep its offset"
+            );
+        }
     }
 }
 

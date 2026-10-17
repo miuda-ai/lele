@@ -56,6 +56,7 @@ pub fn conv1d_fused<'b, 'a>(
     relu: bool,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
+    crate::kernels::enable_flush_denormals();
     conv1d_fused_at(
         Level::new(),
         input,
