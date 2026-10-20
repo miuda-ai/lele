@@ -34,7 +34,8 @@ impl Tokenizer {
         Ok(Tokenizer { id_to_token })
     }
 
-    /// Simple greedy decode without CTC-like collapsing
+    /// Greedy decode matching the ort reference (scripts/sensevoice_bench.py):
+    /// skip blank (id 0), collapse CTC repeats, and keep tags like <|zh|>.
     pub fn decode_greedy(
         &self,
         logits: &[f32],
@@ -48,6 +49,7 @@ impl Tokenizer {
 
         for b in 0..batch_size {
             let mut tokens = Vec::new();
+            let mut prev: usize = usize::MAX;
 
             for t in 0..time_steps {
                 let offset = (b * time_steps + t) * vocab_size;
@@ -61,15 +63,17 @@ impl Tokenizer {
                     .map(|(idx, _)| idx)
                     .unwrap_or(0);
 
-                // Get token string
-                if token_id < self.id_to_token.len() {
-                    let token = &self.id_to_token[token_id];
-                    // Skip blank and special tokens
-                    if token_id == 0 || (token.starts_with("<|") && token.ends_with("|>")) {
-                        continue;
-                    }
-                    tokens.push(token.clone());
+                // ort: `if idx != 0 and idx != prev`, tags are kept
+                if token_id != 0 && token_id != prev {
+                    let token = self
+                        .id_to_token
+                        .get(token_id)
+                        .filter(|t| !t.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| format!("<{}>", token_id));
+                    tokens.push(token);
                 }
+                prev = token_id;
             }
 
             // Join tokens and clean up

@@ -2,9 +2,9 @@
 source = "local"
 
 [[model.files]]
-path = "sensevoice.int8.onnx"
+path = "model_quant.onnx"
 
 [codegen]
 class_name = "SenseVoice"
-model_file = "sensevoice.int8.onnx"
+model_file = "model_quant.onnx"
 custom_methods = ["embedding_concat"]

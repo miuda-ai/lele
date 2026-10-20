@@ -93,7 +93,7 @@ impl SenseVoiceEngine {
 
         let speech_lengths = TensorView::from_owned(vec![t as i64], vec![1]);
         let language = TensorView::from_owned(vec![0i64], vec![1]); // 0=auto detect
-        let text_norm = TensorView::from_owned(vec![0i64], vec![1]);
+        let text_norm = TensorView::from_owned(vec![15i64], vec![1]); // 15=woitn (14=withitn)
 
         // Run inference
         let output = self

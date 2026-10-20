@@ -260,8 +260,10 @@ fn solve_allocation(graph: &GraphProto, outputs: &[String]) -> (Allocator, Analy
                     }
                     // Check inputs of preceding nodes to avoid buffer conflicts in fused
                     // patterns (e.g. Conv+Sigmoid+Mul → Conv2d+SiLU consumes 3 nodes,
-                    // Triple SiLU consumes 6 nodes)
-                    for prev in 1..=5 {
+                    // Triple SiLU consumes 6 nodes). Patterns read the inputs of their
+                    // FIRST node at runtime, so the window must span the whole pattern:
+                    // the largest one (manual LayerNorm) consumes 9 nodes.
+                    for prev in 1..=8 {
                         if id >= prev {
                             if let Some(inps) = visitor.node_inputs.get(&(id - prev)) {
                                 input_bufs.extend(

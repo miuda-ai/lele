@@ -1,4 +1,5 @@
 mod audio;
+mod mvn;
 mod sensevoice;
 mod tokenizer;
 
@@ -77,13 +78,16 @@ fn main() {
         start.elapsed().as_secs_f64() * 1000.0
     );
 
-    // Apply CMVN normalization
-    // SenseVoice usually uses Global CMVN, and the working log shows mean=0.0
-    // let normalized_features = features;
+    // Apply global CMVN from am.mvn — the normalization SenseVoice was trained
+    // with. Per-utterance mean/std normalization degrades accuracy
+    // (开放 -> 开饭) and breaks the language tag (zh -> yue).
+    let (mvn_mean, mvn_std) = mvn::load_am_mvn("examples/sensevoice/am.mvn")
+        .or_else(|_| mvn::load_am_mvn("am.mvn"))
+        .expect("Failed to load am.mvn");
     let cmvn = Cmvn::default();
 
     let start = Instant::now();
-    let normalized_features = cmvn.compute(&features);
+    let normalized_features = cmvn.apply_with_stats(&features, &mvn_mean, &mvn_std);
     let cmvn_time = start.elapsed().as_secs_f64() * 1000.0;
     println!(
         "✓ CMVN normalized: shape {:?}, took {:.2}ms",
@@ -118,14 +122,19 @@ fn main() {
     };
 
     let speech_lengths = TensorView::from_owned(vec![t as i64], vec![1]);
-    let language = TensorView::from_owned(vec![3i64], vec![1]); // Shape [1]
-    let text_norm = TensorView::from_owned(vec![0i64], vec![1]); // Shape [1], 1=with itn
+    // language id: auto=0, zh=3, en=4, yue=7, ja=11, ko=12, nospeech=13
+    let language = TensorView::from_owned(vec![3i64], vec![1]); // zh
+    // textnorm id: withitn=14 (inverse text norm, e.g. 九点 -> 9点), woitn=15
+    let text_norm = TensorView::from_owned(
+        vec![std::env::var("SENSEVOICE_TEXTNORM").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(15)],
+        vec![1],
+    ); // 14=withitn (ITN + punctuation), 15=woitn
 
     println!("Input shapes:");
     println!("  speech: {:?}", speech.shape);
     println!("  speech_lengths: {:?}", speech_lengths.shape);
-    println!("  language: {:?} (3=Chinese)", language.shape);
-    println!("  text_norm: {:?}", text_norm.shape);
+    println!("  language: {:?} (3=zh)", language.shape);
+    println!("  text_norm: {:?} (15=woitn)", text_norm.shape);
 
     // Clone inputs for benchmark (need to do this before first forward which moves them)
     let speech_bench = speech.to_owned();

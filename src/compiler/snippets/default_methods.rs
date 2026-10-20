@@ -82,6 +82,25 @@ fn linear_quantized_arm<'c, 'd>(
     bias: lele::tensor::TensorView<'c, f32>,
     output_buf: &'d mut Vec<f32>,
 ) -> lele::tensor::TensorView<'d, f32> {
+    // The prepared-ARM format carries a single scalar weight zero point.
+    // Per-channel zero points (onnxruntime's dynamic u8 quantization emits
+    // one per output channel) need the packing path, which centers every
+    // column exactly.
+    if weight_zero.data.len() > 1 {
+        return self.linear_quantized_packed(
+            input,
+            weight_offset,
+            weight_len,
+            weight_k,
+            weight_n,
+            weight_signed,
+            weight_scale,
+            weight_zero,
+            bias,
+            false,
+            output_buf,
+        );
+    }
     let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n, weight_signed);
     let zp_b = Some(Self::arm_zero_point(weight_zero.data.first().copied().unwrap_or(0.0), weight_signed));
 
@@ -113,6 +132,23 @@ fn linear_quantized_relu_arm<'c, 'd>(
     bias: lele::tensor::TensorView<'c, f32>,
     output_buf: &'d mut Vec<f32>,
 ) -> lele::tensor::TensorView<'d, f32> {
+    // Per-channel weight zero points need the packing path; see
+    // `linear_quantized_arm`.
+    if weight_zero.data.len() > 1 {
+        return self.linear_quantized_packed(
+            input,
+            weight_offset,
+            weight_len,
+            weight_k,
+            weight_n,
+            weight_signed,
+            weight_scale,
+            weight_zero,
+            bias,
+            true,
+            output_buf,
+        );
+    }
     let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n, weight_signed);
     let zp_b = Some(Self::arm_zero_point(weight_zero.data.first().copied().unwrap_or(0.0), weight_signed));
 
@@ -143,6 +179,21 @@ fn mat_mul_integer_arm<'c, 'd>(
     b_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
     output_buf: &'d mut Vec<f32>,
 ) -> lele::tensor::TensorView<'d, f32> {
+    // Per-channel weight zero points need the packing path; see
+    // `linear_quantized_arm`.
+    if b_zero_point.map(|z| z.data.len() > 1).unwrap_or(false) {
+        return self.mat_mul_integer_packed(
+            a,
+            weight_offset,
+            weight_len,
+            weight_k,
+            weight_n,
+            weight_signed,
+            a_zero_point,
+            b_zero_point,
+            output_buf,
+        );
+    }
     let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n, weight_signed);
     let zp_a = a_zero_point.and_then(|z| z.data.first().cloned());
     let zb = b_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0);
@@ -152,8 +203,8 @@ fn mat_mul_integer_arm<'c, 'd>(
 }
 
 /// Dynamically quantized linear layer (+ ReLU) against an int8 weight packed
-/// once for the integer GEMM.
-#[cfg(not(target_arch = "aarch64"))]
+/// once for the integer GEMM. Supports per-channel weight zero points (each
+/// column is centered exactly at pack time).
 fn linear_quantized_packed<'c, 'd>(
     &self,
     input: &lele::tensor::TensorView<'c, f32>,
@@ -174,7 +225,6 @@ fn linear_quantized_packed<'c, 'd>(
 }
 
 /// MatMulInteger against a static weight packed once for the integer GEMM.
-#[cfg(not(target_arch = "aarch64"))]
 fn mat_mul_integer_packed<'c, 'd>(
     &self,
     a: &lele::tensor::TensorView<'c, f32>,
