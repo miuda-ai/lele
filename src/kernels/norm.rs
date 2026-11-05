@@ -301,7 +301,13 @@ pub fn layer_norm<'b, 'a>(
         outer_size,
         &input.data,
         &scale.data[..norm_size],
-        &bias.data[..norm_size],
+        // ONNX's bias is optional; code generation passes an empty tensor
+        // for a missing one.
+        if bias.data.is_empty() {
+            &[]
+        } else {
+            &bias.data[..norm_size]
+        },
         out_slice,
         epsilon,
     );
@@ -601,7 +607,8 @@ fn scale_norm_rows_simd<S: Simd>(
 /// independent work to overlap.
 const LANES: usize = 16;
 
-/// LayerNorm of the first `rows` `gamma.len()`-wide rows of `src` into `out`.
+/// LayerNorm of the first `rows` `gamma.len()`-wide rows of `src` into `out`,
+/// shifted by `beta` unless it is empty.
 ///
 /// The row count is passed rather than derived: deriving it, as
 /// `chunks_exact` does, costs an integer division per call, which is a
@@ -636,6 +643,10 @@ fn layer_norm_rows_simd<S: Simd>(
     epsilon: f32,
 ) {
     let n = gamma.len();
+    // Without a shift, `gamma` stands in for `beta` in the loops below, which
+    // then do not read it.
+    let has_bias = !beta.is_empty();
+    let beta = if has_bias { beta } else { gamma };
     // Multiplying by 1/n keeps a division off each row's chain from its sums
     // to its first output, which short rows spend most of their time on.
     let inv_n = 1.0 / n as f32;
@@ -668,12 +679,13 @@ fn layer_norm_rows_simd<S: Simd>(
         let inv_std_v = f32x16::splat(simd, inv_std);
         let norm = |x, g, b, o| {
             let normed = (f32x16::load_array_ref(simd, x) - mean_v) * inv_std_v;
-            normed
-                .mul_add(
-                    f32x16::load_array_ref(simd, g),
-                    f32x16::load_array_ref(simd, b),
-                )
-                .store_array(o);
+            let g = f32x16::load_array_ref(simd, g);
+            if has_bias {
+                normed.mul_add(g, f32x16::load_array_ref(simd, b))
+            } else {
+                normed * g
+            }
+            .store_array(o);
         };
         let (x, x_tail) = row.as_chunks::<LANES>();
         let (g, g_tail) = gamma.as_chunks::<LANES>();
@@ -692,6 +704,7 @@ fn layer_norm_rows_simd<S: Simd>(
             norm(x, g, b, o);
         }
         if !x_tail.is_empty() {
+            let b_tail = has_bias.then_some(b_tail);
             layer_norm_tail(x_tail, g_tail, b_tail, o_tail, mean, inv_std);
         }
     }
@@ -704,9 +717,17 @@ fn layer_norm_rows_simd<S: Simd>(
 
 #[cold]
 #[inline(never)]
-fn layer_norm_tail(x: &[f32], g: &[f32], b: &[f32], out: &mut [f32], mean: f32, inv_std: f32) {
-    for (((&x, &g), &b), o) in x.iter().zip(g).zip(b).zip(out) {
-        *o = (x - mean) * inv_std * g + b;
+fn layer_norm_tail(
+    x: &[f32],
+    g: &[f32],
+    b: Option<&[f32]>,
+    out: &mut [f32],
+    mean: f32,
+    inv_std: f32,
+) {
+    for (i, ((&x, &g), o)) in x.iter().zip(g).zip(out).enumerate() {
+        let scaled = (x - mean) * inv_std * g;
+        *o = b.map_or(scaled, |b| scaled + b[i]);
     }
 }
 
@@ -900,6 +921,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// ONNX's bias is optional: an empty one shifts by nothing, as zeros do.
+    #[test]
+    fn test_layer_norm_without_bias_is_layer_norm_with_zero_bias() {
+        for level in levels() {
+            let mut rng = Rng::new(2);
+            for &n in AWKWARD_LENS {
+                let x = rng.vec(ROWS * n, -1.0, 1.0);
+                let gamma = rng.vec(n, 0.5, 1.5);
+                let mut want = vec![0.0; x.len()];
+                layer_norm_rows(level, ROWS, &x, &gamma, &vec![0.0; n], &mut want, EPS);
+                let mut got = vec![0.0; x.len()];
+                layer_norm_rows(level, ROWS, &x, &gamma, &[], &mut got, EPS);
+                assert_eq!(got, want, "{level:?} n={n}");
+            }
+        }
+        let x = Rng::new(3).vec(2 * 5, -1.0, 1.0);
+        let gamma = vec![2.0; 5];
+        let mut out = Vec::new();
+        let got = layer_norm(
+            &TensorView::from_slice(&x, vec![2, 5]),
+            &TensorView::from_slice(&gamma, vec![5]),
+            &TensorView::empty(),
+            -1,
+            EPS,
+            &mut out,
+        );
+        assert_close(&got.data, &layer_norm_ref(&x, &gamma, &[0.0; 5]), 1e-5, "layer_norm");
     }
 
     #[test]

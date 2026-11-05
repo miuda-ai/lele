@@ -84,6 +84,7 @@ pub(crate) fn dispatch_builtin(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         | Op::Gelu { .. }
         | Op::Linear
         | Op::QLinearDynamic { .. }
+        | Op::RmsNorm { .. }
         | Op::ScaleNorm { .. }
         | Op::SimAm { .. }
         | Op::Silu

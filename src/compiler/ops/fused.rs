@@ -34,6 +34,11 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             "{tab}let {} = lele::kernels::scale_norm(&{}, &{}, {scale:?}, {epsilon:?}, {buf});",
             outputs[0], inputs[0], inputs[1]
         )?,
+        Op::RmsNorm { epsilon } => writeln!(
+            w,
+            "{tab}let {} = lele::kernels::rms_norm(&{}, &{}, -1, {epsilon:?}, {buf});",
+            outputs[0], inputs[0], inputs[1]
+        )?,
         Op::Snake => writeln!(
             w,
             "{tab}let {} = lele::kernels::snake(&{}, &{}, &{}, {buf});",

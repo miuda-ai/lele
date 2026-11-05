@@ -19,6 +19,7 @@ pub(crate) fn fuse(g: &mut Graph) {
     fuse_conv_scale(g);
     fuse_layer_norm(g);
     fuse_scale_norm(g);
+    fuse_rms_norm(g);
     fuse_simam(g);
     fuse_snake(g);
     fuse_gelu(g);
@@ -367,50 +368,93 @@ fn fuse_conv_scale(g: &mut Graph) {
     }
 }
 
+/// A LayerNorm before its shift, `x - mean(x)` normalized by
+/// `sqrt(mean((x - mean(x))^2) + eps)` and scaled, over the last axis, ending
+/// in `Mul` node `mul`: its nodes, `x`, the scale and `eps`.
+struct LayerNormChain {
+    nodes: Vec<NodeId>,
+    x: ValueId,
+    scale: Option<ValueId>,
+    epsilon: f32,
+}
+
+fn layer_norm_chain(g: &Graph, mul: NodeId) -> Option<LayerNormChain> {
+    let (div, scale) = (0..2).find_map(|k| {
+        let div = sole_producer(g, g.node(mul).input(k), binary(Binary::Div))?;
+        Some((div, g.node(mul).input(1 - k)))
+    })?;
+    let (centered, std) = (g.node(div).input(0)?, g.node(div).input(1));
+    let sqrt = sole_producer(g, std, unary(Unary::Sqrt))?;
+    let add_eps = sole_producer(g, g.node(sqrt).input(0), binary(Binary::Add))?;
+    let (var, eps) = (g.node(add_eps).input(0), g.node(add_eps).input(1));
+    let epsilon = constant(g, eps).filter(|e| e.len() == 1)?[0];
+    let var_mean = sole_producer(g, var, reduce_mean)?;
+    let pow = sole_producer(g, g.node(var_mean).input(0), binary(Binary::Pow))?;
+    if g.node(pow).input(0) != Some(centered) || !is_scalar(g, g.node(pow).input(1), 2.0) {
+        return None;
+    }
+    // Read by the Pow and the Div.
+    let sub = g.value(centered).producer()?;
+    if !binary(Binary::Sub)(&g.node(sub).op) || g.uses(centered) != 2 {
+        return None;
+    }
+    let x = g.node(sub).input(0)?;
+    let mean = sole_producer(g, g.node(sub).input(1), reduce_mean)?;
+    let fits = g.node(mean).input(0) == Some(x)
+        && reduces_last_axis(g, mean)
+        && reduces_last_axis(g, var_mean)
+        && per_column(g, x, scale);
+    fits.then(|| LayerNormChain {
+        nodes: vec![mean, sub, pow, var_mean, add_eps, sqrt, div, mul],
+        x,
+        scale,
+        epsilon,
+    })
+}
+
+/// Whether `v` is a constant of one element per column of `x` (the kernels
+/// read the first that many): of shape `[n]` or `[1, ..., n]`, with `n`
+/// `x`'s width where that is known.
+fn per_column(g: &Graph, x: ValueId, v: Option<ValueId>) -> bool {
+    let width = g.value(x).shape.as_deref().and_then(|s| s.last());
+    constant_tensor(g, v).is_some_and(|t| match (t.dims.split_last(), width) {
+        (Some((_, rest)), _) if rest.iter().any(|&d| d != 1) => false,
+        (Some((n, _)), Some(Dim::Fixed(w))) => n == w,
+        (Some((n, _)), _) => *n > 1,
+        (None, _) => false,
+    })
+}
+
 /// `x - mean(x)`, normalized by `sqrt(mean((x - mean(x))^2) + eps)`, then
-/// scaled and shifted, all over the last axis → `LayerNormalization`.
+/// scaled and maybe shifted, all over the last axis, with the operands of the
+/// scale's `Mul` and the shift's `Add` in either order → `LayerNormalization`.
 fn fuse_layer_norm(g: &mut Graph) {
+    // Shifted ones first: the unshifted chain is part of each.
     for add in binary_nodes(g, Binary::Add) {
         if !g.contains(add) {
             continue;
         }
         let fused = (0..2).find_map(|k| {
             let node = g.node(add);
-            let (scaled, bias) = (node.input(k)?, node.input(1 - k));
-            let mul = sole_producer(g, Some(scaled), binary(Binary::Mul))?;
-            let normed = g.node(mul).input(0)?;
-            let scale = g.node(mul).input(1);
-            let div = sole_producer(g, Some(normed), binary(Binary::Div))?;
-            let (centered, std) = (g.node(div).input(0)?, g.node(div).input(1));
-            let sqrt = sole_producer(g, std, unary(Unary::Sqrt))?;
-            let add_eps = sole_producer(g, g.node(sqrt).input(0), binary(Binary::Add))?;
-            let (var, eps) = (g.node(add_eps).input(0), g.node(add_eps).input(1));
-            let epsilon = constant(g, eps).filter(|e| e.len() == 1)?[0];
-            let var_mean = sole_producer(g, var, reduce_mean)?;
-            let pow = sole_producer(g, g.node(var_mean).input(0), binary(Binary::Pow))?;
-            if g.node(pow).input(0) != Some(centered) || !is_scalar(g, g.node(pow).input(1), 2.0) {
-                return None;
-            }
-            // Read by the Pow and the Div.
-            let sub = g.value(centered).producer()?;
-            if !binary(Binary::Sub)(&g.node(sub).op) || g.uses(centered) != 2 {
-                return None;
-            }
-            let x = g.node(sub).input(0)?;
-            let mean = sole_producer(g, g.node(sub).input(1), reduce_mean)?;
-            if g.node(mean).input(0) != Some(x)
-                || !reduces_last_axis(g, mean)
-                || !reduces_last_axis(g, var_mean)
-            {
-                return None;
-            }
-            let nodes = [mean, sub, pow, var_mean, add_eps, sqrt, div, mul, add];
-            Some((nodes, [Some(x), scale, bias], epsilon))
+            let (scaled, bias) = (node.input(k), node.input(1 - k));
+            let chain = layer_norm_chain(g, sole_producer(g, scaled, binary(Binary::Mul))?)?;
+            per_column(g, chain.x, bias).then_some((chain, bias))
         });
-        if let Some((nodes, inputs, epsilon)) = fused {
-            let op = Op::LayerNormalization { axis: -1, epsilon };
-            let proto = named_after(g, add);
-            g.fuse(&nodes, op, proto, inputs.to_vec());
+        if let Some((chain, bias)) = fused {
+            let op = Op::LayerNormalization { axis: -1, epsilon: chain.epsilon };
+            let nodes: Vec<_> = chain.nodes.into_iter().chain([add]).collect();
+            let inputs = vec![Some(chain.x), chain.scale, bias];
+            g.fuse(&nodes, op, named_after(g, add), inputs);
+        }
+    }
+    for mul in binary_nodes(g, Binary::Mul) {
+        if !g.contains(mul) {
+            continue;
+        }
+        if let Some(chain) = layer_norm_chain(g, mul) {
+            let op = Op::LayerNormalization { axis: -1, epsilon: chain.epsilon };
+            let inputs = vec![Some(chain.x), chain.scale];
+            g.fuse(&chain.nodes, op, named_after(g, mul), inputs);
         }
     }
 }
@@ -471,6 +515,95 @@ fn fuse_scale_norm(g: &mut Graph) {
         if let Some((nodes, inputs, scale, epsilon)) = fused {
             let proto = named_after(g, mul);
             g.fuse(&nodes, Op::ScaleNorm { scale, epsilon }, proto, inputs.to_vec());
+        }
+    }
+}
+
+/// An unscaled RMSNorm, `x * (1 / sqrt(ReduceMean(x^2) + eps))` over the
+/// last axis of an `x` of known width, ending in `Mul` node `mul`: its nodes,
+/// `x`, `eps` and the width.
+struct RmsChain {
+    nodes: Vec<NodeId>,
+    x: ValueId,
+    epsilon: f32,
+    columns: i64,
+}
+
+fn rms_chain(g: &Graph, mul: NodeId) -> Option<RmsChain> {
+    let (x, div) = (0..2).find_map(|j| {
+        let div = sole_producer(g, g.node(mul).input(1 - j), binary(Binary::Div))?;
+        Some((g.node(mul).input(j)?, div))
+    })?;
+    let sqrt = sole_producer(g, g.node(div).input(1), unary(Unary::Sqrt))?;
+    let add = sole_producer(g, g.node(sqrt).input(0), binary(Binary::Add))?;
+    let (mean, epsilon) = (0..2).find_map(|j| {
+        let eps = constant(g, g.node(add).input(1 - j)).filter(|e| e.len() == 1)?[0];
+        Some((sole_producer(g, g.node(add).input(j), reduce_mean)?, eps))
+    })?;
+    let pow = sole_producer(g, g.node(mean).input(0), binary(Binary::Pow))?;
+    let columns = match g.value(x).shape.as_deref()?.last()? {
+        Dim::Fixed(n) => *n,
+        _ => return None,
+    };
+    let fits = g.node(pow).input(0) == Some(x)
+        && is_scalar(g, g.node(pow).input(1), 2.0)
+        && is_scalar(g, g.node(div).input(0), 1.0)
+        && kept_trailing_axes(g, mean, x) == Some(1)
+        && matches!(g.value(x).dtype, DType::F32 | DType::F16);
+    fits.then(|| RmsChain {
+        nodes: vec![pow, mean, add, sqrt, div, mul],
+        x,
+        epsilon,
+        columns,
+    })
+}
+
+/// RMSNorm over the last axis → `RmsNorm`: `gamma * (x * (1 / sqrt(ReduceMean(x^2) + eps)))`,
+/// with constant scalar `eps`, a constant `gamma` of one element per column,
+/// the operands of each `Mul` and `Add` in either order, and maybe a cast
+/// between float types before the `gamma` product, as in models that scale in
+/// f16. Without `gamma`, as where it was folded into the weights of the
+/// product that follows, the kernel scales by a constant of ones.
+fn fuse_rms_norm(g: &mut Graph) {
+    let float = |t: DType| matches!(t, DType::F32 | DType::F16);
+    // Scaled ones first: the unscaled chain is part of each.
+    for mul in binary_nodes(g, Binary::Mul) {
+        if !g.contains(mul) {
+            continue;
+        }
+        let fused = (0..2).find_map(|k| {
+            let node = g.node(mul);
+            let (y, gamma) = (node.input(k), node.input(1 - k));
+            // lele holds f16 as f32, so such a cast does not round.
+            let cast = sole_producer(g, y, |op| matches!(op, Op::Cast { to } if float(*to)));
+            let scaled = cast.map_or(y, |c| g.node(c).input(0));
+            let chain = rms_chain(g, sole_producer(g, scaled, binary(Binary::Mul))?)?;
+            constant_tensor(g, gamma).filter(|t| t.dims == [chain.columns])?;
+            Some((chain, cast, gamma))
+        });
+        if let Some((chain, cast, gamma)) = fused {
+            let nodes: Vec<_> = chain.nodes.into_iter().chain(cast).chain([mul]).collect();
+            let op = Op::RmsNorm { epsilon: chain.epsilon };
+            g.fuse(&nodes, op, named_after(g, mul), vec![Some(chain.x), gamma]);
+        }
+    }
+    let mut ones = std::collections::HashMap::new();
+    for mul in binary_nodes(g, Binary::Mul) {
+        if !g.contains(mul) {
+            continue;
+        }
+        if let Some(chain) = rms_chain(g, mul) {
+            let gamma = *ones.entry(chain.columns).or_insert_with(|| {
+                let tensor = TensorProto {
+                    dims: vec![chain.columns],
+                    data_type: DType::F32.to_onnx(),
+                    float_data: vec![1.0; chain.columns as usize],
+                    ..Default::default()
+                };
+                g.new_initializer(&format!("rms_norm_ones_{}", chain.columns), tensor)
+            });
+            let op = Op::RmsNorm { epsilon: chain.epsilon };
+            g.fuse(&chain.nodes, op, named_after(g, mul), vec![Some(chain.x), Some(gamma)]);
         }
     }
 }
@@ -1333,6 +1466,108 @@ mod tests {
         assert_eq!(fused(nodes, constants).len(), 6);
     }
 
+    /// RMSNorm as SmolLM2 writes it, and as Hojo-TTS does, scaling in f16
+    /// after a cast, with the operands of each `Mul` and `Add` in either order.
+    #[test]
+    fn fuses_rms_norm() {
+        use crate::model::onnx_proto::{TensorShapeProto, TypeProto, tensor_shape_proto, type_proto};
+        let input = ValueInfoProto {
+            name: "x".to_string(),
+            r#type: Some(TypeProto {
+                value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                    elem_type: DType::F32.to_onnx(),
+                    shape: Some(TensorShapeProto {
+                        dim: [2, 4]
+                            .iter()
+                            .map(|&d| tensor_shape_proto::Dimension {
+                                value: Some(tensor_shape_proto::dimension::Value::DimValue(d)),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    }),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let nodes = |swap: bool, cast_to: Option<DType>, axis: i64, scaled: bool| {
+            let order = |a: &'static str, b: &'static str| if swap { [b, a] } else { [a, b] };
+            let mut mean = node("ReduceMean", &["sq"], "ms");
+            mean.attribute.push(crate::model::onnx_proto::AttributeProto {
+                name: "axes".to_string(),
+                ints: vec![axis],
+                ..Default::default()
+            });
+            let mut nodes = vec![
+                node("Pow", &["x", "two"], "sq"),
+                mean,
+                node("Add", &order("ms", "eps"), "v"),
+                node("Sqrt", &["v"], "s"),
+                node("Div", &["one", "s"], "inv"),
+                node("Mul", &order("x", "inv"), "n"),
+            ];
+            if let Some(to) = cast_to {
+                let mut cast = node("Cast", &["n"], "h");
+                cast.attribute.push(crate::model::onnx_proto::AttributeProto {
+                    name: "to".to_string(),
+                    i: to.to_onnx() as i64,
+                    ..Default::default()
+                });
+                nodes.push(cast);
+            }
+            let normed = if cast_to.is_some() { "h" } else { "n" };
+            if scaled {
+                nodes.push(node("Mul", &if swap { [normed, "gamma"] } else { ["gamma", normed] }, "y"));
+            } else {
+                nodes.push(node("Identity", &[normed], "y"));
+            }
+            nodes
+        };
+        let fused = |nodes: Vec<NodeProto>, gamma_dims: Vec<i64>| {
+            let gamma = TensorProto {
+                name: "gamma".to_string(),
+                data_type: DType::F32.to_onnx(),
+                float_data: vec![1.5; gamma_dims.iter().product::<i64>() as usize],
+                dims: gamma_dims,
+                ..Default::default()
+            };
+            let g = GraphProto {
+                node: nodes,
+                input: vec![input.clone()],
+                initializer: vec![scalar("two", 2.0), scalar("eps", 1e-6), scalar("one", 1.0), gamma],
+                output: vec![ValueInfoProto {
+                    name: "y".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let mut ir = Graph::from_onnx(g);
+            crate::compiler::passes::infer_dtypes(&mut ir);
+            crate::compiler::passes::fold_shapes(&mut ir);
+            fuse(&mut ir);
+            ir.into_onnx().node.into_iter().map(|n| n.op_type).collect::<Vec<_>>()
+        };
+        for swap in [false, true] {
+            for cast_to in [None, Some(DType::F16)] {
+                assert_eq!(fused(nodes(swap, cast_to, -1, true), vec![4]), ["RmsNorm"]);
+            }
+            // Without a gamma, as Hojo-TTS's is folded into the next product.
+            assert_eq!(fused(nodes(swap, None, -1, false), vec![4]), ["RmsNorm", "Identity"]);
+        }
+        assert_eq!(fused(nodes(false, None, 1, true), vec![4]), ["RmsNorm"]);
+
+        // A gamma not of one element per column, or a cast that rounds to
+        // integers, is left out of the norm.
+        assert_eq!(fused(nodes(false, None, -1, true), vec![1]), ["RmsNorm", "Mul"]);
+        assert_eq!(fused(nodes(false, None, -1, true), vec![2, 4]), ["RmsNorm", "Mul"]);
+        assert_eq!(
+            fused(nodes(false, Some(DType::I32), -1, true), vec![4]),
+            ["RmsNorm", "Cast", "Mul"]
+        );
+        // A norm over another axis is left.
+        assert_eq!(fused(nodes(false, None, 0, true), vec![4]).len(), 7);
+    }
+
     /// `DynamicQuantizeLinear → MatMulInteger → Cast → Mul → Add(bias)`.
     #[test]
     fn fuses_dynamic_quant_linear_with_a_constant_bias_only() {
@@ -1388,11 +1623,44 @@ mod tests {
                     ..Default::default()
                 });
         }
-        let constants = vec![scalar("two", 2.0), scalar("eps", 1e-6)];
+        let per_column = |name: &str, dims: Vec<i64>| TensorProto {
+            name: name.to_string(),
+            data_type: DType::F32.to_onnx(),
+            float_data: vec![0.5; dims.iter().product::<i64>() as usize],
+            dims,
+            ..Default::default()
+        };
+        let constants = vec![
+            scalar("two", 2.0),
+            scalar("eps", 1e-6),
+            per_column("scale", vec![4]),
+            per_column("bias", vec![1, 1, 4]),
+        ];
         assert_eq!(
             fused(nodes.clone(), constants.clone()),
             ["LayerNormalization"]
         );
+
+        // Without a shift, as Moonshine's, and with the scale first.
+        let mut unshifted = nodes.clone();
+        unshifted[7] = node("Mul", &["scale", "n"], "s");
+        unshifted[8] = node("Identity", &["s"], "y");
+        assert_eq!(
+            fused(unshifted, constants.clone()),
+            ["LayerNormalization", "Identity"]
+        );
+
+        // A sum computed at run time, as a residual, is not a shift, and a
+        // scale of one element for all is not one per column.
+        let mut residual = nodes.clone();
+        residual[8] = node("Add", &["s", "r"], "y");
+        assert_eq!(
+            fused(residual, constants.clone()),
+            ["LayerNormalization", "Add"]
+        );
+        let mut one_scale = constants.clone();
+        one_scale[2] = per_column("scale", vec![1]);
+        assert_eq!(fused(nodes.clone(), one_scale).len(), 9);
 
         // Normalizing over another axis is not a LayerNorm over the last.
         nodes[3].attribute[0].ints = vec![1];
