@@ -1,9 +1,8 @@
 //! Depthwise convolution and max pooling over the planes of an NCHW tensor:
 //! every channel slides its own window over its own plane.
 
-use crate::kernels::conv2d::Activation;
+use crate::kernels::bias_act::{Act, act_inplace_at};
 use crate::kernels::simd::simd_call;
-use crate::kernels::simd_math as vm;
 use aligned_vec::AVec;
 use fearless_simd::{Level, Simd, f32x16};
 use fearless_simd_macros::simd;
@@ -135,7 +134,7 @@ pub(crate) fn depthwise(
     input: &[f32],
     weights: &[f32],
     bias: Option<&[f32]>,
-    act: Activation,
+    act: Option<Act>,
     out: &mut [f32],
 ) {
     let layout = Layout::new(w);
@@ -196,23 +195,9 @@ macro_rules! sweep {
     }};
 }
 
-#[inline(always)]
-fn activate<S: Simd>(x: f32x16<S>, act: Activation) -> f32x16<S> {
-    match act {
-        Activation::None => x,
-        Activation::Relu => vm::relu(x),
-        Activation::SiLU => vm::silu(x),
-    }
-}
-
-fn activate_scalar(x: f32, act: Activation) -> f32 {
-    match act {
-        Activation::None => x,
-        Activation::Relu => x.max(0.0),
-        Activation::SiLU => x / (1.0 + (-x).exp()),
-    }
-}
-
+/// The activation is applied to each plane as soon as it is written, while it is in
+/// cache, by one call: inlined where the outputs are stored, every activation would be
+/// copied into every one of those places, at every SIMD level.
 #[simd]
 fn depthwise_simd<S: Simd>(
     simd: S,
@@ -221,7 +206,7 @@ fn depthwise_simd<S: Simd>(
     input: &[f32],
     weights: &[f32],
     bias: Option<&[f32]>,
-    act: Activation,
+    act: Option<Act>,
     out: &mut [f32],
     padded: &mut [f32],
 ) {
@@ -240,9 +225,11 @@ fn depthwise_simd<S: Simd>(
                 let x = &padded[oh * w.stride_h * l.row_len..];
                 for (ow, y) in y.iter_mut().enumerate() {
                     let at = &x[ow * l.step..];
-                    let s = taps.iter().zip(k).fold(b, |s, (&o, &kv)| s + kv * at[o]);
-                    *y = activate_scalar(s, act);
+                    *y = taps.iter().zip(k).fold(b, |s, (&o, &kv)| s + kv * at[o]);
                 }
+            }
+            if let Some(act) = act {
+                act_inplace_at(simd.level(), act, dst);
             }
             continue;
         }
@@ -262,13 +249,13 @@ fn depthwise_simd<S: Simd>(
                         Some((_, y1)) => {
                             assert!(x.len() >= row_step + need);
                             sweep!([y0, y1], |t| unsafe {
-                                depthwise_rows::<S, 2>(simd, &x[t..], row_step, taps, k, b, act)
+                                depthwise_rows::<S, 2>(simd, &x[t..], row_step, taps, k, b)
                             })
                         }
                         None => {
                             assert!(x.len() >= need);
                             sweep!([y0], |t| unsafe {
-                                depthwise_rows::<S, 1>(simd, &x[t..], row_step, taps, k, b, act)
+                                depthwise_rows::<S, 1>(simd, &x[t..], row_step, taps, k, b)
                             })
                         }
                     }
@@ -285,6 +272,9 @@ fn depthwise_simd<S: Simd>(
                 &<[f32; 25]>::try_from(k).unwrap()[..]
             ),
             _ => rows!(taps, k),
+        }
+        if let Some(act) = act {
+            act_inplace_at(simd.level(), act, dst);
         }
     }
 }
@@ -310,7 +300,6 @@ unsafe fn depthwise_rows<S: Simd, const R: usize>(
     taps: &[usize],
     k: &[f32],
     bias: f32,
-    act: Activation,
 ) -> [f32x16<S>; R] {
     use fearless_simd::prelude::*;
     let mut acc = [f32x16::splat(simd, bias); R];
@@ -319,9 +308,6 @@ unsafe fn depthwise_rows<S: Simd, const R: usize>(
         for (r, acc) in acc.iter_mut().enumerate() {
             *acc = kv.mul_add(unsafe { load(simd, x, r * row_step + o) }, *acc);
         }
-    }
-    for acc in &mut acc {
-        *acc = activate(*acc, act);
     }
     acc
 }

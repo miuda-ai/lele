@@ -1,8 +1,8 @@
-use crate::kernels::bias_act::bias_act_inplace;
+use crate::kernels::bias_act::{Act, act_inplace_at, bias_act_inplace_at};
 use crate::kernels::conv1d_direct::{
     Depthwise, Kernel3, SingleChannel, depthwise, kernel3, single_channel,
 };
-use crate::kernels::conv2d::{Activation, IM2COL_BYTES, conv2d_activation};
+use crate::kernels::conv2d::{IM2COL_BYTES, conv2d_activation};
 use crate::kernels::gemm::WeightElem;
 use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul};
 use crate::kernels::utils;
@@ -11,27 +11,26 @@ use aligned_vec::AVec;
 use fearless_simd::Level;
 
 /// Adds `bias[oc]` to every `[oc, ..]` row of `out` (laid out `[batch, out_channels, len]`)
-/// and applies ReLU if asked.
-fn bias_relu_rows(
+/// and applies the activation if any.
+///
+/// The activation goes over the whole output at once, not row by row: rows are
+/// often short (a few frames), and each would pay a call and a last vector that
+/// overlaps the one before it.
+fn bias_act_rows(
+    level: Level,
     out: &mut [f32],
     bias: Option<&TensorView>,
-    relu: bool,
+    act: Option<Act>,
     out_channels: usize,
     len: usize,
 ) {
-    let act = if relu {
-        Activation::Relu
-    } else {
-        Activation::None
-    };
-    match bias {
-        Some(bias) => {
-            for (i, row) in out.chunks_exact_mut(len).enumerate() {
-                bias_act_inplace(row, bias.data[i % out_channels], act);
-            }
+    if let Some(bias) = bias {
+        for (i, row) in out.chunks_exact_mut(len).enumerate() {
+            bias_act_inplace_at(level, row, bias.data[i % out_channels], None);
         }
-        None if relu => bias_act_inplace(out, 0.0, act),
-        None => {}
+    }
+    if let Some(act) = act {
+        act_inplace_at(level, act, out);
     }
 }
 
@@ -40,12 +39,13 @@ fn bias_relu_rows(
 /// as a matrix product), whose weights `[out_channels, in_channels, 1]` may be f16: they
 /// are widened as they are read, and the result is that of [`conv1d`] on the widened
 /// weights, bit for bit. Weights stored packed ([`PackedF16`](crate::kernels::PackedF16))
-/// are read in panels from start to end and sum in another order.
+/// are read in panels from start to end and sum in another order. Then the activation, if
+/// any, as its own kernel computes it.
 pub fn conv1d_pointwise<'a, W: WeightElem>(
     input: &TensorView<'_>,
     weights: &TensorView<'_, W>,
     bias: Option<&TensorView<'_>>,
-    relu: bool,
+    act: Option<Act>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     let [batch, in_channels, len] = input.shape[..] else {
@@ -61,22 +61,24 @@ pub fn conv1d_pointwise<'a, W: WeightElem>(
     // SAFETY: the product replaces every element.
     unsafe { utils::ensure_capacity(out, batch * out_channels * len) };
     pointwise(
+        Level::new(),
         input,
         &weights.data,
         bias,
-        relu,
+        act,
         (batch, in_channels, out_channels, len),
         out,
     )
 }
 
 /// Per batch, `weights[out_channels, in_channels] x input[in_channels, len]`, then the
-/// bias and ReLU. `out` is the output's length.
+/// bias and the activation (at `level`). `out` is the output's length.
 fn pointwise<'a, W: WeightElem>(
+    level: Level,
     input: &TensorView<'_>,
     weights: &[W],
     bias: Option<&TensorView<'_>>,
-    relu: bool,
+    act: Option<Act>,
     (batch_size, in_channels, out_channels, len): (usize, usize, usize, usize),
     out: &'a mut [f32],
 ) -> TensorView<'a> {
@@ -113,7 +115,7 @@ fn pointwise<'a, W: WeightElem>(
             );
         }
     }
-    bias_relu_rows(out, bias, relu, out_channels, len);
+    bias_act_rows(level, out, bias, act, out_channels, len);
     TensorView::from_slice(out, vec![batch_size, out_channels, len])
 }
 
@@ -127,12 +129,14 @@ pub fn conv1d<'b, 'a>(
     strides: &[i64],
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let result = conv1d_fused(
-        input, weights, bias, dilations, group, pads, strides, false, out,
-    );
-    result
+    conv1d_fused(
+        input, weights, bias, dilations, group, pads, strides, None, out,
+    )
 }
 
+/// [`conv1d`], then `act`, applied as the output is written: the activation's own kernel
+/// on the output, bit for bit.
+#[allow(clippy::too_many_arguments)]
 pub fn conv1d_fused<'b, 'a>(
     input: &TensorView<'b>,
     weights: &TensorView<'b>,
@@ -141,7 +145,7 @@ pub fn conv1d_fused<'b, 'a>(
     group: i64,
     pads: &[i64],
     strides: &[i64],
-    relu: bool,
+    act: Option<Act>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     crate::kernels::enable_flush_denormals();
@@ -154,33 +158,10 @@ pub fn conv1d_fused<'b, 'a>(
         group,
         pads,
         strides,
-        relu,
+        act,
         IM2COL_BYTES,
         out,
     )
-}
-
-/// [`conv1d`] followed by SiLU, applied in place: [`conv1d`] then
-/// [`silu`](crate::kernels::silu), bit for bit, without a second buffer.
-#[allow(clippy::too_many_arguments)]
-pub fn conv1d_silu<'b, 'a>(
-    input: &TensorView<'b>,
-    weights: &TensorView<'b>,
-    bias: Option<&TensorView<'b>>,
-    dilations: &[i64],
-    group: i64,
-    pads: &[i64],
-    strides: &[i64],
-    out: &'a mut Vec<f32>,
-) -> TensorView<'a> {
-    let shape = conv1d_fused(
-        input, weights, bias, dilations, group, pads, strides, false, out,
-    )
-    .shape
-    .into_owned();
-    let len = shape.iter().product();
-    crate::kernels::bias_act::silu_inplace(&mut out[..len]);
-    TensorView::from_slice(&out[..len], shape)
 }
 
 /// `unfold_bytes` bounds the input unfolded whole ([`IM2COL_BYTES`]; others in tests).
@@ -193,7 +174,7 @@ fn conv1d_fused_at<'b, 'a>(
     group: i64,
     pads: &[i64],
     strides: &[i64],
-    relu: bool,
+    act: Option<Act>,
     unfold_bytes: usize,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
@@ -233,8 +214,13 @@ fn conv1d_fused_at<'b, 'a>(
     };
     let pad_left = if pads.is_empty() { 0 } else { pads[0] as usize };
     let pad_right = if pads.len() > 1 { pads[1] as usize } else { 0 };
-    let output_len =
-        (input_len + pad_left + pad_right - dilation * (kernel_size - 1) - 1) / stride + 1;
+    // An input shorter than the kernel's reach has no outputs.
+    let padded_len = input_len + pad_left + pad_right;
+    let reach = dilation * (kernel_size - 1) + 1;
+    if padded_len < reach {
+        return TensorView::from_slice(&out[..0], vec![batch_size, out_channels, 0]);
+    }
+    let output_len = (padded_len - reach) / stride + 1;
     let total_output_size = batch_size * out_channels * output_len;
     // SAFETY: every element is written below before any is read (the group
     // count divides the channels, asserted above).
@@ -254,7 +240,7 @@ fn conv1d_fused_at<'b, 'a>(
             stride,
             out_len: output_len,
             bias: bias.map(|b| &b.data[..out_channels]),
-            relu,
+            act,
         };
         single_channel(
             level,
@@ -281,7 +267,7 @@ fn conv1d_fused_at<'b, 'a>(
             pad_left,
             out_len: output_len,
             bias: bias.map(|b| &b.data[..out_channels]),
-            relu,
+            act,
         };
         depthwise(
             level,
@@ -311,7 +297,7 @@ fn conv1d_fused_at<'b, 'a>(
             weights,
             bias,
             (kernel_size, stride, dilation, pad_left),
-            relu,
+            act,
             (out_channels_per_group, output_len),
             &mut out[..total_output_size],
         );
@@ -331,7 +317,7 @@ fn conv1d_fused_at<'b, 'a>(
             out_channels,
             len: input_len,
             bias: bias.map(|b| &b.data[..out_channels]),
-            relu,
+            act,
         };
         kernel3(
             level,
@@ -354,10 +340,11 @@ fn conv1d_fused_at<'b, 'a>(
         && pad_right == 0
     {
         return pointwise(
+            level,
             input,
             &weights.data,
             bias,
-            relu,
+            act,
             (batch_size, in_channels, out_channels, input_len),
             out,
         );
@@ -375,7 +362,7 @@ fn conv1d_fused_at<'b, 'a>(
             weights,
             bias,
             (dilation, group, pad_left, pad_right, stride),
-            relu,
+            act,
             out,
         );
     }
@@ -494,7 +481,7 @@ fn conv1d_fused_at<'b, 'a>(
             }
         }
 
-        bias_relu_rows(out, bias, relu, out_channels, output_len);
+        bias_act_rows(level, out, bias, act, out_channels, output_len);
 
         TensorView::from_slice(out, vec![batch_size, out_channels, output_len])
     })
@@ -513,7 +500,7 @@ fn depthwise_multiplied(
     weights: &TensorView,
     bias: Option<&TensorView>,
     (kernel, stride, dilation, pad_left): (usize, usize, usize, usize),
-    relu: bool,
+    act: Option<Act>,
     (multiplier, out_len): (usize, usize),
     out: &mut [f32],
 ) {
@@ -545,7 +532,7 @@ fn depthwise_multiplied(
                 pad_left,
                 out_len,
                 bias: bias.map(|_| &biases[..]),
-                relu,
+                act,
             };
             depthwise(
                 level,
@@ -574,7 +561,7 @@ fn conv1d_as_2d<'a>(
     weights: &TensorView<'_>,
     bias: Option<&TensorView<'_>>,
     (dilation, group, pad_left, pad_right, stride): (usize, i64, usize, usize, usize),
-    relu: bool,
+    act: Option<Act>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     let [batch_size, in_channels, input_len] = dims;
@@ -589,7 +576,6 @@ fn conv1d_as_2d<'a>(
         &weights.data[..out_channels * in_channels_per_group * kernel_size],
         vec![out_channels, in_channels_per_group, 1, kernel_size],
     );
-    let act = if relu { Activation::Relu } else { Activation::None };
     let pads = [0, pad_left as i64, 0, pad_right as i64];
     let (dilations, strides) = ([1, dilation as i64], [1, stride as i64]);
     let output_len = conv2d_activation(
@@ -617,11 +603,12 @@ mod tests {
     use crate::kernels::test_util::{Rng, assert_close, assert_same_bits};
     use crate::tensor::TensorView;
 
-    /// `conv1d_silu` is `conv1d` then `silu`, bit for bit: T-one's depthwise
+    /// `conv1d_fused` with an activation the kernels do not apply themselves is
+    /// `conv1d` then that activation's kernel, bit for bit: T-one's depthwise
     /// convolution and a dense one, outputs shorter and longer than a vector,
     /// with and without bias.
     #[test]
-    fn test_conv1d_silu_is_conv1d_then_silu() {
+    fn test_conv1d_fused_is_conv1d_then_the_activation() {
         let mut rng = Rng::new(11);
         // (channels in, channels out, groups, kernel, padding, length)
         for (cin, cout, group, k, pad, len) in [
@@ -635,20 +622,76 @@ mod tests {
             let x = TensorView::from_slice(&x, vec![2, cin, len]);
             let w = TensorView::from_slice(&w, vec![cout, cin / group, k]);
             let b = TensorView::from_slice(&b, vec![cout]);
-            for bias in [None, Some(&b)] {
-                let (mut c, mut s, mut got) = (Vec::new(), Vec::new(), Vec::new());
+            for (bias, act) in [None, Some(&b)]
+                .into_iter()
+                .flat_map(|b| [Act::Silu, Act::Sigmoid, Act::GeluErf].map(|a| (b, a)))
+            {
+                let (mut c, mut got) = (Vec::new(), Vec::new());
                 let (pads, groups) = ([pad as i64; 2], group as i64);
                 let conv = conv1d(&x, &w, bias, &[1], groups, &pads, &[1], &mut c);
-                let want = crate::kernels::silu(&conv, &mut s);
-                let fused = conv1d_silu(&x, &w, bias, &[1], groups, &pads, &[1], &mut got);
-                assert_eq!(fused.shape, want.shape);
+                let mut want = conv.data.to_vec();
+                crate::kernels::act_inplace(act, &mut want);
+                let fused =
+                    conv1d_fused(&x, &w, bias, &[1], groups, &pads, &[1], Some(act), &mut got);
+                assert_eq!(fused.shape, conv.shape);
                 let what = format!(
-                    "{cin}->{cout}/{group} k{k} len {len} bias {}",
+                    "{cin}->{cout}/{group} k{k} len {len} bias {} {act:?}",
                     bias.is_some()
                 );
-                assert_same_bits(&fused.data, &want.data, &what);
+                assert_same_bits(&fused.data, &want, &what);
             }
         }
+    }
+
+    /// Padding a depthwise conv `s * stride` less on the left and
+    /// `d * stride` less on the right drops `s` outputs at the start and `d`
+    /// at the end, the rest bit for bit, which is what folding slices into
+    /// its padding relies on: FireRedVAD's lookback filter as it folds in
+    /// two steps, stride 2 and dilation 2.
+    #[test]
+    fn test_depthwise_conv1d_less_padding_is_sliced_conv1d() {
+        let mut rng = Rng::new(13);
+        // (channels, kernel, stride, dilation, pads, slice)
+        for (c, k, stride, dilation, pads, (s, d)) in [
+            (128, 20, 1, 1, [19, 19], (0, 19)),
+            (128, 20, 1, 1, [19, 0], (19, 0)),
+            (8, 5, 2, 1, [4, 5], (1, 2)),
+            (8, 3, 1, 2, [4, 4], (3, 1)),
+        ] {
+            for len in [20, 29, 40] {
+                let x = rng.vec(c * len, -3.0, 3.0);
+                let w = rng.vec(c * k, -0.5, 0.5);
+                let x = TensorView::from_slice(&x, vec![1, c, len]);
+                let w = TensorView::from_slice(&w, vec![c, 1, k]);
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                let (g, dil) = (c as i64, [dilation]);
+                let full = conv1d(&x, &w, None, &dil, g, &pads, &[stride], &mut a);
+                let less = [pads[0] - s * stride, pads[1] - d * stride];
+                let got = conv1d(&x, &w, None, &dil, g, &less, &[stride], &mut b);
+                let n = full.shape[2];
+                let keep = s as usize..n - d as usize;
+                assert_eq!(*got.shape, [1, c, keep.len()]);
+                let want: Vec<f32> = full
+                    .data
+                    .chunks_exact(n)
+                    .flat_map(|row| row[keep.clone()].to_vec())
+                    .collect();
+                let what = format!("k{k} stride {stride} dilation {dilation} len {len}");
+                assert_same_bits(&got.data, &want, &what);
+            }
+        }
+    }
+
+    /// An input shorter than the kernel, padding included, has no outputs.
+    #[test]
+    fn test_conv1d_short_input_is_empty() {
+        let x = vec![1.0; 4 * 19];
+        let w = vec![1.0; 4 * 20];
+        let x = TensorView::from_slice(&x, vec![1, 4, 19]);
+        let w = TensorView::from_slice(&w, vec![4, 1, 20]);
+        let mut out = Vec::new();
+        let y = conv1d(&x, &w, None, &[1], 4, &[0, 0], &[1], &mut out);
+        assert_eq!(*y.shape, [1, 4, 0]);
     }
 
     /// `conv1d_pointwise` is `conv1d` for f32 weights, and for f16 weights `conv1d` of
@@ -691,20 +734,24 @@ mod tests {
             let packed = p16
                 .as_ref()
                 .map(|p| TensorView::from_slice(p, vec![cout, cin, 1]));
-            for (b, relu) in [(None, false), (Some(&tb), true)] {
+            for (b, act) in [
+                (None, None),
+                (Some(&tb), Some(Act::Relu)),
+                (Some(&tb), Some(Act::GeluErf)),
+            ] {
                 let mut want = Vec::new();
-                let want = conv1d_fused(&x, &t32, b, &[1], 1, &[0, 0], &[1], relu, &mut want);
-                let what = format!("[{batch},{cin},{len}] -> {cout} relu={relu}");
+                let want = conv1d_fused(&x, &t32, b, &[1], 1, &[0, 0], &[1], act, &mut want);
+                let what = format!("[{batch},{cin},{len}] -> {cout} {act:?}");
                 let mut got = Vec::new();
-                let got = conv1d_pointwise(&x, &t32, b, relu, &mut got);
+                let got = conv1d_pointwise(&x, &t32, b, act, &mut got);
                 assert_eq!(got.shape, want.shape);
                 assert_same_bits(&got.data, &want.data, &format!("f32 {what}"));
                 let mut got = Vec::new();
-                let got = conv1d_pointwise(&x, &t16, b, relu, &mut got);
+                let got = conv1d_pointwise(&x, &t16, b, act, &mut got);
                 assert_same_bits(&got.data, &want.data, &format!("f16 {what}"));
                 if let Some(packed) = &packed {
                     let mut got = Vec::new();
-                    let got = conv1d_pointwise(&x, packed, b, relu, &mut got);
+                    let got = conv1d_pointwise(&x, packed, b, act, &mut got);
                     let want: Vec<f64> = want.data.iter().map(|&x| x as f64).collect();
                     assert_close(&got.data, &want, 1e-5, &format!("packed {what}"));
                 }
@@ -953,7 +1000,7 @@ mod tests {
     }
 
     /// The textbook definition, in f64: padding contributes zeros.
-    fn reference(c: &Case, x: &[f32], w: &[f32], bias: Option<&[f32]>, relu: bool) -> Vec<f64> {
+    fn reference(c: &Case, x: &[f32], w: &[f32], bias: Option<&[f32]>) -> Vec<f64> {
         let out_len =
             (c.len + c.pads[0] + c.pads[1] - c.dilation * (c.kernel - 1) - 1) / c.stride + 1;
         let (icg, ocg) = (c.in_ch / c.group, c.out_ch / c.group);
@@ -972,7 +1019,7 @@ mod tests {
                             }
                         }
                     }
-                    out.push(if relu { s.max(0.0) } else { s });
+                    out.push(s);
                 }
             }
         }
@@ -993,35 +1040,46 @@ mod tests {
             let weights = TensorView::from_slice(&w, vec![c.out_ch, c.in_ch / c.group, c.kernel]);
             let bias_view = TensorView::from_slice(&bias, vec![c.out_ch]);
             // Unfolded whole, and (no input being small enough) as a 2D convolution.
-            for (has_bias, relu, unfold_bytes) in [false, true]
+            for (has_bias, unfold_bytes) in [false, true]
                 .into_iter()
-                .flat_map(|b| [(b, false), (b, true)])
-                .flat_map(|(b, r)| [(b, r, IM2COL_BYTES), (b, r, 0)])
+                .flat_map(|b| [(b, IM2COL_BYTES), (b, 0)])
             {
                 let bias_arg = has_bias.then_some(&bias_view);
-                let mut out = Vec::new();
-                let got = conv1d_fused_at(
-                    level,
-                    &input,
-                    &weights,
-                    bias_arg,
-                    &[c.dilation as i64],
-                    c.group as i64,
-                    &[c.pads[0] as i64, c.pads[1] as i64],
-                    &[c.stride as i64],
-                    relu,
-                    unfold_bytes,
-                    &mut out,
-                );
-                let want = reference(&c, &x, &w, has_bias.then_some(&bias[..]), relu);
+                let conv = |act: Option<Act>| {
+                    let mut out = Vec::new();
+                    conv1d_fused_at(
+                        level,
+                        &input,
+                        &weights,
+                        bias_arg,
+                        &[c.dilation as i64],
+                        c.group as i64,
+                        &[c.pads[0] as i64, c.pads[1] as i64],
+                        &[c.stride as i64],
+                        act,
+                        unfold_bytes,
+                        &mut out,
+                    );
+                    out
+                };
+                let plain = conv(None);
+                let want = reference(&c, &x, &w, has_bias.then_some(&bias[..]));
+                let what = format!("{level:?} {c:?} bias {has_bias} unfold {unfold_bytes}");
                 // f32 rounding grows with the length of the dot products.
                 let terms = (c.in_ch / c.group * c.kernel).max(64);
+                let n = want.len();
                 crate::kernels::test_util::assert_close(
-                    &got.data,
+                    &plain[..n],
                     &want,
                     1e-5 * terms as f64 / 64.0,
-                    &format!("{level:?} {c:?} bias {has_bias} relu {relu} unfold {unfold_bytes}"),
+                    &what,
                 );
+                // An activation is the plain output, then its own kernel at that level.
+                for act in [Act::Relu, Act::Silu, Act::Sigmoid, Act::GeluErf] {
+                    let mut want = plain[..n].to_vec();
+                    crate::kernels::bias_act::act_inplace_at(level, act, &mut want);
+                    assert_same_bits(&conv(Some(act))[..n], &want, &format!("{what} {act:?}"));
+                }
             }
         }
     }

@@ -1,5 +1,5 @@
 #![allow(unsafe_op_in_unsafe_fn)]
-use crate::kernels::bias_act::bias_act_inplace;
+use crate::kernels::bias_act::{Act, act_inplace_at, bias_act_inplace_at};
 use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul as strided_matmul};
 use crate::kernels::matmul_nn;
 use crate::kernels::simd::simd_call;
@@ -26,46 +26,14 @@ pub fn conv2d<'b, 'a>(
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     crate::kernels::enable_flush_denormals();
-    return conv2d_fused(
-        input, weights, bias, dilations, group, pads, strides, false, out,
-    );
+    conv2d_fused(
+        input, weights, bias, dilations, group, pads, strides, None, out,
+    )
 }
 
-/// 2D Convolution with fused SiLU activation (x * sigmoid(x)).
-/// Avoids separate sigmoid + mul passes over the output.
-pub fn conv2d_silu<'b, 'a>(
-    input: &TensorView<'b>,
-    weights: &TensorView<'b>,
-    bias: Option<&TensorView<'b>>,
-    dilations: &[i64],
-    group: i64,
-    pads: &[i64],
-    strides: &[i64],
-    out: &'a mut Vec<f32>,
-) -> TensorView<'a> {
-    return conv2d_activation(
-        Level::new(),
-        input,
-        weights,
-        bias,
-        dilations,
-        group,
-        pads,
-        strides,
-        Activation::SiLU,
-        IM2COL_BYTES,
-        out,
-    );
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) enum Activation {
-    None,
-    Relu,
-    SiLU,
-}
-
-/// 2D Convolution with optional fused ReLU activation.
+/// 2D convolution, then `act`, applied as the output is written: the activation's own
+/// kernel on the output, bit for bit.
+#[allow(clippy::too_many_arguments)]
 pub fn conv2d_fused<'b, 'a>(
     input: &TensorView<'b>,
     weights: &TensorView<'b>,
@@ -74,16 +42,11 @@ pub fn conv2d_fused<'b, 'a>(
     group: i64,
     pads: &[i64],
     strides: &[i64],
-    relu: bool,
+    act: Option<Act>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     crate::kernels::enable_flush_denormals();
-    let act = if relu {
-        Activation::Relu
-    } else {
-        Activation::None
-    };
-    return conv2d_activation(
+    conv2d_activation(
         Level::new(),
         input,
         weights,
@@ -95,7 +58,17 @@ pub fn conv2d_fused<'b, 'a>(
         act,
         IM2COL_BYTES,
         out,
-    );
+    )
+}
+
+/// `act?(row + bias)`. A zero bias is not added, as it is not without an activation:
+/// adding it would turn -0 into +0.
+fn bias_act_row(level: Level, row: &mut [f32], bias: f32, act: Option<Act>) {
+    if bias != 0.0 {
+        bias_act_inplace_at(level, row, bias, act);
+    } else if let Some(act) = act {
+        act_inplace_at(level, act, row);
+    }
 }
 
 /// Most bytes of unfolded input per band of output rows: about half of L2, so the
@@ -112,11 +85,10 @@ pub(crate) fn conv2d_activation<'b, 'a>(
     group: i64,
     pads: &[i64],
     strides: &[i64],
-    act: Activation,
+    act: Option<Act>,
     band_bytes: usize,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let _relu = act == Activation::Relu;
     let _t0 = if timing::TIMING_ENABLED {
         Some(std::time::Instant::now())
     } else {
@@ -297,10 +269,13 @@ pub(crate) fn conv2d_activation<'b, 'a>(
             // Apply bias and optional activation
             for oc in 0..out_channels {
                 let bias_val = if let Some(b) = bias { b.data[oc] } else { 0.0 };
-                if bias_val != 0.0 || act != Activation::None {
-                    let row_start = o_offset + oc * spatial;
-                    bias_act_inplace(&mut out[row_start..row_start + spatial], bias_val, act);
-                }
+                let row_start = o_offset + oc * spatial;
+                bias_act_row(
+                    level,
+                    &mut out[row_start..row_start + spatial],
+                    bias_val,
+                    act,
+                );
             }
         }
         return {
@@ -393,10 +368,8 @@ pub(crate) fn conv2d_activation<'b, 'a>(
                 let finish_band = |out: &mut [f32], band_offset: usize, band_cols: usize| {
                     for oc in 0..out_channels_per_group {
                         let bias_val = bias.map_or(0.0, |b| b.data[out_ch_start + oc]);
-                        if bias_val != 0.0 || act != Activation::None {
-                            let start = band_offset + oc * col_cols;
-                            bias_act_inplace(&mut out[start..start + band_cols], bias_val, act);
-                        }
+                        let start = band_offset + oc * col_cols;
+                        bias_act_row(level, &mut out[start..start + band_cols], bias_val, act);
                     }
                 };
                 for oh_start in (0..out_h).step_by(band_rows) {
@@ -421,6 +394,7 @@ pub(crate) fn conv2d_activation<'b, 'a>(
                             alpha: 1.0,
                             add: false,
                             b_cols: false,
+                            act: None,
                         };
                         matmul_nn::gemm_nn(
                             level,
@@ -1713,7 +1687,7 @@ mod tests {
             let x = rng.vec(batch * c * h * w, -1.0, 1.0);
             let wt = rng.vec(c * kh * kw, -1.0, 1.0);
             let b = rng.vec(c, -1.0, 1.0);
-            for act in [Activation::None, Activation::Relu, Activation::SiLU] {
+            for act in [None, Some(Act::Relu), Some(Act::Silu)] {
                 for bias in [None, Some(&b)] {
                     let mut want = Vec::new();
                     for n in 0..batch {
@@ -1726,9 +1700,9 @@ mod tests {
                                         s += plane[i] as f64 * wt[ch * kh * kw + k] as f64;
                                     }
                                     want.push(match act {
-                                        Activation::None => s,
-                                        Activation::Relu => s.max(0.0),
-                                        Activation::SiLU => s / (1.0 + (-s).exp()),
+                                        None => s,
+                                        Some(Act::Relu) => s.max(0.0),
+                                        _ => s / (1.0 + (-s).exp()),
                                     });
                                 }
                             }
@@ -1814,7 +1788,7 @@ mod tests {
                         groups as i64,
                         &to_i64(&pads),
                         &to_i64(&strides),
-                        Activation::SiLU,
+                        Some(Act::Silu),
                         band_bytes,
                         &mut out,
                     );
@@ -1823,6 +1797,66 @@ mod tests {
                     // The deepest cases dot 576 terms in f32 against an f64
                     // reference; their rounding is just above 1e-5.
                     assert_close(&got.data, &want, 2e-5, &what);
+                }
+            }
+        }
+    }
+
+    /// `conv2d_fused` with an activation is `conv2d` then that activation's kernel,
+    /// bit for bit, at every level: dense, grouped and depthwise convolutions, with
+    /// biases and without (a zero bias is not added, so a -0 stays).
+    #[test]
+    fn test_conv2d_fused_is_conv2d_then_the_activation() {
+        use crate::kernels::bias_act::{Act, act_inplace_at};
+        use crate::kernels::test_util::assert_same_bits;
+        let mut rng = Rng::new(13);
+        for case in WINDOW_CASES {
+            let ([c, h, w], [kh, kw], strides, dilations, pads) = *case;
+            for (groups, oc) in [(1, 4), (c, c), (c, 2 * c)] {
+                let cg = c / groups;
+                let x = rng.vec(2 * c * h * w, -1.0, 1.0);
+                let wt = rng.vec(oc * cg * kh * kw, -1.0, 1.0);
+                let b = rng.vec(oc, -1.0, 1.0);
+                let to_i64 = |v: &[usize]| v.iter().map(|&v| v as i64).collect::<Vec<_>>();
+                let (dil, pad, stride) = (to_i64(&dilations), to_i64(&pads), to_i64(&strides));
+                let input = TensorView::from_slice(&x, vec![2, c, h, w]);
+                let weights = TensorView::from_slice(&wt, vec![oc, cg, kh, kw]);
+                let bias = TensorView::from_slice(&b, vec![oc]);
+                let g = groups as i64;
+                for (level, bias) in levels()
+                    .into_iter()
+                    .flat_map(|l| [(l, Some(&bias)), (l, None)])
+                {
+                    let conv = |act: Option<Act>| {
+                        let mut out = Vec::new();
+                        let shape = conv2d_activation(
+                            level,
+                            &input,
+                            &weights,
+                            bias,
+                            &dil,
+                            g,
+                            &pad,
+                            &stride,
+                            act,
+                            IM2COL_BYTES,
+                            &mut out,
+                        )
+                        .shape
+                        .into_owned();
+                        out.truncate(shape.iter().product());
+                        out
+                    };
+                    let plain = conv(None);
+                    for act in [Act::Relu, Act::Silu, Act::Sigmoid, Act::GeluErf] {
+                        let mut want = plain.clone();
+                        act_inplace_at(level, act, &mut want);
+                        let what = format!(
+                            "{level:?} {case:?} groups {groups} -> {oc} bias {} {act:?}",
+                            bias.is_some()
+                        );
+                        assert_same_bits(&conv(Some(act)), &want, &what);
+                    }
                 }
             }
         }

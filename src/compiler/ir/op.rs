@@ -175,6 +175,9 @@ pub enum Activation {
     Relu,
     /// `x * sigmoid(x)`.
     Silu,
+    Sigmoid,
+    /// GELU with `erf`, as [`gelu_erf`](crate::kernels::gelu_erf) computes it.
+    GeluErf,
 }
 
 impl Activation {
@@ -182,6 +185,8 @@ impl Activation {
         match self {
             Activation::Relu => "Relu",
             Activation::Silu => "Silu",
+            Activation::Sigmoid => "Sigmoid",
+            Activation::GeluErf => "GeluErf",
         }
     }
 }
@@ -375,6 +380,8 @@ pub enum Op {
         beta: f32,
         trans_a: bool,
         trans_b: bool,
+        /// An activation fused after it.
+        act: Option<Activation>,
     },
     GlobalAveragePool,
     /// The other attributes (`hidden_size`, `direction`, ...) stay in the
@@ -553,8 +560,11 @@ pub enum Op {
         scale: f32,
         shift: f32,
     },
-    /// `MatMul` + `Add`. Inputs: `[a, b, bias]`.
-    Linear,
+    /// `MatMul`, then `Add` of a bias if there is one, then the activation if
+    /// there is one. Inputs: `[a, b, bias]`, the bias optional.
+    Linear {
+        act: Option<Activation>,
+    },
     /// The gated product of a SwiGLU feed-forward, two `Linear`s of one input,
     /// `silu` of the first times the second: `silu(x · w[:, :n] + b[:n]) *
     /// (x · w[:, n:] + b[n:])`. Inputs: `[x, w, b]`, `w` `[k, 2n]` holding the
@@ -562,10 +572,10 @@ pub enum Op {
     SwiGlu,
     /// Dynamically quantized linear layer: `DynamicQuantizeLinear` of the
     /// activation, `MatMulInteger` against a quantized weight, rescale and
-    /// bias, optionally ReLU. Inputs:
+    /// bias, optionally an activation. Inputs:
     /// `[x, weight, weight_scale, weight_zero_point, bias]`.
     QLinearDynamic {
-        relu: bool,
+        act: Option<Activation>,
     },
     /// `Concat([weight, ConstantOfShape(shape, value)], axis = 0)`. Inputs:
     /// `[shape, weight]`.
@@ -699,6 +709,7 @@ impl Op {
                 beta: attr_f(node, "beta").unwrap_or(1.0),
                 trans_a: attr_i(node, "transA").unwrap_or(0) != 0,
                 trans_b: attr_i(node, "transB").unwrap_or(0) != 0,
+                act: None,
             },
             "GRU" => Op::Gru {
                 linear_before_reset: attr_i(node, "linear_before_reset").unwrap_or(0) != 0,
@@ -867,7 +878,7 @@ impl Op {
             Op::ScaleNormPair { .. } => "ScaleNormPair",
             Op::RmsNorm { .. } => "RmsNorm",
             Op::SimAm { .. } => "SimAm",
-            Op::Linear => "Linear",
+            Op::Linear { .. } => "Linear",
             Op::SwiGlu => "SwiGlu",
             Op::QLinearDynamic { .. } => "QLinearDynamic",
             Op::EmbeddingConcat { .. } => "EmbeddingConcat",
@@ -962,11 +973,13 @@ impl Op {
                 beta,
                 trans_a,
                 trans_b,
+                act,
             } => {
                 set_attr_f(attrs, "alpha", alpha, 1.0);
                 set_attr_f(attrs, "beta", beta, 1.0);
                 set_attr_i(attrs, "transA", trans_a as i64, 0);
                 set_attr_i(attrs, "transB", trans_b as i64, 0);
+                write_activation(attrs, act);
             }
             Op::Gru {
                 linear_before_reset,
@@ -1020,7 +1033,7 @@ impl Op {
                 set_attr_i(attrs, "sorted", sorted as i64, 1);
             }
             Op::Transpose { perm } => set_attr_ints(attrs, "perm", perm),
-            Op::QLinearDynamic { relu } => set_attr_i(attrs, "relu", relu as i64, 0),
+            Op::QLinearDynamic { act } | Op::Linear { act } => write_activation(attrs, act),
             Op::ScaleNorm { scale, epsilon } => {
                 set_attr_f(attrs, "scale", scale, 1.0);
                 set_attr_f(attrs, "epsilon", epsilon, 0.0);
@@ -1094,7 +1107,6 @@ impl Op {
             | Op::QWeightMatMul
             | Op::Silu
             | Op::Snake
-            | Op::Linear
             | Op::SwiGlu => {}
         }
     }
@@ -1165,6 +1177,11 @@ fn set_attr_opt_s(attrs: &mut Vec<AttributeProto>, name: &str, value: Option<Str
         Some(s) => set_attr(attrs, name, 3 /* STRING */, |a| a.s = s.into_bytes()),
         None => attrs.retain(|a| a.name != name),
     }
+}
+
+/// Sets the `activation` attribute to the name of `act`, or removes it.
+fn write_activation(attrs: &mut Vec<AttributeProto>, act: Option<Activation>) {
+    set_attr_opt_s(attrs, "activation", act.map(|a| a.name().to_string()))
 }
 
 /// Sets attribute `name` to `value`, or removes it if `value` is `None`.

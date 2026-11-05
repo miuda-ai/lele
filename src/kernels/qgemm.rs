@@ -24,6 +24,7 @@
 //! [`crate::kernels::qgemm_dot`] instead, which is about four times faster; [`QWeights`]
 //! picks the layout when it packs, and [`run_at`] the matching kernel.
 
+use crate::kernels::bias_act::{Act, act_f32x8, act_inplace_at};
 use crate::kernels::qgemm_dot::{self, Dot, QuadWeights};
 use crate::kernels::simd::simd_call;
 use crate::tensor::TensorView;
@@ -354,7 +355,7 @@ impl QWeights {
 }
 
 /// What happens to the integer sums on the way out:
-/// `C[i][j] = relu?(requant?(sum * (scale * column scale of B)) + bias[j])`.
+/// `C[i][j] = act?(requant?(sum * (scale * column scale of B)) + bias[j])`.
 pub(crate) struct Epilogue<'a> {
     /// The scale of A.
     pub scale: f32,
@@ -362,8 +363,9 @@ pub(crate) struct Epilogue<'a> {
     pub requant: Option<Requant>,
     /// `n` values to add, if any.
     pub bias: Option<&'a [f32]>,
-    pub relu: bool,
+    pub act: Option<Act>,
 }
+
 
 /// A `u8` `QuantizeLinear` -> `DequantizeLinear` round trip of a product, as static-QDQ
 /// graphs follow every product with:
@@ -466,7 +468,7 @@ fn qgemm_simd<S: Simd>(
                 col_scale: w.scale[j..][..NR].try_into().unwrap(),
                 requant: e.requant,
                 bias: e.bias.map(|b| &b[j..w.n.min(j + NR)]),
-                relu: e.relu,
+                act: e.act,
             };
             let mut ir = 0;
             while ir < m {
@@ -516,7 +518,7 @@ struct Tile<'a> {
     requant: Option<Requant>,
     /// `width` values.
     bias: Option<&'a [f32]>,
-    relu: bool,
+    act: Option<Act>,
 }
 
 /// `tileR(simd, t, a, b, sums, c)`: `R` rows of sums from the rows of A in place (row
@@ -592,13 +594,15 @@ fn finish<S: Simd, const R: usize>(simd: S, t: &Tile, acc: [[i32x8<S>; 2]; R], c
     }
     let bias: [f32x8<S>; 2] =
         core::array::from_fn(|v| f32x8::from_slice(simd, &bias[8 * v..][..8]));
-    let zero = f32x8::splat(simd, 0.0);
     for r in 0..R {
         let vals: [f32x8<S>; 2] = core::array::from_fn(|v| {
             let x = simd.cvt_f32_i32x8(acc[r][v]) * col_scale[v];
-            let x = requant!(simd, f32x8, t.requant, x) + bias[v];
-            if t.relu { x.max(zero) } else { x }
+            requant!(simd, f32x8, t.requant, x) + bias[v]
         });
+        let vals = match t.act {
+            None => vals,
+            Some(act) => act_f32x8(simd, act, vals),
+        };
         let row = &mut c[r * t.ldc..][..t.width];
         if t.width == NR {
             for v in 0..2 {
@@ -905,14 +909,16 @@ pub(crate) fn dynamic_quant_params_at(level: Level, x: &[f32]) -> (f32, i32) {
     (scale, zero_point)
 }
 
-/// `relu?(dequantize(DynamicQuantizeLinear(x)) * dequantize(w) + bias)`: ONNX's
+/// `act?(dequantize(DynamicQuantizeLinear(x)) * dequantize(w) + bias)`: ONNX's
 /// dynamically quantized linear layer. The last axis of `x` is the depth; the output keeps
-/// the other axes and has `n` for the last.
+/// the other axes and has `n` for the last. The activation is applied as each tile of the
+/// output is written, element for element as its own kernel would apply it
+/// ([`act_inplace`](crate::kernels::act_inplace)).
 pub fn qlinear_dynamic<'a>(
     x: &TensorView<'_, f32>,
     w: &QWeights,
     bias: Option<&[f32]>,
-    relu: bool,
+    act: Option<Act>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
     let (scale, zero_point) = dynamic_quant_params(&x.data);
@@ -920,7 +926,7 @@ pub fn qlinear_dynamic<'a>(
         scale,
         requant: None,
         bias,
-        relu,
+        act,
     };
     quantized_matmul(x, zero_point, zero_point, w, &e, out)
 }
@@ -942,7 +948,7 @@ pub fn qlinear_static<'a>(
         scale,
         requant,
         bias,
-        relu: false,
+        act: None,
     };
     quantized_matmul(x, zero_point, zero_point, w, &e, out)
 }
@@ -959,14 +965,14 @@ pub fn mat_mul_integer_qweights<'a>(
         scale: 1.0,
         requant: None,
         bias: None,
-        relu: false,
+        act: None,
     };
     quantized_matmul(a, 0, a_zero_point, w, &e, out)
 }
 
 /// ONNX `MatMulInteger` with both operands given at run time as `f32` holding codes (`a`
 /// `u8`, `b` `u8` or `i8`), then an optional scale (one, or one per column), bias and
-/// ReLU. B is packed on every call, once per batch of it.
+/// activation. B is packed on every call, once per batch of it.
 pub fn mat_mul_integer_f32<'a>(
     a: &TensorView<'_, f32>,
     b: &TensorView<'_, f32>,
@@ -974,7 +980,7 @@ pub fn mat_mul_integer_f32<'a>(
     b_zero_point: &[i32],
     scale: Option<&[f32]>,
     bias: Option<&[f32]>,
-    relu: bool,
+    act: Option<Act>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
     let (ad, bd) = (a.shape.len(), b.shape.len());
@@ -1002,7 +1008,7 @@ pub fn mat_mul_integer_f32<'a>(
         scale: 1.0,
         requant: None,
         bias,
-        relu,
+        act,
     };
     let level = Level::new();
     if batch_b == 1 {
@@ -1113,7 +1119,7 @@ pub fn qmatmul_acts<'a>(
         scale: a_scale,
         requant,
         bias: None,
-        relu: false,
+        act: None,
     };
     let pack_b = |b: &[f32]| QWeights::from_grid(level, layout, b, k, n, b_scale, b_zero_point);
     let product = |w: &QWeights, a: &[f32], rows: usize, c: &mut [f32]| {
@@ -1196,6 +1202,9 @@ pub(crate) fn run_at(
             );
             sgemm(&a[..m * k], b, m, k, n, &mut c[..m * n]);
             simd_call!(level, epilogue_simd(m, n, &w.scale, e, c));
+            if let Some(act) = e.act {
+                act_inplace_at(level, act, &mut c[..m * n]);
+            }
         }),
     })
 }
@@ -1253,7 +1262,8 @@ fn sgemm(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, c: &mut [f32]) {
     }
 }
 
-/// `c[i][j] = relu?(requant?(c[i][j] * e.scale * col_scale[j]) + bias[j])`, in place.
+/// `c[i][j] = requant?(c[i][j] * e.scale * col_scale[j]) + bias[j]`, in place; the
+/// caller applies the activation.
 #[simd]
 fn epilogue_simd<S: Simd>(
     simd: S,
@@ -1275,13 +1285,13 @@ fn epilogue_simd<S: Simd>(
                 .map_or(zero, |b| f32x8::from_slice(simd, &b[8 * i..][..8]));
             let x = f32x8::from_slice(simd, o) * s;
             let x = requant!(simd, f32x8, e.requant, x) + b;
-            (if e.relu { x.max(zero) } else { x }).store_slice(o);
+            x.store_slice(o);
         }
         let done = chunks.len() * 8;
         for (j, o) in rest.iter_mut().enumerate() {
             let x = *o * (e.scale * col_scale[done + j]);
             let x = e.requant.map_or(x, |r| r.apply(x)) + e.bias.map_or(0.0, |b| b[done + j]);
-            *o = if e.relu { x.max(0.0) } else { x };
+            *o = x;
         }
     }
 }
@@ -1433,10 +1443,27 @@ mod tests {
                         scale: sa,
                         requant,
                         bias: (case != 3).then_some(&bias[..]),
-                        relu,
+                        act: relu.then_some(Act::Relu),
                     };
                     let mut c = vec![f32::NAN; m * n];
                     run_at(level, &w, &x, m, sa, za, za, &e, &mut c);
+
+                    // Another activation: that output, then the activation's own kernel.
+                    if !relu {
+                        for act in [Act::Silu, Act::Sigmoid, Act::GeluErf] {
+                            let e = Epilogue {
+                                act: Some(act),
+                                ..e
+                            };
+                            let mut got = vec![f32::NAN; m * n];
+                            run_at(level, &w, &x, m, sa, za, za, &e, &mut got);
+                            let mut want = c.clone();
+                            act_inplace_at(level, act, &mut want);
+                            let what =
+                                format!("{level:?} {layout:?} {m}x{k}x{n} case {case} {act:?}");
+                            assert_same_bits(&got, &want, &what);
+                        }
+                    }
 
                     let ac: Vec<i32> = x
                         .iter()
@@ -1622,7 +1649,7 @@ mod tests {
             &TensorView::from_slice(&x, vec![batch, m, k]),
             &w,
             Some(&bias),
-            true,
+            Some(Act::Relu),
             &mut out,
         );
         let (s, z) = dynamic_quant_params(&x);
@@ -1686,7 +1713,7 @@ mod tests {
                         scale: sa,
                         requant: None,
                         bias: None,
-                        relu: false,
+                        act: None,
                     };
                     let (mut got, mut want) = (vec![f32::NAN; m * n], vec![f32::NAN; m * n]);
                     run_at(level, &w, &x, m, sa, za, za, &e, &mut got);
@@ -1840,7 +1867,7 @@ mod tests {
                     scale: 1.0,
                     requant: Some(r),
                     bias: None,
-                    relu: false,
+                    act: None,
                 };
                 simd_call!(
                     level,

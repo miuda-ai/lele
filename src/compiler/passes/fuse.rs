@@ -17,6 +17,7 @@ use crate::model::tensor_to_vec_u8;
 /// Runs every fusion on `g` and its subgraphs.
 pub(crate) fn fuse(g: &mut Graph) {
     fuse_pad_conv(g);
+    fuse_conv_slice(g);
     fuse_conv_batch_norm(g);
     fuse_conv_scale(g);
     fuse_layer_norm(g);
@@ -31,6 +32,7 @@ pub(crate) fn fuse(g: &mut Graph) {
     fuse_dynamic_quant_linear(g);
     fuse_linear(g);
     fuse_swiglu(g);
+    fuse_product_act(g);
     fuse_embedding_concat(g);
     for id in g.node_ids() {
         for sub in g.node_mut(id).op.subgraphs_mut() {
@@ -169,6 +171,105 @@ fn fuse_pad_conv(g: &mut Graph) {
         inputs[0] = p.input(0);
         let proto = g.node(conv).proto.clone();
         g.fuse(&[pad, conv], Op::Conv(merged), proto, inputs);
+    }
+}
+
+/// `Slice(Conv(x))` of a depthwise 1D `Conv`, slicing time alone with step
+/// 1 → the `Conv`, padding less, so that it computes only the outputs kept.
+///
+/// Output `t` of a `Conv` reads from input `t * stride - pad_left` on, so
+/// starting the slice `s` outputs in is padding `s * stride` less on the
+/// left, and ending it `d` outputs before the end is padding `d * stride`
+/// less on the right. The slice must cut no further than the padding
+/// reaches. Each kept output reads the same inputs with the same weights,
+/// and the depthwise kernel sums each output on its own, so it comes out
+/// the same; other convolutions run as products whose rounding depends on
+/// how many outputs there are. A `Conv` left too little input for any output
+/// has none ([`conv1d`](crate::kernels::conv1d)), as the slice would have
+/// kept none.
+///
+/// Streaming models slice what they need from a `Conv` that pads its
+/// cached history again: FireRedVAD's blocks pad 19 frames on both sides
+/// and keep `T` of the `T + 38` outputs.
+fn fuse_conv_slice(g: &mut Graph) {
+    let slices: Vec<NodeId> = g
+        .nodes()
+        .filter(|(_, n)| matches!(n.op, Op::Slice))
+        .map(|(id, _)| id)
+        .collect();
+    for slice in slices {
+        let node = g.node(slice);
+        let Some(conv) = sole_producer(g, node.input(0), |op| matches!(op, Op::Conv(_))) else {
+            continue;
+        };
+        let ints = |i: usize| constant_tensor(g, node.input(i)).and_then(exact_ints);
+        let (Some(starts), Some(ends)) = (ints(1), ints(2)) else {
+            continue;
+        };
+        let axes = match node.input(3) {
+            Some(_) => ints(3),
+            None => Some((0..starts.len() as i64).collect()),
+        };
+        let steps = match node.input(4) {
+            Some(_) => ints(4),
+            None => Some(vec![1; starts.len()]),
+        };
+        let (Some(axes), Some(steps)) = (axes, steps) else {
+            continue;
+        };
+        let c = g.node(conv);
+        let Op::Conv(attrs) = &c.op else {
+            unreachable!()
+        };
+        let stride = attrs.strides.as_ref().map_or(1, |s| s[0]);
+        let dilation = attrs.dilations.as_ref().map_or(1, |d| d[0]);
+        let depthwise = c
+            .input(1)
+            .and_then(|w| g.data(w))
+            .is_some_and(|w| w.dims.len() == 3 && w.dims[1] == 1 && Some(w.dims[0]) == attrs.group);
+        let explicit = matches!(
+            attrs.auto_pad.as_deref(),
+            None | Some("NOTSET" | "VALID" | "")
+        );
+        let fits = depthwise
+            && (stride == 1 || dilation == 1)
+            && explicit
+            && starts.len() == 1
+            && matches!(axes[..], [2 | -1])
+            && steps == [1];
+        if !fits {
+            continue;
+        }
+        // Outputs cut at the start and at the end. Without the length, only a
+        // start counted from the front and an end counted from the back tell.
+        let len = match g.value(node.input(0).unwrap()).shape.as_deref() {
+            Some([_, _, Dim::Fixed(n)]) => Some(*n),
+            _ => None,
+        };
+        let to_end = ends[0] >= i32::MAX as i64;
+        let (start, dropped) = match (len, starts[0], ends[0]) {
+            (Some(n), s, e) => {
+                let clamp = |i: i64| if i < 0 { (i + n).max(0) } else { i.min(n) };
+                let (s, e) = (clamp(s), clamp(e));
+                if s >= e {
+                    continue;
+                }
+                (s, n - e)
+            }
+            (None, s, e) if s >= 0 && (e < 0 || to_end) => (s, if to_end { 0 } else { -e }),
+            _ => continue,
+        };
+        let pads = attrs.pads.clone().unwrap_or_else(|| vec![0, 0]);
+        let new_pads = vec![pads[0] - start * stride, pads[1] - dropped * stride];
+        if new_pads.iter().any(|&p| p < 0) {
+            continue;
+        }
+        let mut sliced = attrs.clone();
+        sliced.auto_pad = None;
+        sliced.pads = Some(new_pads);
+        let inputs = c.inputs().to_vec();
+        let proto = c.proto.clone();
+        g.fuse(&[conv, slice], Op::Conv(sliced), proto, inputs);
     }
 }
 
@@ -857,16 +958,28 @@ fn fuse_conv_bias(g: &mut Graph) {
     }
 }
 
-/// `Conv` followed by `Relu`, or a 2D or non-pointwise 1D `Conv` followed by
-/// `Silu` → `ConvAct`.
+/// The activation a node computes, as the kernels apply it to what they
+/// write: `Relu`, `Sigmoid`, `Silu` or erf `Gelu`.
+fn kernel_activation(op: &Op) -> Option<Activation> {
+    match op {
+        Op::Unary(Unary::Relu) => Some(Activation::Relu),
+        Op::Unary(Unary::Sigmoid) => Some(Activation::Sigmoid),
+        Op::Silu => Some(Activation::Silu),
+        Op::Gelu { approximate } if approximate.as_deref().is_none_or(|a| a == "none") => {
+            Some(Activation::GeluErf)
+        }
+        _ => None,
+    }
+}
+
+/// `Conv` followed by an activation ([`kernel_activation`]) whose input
+/// nothing else reads → `ConvAct`. The kernels apply it as they write the
+/// output, with the arithmetic of its own kernel: the result is unchanged bit
+/// for bit.
 fn fuse_conv_act(g: &mut Graph) {
     let acts: Vec<(NodeId, Activation)> = g
         .nodes()
-        .filter_map(|(id, n)| match n.op {
-            Op::Unary(Unary::Relu) => Some((id, Activation::Relu)),
-            Op::Silu => Some((id, Activation::Silu)),
-            _ => None,
-        })
+        .filter_map(|(id, n)| Some((id, kernel_activation(&n.op)?)))
         .collect();
     for (act_id, act) in acts {
         if !g.contains(act_id) {
@@ -879,18 +992,6 @@ fn fuse_conv_act(g: &mut Graph) {
         let Op::Conv(attrs) = g.node(conv).op.clone() else {
             unreachable!()
         };
-        // SiLU fuses into a 2D kernel, or into a 1D one whose constant weights
-        // say it is 1D; not into a pointwise one, whose weights are read by
-        // the matrix product kernels, packed.
-        let weight_dims = constant_tensor(g, g.node(conv).input(1)).map(|w| w.dims.as_slice());
-        let silu_fuses = match (attrs.kernel_shape.as_deref(), weight_dims) {
-            (_, Some(&[_, _, k])) => k > 1,
-            (Some(k), _) => k.len() >= 2,
-            (None, _) => false,
-        };
-        if act == Activation::Silu && !silu_fuses {
-            continue;
-        }
         let inputs = g.node(conv).inputs().to_vec();
         let proto = g.node(conv).proto.clone();
         let op = Op::ConvAct { conv: attrs, act };
@@ -919,7 +1020,7 @@ fn fuse_linear(g: &mut Graph) {
         if let Some((mm, bias)) = fused {
             let inputs = vec![g.node(mm).input(0), g.node(mm).input(1), bias];
             let proto = named_after(g, mm);
-            g.fuse(&[mm, add], Op::Linear, proto, inputs);
+            g.fuse(&[mm, add], Op::Linear { act: None }, proto, inputs);
         }
     }
 }
@@ -943,7 +1044,7 @@ fn fuse_swiglu(g: &mut Graph) {
         let fused = (0..2).find_map(|k| {
             let node = g.node(mul);
             let silu = sole_producer(g, node.input(k), |op| matches!(op, Op::Silu))?;
-            let linear = |op: &Op| matches!(op, Op::Linear);
+            let linear = |op: &Op| matches!(op, Op::Linear { act: None });
             let gate = sole_producer(g, g.node(silu).input(0), linear)?;
             let value = sole_producer(g, node.input(1 - k), linear)?;
             let (gn, vn) = (g.node(gate), g.node(value));
@@ -1011,7 +1112,8 @@ fn side_by_side(a: &TensorProto, b: &TensorProto) -> Option<TensorProto> {
 }
 
 /// The dynamically quantized linear layer ONNX Runtime's
-/// `quantize_dynamic` emits, optionally followed by `Relu`:
+/// `quantize_dynamic` emits (an activation after it joins it in
+/// [`fuse_product_act`]):
 ///
 /// ```text
 /// q, s, z = DynamicQuantizeLinear(x)
@@ -1058,20 +1160,77 @@ fn fuse_dynamic_quant_linear(g: &mut Graph) {
                 return None;
             }
             let x = dql_node.input(0);
-            let mut nodes = vec![dql, scale_mul, mmi, cast, mul, add];
-            // A ReLU reading nothing but the layer joins it.
-            let out = g.node(add).output(0)?;
-            let relu = match g.value(out).consumers() {
-                [r] if g.uses(out) == 1 && unary(Unary::Relu)(&g.node(*r).op) => Some(*r),
-                _ => None,
-            };
-            nodes.extend(relu);
-            Some((nodes, vec![x, w, w_scale, w_zp, bias], relu.is_some()))
+            let nodes = vec![dql, scale_mul, mmi, cast, mul, add];
+            Some((nodes, vec![x, w, w_scale, w_zp, bias]))
         });
-        if let Some((nodes, inputs, relu)) = fused {
+        if let Some((nodes, inputs)) = fused {
             let proto = named_after(g, add);
-            g.fuse(&nodes, Op::QLinearDynamic { relu }, proto, inputs);
+            g.fuse(&nodes, Op::QLinearDynamic { act: None }, proto, inputs);
         }
+    }
+}
+
+/// An activation ([`kernel_activation`]) of a product → the product, applying
+/// it: of a `MatMul`, `Linear`, `Gemm` or `QLinearDynamic` whose output
+/// nothing else reads. A `MatMul` becomes a `Linear` without a bias.
+///
+/// The product's kernel applies the activation as it writes its output (a
+/// `Gemm` runs over it in place after, [`activated`](crate::kernels::activated)),
+/// with the arithmetic of the activation's own kernel, so the result is
+/// unchanged bit for bit; the activation needs no buffer of its own and no
+/// call.
+fn fuse_product_act(g: &mut Graph) {
+    let acts: Vec<(NodeId, Activation)> = g
+        .nodes()
+        .filter_map(|(id, n)| Some((id, kernel_activation(&n.op)?)))
+        .collect();
+    for (id, act) in acts {
+        if !g.contains(id) {
+            continue;
+        }
+        let x = g.node(id).input(0);
+        // f16 is held as f32 and goes through the same kernels.
+        let float = x.is_some_and(|x| {
+            matches!(g.value(x).dtype, DType::F32 | DType::F16 | DType::Undefined)
+        });
+        let is_product = |op: &Op| {
+            matches!(
+                op,
+                Op::MatMul
+                    | Op::Linear { act: None }
+                    | Op::Gemm { act: None, .. }
+                    | Op::QLinearDynamic { act: None }
+            )
+        };
+        let Some(product) = sole_producer(g, x, is_product).filter(|_| float) else {
+            continue;
+        };
+        let node = g.node(product);
+        let mut inputs = node.inputs().to_vec();
+        let op = match node.op.clone() {
+            Op::MatMul => {
+                inputs.resize(3, None);
+                Op::Linear { act: Some(act) }
+            }
+            Op::Linear { .. } => Op::Linear { act: Some(act) },
+            Op::Gemm {
+                alpha,
+                beta,
+                trans_a,
+                trans_b,
+                ..
+            } => Op::Gemm {
+                alpha,
+                beta,
+                trans_a,
+                trans_b,
+                act: Some(act),
+            },
+            Op::QLinearDynamic { .. } => Op::QLinearDynamic { act: Some(act) },
+            _ => unreachable!(),
+        };
+        let proto = node.proto.clone();
+        g.fuse(&[product, id], op, proto, inputs);
     }
 }
 
@@ -1312,6 +1471,65 @@ mod tests {
         }
     }
 
+    /// FireRedVAD's lookback filter: padded 19 frames on both sides, of
+    /// which two slices keep the outputs that read no padding.
+    #[test]
+    fn folds_slices_into_conv_padding() {
+        let mut conv = node("Conv", &["x", "w"], "c");
+        conv.attribute.push(attr("pads", &[19, 19]));
+        conv.attribute
+            .push(crate::model::onnx_proto::AttributeProto {
+                name: "group".to_string(),
+                i: 4,
+                r#type: 2, // INT
+                ..Default::default()
+            });
+        let nodes = vec![
+            conv,
+            node("Slice", &["c", "zero", "minus19", "time"], "s"),
+            node("Slice", &["s", "start", "end", "axis", "step"], "y"),
+        ];
+        let initializer = |w: &[i64], start: i64, step: i64, axis: i64| {
+            vec![
+                floats("w", w, &vec![0.5; w.iter().product::<i64>() as usize]),
+                ints("zero", &[0]),
+                ints("minus19", &[-19]),
+                ints("time", &[2]),
+                ints("start", &[start]),
+                ints("end", &[i64::MAX]),
+                ints("axis", &[axis]),
+                ints("step", &[step]),
+            ]
+        };
+        let pads = |g: &Graph| -> Vec<Option<Vec<i64>>> {
+            g.nodes()
+                .map(|(_, n)| match &n.op {
+                    Op::Conv(attrs) => attrs.pads.clone(),
+                    _ => None,
+                })
+                .collect()
+        };
+        let g = fused_graph(nodes.clone(), initializer(&[4, 1, 20], 19, 1, -1));
+        assert_eq!(pads(&g), [Some(vec![0, 0])]);
+        assert_eq!(g.nodes().next().unwrap().1.input(0), g.find_value("x"));
+
+        // A second slice cutting into the input, with a step or along
+        // channels stays; the first still folds.
+        for (w, start, step, axis) in [
+            (&[4, 1, 20][..], 20, 1, -1),
+            (&[4, 1, 20], 19, 2, -1),
+            (&[4, 1, 20], 1, 1, 1),
+        ] {
+            let g = fused_graph(nodes.clone(), initializer(w, start, step, axis));
+            assert_eq!(pads(&g), [Some(vec![19, 0]), None], "{start} {step} {axis}");
+        }
+        // Slices of a 2D or a dense conv stay.
+        for w in [&[4, 1, 20, 1][..], &[4, 4, 20]] {
+            let g = fused_graph(nodes.clone(), initializer(w, 19, 1, -1));
+            assert_eq!(g.nodes().count(), 3, "{w:?}");
+        }
+    }
+
     #[test]
     fn folds_spatial_zero_padding_into_conv() {
         let mut conv = node("Conv", &["p", "w"], "y");
@@ -1366,8 +1584,8 @@ mod tests {
         ];
         assert_eq!(fused(nodes, vec![]), ["ConvAct"]);
 
-        // A 1D one, as T-one's depthwise convolution, fuses; a pointwise one,
-        // and one whose rank is not known, do not.
+        // A 1D one, as T-one's depthwise convolution, a pointwise one, whose
+        // kernel takes the activation too, and one whose rank is not known.
         let weights = |dims: &[i64]| TensorProto {
             name: "w".to_string(),
             data_type: DType::F32.to_onnx(),
@@ -1383,8 +1601,50 @@ mod tests {
             ]
         };
         assert_eq!(fused(nodes(), vec![weights(&[4, 1, 31])]), ["ConvAct"]);
-        assert_eq!(fused(nodes(), vec![weights(&[4, 4, 1])]), ["Conv", "Silu"]);
-        assert_eq!(fused(nodes(), vec![]), ["Conv", "Silu"]);
+        assert_eq!(fused(nodes(), vec![weights(&[4, 4, 1])]), ["ConvAct"]);
+        assert_eq!(fused(nodes(), vec![]), ["ConvAct"]);
+    }
+
+    /// Every activation the kernels apply joins the `Conv` before it, unless
+    /// something else reads the convolution's output; not a tanh GELU.
+    #[test]
+    fn fuses_activations_into_convs() {
+        let act_of = |nodes: Vec<NodeProto>| -> Vec<(String, Option<Activation>)> {
+            fused_graph(nodes, vec![])
+                .nodes()
+                .map(|(_, n)| {
+                    let act = match &n.op {
+                        Op::ConvAct { act, .. } => Some(*act),
+                        _ => None,
+                    };
+                    (n.op.op_type().to_string(), act)
+                })
+                .collect()
+        };
+        let conv = || node("Conv", &["x", "w"], "c");
+        for (op, act) in [
+            ("Relu", Activation::Relu),
+            ("Sigmoid", Activation::Sigmoid),
+            ("Gelu", Activation::GeluErf),
+        ] {
+            let nodes = vec![conv(), node(op, &["c"], "y")];
+            assert_eq!(act_of(nodes), [("ConvAct".into(), Some(act))], "{op}");
+        }
+        let mut tanh = node("Gelu", &["c"], "y");
+        tanh.attribute
+            .push(crate::model::onnx_proto::AttributeProto {
+                name: "approximate".to_string(),
+                s: b"tanh".to_vec(),
+                r#type: 3, // STRING
+                ..Default::default()
+            });
+        assert_eq!(act_of(vec![conv(), tanh]).len(), 2);
+        let shared = vec![
+            conv(),
+            node("Gelu", &["c"], "g"),
+            node("Add", &["c", "g"], "y"),
+        ];
+        assert_eq!(act_of(shared).len(), 3);
     }
 
     #[test]
@@ -1482,7 +1742,8 @@ mod tests {
             let (nodes, init) = graph(n, "x", swap);
             assert_eq!(fused(nodes, init), ["SwiGlu"], "swap {swap}");
         }
-        let unfused = ["Linear", "Silu", "Linear", "Mul"];
+        // Unfused, the gate's `Linear` applies the SiLU.
+        let unfused = ["Linear", "Linear", "Mul"];
         let (nodes, init) = graph(n + 1, "x", false);
         assert_eq!(fused(nodes, init), unfused);
         let (nodes, init) = graph(n, "z", false);
@@ -1522,6 +1783,70 @@ mod tests {
             node("Add", &["b", "m"], "y"),
         ];
         assert_eq!(fused(nodes, vec![]), ["Relu", "Linear"]);
+    }
+
+    /// FireRedVAD's `Linear` → `Relu` and output `Sigmoid`, a `MatMul` →
+    /// erf `Gelu` (MOSS, pocket) and a `Gemm` → `Silu`: each becomes the
+    /// product applying the activation. Not when another node reads the
+    /// product, nor a tanh `Gelu`.
+    #[test]
+    fn fuses_activations_into_products() {
+        let acts = |g: &Graph| -> Vec<(String, Option<Activation>)> {
+            g.nodes()
+                .map(|(_, n)| {
+                    let act = match &n.op {
+                        Op::Linear { act } | Op::Gemm { act, .. } => *act,
+                        _ => None,
+                    };
+                    (n.op.op_type().to_string(), act)
+                })
+                .collect()
+        };
+        let one = |product: NodeProto, act: NodeProto| fused_graph(vec![product, act], vec![]);
+        let linear = || {
+            vec![
+                node("MatMul", &["x", "w"], "m"),
+                node("Add", &["m", "b"], "p"),
+            ]
+        };
+        let mut nodes = linear();
+        nodes.push(node("Relu", &["p"], "y"));
+        let g = fused_graph(nodes, vec![]);
+        assert_eq!(acts(&g), [("Linear".into(), Some(Activation::Relu))]);
+        let mut nodes = linear();
+        nodes.push(node("Sigmoid", &["p"], "y"));
+        let g = fused_graph(nodes, vec![]);
+        assert_eq!(acts(&g), [("Linear".into(), Some(Activation::Sigmoid))]);
+
+        let g = one(node("MatMul", &["x", "w"], "p"), node("Gelu", &["p"], "y"));
+        assert_eq!(acts(&g), [("Linear".into(), Some(Activation::GeluErf))]);
+        assert_eq!(g.nodes().next().unwrap().1.input(2), None);
+        let nodes = vec![
+            node("Gemm", &["x", "w"], "p"),
+            node("Sigmoid", &["p"], "s"),
+            node("Mul", &["p", "s"], "y"),
+        ];
+        let g = fused_graph(nodes, vec![]);
+        assert_eq!(acts(&g), [("Gemm".into(), Some(Activation::Silu))]);
+
+        let mut tanh = node("Gelu", &["p"], "y");
+        tanh.attribute
+            .push(crate::model::onnx_proto::AttributeProto {
+                name: "approximate".to_string(),
+                s: b"tanh".to_vec(),
+                r#type: 3, // STRING
+                ..Default::default()
+            });
+        assert_eq!(
+            one(node("MatMul", &["x", "w"], "p"), tanh).nodes().count(),
+            2
+        );
+        let nodes = vec![
+            node("MatMul", &["x", "w"], "p"),
+            node("Relu", &["p"], "r"),
+            node("Add", &["p", "r"], "y"),
+        ];
+        assert_eq!(fused_graph(nodes, vec![]).nodes().count(), 3);
     }
 
     /// T-one's ScaleNorm: `gamma * (x / (ReduceL2(x) * scale + eps))`, of an

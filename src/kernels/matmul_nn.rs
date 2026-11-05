@@ -23,6 +23,7 @@
 //! multiply-adds. That holds a row of A in a register for four steps, so they are 5 rows
 //! high: 20 accumulators, 5 of A and 4 of B, of the 32 registers.
 
+use crate::kernels::bias_act::{Act, act_f32x8};
 use crate::kernels::simd::simd_call;
 use aligned_vec::AVec;
 use fearless_simd::{Level, Simd, f32x4, f32x8};
@@ -173,6 +174,9 @@ pub(crate) struct Dims {
     pub add: bool,
     /// `b` is the transpose of B, row-major with `ldb` between rows (`gemm_nn` only).
     pub b_cols: bool,
+    /// An activation of C, applied as each tile of it is stored for the last
+    /// time (`gemm_nn` only).
+    pub act: Option<Act>,
 }
 
 /// The depth of each block: `k` in equal parts of at most `KC`, so no block is a sliver.
@@ -225,6 +229,7 @@ fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32], b
         let kc = depth.min(d.k - pc);
         // The first depth block overwrites C unless asked to add; later ones add.
         let accumulate = d.add || pc > 0;
+        let act = if pc + kc == d.k { d.act } else { None };
         let mut jc = 0;
         while jc < d.n {
             let nc = (PANELS * NR).min(d.n - jc);
@@ -291,6 +296,7 @@ fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32], b
                                 width,
                                 accumulate,
                                 src16: panel16,
+                                act,
                             };
                             // A panel no wider than a vector takes the one-vector tiles.
                             match (rows, width > 8) {
@@ -422,6 +428,8 @@ struct Tile<'a> {
     width: usize,
     /// Add to C instead of overwriting it.
     accumulate: bool,
+    /// Applied to what is written, in the last depth block.
+    act: Option<Act>,
 }
 
 /// `tileR(simd, d, t, a, src, dst, c)`: `R` rows of C (columns `..t.width`) from the
@@ -518,7 +526,7 @@ macro_rules! tile_fn {
                     }
                 }
             }
-            store_tile(simd, d, acc, c, t.width, t.accumulate);
+            store_tile(simd, d, acc, c, t.width, t.accumulate, t.act);
         }
     };
 }
@@ -634,7 +642,7 @@ macro_rules! lane_tile_fn {
                     }
                 }
             }
-            store_tile(simd, d, acc, c, t.width, t.accumulate);
+            store_tile(simd, d, acc, c, t.width, t.accumulate, t.act);
         }
     };
 }
@@ -650,7 +658,8 @@ lane_tile_fn!(lanes3_narrow, 3, 1);
 lane_tile_fn!(lanes2_narrow, 2, 1);
 lane_tile_fn!(lanes1_narrow, 1, 1);
 
-/// Writes `alpha * acc` to the `R` rows of C, the first `width` columns, adding to what is there if asked.
+/// Writes `act(alpha * acc)` to the `R` rows of C, the first `width` columns, adding
+/// `alpha * acc` to what is there first if asked.
 #[inline(always)]
 fn store_tile<S: Simd, const R: usize, const V: usize>(
     simd: S,
@@ -659,6 +668,7 @@ fn store_tile<S: Simd, const R: usize, const V: usize>(
     c: &mut [f32],
     width: usize,
     accumulate: bool,
+    act: Option<Act>,
 ) {
     use fearless_simd::prelude::*;
     let alpha = f32x8::splat(simd, d.alpha);
@@ -666,22 +676,36 @@ fn store_tile<S: Simd, const R: usize, const V: usize>(
         let row = &mut c[r * d.ldc..][..width];
         let vals = acc[r].map(|a| a * alpha);
         if width == 8 * V {
-            for (v, val) in vals.iter().enumerate() {
-                let dst = &mut row[v * 8..][..8];
-                if accumulate {
-                    (*val + f32x8::from_slice(simd, dst)).store_slice(dst);
-                } else {
-                    val.store_slice(dst);
+            let mut out = vals;
+            if accumulate {
+                for (v, out) in out.iter_mut().enumerate() {
+                    *out = *out + f32x8::from_slice(simd, &row[v * 8..][..8]);
                 }
+            }
+            if let Some(act) = act {
+                out = act_f32x8(simd, act, out);
+            }
+            for (v, out) in out.iter().enumerate() {
+                out.store_slice(&mut row[v * 8..][..8]);
             }
         } else {
             let mut flat = [0.0f32; NR];
             for (v, val) in vals.iter().enumerate() {
                 val.store_slice(&mut flat[v * 8..][..8]);
             }
-            for (x, &v) in row.iter_mut().zip(&flat) {
-                *x = if accumulate { *x + v } else { v };
+            for (x, &v) in flat.iter_mut().zip(row.iter()) {
+                if accumulate {
+                    *x += v;
+                }
             }
+            if let Some(act) = act {
+                let x: [f32x8<S>; 2] =
+                    core::array::from_fn(|v| f32x8::from_slice(simd, &flat[v * 8..][..8]));
+                for (v, y) in act_f32x8(simd, act, x).iter().enumerate() {
+                    y.store_slice(&mut flat[v * 8..][..8]);
+                }
+            }
+            row.copy_from_slice(&flat[..width]);
         }
     }
 }

@@ -703,6 +703,7 @@ fn fold_product(op: &Op, inputs: &[&Const]) -> Option<(Vec<f32>, Vec<usize>)> {
             beta,
             trans_a,
             trans_b,
+            act: None,
         } => {
             let ([m0, k0], [k1, n1]) = (a.shape[..].try_into().ok()?, b.shape[..].try_into().ok()?);
             let (m, k) = if *trans_a { (k0, m0) } else { (m0, k0) };

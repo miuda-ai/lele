@@ -351,7 +351,7 @@ pub(crate) fn conv_integer_at<'a>(
         scale: 1.0,
         requant: None,
         bias: None,
-        relu: false,
+        act: None,
     };
     let pointwise = kh == 1 && kw == 1 && sh == 1 && sw == 1 && pt + pl + pb + pr == 0;
     // A kernel row's taps are one run of `kw * in_channels` values when they are adjacent

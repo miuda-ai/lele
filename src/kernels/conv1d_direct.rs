@@ -1,6 +1,7 @@
 //! Direct 1D convolutions: dot products straight from the input, with no
 //! im2col copy and no matrix multiply.
 
+use crate::kernels::bias_act::{Act, act_inplace_at};
 use crate::kernels::simd::simd_call;
 use aligned_vec::AVec;
 use fearless_simd::{Level, Simd, f32x8, f32x16};
@@ -19,7 +20,7 @@ pub(crate) struct Depthwise<'a> {
     pub pad_left: usize,
     pub out_len: usize,
     pub bias: Option<&'a [f32]>,
-    pub relu: bool,
+    pub act: Option<Act>,
 }
 
 /// `out[b, c, t] = act(bias[c] + sum_k input[b, c, t * stride + k * dilation - pad_left] * weights[c, k])`,
@@ -43,7 +44,17 @@ pub(crate) fn depthwise(
         padded.clear();
         padded.resize(padded_row_len(shape) + phases, 0.0);
         simd_call!(level, depthwise_simd(shape, input, weights, out, padded))
-    })
+    });
+    activate(level, shape.act, out);
+}
+
+/// `act` over the output just written, while it is in cache. One call rather than
+/// the activation inlined in every kernel: monomorphized per SIMD level and per tile
+/// shape, those copies made the crate slow and costly to compile.
+fn activate(level: Level, act: Option<Act>, out: &mut [f32]) {
+    if let Some(act) = act {
+        act_inplace_at(level, act, out);
+    }
 }
 
 /// Room for a row between zeros, as an even number of entries.
@@ -109,7 +120,7 @@ fn depthwise_simd<S: Simd>(
                 for (&xv, &w) in x[t * stride..][..k].iter().zip(w) {
                     sum += xv * w;
                 }
-                *y = if s.relu { sum.max(0.0) } else { sum };
+                *y = sum;
             }
             continue;
         }
@@ -120,18 +131,18 @@ fn depthwise_simd<S: Simd>(
                 if out_len >= $n {
                     let mut t = 0;
                     while t + $n <= out_len {
-                        $at::<S, $m>(simd, srcs, w, bias, s.relu, s.dilation, t)
+                        $at::<S, $m>(simd, srcs, w, bias, s.dilation, t)
                             .store_slice(&mut y[t..][..$n]);
                         t += $n;
                     }
                     if t < out_len {
                         // The last vector overlaps its predecessor.
-                        $at::<S, $m>(simd, srcs, w, bias, s.relu, s.dilation, out_len - $n)
+                        $at::<S, $m>(simd, srcs, w, bias, s.dilation, out_len - $n)
                             .store_slice(&mut y[out_len - $n..]);
                     }
                 } else {
                     let mut tile = [0.0f32; $n];
-                    $at::<S, $m>(simd, srcs, w, bias, s.relu, s.dilation, 0).store_slice(&mut tile);
+                    $at::<S, $m>(simd, srcs, w, bias, s.dilation, 0).store_slice(&mut tile);
                     y.copy_from_slice(&tile[..out_len]);
                 }
             }};
@@ -157,7 +168,6 @@ macro_rules! depthwise_at {
             srcs: [&[f32]; 2],
             w: &[f32],
             bias: f32,
-            relu: bool,
             dilation: usize,
             t: usize,
         ) -> $v<S> {
@@ -178,12 +188,7 @@ macro_rules! depthwise_at {
                 let x0 = $v::from_slice(simd, &srcs[k0 % M][t + k0 / M * dilation..][..$n]);
                 acc = $v::splat(simd, w0).mul_add(x0, acc);
             }
-            acc = acc + acc2;
-            if relu {
-                acc.max($v::splat(simd, 0.0))
-            } else {
-                acc
-            }
+            acc + acc2
         }
     };
 }
@@ -199,7 +204,7 @@ pub(crate) struct Kernel3<'a> {
     pub out_channels: usize,
     pub len: usize,
     pub bias: Option<&'a [f32]>,
-    pub relu: bool,
+    pub act: Option<Act>,
 }
 
 pub(crate) fn kernel3(
@@ -228,7 +233,8 @@ pub(crate) fn kernel3(
         } else {
             simd_call!(level, kernel3_simd(shape, input, weights, out, padded))
         }
-    })
+    });
+    activate(level, shape.act, out);
 }
 
 /// Rows shorter than this are computed as dot products.
@@ -271,10 +277,8 @@ macro_rules! kernel3_tile {
                     acc[j] = $v::splat(simd, w2).mul_add(x2, acc[j]);
                 }
             }
-            let zero = $v::splat(simd, 0.0);
             for j in 0..OC {
-                let y = if s.relu { acc[j].max(zero) } else { acc[j] };
-                y.store_slice(&mut out[(oc + j) * s.len.max(8) + t..][..$n]);
+                acc[j].store_slice(&mut out[(oc + j) * s.len.max(8) + t..][..$n]);
             }
         }
     };
@@ -330,13 +334,7 @@ fn kernel3_cols_simd<S: Simd>(
                 }
             }
             let cols = &*cols;
-            let finish = |sum: f32, bias: f32| {
-                if s.relu {
-                    (sum + bias).max(0.0)
-                } else {
-                    sum + bias
-                }
-            };
+            let finish = |sum: f32, bias: f32| sum + bias;
             let mut oc = 0;
             while oc + 4 <= s.out_channels {
                 let ws: [&[f32]; 4] = core::array::from_fn(|j| &weights[(oc + j) * ic3..][..ic3]);
@@ -430,7 +428,7 @@ pub(crate) struct SingleChannel<'a> {
     pub stride: usize,
     pub out_len: usize,
     pub bias: Option<&'a [f32]>,
-    pub relu: bool,
+    pub act: Option<Act>,
 }
 
 /// `out[b, oc, t] = act(bias[oc] + sum_k input[b, t * stride + k] * weights[oc, k])`.
@@ -452,6 +450,7 @@ pub(crate) fn single_channel(
     } else {
         simd_call!(level, single_channel_simd(shape, input, weights, out))
     }
+    activate(level, shape.act, out);
 }
 
 /// Output channels per vector.
@@ -551,10 +550,7 @@ fn lanes_blocks<S: Simd, const U: usize>(
             }
         }
         for u in 0..U {
-            let y = acc[u].map(|a| {
-                let y = a + bias[u];
-                *(if s.relu { y.max(zero) } else { y }).as_array()
-            });
+            let y = acc[u].map(|a| *(a + bias[u]).as_array());
             let first = oc + u * LANES;
             let lanes = (s.out_channels - first).min(LANES);
             // The positions of one channel are contiguous in the output.
@@ -626,10 +622,7 @@ fn single_channel_simd<S: Simd>(
     out: &mut [f32],
 ) {
     let (k, out_len) = (s.kernel, s.out_len);
-    let finish = |sum: f32, bias: f32| {
-        let v = sum + bias;
-        if s.relu { v.max(0.0) } else { v }
-    };
+    let finish = |sum: f32, bias: f32| sum + bias;
     for b in 0..s.batch {
         let x = &input[b * s.input_len..][..s.input_len];
         let out = &mut out[b * s.out_channels * out_len..][..s.out_channels * out_len];

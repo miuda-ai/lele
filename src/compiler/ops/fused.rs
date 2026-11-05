@@ -2,20 +2,37 @@
 
 use super::super::{
     generate::{ElemType, OpContext},
-    ir::{Activation, ConvAttrs, DType, Op},
+    ir::{Activation, DType, Op},
 };
 use std::io::Write;
 
-impl ConvAttrs {
-    /// Strides and dilations with one entry per spatial axis of a 2D
-    /// convolution (a single value covers both, none means 1); each axis
-    /// keeps its own, so a stride of `[2, 1]` stays `[2, 1]`.
-    fn per_axis(ints: &Option<Vec<i64>>) -> Vec<i64> {
-        match ints.as_deref() {
-            None | Some([]) => vec![1, 1],
-            Some([v]) => vec![*v, *v],
-            Some(ints) => ints.to_vec(),
-        }
+/// `let {out} = {product};`, `product(buf)` being the call that writes the
+/// product to `buf`; with an activation, the call goes through
+/// `lele::kernels::activated`, which applies it in place.
+pub(super) fn write_product(
+    w: &mut dyn Write,
+    tab: &str,
+    out: &str,
+    buf: &str,
+    act: Option<Activation>,
+    product: impl Fn(&str) -> String,
+) -> std::io::Result<()> {
+    match act {
+        None => writeln!(w, "{tab}let {out} = {};", product(buf)),
+        Some(act) => writeln!(
+            w,
+            "{tab}let {out} = lele::kernels::activated(lele::kernels::Act::{}, {buf}, |buf| {});",
+            act.name(),
+            product("buf")
+        ),
+    }
+}
+
+/// An activation as the kernels take it: `None` or `Some(lele::kernels::Act::…)`.
+pub(super) fn act_arg(act: Option<Activation>) -> String {
+    match act {
+        None => "None".to_string(),
+        Some(act) => format!("Some(lele::kernels::Act::{})", act.name()),
     }
 }
 
@@ -91,14 +108,24 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 outputs[0], inputs[0]
             )?;
         }
-        Op::Linear => writeln!(
-            w,
-            "{tab}let {} = self.linear(&{}, &{}, &{}, {buf});",
-            outputs[0],
-            inputs[0],
-            ctx.matmul_weight(1),
-            inputs[2]
-        )?,
+        // The product kernels apply the activation as they write the output.
+        Op::Linear { act } => {
+            let (x, weight, out) = (&inputs[0], ctx.matmul_weight(1), &outputs[0]);
+            let call = match (ctx.ir().input(2), act) {
+                (Some(_), None) => format!("self.linear(&{x}, &{weight}, &{}", inputs[2]),
+                (Some(_), Some(_)) => format!(
+                    "self.linear_act(&{x}, &{weight}, &{}, {}",
+                    inputs[2],
+                    act_arg(*act)
+                ),
+                (None, None) => format!("lele::kernels::matmul(&{x}, &{weight}"),
+                (None, Some(_)) => format!(
+                    "lele::kernels::matmul_act(&{x}, &{weight}, {}",
+                    act_arg(*act)
+                ),
+            };
+            writeln!(w, "{tab}let {out} = {call}, {buf});")?
+        }
         Op::SwiGlu => writeln!(
             w,
             "{tab}let {} = lele::kernels::linear_swiglu(&{}, &{}, &{}, {buf});",
@@ -107,84 +134,10 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             ctx.matmul_weight(1),
             inputs[2]
         )?,
-        Op::ConvAct { conv, act } => {
-            let weight_shape = ctx
-                .weight(1)
-                .map(|weight| weight.shape.clone())
-                .unwrap_or(vec![3, 3, 3, 3]);
-            let bias = match ctx.ir().input(2) {
-                Some(_) => format!("Some(&{})", inputs[2]),
-                None => "None".to_string(),
-            };
-            // 1-D SiLU goes with the 1-D kernels below.
-            if *act == Activation::Silu && weight_shape.len() != 3 {
-                // Attributes as written, with ONNX defaults.
-                let ints = |v: &Option<Vec<i64>>, default: &[i64]| {
-                    v.clone().unwrap_or_else(|| default.to_vec())
-                };
-                writeln!(
-                    w,
-                    "{tab}let {} = lele::kernels::conv2d_silu(&{}, &{}, {bias}, &{:?}, {}, &{:?}, &{:?}, {buf});",
-                    outputs[0],
-                    inputs[0],
-                    inputs[1],
-                    ints(&conv.dilations, &[1, 1]),
-                    conv.group.unwrap_or(1),
-                    ints(&conv.pads, &[0, 0, 0, 0]),
-                    ints(&conv.strides, &[1, 1]),
-                )?;
-                return Ok(());
-            }
-            let strides = ConvAttrs::per_axis(&conv.strides);
-            let dilations = ConvAttrs::per_axis(&conv.dilations);
-            let groups = conv.group.unwrap_or(1) as usize;
-            let mut pads = conv.pads.clone().unwrap_or_default();
-            let auto_pad = conv.auto_pad.as_deref().unwrap_or("");
-            if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") && pads.is_empty() {
-                let kh = weight_shape.get(2).copied().unwrap_or(1) as i64;
-                let kw = weight_shape.get(3).copied().unwrap_or(kh as usize) as i64;
-                let total_h = (kh - 1) * dilations[0];
-                let total_w = (kw - 1) * dilations[1];
-                let split = |total: i64| {
-                    if auto_pad == "SAME_LOWER" {
-                        (total - total / 2, total / 2)
-                    } else {
-                        (total / 2, total - total / 2)
-                    }
-                };
-                let ((pt, pb), (pl, pr)) = (split(total_h), split(total_w));
-                pads = vec![pt, pl, pb, pr];
-            }
-            if pads.is_empty() {
-                pads = vec![0, 0, 0, 0];
-            }
-            if weight_shape.len() >= 4 {
-                writeln!(
-                    w,
-                    "{tab}let {} = lele::kernels::conv2d_fused(&{}, &{}, {bias}, &{:?}, {groups}, &{:?}, &{:?}, true, {buf});",
-                    outputs[0], inputs[0], inputs[1], dilations, pads, strides,
-                )?;
-            } else {
-                let (kernel, relu) = match act {
-                    Activation::Silu => ("conv1d_silu", ""),
-                    _ => ("conv1d_fused", " true,"),
-                };
-                // Pads are [begin, end], or [begin, _, end, _] as computed above.
-                writeln!(
-                    w,
-                    "{tab}let {} = lele::kernels::{kernel}(&{}, &{}, {bias}, &[{}], {groups}, &[{}, {}], &[{}],{relu} {buf});",
-                    outputs[0],
-                    inputs[0],
-                    inputs[1],
-                    dilations[0],
-                    pads[0],
-                    pads[pads.len() / 2],
-                    strides[0],
-                )?;
-            }
-        }
-        Op::QLinearDynamic { relu } => {
+        Op::ConvAct { conv, act } => super::nn::write_conv(ctx, w, conv, Some(*act))?,
+        Op::QLinearDynamic { act } => {
             let (x, scale, zero_point, bias) = (&inputs[0], &inputs[2], &inputs[3], &inputs[4]);
+            let (out, act) = (&outputs[0], act_arg(*act));
             // A static weight with static scales and zero points is packed for
             // the integer GEMM when the model is created.
             let at_load = (
@@ -204,22 +157,14 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                     ));
                     writeln!(
                         w,
-                        "{tab}let {} = self.linear_quantized_packed(&{x}, self.qweights({n}), {bias}, {relu}, {buf});",
-                        outputs[0],
+                        "{tab}let {out} = self.linear_quantized_packed(&{x}, self.qweights({n}), {bias}, {act}, {buf});"
                     )?
                 }
-                _ => {
-                    let method = if *relu {
-                        "linear_quantized_relu"
-                    } else {
-                        "linear_quantized"
-                    };
-                    writeln!(
-                        w,
-                        "{tab}let {} = self.{method}(&{x}, {}, {scale}, {zero_point}, {bias}, {buf});",
-                        outputs[0], inputs[1],
-                    )?
-                }
+                _ => writeln!(
+                    w,
+                    "{tab}let {out} = self.linear_quantized(&{x}, {}, {scale}, {zero_point}, {bias}, {act}, {buf});",
+                    inputs[1]
+                )?,
             }
         }
         Op::EmbeddingConcat { value } => {

@@ -676,7 +676,7 @@ fn output_shapes(g: &Graph, node: &Node, elems: &Elems) -> Vec<Option<Shape>> {
                 .collect();
             first(shapes.map(|s| broadcast(&s.iter().map(Vec::as_slice).collect::<Vec<_>>())))
         }
-        Op::MatMul | Op::MatMulInteger | Op::QWeightMatMul | Op::Linear => {
+        Op::MatMul | Op::MatMulInteger | Op::QWeightMatMul | Op::Linear { .. } => {
             first(shape(0).zip(shape(1)).and_then(|(a, b)| matmul(&a, &b)))
         }
         // Half the columns of the product.

@@ -29,6 +29,7 @@
 //! 16 for `sdot` (24 128-bit ones, of Neon's 32 registers). A whole panel's depth is one
 //! block, read from L2.
 
+use crate::kernels::bias_act::{Act, act_f32x16};
 use crate::kernels::qgemm::{AlignedI32, Epilogue, Requant, requant};
 use aligned_vec::AVec;
 use fearless_simd::{Level, Simd, f32x16, i32x16};
@@ -301,7 +302,7 @@ fn qgemm_simd<S: Simd>(
             row_sum_factor: w.row_term.then_some(&factor),
             bias: &bias,
             requant: e.requant,
-            relu: e.relu,
+            act: e.act,
         };
         let b = &w.data[jp * kq * nr..][..kq * nr];
         let mut ir = 0;
@@ -343,7 +344,7 @@ struct Tile<'a> {
     row_sum_factor: Option<&'a [i32; NR]>,
     requant: Option<Requant>,
     bias: &'a [f32; NR],
-    relu: bool,
+    act: Option<Act>,
 }
 
 /// `name(simd, t, a, row_sums, b, c)`: `R` rows of C from the rows of A in place and a
@@ -412,7 +413,6 @@ fn finish<S: Simd, const R: usize, const V: usize>(
     };
     let (scale, col_term, bias) = (vecs(t.scale), ivecs(t.col_term), vecs(t.bias));
     let factor = t.row_sum_factor.map(|f| ivecs(f));
-    let zero = f32x16::splat(simd, 0.0);
     for r in 0..R {
         let rs = i32x16::splat(simd, row_sums[r]);
         let vals: [f32x16<S>; V] = core::array::from_fn(|v| {
@@ -422,7 +422,10 @@ fn finish<S: Simd, const R: usize, const V: usize>(
             }
             let x = simd.cvt_f32_i32x16(sum) * scale[v];
             let x = requant!(simd, f32x16, t.requant, x) + bias[v];
-            if t.relu { x.max(zero) } else { x }
+            match t.act {
+                None => x,
+                Some(act) => act_f32x16(act, x),
+            }
         });
         let row = &mut c[r * t.ldc..][..t.width];
         if t.width == 16 * V {

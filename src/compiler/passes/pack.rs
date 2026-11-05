@@ -77,7 +77,7 @@ fn pack(t: &TensorProto, packing: Packing) -> Option<TensorProto> {
 /// with a multiple of [`PACK_COLS`] columns, every read of which (in `g`) is
 /// as the right operand of a `MatMul`, `Linear` or `SwiGlu`; or f16 weights
 /// `[m, k, 1]`, `m` a multiple of [`PACK_COLS`], every read of which is by a
-/// `Conv` code generation computes with `conv1d_pointwise`. Neither if `skip`
+/// `Conv` or `ConvAct` code generation computes with `conv1d_pointwise`. Neither if `skip`
 /// holds one of the nodes reading it.
 fn packable(g: &Graph, v: ValueId, skip: &dyn Fn(&Node) -> bool) -> Option<Packing> {
     let value = g.value(v);
@@ -91,8 +91,8 @@ fn packable(g: &Graph, v: ValueId, skip: &dyn Fn(&Node) -> bool) -> Option<Packi
     let read_by = |id| {
         let node = g.node(id);
         let op_reads = match (&node.op, packing) {
-            (Op::MatMul | Op::Linear | Op::SwiGlu, Packing::Matrix) => true,
-            (Op::Conv(conv), Packing::Transposed) => is_pointwise(conv),
+            (Op::MatMul | Op::Linear { .. } | Op::SwiGlu, Packing::Matrix) => true,
+            (Op::Conv(conv) | Op::ConvAct { conv, .. }, Packing::Transposed) => is_pointwise(conv),
             _ => false,
         };
         op_reads

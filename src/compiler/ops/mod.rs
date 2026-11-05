@@ -82,7 +82,7 @@ pub(crate) fn dispatch_builtin(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         Op::ConvAct { .. }
         | Op::EmbeddingConcat { .. }
         | Op::Gelu { .. }
-        | Op::Linear
+        | Op::Linear { .. }
         | Op::QLinearDynamic { .. }
         | Op::RmsNorm { .. }
         | Op::ScaleNorm { .. }

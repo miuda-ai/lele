@@ -1434,7 +1434,57 @@ mod tests {
             .code;
         let line = code.lines().find(|l| l.contains("let r = ")).unwrap_or_else(|| panic!("{code}"));
         assert!(line.contains("lele::kernels::conv1d_fused(&x, "), "{line}");
-        assert!(line.contains("&[0, 1], &[1], true, "), "{line}");
+        assert!(
+            line.contains("&[0, 1], &[1], Some(lele::kernels::Act::Relu), "),
+            "{line}"
+        );
+    }
+
+    /// A pointwise 1D Conv of f16 weights followed by a GELU is one call to
+    /// `conv1d_pointwise`, which reads the weights as stored and applies the
+    /// activation.
+    #[test]
+    fn test_pointwise_f16_conv_takes_its_activation() {
+        use crate::model::onnx_proto::{GraphProto, TensorProto, ValueInfoProto};
+        let info = |name: &str| ValueInfoProto {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let node = |op: &str, input: &[&str], output: &str| NodeProto {
+            op_type: op.to_string(),
+            input: input.iter().map(|s| s.to_string()).collect(),
+            output: vec![output.to_string()],
+            ..Default::default()
+        };
+        let weights = [half::f16::from_f32(0.5); 8 * 4];
+        let graph = GraphProto {
+            node: vec![node("Conv", &["x", "w"], "c"), node("Gelu", &["c"], "y")],
+            initializer: vec![TensorProto {
+                name: "w".to_string(),
+                data_type: DType::F16.to_onnx(),
+                dims: vec![8, 4, 1],
+                raw_data: weights.iter().flat_map(|x| x.to_le_bytes()).collect(),
+                ..Default::default()
+            }],
+            input: vec![info("x")],
+            output: vec![info("y")],
+            ..Default::default()
+        };
+        let code = Compiler::new()
+            .with_default_optimizations()
+            .compile(&graph)
+            .unwrap()
+            .code;
+        let line = code
+            .lines()
+            .find(|l| l.contains("let y = "))
+            .unwrap_or_else(|| panic!("{code}"));
+        assert!(
+            line.contains("lele::kernels::conv1d_pointwise(&x, "),
+            "{line}"
+        );
+        assert!(line.contains("Some(lele::kernels::Act::GeluErf)"), "{line}");
+        assert!(!code.contains("gelu_erf("), "{code}");
     }
 
     /// A chunk returns what later chunks read. The nodes of `If` branches

@@ -1,6 +1,6 @@
 use super::super::{
     generate::OpContext,
-    ir::{DType, Op},
+    ir::{Activation, ConvAttrs, DType, Op},
 };
 use std::io::Write;
 
@@ -58,6 +58,100 @@ fn compute_same_pads(
     Some(vec![pad_top, pad_left, pad_bottom, pad_right])
 }
 
+/// `Conv`, then `act` if any (a `ConvAct`), which the kernels apply as they
+/// write the output.
+///
+/// Strides and dilations go one per spatial axis (none means 1), and pads as
+/// `[begin, end]` in 1D and `[top, left, bottom, right]` in 2D; `SAME_UPPER`
+/// and `SAME_LOWER` pads are those of stride 1, the larger half at the end or
+/// at the start.
+pub(super) fn write_conv(
+    ctx: &OpContext,
+    w: &mut dyn Write,
+    conv: &ConvAttrs,
+    act: Option<Activation>,
+) -> std::io::Result<()> {
+    let tab = ctx.tab();
+    let (inputs, outputs, buf) = (&ctx.inputs, &ctx.outputs, &ctx.buf_expr);
+    // The kernel's extent per spatial axis, from the weights or the attribute.
+    let kernel: Vec<i64> = match ctx.weight(1) {
+        Some(weight) if weight.shape.len() >= 3 => {
+            weight.shape[2..].iter().map(|&k| k as i64).collect()
+        }
+        _ => conv.kernel_shape.clone().unwrap_or_else(|| vec![1]),
+    };
+    let axes = kernel.len().clamp(1, 2);
+    let per_axis = |ints: &Option<Vec<i64>>| match ints.as_deref() {
+        None | Some([]) => vec![1; axes],
+        Some([v]) => vec![*v; axes],
+        Some(ints) => ints.to_vec(),
+    };
+    let (strides, dilations) = (per_axis(&conv.strides), per_axis(&conv.dilations));
+    let pads = match (conv.pads.as_deref(), conv.auto_pad.as_deref()) {
+        (None | Some([]), Some(auto_pad @ ("SAME_UPPER" | "SAME_LOWER"))) => {
+            let (begin, end): (Vec<i64>, Vec<i64>) = (0..axes)
+                .map(|i| {
+                    let total = (kernel.get(i).copied().unwrap_or(1) - 1) * dilations[i];
+                    if auto_pad == "SAME_LOWER" {
+                        (total - total / 2, total / 2)
+                    } else {
+                        (total / 2, total - total / 2)
+                    }
+                })
+                .unzip();
+            [begin, end].concat()
+        }
+        (None | Some([]), _) => vec![0; 2 * axes],
+        (Some(pads), _) => pads.to_vec(),
+    };
+    let group = conv.group.unwrap_or(1);
+    let bias = match ctx.ir().input(2) {
+        Some(_) => format!("Some(&{})", inputs[2]),
+        None => "None".to_string(),
+    };
+    let act_arg = super::fused::act_arg(act);
+    // An f16 pointwise conv1d (the case `conv1d` computes as a matrix product)
+    // takes its weights as stored, widening them as it reads them.
+    // `weights::packable` packs only weights of Convs taking this path.
+    let ones = |v: &[i64]| v.iter().all(|&x| x == 1);
+    if let Some(weight) = ctx.weight(1)
+        && weight.dtype == DType::F16
+        && matches!(weight.shape[..], [_, in_channels, 1] if in_channels > 1)
+        && group == 1
+        && ones(&strides)
+        && ones(&dilations)
+        && pads.iter().all(|&p| p == 0)
+    {
+        return writeln!(
+            w,
+            "{tab}let {} = lele::kernels::conv1d_pointwise(&{}, &{}, {bias}, {act_arg}, {buf});",
+            outputs[0],
+            inputs[0],
+            ctx.matmul_weight(1),
+        );
+    }
+    assert!(
+        !ctx.weight(1).is_some_and(|weight| weight.packed),
+        "Conv weights packed for conv1d_pointwise read by another kernel"
+    );
+    let kernel_fn = match (axes, act) {
+        (1, None) => "conv1d",
+        (1, Some(_)) => "conv1d_fused",
+        (_, None) => "conv2d",
+        (_, Some(_)) => "conv2d_fused",
+    };
+    let act_arg = if act.is_some() {
+        format!(" {act_arg},")
+    } else {
+        String::new()
+    };
+    writeln!(
+        w,
+        "{tab}let {} = lele::kernels::{kernel_fn}(&{}, &{}, {bias}, &{dilations:?}, {group}, &{pads:?}, &{strides:?},{act_arg} {buf});",
+        outputs[0], inputs[0], inputs[1],
+    )
+}
+
 pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<()> {
     let tab = ctx.tab();
     let inputs = &ctx.inputs;
@@ -65,96 +159,25 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
     let buf_expr = &ctx.buf_expr;
 
     match &ctx.ir().op {
-        Op::Conv(conv) => {
-            let dilations = conv.dilations.clone().unwrap_or_default();
-            let group = conv.group.unwrap_or(1);
-            let auto_pad = conv.auto_pad.as_deref().unwrap_or("NOTSET");
-            let kernel_shape: Vec<i64> = ctx
-                .weight(1)
-                .and_then(|weight| {
-                    let shape = &weight.shape;
-                    if shape.len() >= 4 {
-                        Some(vec![shape[2] as i64, shape[3] as i64])
-                    } else if shape.len() == 3 {
-                        Some(vec![shape[2] as i64])
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default();
-            let pads = if auto_pad != "NOTSET" && !auto_pad.is_empty() {
-                compute_same_pads(&kernel_shape, &[1, 1], &dilations, auto_pad).unwrap_or_default()
-            } else {
-                conv.pads.clone().unwrap_or_default()
-            };
-            let strides = conv.strides.clone().unwrap_or_default();
-            let bias_arg = if ctx.ir().input(2).is_some() {
-                format!("Some(&{})", inputs[2])
-            } else {
-                "None".to_string()
-            };
-            // An f16 pointwise conv1d (the case `conv1d` computes as a matrix
-            // product) takes its weights as stored, widening them as it reads them.
-            // `weights::packable` packs only weights of Convs taking this path.
-            let ones = |v: &[i64]| v.iter().all(|&x| x == 1);
-            if let Some(weight) = ctx.weight(1)
-                && weight.dtype == DType::F16
-                && matches!(weight.shape[..], [_, in_channels, 1] if in_channels > 1)
-                && group == 1
-                && ones(&strides)
-                && ones(&dilations)
-                && pads.iter().all(|&p| p == 0)
-            {
-                return writeln!(
-                    w,
-                    "{}let {} = lele::kernels::conv1d_pointwise(&{}, &{}, {}, false, {});",
-                    tab,
-                    outputs[0],
-                    inputs[0],
-                    ctx.matmul_weight(1),
-                    bias_arg,
-                    buf_expr
-                );
-            }
-            assert!(
-                !ctx.weight(1).is_some_and(|weight| weight.packed),
-                "Conv weights packed for conv1d_pointwise read by another kernel"
-            );
-            // Determine conv1d vs conv2d based on weight tensor rank
-            let weight_rank = ctx.weight(1).map(|weight| weight.shape.len()).unwrap_or(3);
-            let kernel_fn = if weight_rank >= 4 { "conv2d" } else { "conv1d" };
-            writeln!(
-                w,
-                "{}let {} = lele::kernels::{}(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
-                tab,
-                outputs[0],
-                kernel_fn,
-                inputs[0],
-                inputs[1],
-                bias_arg,
-                dilations,
-                group,
-                pads,
-                strides,
-                buf_expr
-            )?;
-        }
+        Op::Conv(conv) => write_conv(ctx, w, conv, None)?,
         Op::Gemm {
             alpha,
             beta,
             trans_a,
             trans_b,
+            act,
         } => {
             let c = if inputs.len() > 2 && !inputs[2].is_empty() {
                 format!("Some(&{})", inputs[2])
             } else {
                 "None".to_string()
             };
-            writeln!(
-                w,
-                "{}let {} = lele::kernels::gemm(&{}, &{}, {}, {:?}, {:?}, {}, {}, {});",
-                tab, outputs[0], inputs[0], inputs[1], c, alpha, beta, trans_a, trans_b, buf_expr
-            )?;
+            super::fused::write_product(w, &tab, &outputs[0], buf_expr, *act, |buf| {
+                format!(
+                    "lele::kernels::gemm(&{}, &{}, {c}, {alpha:?}, {beta:?}, {trans_a}, {trans_b}, {buf})",
+                    inputs[0], inputs[1]
+                )
+            })?;
         }
         Op::Lstm => {
             let bias = if inputs.len() > 3 && !ctx.node.input[3].is_empty() {

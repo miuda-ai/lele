@@ -127,7 +127,7 @@ fn test_conv2d_3x3_stride1_pad1() {
         1,
         &[1, 1, 1, 1],
         &[1, 1],
-        true,
+        Some(Act::Relu),
         &mut out_buf,
     );
 
@@ -178,7 +178,7 @@ fn test_conv2d_3x3_stride1_no_bias() {
         1,
         &[1, 1, 1, 1],
         &[1, 1],
-        false,
+        None,
         &mut out_buf,
     );
 
@@ -212,7 +212,7 @@ fn test_conv2d_3x3_stride2() {
         1,
         &[1, 1, 1, 1],
         &[2, 2],
-        true,
+        Some(Act::Relu),
         &mut out_buf,
     );
 
@@ -288,7 +288,7 @@ fn assert_depthwise_matches_im2col(
         1,
         &[1, 1, 1, 1],
         &[1, 1],
-        false,
+        None,
         &mut out_buf2,
     );
     assert_close(&result.data, &ref_result.data, 1e-3, name);
@@ -387,7 +387,7 @@ fn test_conv2d_3x3_row_stride_only() {
         1,
         &[1, 1, 1, 1],
         &[2, 1],
-        true,
+        Some(Act::Relu),
         &mut out_buf,
     );
 
@@ -440,7 +440,7 @@ fn test_conv2d_3x3_column_stride_only() {
         1,
         &[1, 1, 1, 1],
         &[1, 2],
-        false,
+        None,
         &mut out_buf,
     );
 
@@ -502,7 +502,7 @@ fn test_conv2d_1x1() {
         1,
         &[0, 0, 0, 0],
         &[1, 1],
-        true,
+        Some(Act::Relu),
         &mut out_buf,
     );
 
@@ -555,7 +555,7 @@ fn test_conv2d_pointwise_after_depthwise() {
         1,
         &[0, 0, 0, 0],
         &[1, 1],
-        true,
+        Some(Act::Relu),
         &mut out_buf,
     );
 

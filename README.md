@@ -53,7 +53,7 @@ lele is not an interpreter. It **compiles ONNX graphs into Rust source code** at
   - **LayerNorm**: 9-node subgraph (ReduceMean→Sub→Pow→ReduceMean→Add→Sqrt→Div→Mul→Add) → one `layer_norm` call
   - **GELU**: 5-node subgraph (Div→Erf→Add→Mul→Mul) → one `gelu` call
   - **Conv + Add(bias)**: Conv→Add → single-pass fused bias convolution
-  - **Conv + SiLU**: Conv→Sigmoid→Mul → single-pass `conv2d_silu`
+  - **Conv + SiLU**: Conv→Sigmoid→Mul → single-pass `conv2d_fused` with SiLU
   - **Conv + ReLU**, **SiLU** (single / double / triple), **Linear** (MatMul→Add), **Embedding Concat**, **Quantized Linear** (6-node DynamicQuantizeLinear chain)
 - **Constant folding**: Shape, Unsqueeze, Squeeze, Concat, Slice, Cast, and ConstantOfShape with all-constant inputs are evaluated at compile time and removed from the graph.
 - **Buffer allocation**: Liveness analysis assigns each tensor to a reusable workspace buffer with zero-copy aliasing for Reshape/Squeeze/Unsqueeze/Identity/Cast.
@@ -222,6 +222,7 @@ The `Compiler` takes the same settings: `with_input_shape("input", &[1, 512])`, 
 ./run_hojo_tts.sh "text"     # Hojo-TTS-Light voice cloning
 cd examples/moss-tts-nano && cargo run --release -- "text"  # MOSS-TTS-Nano
 cd examples/ppocr && cargo run --release -- image.png      # PP-OCRv6 OCR
+cargo run --release -p fireredvad-example -- [in.wav]       # FireRedVAD streaming VAD (16 kHz WAV)
 cargo run --release -p tone-example --bin tone -- in.wav    # T-one ASR (8 kHz WAV)
 cargo run --release -p tone-example --bin tone-live         # T-one, live from the microphone
 cargo run --release -p whisper-example --bin whisper -- in.wav [--lang en]  # Whisper ASR (16 kHz WAV)
@@ -234,6 +235,7 @@ cargo run --release -p whisper-example --bin whisper-live [-- --lang en]    # Wh
 |-------|------|---------|
 | **SenseVoiceSmall** | ASR | Multilingual speech recognition |
 | **Silero VAD** | VAD | Streaming voice activity detection |
+| **FireRedVAD** | VAD | Streaming voice activity detection (DFSMN, 10 ms frames, Kaldi fbank) |
 | **T-one** | ASR | Streaming Russian telephony speech recognition (8 kHz, CTC) |
 | **Whisper** (base, int8) | ASR | Multilingual speech recognition with language detection; encoder and decoder with a key/value cache |
 | **Supertonic 2** | TTS | 5 languages |

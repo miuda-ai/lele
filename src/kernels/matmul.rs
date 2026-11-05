@@ -12,6 +12,7 @@
 //!
 //! The only `unsafe` is turning the caller's pointers and strides into slices, once.
 
+use crate::kernels::bias_act::{Act, act_inplace};
 use crate::kernels::matmul_dot::{DotDims, gemm_dot};
 use crate::kernels::matmul_nn::{BSrc, Dims, SMALL_M, gemm_nn, gemm_small_m};
 use aligned_vec::AVec;
@@ -140,11 +141,54 @@ pub fn matmul(
     alpha: f32,
     _par: Par,
 ) {
+    matmul_act(dst, accum, a, b, alpha, None)
+}
+
+/// [`matmul`], then `act` of C, applied as the kernels store it where they can.
+pub(crate) fn matmul_act(
+    dst: MatMut<f32>,
+    accum: Accum,
+    a: MatRef<f32>,
+    b: MatRef<f32>,
+    alpha: f32,
+    act: Option<Act>,
+) {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     if matmul_accelerate(&dst, &accum, &a, &b, alpha) {
+        let mut dst = dst;
+        act_elements(&mut dst, act);
         return;
     }
-    matmul_at(Level::new(), dst, accum, a, b, alpha)
+    assert_eq!(b.nrows, a.ncols, "matmul: inner dimensions differ");
+    assert_eq!(dst.ncols, b.ncols, "matmul: output shape");
+    matmul_b_act(Level::new(), dst, accum, a, BMat::F32(b), alpha, act)
+}
+
+/// `act` of every element of `dst`, in place.
+fn act_elements(dst: &mut MatMut<f32>, act: Option<Act>) {
+    let Some(act) = act else { return };
+    let (m, n, rs, cs) = (dst.nrows, dst.ncols, dst.rs, dst.cs);
+    if m == 0 || n == 0 {
+        return;
+    }
+    let c = dst.data();
+    match row_major(m, n, rs, cs) {
+        Some(ldc) => {
+            for i in 0..m {
+                act_inplace(act, &mut c[i * ldc..][..n]);
+            }
+        }
+        None => {
+            for i in 0..m {
+                for j in 0..n {
+                    let x = &mut c[i * rs as usize + j * cs as usize];
+                    let mut one = [*x];
+                    act_inplace(act, &mut one);
+                    *x = one[0];
+                }
+            }
+        }
+    }
 }
 
 /// The product through Accelerate, if its layouts are ones `cblas_sgemm`
@@ -222,13 +266,27 @@ pub fn matmul_f16(
     ldb: usize,
     alpha: f32,
 ) {
-    matmul_b(
+    matmul_f16_act(dst, accum, a, b, ldb, alpha, None)
+}
+
+/// [`matmul_f16`], then `act` of C, as [`matmul_act`].
+pub(crate) fn matmul_f16_act(
+    dst: MatMut<f32>,
+    accum: Accum,
+    a: MatRef<f32>,
+    b: &[half::f16],
+    ldb: usize,
+    alpha: f32,
+    act: Option<Act>,
+) {
+    matmul_b_act(
         Level::new(),
         dst,
         accum,
         a,
         BMat::F16 { data: b, ldb },
         alpha,
+        act,
     )
 }
 
@@ -256,7 +314,19 @@ pub fn matmul_f16_packed(
     b: &[half::f16],
     alpha: f32,
 ) {
-    matmul_b(Level::new(), dst, accum, a, BMat::F16Packed(b), alpha)
+    matmul_f16_packed_act(dst, accum, a, b, alpha, None)
+}
+
+/// [`matmul_f16_packed`], then `act` of C, as [`matmul_act`].
+pub(crate) fn matmul_f16_packed_act(
+    dst: MatMut<f32>,
+    accum: Accum,
+    a: MatRef<f32>,
+    b: &[half::f16],
+    alpha: f32,
+    act: Option<Act>,
+) {
+    matmul_b_act(Level::new(), dst, accum, a, BMat::F16Packed(b), alpha, act)
 }
 
 /// [`matmul`] with A an f16 matrix of `dst.nrows` rows of `b.nrows` columns stored as
@@ -392,8 +462,22 @@ pub fn matmul_codes(
     )
 }
 
-fn matmul_b(level: Level, mut dst: MatMut<f32>, accum: Accum, a: MatRef<f32>, b: BMat, alpha: f32) {
+fn matmul_b(level: Level, dst: MatMut<f32>, accum: Accum, a: MatRef<f32>, b: BMat, alpha: f32) {
     crate::kernels::enable_flush_denormals();
+    matmul_b_act(level, dst, accum, a, b, alpha, None)
+}
+
+/// [`matmul_b`], then `act` of C: as `gemm_nn` stores each tile of C, or over the rows
+/// of C once the kernels for few rows or columns have written them.
+fn matmul_b_act(
+    level: Level,
+    mut dst: MatMut<f32>,
+    accum: Accum,
+    a: MatRef<f32>,
+    b: BMat,
+    alpha: f32,
+    act: Option<Act>,
+) {
     let (m, k, n) = (a.nrows, a.ncols, dst.ncols);
     assert_eq!(dst.nrows, m, "matmul: output shape");
     if m == 0 || n == 0 {
@@ -401,8 +485,8 @@ fn matmul_b(level: Level, mut dst: MatMut<f32>, accum: Accum, a: MatRef<f32>, b:
     }
     let add = matches!(accum, Accum::Add);
     let (rsc, csc) = (dst.rs, dst.cs);
-    let c = dst.data();
     if k == 0 {
+        let c = dst.data();
         if !add {
             for i in 0..m {
                 for j in 0..n {
@@ -410,8 +494,10 @@ fn matmul_b(level: Level, mut dst: MatMut<f32>, accum: Accum, a: MatRef<f32>, b:
                 }
             }
         }
+        act_elements(&mut dst, act);
         return;
     }
+    let c = dst.data();
     // An f16 B against a narrow C is widened whole for the dot products.
     let b_wide: Vec<f32>;
     let b = match b {
@@ -498,7 +584,7 @@ fn matmul_b(level: Level, mut dst: MatMut<f32>, accum: Accum, a: MatRef<f32>, b:
             }
         };
         let dims = (m, n, k, lda, alpha, add);
-        run_b(level, dims, a_data, operand, c, (rsc, csc), c_rm)
+        run_b(level, dims, a_data, operand, c, (rsc, csc), c_rm, act)
     })
 }
 
@@ -512,7 +598,17 @@ fn run_b(
     c: &mut [f32],
     (rsc, csc): (isize, isize),
     c_rm: &mut AVec<f32>,
+    act: Option<Act>,
 ) {
+    // The kernels for few rows or columns leave the activation to be applied to the rows
+    // they wrote, still in L1.
+    let act_rows = |c: &mut [f32], ldc: usize| {
+        if let Some(act) = act {
+            for i in 0..m {
+                act_inplace(act, &mut c[i * ldc..][..n]);
+            }
+        }
+    };
     let run = |c: &mut [f32], ldc: usize| match operand {
         BOperand::Rows(b, ldb) => {
             let dims = Dims {
@@ -525,18 +621,19 @@ fn run_b(
                 alpha,
                 add,
                 b_cols: false,
+                act,
             };
             // Packed B is read in panels whatever the rows of C.
             if m <= SMALL_M && !matches!(b, BSrc::F16Packed(_)) {
-                gemm_small_m(level, &dims, a_data, b, c)
+                gemm_small_m(level, &dims, a_data, b, c);
+                act_rows(c, ldc);
             } else {
                 gemm_nn(level, &dims, a_data, b, c)
             }
         }
         // Few rows or columns of C: dot products. Otherwise the columns are packed.
-        BOperand::Columns(bt, ldbt) if n <= DOT_MAX_N || m <= SMALL_M => gemm_dot(
-            level,
-            &DotDims {
+        BOperand::Columns(bt, ldbt) if n <= DOT_MAX_N || m <= SMALL_M => {
+            let dims = DotDims {
                 m,
                 n,
                 k,
@@ -545,11 +642,10 @@ fn run_b(
                 ldc,
                 alpha,
                 add,
-            },
-            a_data,
-            bt,
-            c,
-        ),
+            };
+            gemm_dot(level, &dims, a_data, bt, c);
+            act_rows(c, ldc);
+        }
         BOperand::Columns(bt, ldb) => gemm_nn(
             level,
             &Dims {
@@ -562,6 +658,7 @@ fn run_b(
                 alpha,
                 add,
                 b_cols: true,
+                act,
             },
             a_data,
             BSrc::F32(bt),

@@ -1,8 +1,7 @@
-use crate::kernels::bias_act::bias_act_inplace;
-use crate::kernels::conv2d::Activation;
+use crate::kernels::bias_act::{Act, act_inplace, bias_act_inplace};
 use crate::kernels::matmul::{
-    Accum, Codes, MatMut, MatRef, Par, matmul as strided_matmul, matmul_codes, matmul_f16,
-    matmul_f16_a, matmul_f16_packed, matmul_f16_packed_a,
+    Accum, Codes, MatMut, MatRef, Par, matmul as strided_matmul, matmul_act as strided_matmul_act,
+    matmul_codes, matmul_f16_a, matmul_f16_act, matmul_f16_packed_a, matmul_f16_packed_act,
 };
 use crate::kernels::utils;
 use crate::tensor::TensorView;
@@ -12,7 +11,8 @@ use std::borrow::Cow;
 /// [`matmul_fused_add`], pointwise `conv1d`): f32, or f16, which the kernels widen as they
 /// read it, so that the product is that of the widened matrix, bit for bit.
 pub trait WeightElem: Clone + std::fmt::Debug + 'static {
-    /// `out (+)= a * b`, with `b` the row-major `k x n` matrix at `b`.
+    /// `out (+)= a * b`, with `b` the row-major `k x n` matrix at `b`, then `act` of
+    /// `out`.
     ///
     /// # Safety
     /// `b` must be valid for reads of `k * n` elements.
@@ -24,6 +24,7 @@ pub trait WeightElem: Clone + std::fmt::Debug + 'static {
         b: *const Self,
         k: usize,
         n: usize,
+        act: Option<Act>,
     );
 
     /// `out (+)= a * b`, with `a` the row-major `m x k` matrix at `a`.
@@ -49,10 +50,11 @@ impl WeightElem for f32 {
         b: *const f32,
         k: usize,
         n: usize,
+        act: Option<Act>,
     ) {
         // SAFETY: the caller promised `k * n` readable elements.
         let b = unsafe { MatRef::<f32>::from_raw_parts(b, k, n, n as isize, 1) };
-        strided_matmul(out, accum, a, b, 1.0, Par::Seq);
+        strided_matmul_act(out, accum, a, b, 1.0, act);
     }
 
     unsafe fn matmul_left_into(
@@ -77,10 +79,11 @@ impl WeightElem for half::f16 {
         b: *const half::f16,
         k: usize,
         n: usize,
+        act: Option<Act>,
     ) {
         // SAFETY: the caller promised `k * n` readable elements.
         let b = unsafe { std::slice::from_raw_parts(b, k * n) };
-        matmul_f16(out, accum, a, b, n, 1.0);
+        matmul_f16_act(out, accum, a, b, n, 1.0, act);
     }
 
     unsafe fn matmul_left_into(
@@ -114,11 +117,12 @@ impl WeightElem for PackedF16 {
         b: *const PackedF16,
         k: usize,
         n: usize,
+        act: Option<Act>,
     ) {
         // SAFETY: the caller promised `k * n` readable elements, and `PackedF16` is a
         // transparent `f16`.
         let b = unsafe { std::slice::from_raw_parts(b as *const half::f16, k * n) };
-        matmul_f16_packed(out, accum, a, b, 1.0);
+        matmul_f16_packed_act(out, accum, a, b, 1.0, act);
     }
 
     unsafe fn matmul_left_into(
@@ -174,12 +178,13 @@ where
 }
 
 /// Each batch of `out` (`m x n`, as [`matmul_shape`] gives them) `= a * b`, or `+=`
-/// with [`Accum::Add`].
+/// with [`Accum::Add`], then `act` of it.
 fn matmul_batches<B: WeightElem>(
     a: &TensorView<'_>,
     b: &TensorView<'_, B>,
     ((m, k, n), batch_a, batch_b): ((usize, usize, usize), usize, usize),
     accum: Accum,
+    act: Option<Act>,
     out: &mut [f32],
 ) {
     for (b_i, out) in out.chunks_exact_mut(m * n).enumerate() {
@@ -191,7 +196,15 @@ fn matmul_batches<B: WeightElem>(
             let a_mat =
                 MatRef::<f32>::from_raw_parts(a.data.as_ptr().add(a_offset), m, k, k as isize, 1);
             let out_mat = MatMut::<f32>::from_raw_parts_mut(out.as_mut_ptr(), m, n, n as isize, 1);
-            B::matmul_into(out_mat, accum, a_mat, b.data.as_ptr().add(b_offset), k, n);
+            B::matmul_into(
+                out_mat,
+                accum,
+                a_mat,
+                b.data.as_ptr().add(b_offset),
+                k,
+                n,
+                act,
+            );
         }
     }
 }
@@ -201,13 +214,25 @@ pub fn matmul<'a, B: WeightElem>(
     b: &TensorView<'_, B>,
     out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
+    matmul_act(a, b, None, out_buf)
+}
+
+/// `act?(a * b)`: [`matmul`] with the activation applied as the product is stored,
+/// element for element as its own kernel would apply it
+/// ([`act_inplace`](crate::kernels::act_inplace)).
+pub fn matmul_act<'a, B: WeightElem>(
+    a: &TensorView<'_>,
+    b: &TensorView<'_, B>,
+    act: Option<Act>,
+    out_buf: &'a mut Vec<f32>,
+) -> TensorView<'a> {
     let (dims, batch_a, batch_b, out_shape) = matmul_shape(a, b);
     let output_len = out_shape.iter().product();
     // SAFETY: the product replaces every element.
     unsafe { utils::ensure_capacity(out_buf, output_len) };
     let out = &mut out_buf[..output_len];
     if output_len > 0 {
-        matmul_batches(a, b, (dims, batch_a, batch_b), Accum::Replace, out);
+        matmul_batches(a, b, (dims, batch_a, batch_b), Accum::Replace, act, out);
     }
     TensorView {
         data: Cow::Borrowed(out),
@@ -263,6 +288,19 @@ pub fn matmul_fused_add<'a, B: WeightElem>(
     bias: &TensorView<'_>,
     out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
+    matmul_fused_add_act(a, b, bias, None, out_buf)
+}
+
+/// `act?(a * b + bias)`: [`matmul_fused_add`] with the activation applied as the sum is
+/// stored, element for element as its own kernel would apply it
+/// ([`act_inplace`](crate::kernels::act_inplace)).
+pub fn matmul_fused_add_act<'a, B: WeightElem>(
+    a: &TensorView<'_>,
+    b: &TensorView<'_, B>,
+    bias: &TensorView<'_>,
+    act: Option<Act>,
+    out_buf: &'a mut Vec<f32>,
+) -> TensorView<'a> {
     let (dims, batch_a, batch_b, out_shape) = matmul_shape(a, b);
     let n = dims.2;
     let out_numel: usize = out_shape.iter().product();
@@ -280,7 +318,8 @@ pub fn matmul_fused_add<'a, B: WeightElem>(
     // How the bias broadcasts against the output.
     let bias_shape = utils::broadcast_shapes(&out_shape, &bias.shape);
     assert!(
-        bias_shape.as_ref() == Some(&out_shape) && bias_data.len() == bias.shape.iter().product(),
+        bias_shape.as_ref() == Some(&out_shape)
+            && bias_data.len() == bias.shape.iter().product::<usize>(),
         "MatMul output {out_shape:?} and bias {:?} do not broadcast",
         bias.shape
     );
@@ -289,15 +328,15 @@ pub fn matmul_fused_add<'a, B: WeightElem>(
         for row in out.chunks_exact_mut(n) {
             row.copy_from_slice(bias_data);
         }
-        matmul_batches(a, b, (dims, batch_a, batch_b), Accum::Add, out);
+        matmul_batches(a, b, (dims, batch_a, batch_b), Accum::Add, act, out);
     } else {
-        matmul_batches(a, b, (dims, batch_a, batch_b), Accum::Replace, out);
+        matmul_batches(a, b, (dims, batch_a, batch_b), Accum::Replace, None, out);
         // The bias repeats whole over the output when its dimensions, past any
         // leading ones, are the output's last ones.
         let first = bias.shape.iter().position(|&d| d != 1);
         let trailing = first.map_or(&[][..], |f| &bias.shape[f..]);
         if bias_data.len() == 1 {
-            bias_act_inplace(out, bias_data[0], Activation::None);
+            bias_act_inplace(out, bias_data[0], None);
         } else if out_shape.ends_with(trailing) {
             for chunk in out.chunks_exact_mut(bias_data.len()) {
                 for (o, &b) in chunk.iter_mut().zip(bias_data) {
@@ -327,6 +366,10 @@ pub fn matmul_fused_add<'a, B: WeightElem>(
                     coords[d] = 0;
                 }
             }
+        }
+        // The bias comes after the product here, and the activation after it.
+        if let Some(act) = act {
+            act_inplace(act, out);
         }
     }
     TensorView {
@@ -475,6 +518,23 @@ pub fn gemm<'a>(
 mod tests {
     use super::*;
 
+    /// [`linear_swiglu`] is bit for bit the chain it replaces, except where the
+    /// product goes to Accelerate: CBLAS blocks by the width of C, so a 2n-wide
+    /// product sums the same terms in a different order from two n-wide ones.
+    fn assert_same_product(got: &[f32], want: &[f32], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        let worst = got
+            .iter()
+            .zip(want)
+            .map(|(&g, &w)| (g - w).abs() / w.abs().max(1.0))
+            .fold(0.0f32, f32::max);
+        if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+            assert!(worst <= 1e-6, "{what}: worst error {worst:e}");
+        } else {
+            assert_eq!(got, want, "{what}");
+        }
+    }
+
     /// `linear_swiglu` is the two products, `silu` and `mul` it replaces, bit for
     /// bit, with f32, f16 and packed f16 weights, and rows of C below and above
     /// the small-M kernel's, for gates a multiple of `PACK_COLS` wide.
@@ -526,7 +586,7 @@ mod tests {
                     &mut out,
                 );
                 assert_eq!(got.shape.as_ref(), &[m, n]);
-                assert_eq!(got.data.as_ref(), want, "f32, m {m}, n {n}");
+                assert_same_product(&got.data, &want, &format!("f32, m {m}, n {n}"));
                 // f16 weights, as stored and packed.
                 let f16 = |x: &[f32]| -> Vec<half::f16> {
                     x.iter().map(|&x| half::f16::from_f32(x)).collect()
@@ -552,7 +612,7 @@ mod tests {
                     &bias_both,
                     &mut out,
                 );
-                assert_eq!(got.data.as_ref(), want, "f16, m {m}, n {n}");
+                assert_same_product(&got.data, &want, &format!("f16, m {m}, n {n}"));
                 let packed = |h: &[half::f16], cols: usize| -> Vec<PackedF16> {
                     pack_f16(h, k, cols).into_iter().map(PackedF16).collect()
                 };
@@ -577,7 +637,78 @@ mod tests {
                     &bias_both,
                     &mut out,
                 );
-                assert_eq!(got.data.as_ref(), want, "packed f16, m {m}, n {n}");
+                assert_same_product(&got.data, &want, &format!("packed f16, m {m}, n {n}"));
+            }
+        }
+    }
+
+    /// A product applying an activation is the product, then the activation's own kernel,
+    /// bit for bit: rows of C for the small-M kernel and for the panels (with a narrow last
+    /// panel, and two depth blocks), few columns for the dot products, no depth, a batch;
+    /// f32, f16 and packed f16 weights; a bias per column and a scalar one.
+    #[test]
+    fn test_product_activation_is_the_product_then_the_activation() {
+        use crate::kernels::bias_act::{Act, act_inplace};
+        use crate::kernels::matmul::{PACK_COLS, pack_f16};
+        use crate::kernels::test_util::assert_same_bits;
+        let value = |i: usize, scale: f32| ((i * 7919) % 23) as f32 * scale - 1.0;
+        let then = |y: TensorView<'_>, act: Act| {
+            let mut y = y.data.to_vec();
+            act_inplace(act, &mut y);
+            y
+        };
+        // (batch, m, k, n)
+        for (batch, m, k, n) in [
+            (1, 1, 40, 48),
+            (1, 3, 40, 10),
+            (1, 7, 40, 40),
+            (1, 13, 1100, 33),
+            (2, 6, 40, 32),
+            (1, 5, 0, 16),
+        ] {
+            let a: Vec<f32> = (0..batch * m * k).map(|i| value(i, 0.11)).collect();
+            let w: Vec<f32> = (0..k * n).map(|i| value(i, 0.07)).collect();
+            let bias: Vec<f32> = (0..n).map(|i| value(i, 0.05)).collect();
+            let at = TensorView::from_slice(&a, vec![batch, m, k]);
+            let wt = TensorView::from_slice(&w, vec![k, n]);
+            let h: Vec<half::f16> = w.iter().map(|&x| half::f16::from_f32(x)).collect();
+            let ht = TensorView::from_slice(&h, vec![k, n]);
+            let packed: Vec<PackedF16> = if n % PACK_COLS == 0 && k > 0 {
+                pack_f16(&h, k, n).into_iter().map(PackedF16).collect()
+            } else {
+                Vec::new()
+            };
+            let (col_bias, one_bias) = (
+                TensorView::from_slice(&bias, vec![n]),
+                TensorView::from_slice(&bias[..1], vec![1]),
+            );
+            let (mut p, mut out) = (Vec::new(), Vec::new());
+            for act in [Act::Relu, Act::Silu, Act::Sigmoid, Act::GeluErf] {
+                let what = |weights: &str| format!("{weights} {batch}x{m}x{k}x{n} {act:?}");
+                let want = then(matmul(&at, &wt, &mut p), act);
+                assert_same_bits(
+                    &matmul_act(&at, &wt, Some(act), &mut out).data,
+                    &want,
+                    &what("f32"),
+                );
+                let want = then(matmul(&at, &ht, &mut p), act);
+                assert_same_bits(
+                    &matmul_act(&at, &ht, Some(act), &mut out).data,
+                    &want,
+                    &what("f16"),
+                );
+                if !packed.is_empty() {
+                    let pt = TensorView::from_slice(&packed, vec![k, n]);
+                    let want = then(matmul(&at, &pt, &mut p), act);
+                    let got = matmul_act(&at, &pt, Some(act), &mut out);
+                    assert_same_bits(&got.data, &want, &what("packed f16"));
+                }
+                for bias in [&col_bias, &one_bias] {
+                    let want = then(matmul_fused_add(&at, &wt, bias, &mut p), act);
+                    let got = matmul_fused_add_act(&at, &wt, bias, Some(act), &mut out);
+                    assert_eq!(*got.shape, [batch, m, n]);
+                    assert_same_bits(&got.data, &want, &what("f32 + bias"));
+                }
             }
         }
     }

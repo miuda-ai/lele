@@ -334,30 +334,6 @@ fn widened<'s, T>(widened: &'s [T], index: &[(usize, usize)], offset: usize, len
 /// Fused ops the compiler's patterns emit as `self.<op>(...)`.
 #[allow(clippy::too_many_arguments)]
 impl Weights<'_> {
-    pub fn conv1d_relu<'c, 'd>(
-        &self,
-        input: TensorView<'c>,
-        weight: TensorView<'c>,
-        bias: Option<&TensorView<'c>>,
-        stride: usize,
-        dilation: usize,
-        groups: usize,
-        padding: usize,
-        output_buf: &'d mut Vec<f32>,
-    ) -> TensorView<'d> {
-        kernels::conv1d_fused(
-            &input,
-            &weight,
-            bias,
-            &[dilation as i64],
-            groups as i64,
-            &[padding as i64, padding as i64],
-            &[stride as i64],
-            true,
-            output_buf,
-        )
-    }
-
     pub fn layer_norm<'c, 'd>(
         &self,
         input: &TensorView<'c>,
@@ -371,6 +347,8 @@ impl Weights<'_> {
         kernels::layer_norm(input, &scale, &bias, -1, eps, output_buf)
     }
 
+    /// Dynamically quantized linear layer (+ activation), its weight packed on every call.
+    #[allow(clippy::too_many_arguments)]
     pub fn linear_quantized<'c, 'd>(
         &self,
         input: &TensorView<'c>,
@@ -378,35 +356,32 @@ impl Weights<'_> {
         weight_scale: TensorView<'c>,
         weight_zero: TensorView<'c>,
         bias: TensorView<'c>,
+        act: Option<kernels::Act>,
         output_buf: &'d mut Vec<f32>,
     ) -> TensorView<'d> {
-        kernels::fused_quantized_linear(input, &weight_int8, &weight_scale, &weight_zero, &bias, false, output_buf)
+        kernels::fused_quantized_linear(
+            input,
+            &weight_int8,
+            &weight_scale,
+            &weight_zero,
+            &bias,
+            act,
+            output_buf,
+        )
     }
 
-    pub fn linear_quantized_relu<'c, 'd>(
-        &self,
-        input: &TensorView<'c>,
-        weight_int8: TensorView<'c>,
-        weight_scale: TensorView<'c>,
-        weight_zero: TensorView<'c>,
-        bias: TensorView<'c>,
-        output_buf: &'d mut Vec<f32>,
-    ) -> TensorView<'d> {
-        kernels::fused_quantized_linear(input, &weight_int8, &weight_scale, &weight_zero, &bias, true, output_buf)
-    }
-
-    /// Dynamically quantized linear layer (+ ReLU) against an int8 weight packed
+    /// Dynamically quantized linear layer (+ activation) against an int8 weight packed
     /// once for the integer GEMM.
     pub fn linear_quantized_packed<'c, 'd>(
         &self,
         input: &TensorView<'c>,
         weight: &QWeights,
         bias: TensorView<'c>,
-        relu: bool,
+        act: Option<kernels::Act>,
         output_buf: &'d mut Vec<f32>,
     ) -> TensorView<'d> {
         let bias = (!bias.data.is_empty()).then_some(&bias.data[..]);
-        kernels::qlinear_dynamic(input, weight, bias, relu, output_buf)
+        kernels::qlinear_dynamic(input, weight, bias, act, output_buf)
     }
 
     /// MatMulInteger against a static weight packed for the integer GEMM.
@@ -514,6 +489,18 @@ impl Weights<'_> {
         output_buf: &'d mut Vec<f32>,
     ) -> TensorView<'d> {
         kernels::matmul_fused_add(input, weight, bias, output_buf)
+    }
+
+    /// [`linear`](Self::linear), then `act`, applied as the output is written.
+    pub fn linear_act<'c, 'd, B: kernels::WeightElem>(
+        &self,
+        input: &TensorView<'c>,
+        weight: &TensorView<'c, B>,
+        bias: &TensorView<'c>,
+        act: Option<kernels::Act>,
+        output_buf: &'d mut Vec<f32>,
+    ) -> TensorView<'d> {
+        kernels::matmul_fused_add_act(input, weight, bias, act, output_buf)
     }
 
     /// ConstantOfShape + Concat: `weight` followed along axis 0 by a tensor of

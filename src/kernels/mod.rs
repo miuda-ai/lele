@@ -69,15 +69,17 @@ pub(crate) mod test_util;
 pub mod timing;
 pub mod utils;
 pub(crate) mod window2d;
+pub use bias_act::{Act, act_inplace, activated};
 pub use conv_integer::{ConvWeights, conv_integer, conv_integer_packed};
 pub use conv1d::{conv1d, conv1d_pointwise};
-pub use conv1d::{conv1d_fused, conv1d_silu};
+pub use conv1d::conv1d_fused;
 pub use conv2d::{
-    conv_transpose, conv2d, conv2d_fused, conv2d_silu, gather_elements, max_pool2d, resize_nearest,
+    conv_transpose, conv2d, conv2d_fused, gather_elements, max_pool2d, resize_nearest,
     topk,
 };
 pub use gemm::{
-    PackedF16, WeightElem, gemm, linear_swiglu, matmul, matmul_fused_add, weight_only_matmul,
+    PackedF16, WeightElem, gemm, linear_swiglu, matmul, matmul_act, matmul_fused_add,
+    matmul_fused_add_act, weight_only_matmul,
 };
 pub use matmul::Codes;
 pub use manipulation::*;

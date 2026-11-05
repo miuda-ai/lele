@@ -591,7 +591,7 @@ fn bench_window2d(c: &mut Criterion) {
         });
         group.bench_function(BenchmarkId::new("depthwise_silu", &name), |bencher| {
             bencher.iter(|| {
-                let _ = lele::kernels::conv2d_silu(
+                let _ = lele::kernels::conv2d_fused(
                     black_box(&input),
                     &weights,
                     Some(&bias),
@@ -599,6 +599,7 @@ fn bench_window2d(c: &mut Criterion) {
                     ch as i64,
                     &pads,
                     &strides,
+                    Some(lele::kernels::Act::Silu),
                     &mut out,
                 );
             });

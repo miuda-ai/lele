@@ -254,11 +254,11 @@ fn bench_int8_linear(m: usize, k: usize, n: usize, iters: usize) -> f64 {
     let mut out = Vec::new();
 
     // Warmup
-    let _ = fused_quantized_linear(&input, &weight, &scale, &zero, &bias, false, &mut out);
+    let _ = fused_quantized_linear(&input, &weight, &scale, &zero, &bias, None, &mut out);
 
     let start = now_ns();
     for _ in 0..iters {
-        let _ = fused_quantized_linear(&input, &weight, &scale, &zero, &bias, false, &mut out);
+        let _ = fused_quantized_linear(&input, &weight, &scale, &zero, &bias, None, &mut out);
     }
     let end = now_ns();
     elapsed_ms(start, end) / iters as f64

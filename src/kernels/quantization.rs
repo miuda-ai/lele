@@ -1,3 +1,4 @@
+use crate::kernels::bias_act::Act;
 use crate::kernels::simd::simd_call;
 use crate::tensor::TensorView;
 use fearless_simd::{Level, Simd, f32x8};
@@ -36,41 +37,11 @@ pub fn mat_mul_integer_with_scale_bias<'a, 'b, 'c>(
     bias: Option<&TensorView<'b, f32>>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
-    mat_mul_integer_with_scale_bias_activation(
-        a,
-        b,
-        a_zero_point,
-        b_zero_point,
-        scale,
-        bias,
-        false,
-        out,
-    )
+    mat_mul_integer_with_scale_bias_act(a, b, a_zero_point, b_zero_point, scale, bias, None, out)
 }
 
-// MatMulInteger with optional scale, bias, and ReLU fusion
-pub fn mat_mul_integer_with_scale_bias_relu<'a, 'b, 'c>(
-    a: &TensorView<'b, f32>,
-    b: &TensorView<'c, f32>,
-    a_zero_point: Option<&TensorView<'b, f32>>,
-    b_zero_point: Option<&TensorView<'c, f32>>,
-    scale: Option<&TensorView<'b, f32>>,
-    bias: Option<&TensorView<'b, f32>>,
-    out: &'a mut Vec<f32>,
-) -> TensorView<'a, f32> {
-    mat_mul_integer_with_scale_bias_activation(
-        a,
-        b,
-        a_zero_point,
-        b_zero_point,
-        scale,
-        bias,
-        true,
-        out,
-    )
-}
-
-/// Fully-fused quantized linear: DynamicQuantizeLinear + MatMulInteger + Scale + Bias [+ ReLU].
+/// Fully-fused quantized linear: DynamicQuantizeLinear + MatMulInteger + Scale + Bias
+/// [+ activation].
 ///
 /// The weight arrives as a tensor here, so it is packed for [`crate::kernels::qgemm`] on
 /// every call; generated code packs the weights it knows once instead
@@ -81,7 +52,7 @@ pub fn fused_quantized_linear<'a>(
     weight_scale: &TensorView<'_, f32>,
     weight_zero: &TensorView<'_, f32>,
     bias: &TensorView<'_, f32>,
-    apply_relu: bool,
+    act: Option<Act>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
     use crate::kernels::qgemm::{QWeights, qlinear_dynamic};
@@ -99,19 +70,20 @@ pub fn fused_quantized_linear<'a>(
         &weight_scale.data,
     );
     let bias = (!bias.data.is_empty()).then_some(&bias.data[..]);
-    qlinear_dynamic(input, &w, bias, apply_relu, out)
+    qlinear_dynamic(input, &w, bias, act, out)
 }
 
 /// `MatMulInteger` with B given at run time, through [`crate::kernels::qgemm`]: it takes
-/// `u8` and `i8` weights alike.
-fn mat_mul_integer_with_scale_bias_activation<'a, 'b, 'c>(
+/// `u8` and `i8` weights alike. Then a scale (one, or one per column), a bias and an
+/// activation, each if given.
+pub fn mat_mul_integer_with_scale_bias_act<'a, 'b, 'c>(
     a: &TensorView<'b, f32>,
     b: &TensorView<'c, f32>,
     a_zero_point: Option<&TensorView<'b, f32>>,
     b_zero_point: Option<&TensorView<'c, f32>>,
     scale: Option<&TensorView<'b, f32>>,
     bias: Option<&TensorView<'b, f32>>,
-    apply_relu: bool,
+    act: Option<Act>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
     let a_zp = a_zero_point
@@ -128,7 +100,7 @@ fn mat_mul_integer_with_scale_bias_activation<'a, 'b, 'c>(
         &b_zp,
         scale.map(|s| &s.data[..]),
         bias.map(|b| &b.data[..]),
-        apply_relu,
+        act,
         out,
     )
 }
