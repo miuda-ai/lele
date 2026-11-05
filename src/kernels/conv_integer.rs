@@ -360,11 +360,11 @@ mod tests {
             (1, 4, 3, 3, 3, 3, 3, 1, [1, 1], [0; 4], [1, 1]),
             (1, 4, 9, 8, 6, 3, 3, 1, [1, 2], [1, 2, 1, 0], [1, 1]),
         ];
-        // The GEMM with both layouts at every level (the quads emulate VNNI off the AVX-512
-        // level), then the f32 path wherever its sums are exact.
+        // The GEMM with every layout at every level (the dot layouts emulate their
+        // instructions elsewhere), then the f32 path wherever its sums are exact.
         let runs = levels()
             .into_iter()
-            .flat_map(|l| [(l, Layout::Pairs, 0), (l, Layout::Quads, 0)])
+            .flat_map(|l| Layout::ALL.map(|layout| (l, layout, 0)))
             .chain([(Level::new(), Layout::for_level(Level::new()), EXACT_F32_DEPTH)]);
         for (level, layout, float_depth) in runs {
             for (i, &(n, c, h, wd, oc, kh, kw, groups, d, p, s)) in cases.iter().enumerate() {

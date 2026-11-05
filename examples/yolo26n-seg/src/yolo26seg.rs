@@ -43,8 +43,6 @@ impl Yolo26SegWorkspace {
 pub struct Yolo26Seg<'a> {
     data: &'a [u8],
     _phantom: std::marker::PhantomData<&'a ()>,
-    #[cfg(target_arch = "aarch64")]
-    prepared_weights_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<lele::kernels::PreparedWeightsArm>>>,
 }
 
 impl<'a> Yolo26Seg<'a> {
@@ -52,8 +50,6 @@ impl<'a> Yolo26Seg<'a> {
         Self {
             data,
             _phantom: std::marker::PhantomData,
-            #[cfg(target_arch = "aarch64")]
-            prepared_weights_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 fn conv1d_relu<'c, 'd>(
@@ -117,85 +113,6 @@ fn linear_quantized_relu<'c, 'd>(
     lele::kernels::fused_quantized_linear(
         input, &weight_int8, &weight_scale, &weight_zero, &bias, true, output_buf,
     )
-}
-
-#[cfg(target_arch = "aarch64")]
-fn linear_quantized_arm<'c, 'd>(
-    &self,
-    input: &lele::tensor::TensorView<'c, f32>,
-    weight_offset: usize,
-    weight_len: usize,
-    weight_k: usize,
-    weight_n: usize,
-    weight_scale: lele::tensor::TensorView<'c, f32>,
-    weight_zero: lele::tensor::TensorView<'c, f32>,
-    bias: lele::tensor::TensorView<'c, f32>,
-    output_buf: &'d mut Vec<f32>,
-) -> lele::tensor::TensorView<'d, f32> {
-    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n);
-    let zp_b = weight_zero.data.first().map(|&v| v as u8);
-
-    lele::kernels::fused_dq_gemm_prepared_arm(
-        input,
-        &pw,
-        zp_b,
-        &weight_scale,
-        Some(&bias),
-        false,
-        output_buf,
-    )
-}
-
-/// ARM-optimized quantized linear + ReLU with pre-packed weights.
-/// Uses fused DynQuant+GEMM: eliminates f32 intermediate buffer, per-call u8
-/// allocation, and separate f32→u8 conversion pass.
-#[cfg(target_arch = "aarch64")]
-fn linear_quantized_relu_arm<'c, 'd>(
-    &self,
-    input: &lele::tensor::TensorView<'c, f32>,
-    weight_offset: usize,
-    weight_len: usize,
-    weight_k: usize,
-    weight_n: usize,
-    weight_scale: lele::tensor::TensorView<'c, f32>,
-    weight_zero: lele::tensor::TensorView<'c, f32>,
-    bias: lele::tensor::TensorView<'c, f32>,
-    output_buf: &'d mut Vec<f32>,
-) -> lele::tensor::TensorView<'d, f32> {
-    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n);
-    let zp_b = weight_zero.data.first().map(|&v| v as u8);
-
-    lele::kernels::fused_dq_gemm_prepared_arm(
-        input,
-        &pw,
-        zp_b,
-        &weight_scale,
-        Some(&bias),
-        true,
-        output_buf,
-    )
-}
-
-/// ARM-optimized MatMulInteger with pre-packed weight cache.
-/// Used for unfused MatMulInteger nodes where B is a static model weight.
-/// Eliminates: per-call B packing, B u8→f32→u8 roundtrip, heap alloc.
-#[cfg(target_arch = "aarch64")]
-fn mat_mul_integer_arm<'c, 'd>(
-    &self,
-    a: &lele::tensor::TensorView<'c, f32>,
-    weight_offset: usize,
-    weight_len: usize,
-    weight_k: usize,
-    weight_n: usize,
-    a_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
-    b_zero_point: Option<&lele::tensor::TensorView<'c, f32>>,
-    output_buf: &'d mut Vec<f32>,
-) -> lele::tensor::TensorView<'d, f32> {
-    let pw = self.get_prepared_weight(weight_offset, weight_len, weight_k, weight_n);
-    let zp_a = a_zero_point.and_then(|z| z.data.first().cloned());
-    let zp_b = b_zero_point.and_then(|z| z.data.first()).map(|&v| v as u8);
-
-    lele::kernels::mat_mul_integer_prepared_arm(a, &pw, zp_a, zp_b, None, None, false, output_buf)
 }
 
 // Helper for pre-quantized inputs (used in attention where input is already quantized)
@@ -660,20 +577,6 @@ fn embedding_concat_i64<'c, 'd>(
     }
 
 
-    #[cfg(target_arch = "aarch64")]
-    fn get_prepared_weight(&self, offset: usize, len: usize, k: usize, n: usize) -> std::sync::Arc<lele::kernels::PreparedWeightsArm> {
-        let key = (offset, len);
-        {
-            let cache = self.prepared_weights_cache.borrow();
-            if let Some(pw) = cache.get(&key) {
-                return pw.clone();
-            }
-        }
-        let raw_bytes = &self.data[offset..offset+len];
-        let pw = std::sync::Arc::new(lele::kernels::prepare_weights_arm(raw_bytes, k, n));
-        self.prepared_weights_cache.borrow_mut().insert(key, pw.clone());
-        pw
-    }
     fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {
         TensorView::from_bytes_f32(&self.data[offset..offset+len], shape)
     }
