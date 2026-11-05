@@ -72,7 +72,7 @@ impl<'a> OpContext<'a> {
 }
 
 /// Element type of the `TensorView` holding a value in generated code.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum ElemType {
     #[default]
     F32,
@@ -94,6 +94,16 @@ impl ElemType {
         match self {
             Self::F32 => "f32",
             Self::I64 => "i64",
+        }
+    }
+
+    /// Whether a `Cast` to `to` of a tensor of this type is generated as a view of
+    /// its input rather than a conversion into a buffer of its own.
+    pub fn cast_is_view(self, to: DType) -> bool {
+        match to {
+            DType::I64 | DType::I32 | DType::Bool => false,
+            DType::F32 => self == Self::F32,
+            _ => true,
         }
     }
 }
@@ -402,14 +412,14 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
         generate_nodes(
             chunk, &mut f, 2, weights, allocator, analysis, current_id, compiler, var_types,
         )?;
-        // Return — detach_or_own (zero-copy) for f32 views of the workspace or the weights,
-        // which outlive the chunk; to_owned for everything else, i64 and views of buffers
-        // local to the chunk included, which are freed when it returns.
+        // Return — detach_or_own (zero-copy) for views of the workspace or the weights,
+        // which outlive the chunk; to_owned for everything else, views of buffers local
+        // to the chunk included, which are freed when it returns.
         let body = String::from_utf8_lossy(&f).into_owned();
         let ret_vals: Vec<String> = chunk_outputs
             .iter()
             .map(|s| {
-                if var_types.get(s) == ElemType::F32 && outlives_chunk(&body, s, 0) {
+                if outlives_chunk(&body, s, 0) {
                     format!("unsafe {{ {}.detach_or_own() }}", s)
                 } else {
                     format!("{}.to_owned()", s)
@@ -479,8 +489,8 @@ fn outlives_chunk(body: &str, var: &str, depth: usize) -> bool {
     if depth > 64 {
         return false;
     }
-    // Multi-output kernels (`let (a, b) = topk(..)`, `split`, ...) write
-    // buffers local to the chunk.
+    // Multi-output kernels (`let (a, b) = topk(..)`, ...) write buffers local to the
+    // chunk.
     let in_tuple = body.lines().map(str::trim_start).any(|l| {
         l.strip_prefix("let (")
             .and_then(|l| l.split_once(") ="))
@@ -617,11 +627,7 @@ pub(crate) fn generate_nodes(
         let buf_expr = if let Some(alloc) = allocator {
             if !node.output.is_empty() {
                 if let Some(&idx) = alloc.tensor_to_buffer.get(&node.output[0]) {
-                    if is_i64 {
-                        format!("&mut buf_{}", outputs[0])
-                    } else {
-                        format!("&mut ws.buf_{}", idx)
-                    }
+                    format!("&mut ws.buf_{}", idx)
                 } else {
                     if !outputs.is_empty() {
                         format!("&mut buf_{}", outputs[0])
@@ -937,6 +943,72 @@ mod tests {
         assert!(!unpacked.code.contains("weight_f16_packed"));
         assert!(contains(&unpacked.weights, &raw));
         assert!(contains(&unpacked.weights, &bytes(&conv)));
+    }
+
+    /// i64 tensors, casts and every output of a Split are written into the workspace,
+    /// each into a buffer of its own type, not into vectors allocated on every call.
+    #[test]
+    fn test_workspace_holds_i64_tensors_casts_and_splits() {
+        use crate::model::onnx_proto::{AttributeProto, GraphProto, TensorProto, ValueInfoProto};
+        let info = |name: &str| ValueInfoProto {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let node = |op: &str, input: &[&str], output: &[&str], attribute: Vec<AttributeProto>| {
+            NodeProto {
+                op_type: op.to_string(),
+                input: input.iter().map(|s| s.to_string()).collect(),
+                output: output.iter().map(|s| s.to_string()).collect(),
+                attribute,
+                ..Default::default()
+            }
+        };
+        let int = |name: &str, i: i64| AttributeProto {
+            name: name.to_string(),
+            i,
+            ..Default::default()
+        };
+        let graph = GraphProto {
+            node: vec![
+                node("Shape", &["x"], &["s"], vec![]),
+                node("Gather", &["s", "idx"], &["g"], vec![]),
+                node("Cast", &["g"], &["c"], vec![int("to", DType::F32.to_onnx() as i64)]),
+                node("Split", &["x"], &["a", "b"], vec![int("axis", 0)]),
+            ],
+            initializer: vec![TensorProto {
+                name: "idx".to_string(),
+                data_type: DType::I64.to_onnx(),
+                dims: vec![1],
+                raw_data: 0i64.to_le_bytes().to_vec(),
+                ..Default::default()
+            }],
+            input: vec![info("x")],
+            output: ["c", "a", "b"].map(info).to_vec(),
+            ..Default::default()
+        };
+        let code = Compiler::new().compile(&graph).unwrap().code;
+        assert!(!code.contains("Vec::<"), "{code}");
+        let buffer = |call: &str| -> String {
+            let line = code.lines().find(|l| l.contains(call)).unwrap_or_else(|| panic!("{code}"));
+            let at = line.find("&mut ws.buf_").unwrap_or_else(|| panic!("{line}"));
+            let digits = &line[at + "&mut ws.buf_".len()..];
+            let n: String = digits.chars().take_while(char::is_ascii_digit).collect();
+            format!("pub buf_{n}: ")
+        };
+        let field = |call: &str| {
+            let name = buffer(call);
+            code.lines()
+                .find_map(|l| l.trim().strip_prefix(&name))
+                .unwrap_or_else(|| panic!("{code}"))
+                .to_string()
+        };
+        assert_eq!(field("kernels::gather("), "Vec<i64>,");
+        assert_eq!(field("cast_to_f32("), "Vec<f32>,");
+        assert_eq!(field("split_one(&x, 0, &[0, 0], 0,"), "Vec<f32>,");
+        assert_ne!(
+            buffer("split_one(&x, 0, &[0, 0], 0,"),
+            buffer("split_one(&x, 0, &[0, 0], 1,")
+        );
     }
 
     /// An `If` branch that returns one of its initializers reads it through

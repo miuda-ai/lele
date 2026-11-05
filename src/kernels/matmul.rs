@@ -377,41 +377,58 @@ fn matmul_b(level: Level, mut dst: MatMut<f32>, accum: Accum, a: MatRef<f32>, b:
         }
         BMat::F32(b) => Ok(b),
     };
-    // Copy what is not row-major into row-major.
-    let a_data = a.data();
-    let a_rm;
-    let (a_data, lda) = match row_major(m, k, a.rs, a.cs) {
-        Some(lda) => (a_data, lda),
-        None => {
-            a_rm = gather(a_data, m, k, a.rs as usize, a.cs as usize);
-            (&a_rm[..], k)
-        }
-    };
-    // A narrow C is computed as dot products against the columns of B, a wider one
-    // from panels of its rows.
-    let b_rm;
-    let operand = match &b {
-        Err((b, ldb)) => BOperand::Rows(*b, *ldb),
-        Ok(b) => {
-            let b_data = b.data();
-            if n <= DOT_MAX_N {
-                match row_major(n, k, b.cs, b.rs) {
-                    Some(ldbt) => BOperand::Columns(b_data, ldbt),
-                    None => {
-                        b_rm = gather(b_data, n, k, b.cs as usize, b.rs as usize);
-                        BOperand::Columns(&b_rm, k)
+    // Row-major copies of what is not row-major, kept for the thread (as large as the
+    // largest seen).
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<[Vec<f32>; 3]> =
+            const { std::cell::RefCell::new([Vec::new(), Vec::new(), Vec::new()]) };
+    }
+    SCRATCH.with_borrow_mut(|[a_rm, b_rm, c_rm]| {
+        let a_data = a.data();
+        let (a_data, lda) = match row_major(m, k, a.rs, a.cs) {
+            Some(lda) => (a_data, lda),
+            None => (gather(a_rm, a_data, m, k, a.rs as usize, a.cs as usize), k),
+        };
+        // A narrow C is computed as dot products against the columns of B, a wider one
+        // from panels of its rows.
+        let operand = match &b {
+            Err((b, ldb)) => BOperand::Rows(*b, *ldb),
+            Ok(b) => {
+                let b_data = b.data();
+                if n <= DOT_MAX_N {
+                    match row_major(n, k, b.cs, b.rs) {
+                        Some(ldbt) => BOperand::Columns(b_data, ldbt),
+                        None => BOperand::Columns(
+                            gather(b_rm, b_data, n, k, b.cs as usize, b.rs as usize),
+                            k,
+                        ),
                     }
+                } else if let Some(ldb) = row_major(k, n, b.rs, b.cs) {
+                    BOperand::Rows(BSrc::F32(b_data), ldb)
+                } else if let Some(ldbt) = row_major(n, k, b.cs, b.rs) {
+                    BOperand::Columns(b_data, ldbt)
+                } else {
+                    let b_data = gather(b_rm, b_data, k, n, b.rs as usize, b.cs as usize);
+                    BOperand::Rows(BSrc::F32(b_data), n)
                 }
-            } else if let Some(ldb) = row_major(k, n, b.rs, b.cs) {
-                BOperand::Rows(BSrc::F32(b_data), ldb)
-            } else if let Some(ldbt) = row_major(n, k, b.cs, b.rs) {
-                BOperand::Columns(b_data, ldbt)
-            } else {
-                b_rm = gather(b_data, k, n, b.rs as usize, b.cs as usize);
-                BOperand::Rows(BSrc::F32(&b_rm), n)
             }
-        }
-    };
+        };
+        let dims = (m, n, k, lda, alpha, add);
+        run_b(level, dims, a_data, operand, c, (rsc, csc), c_rm)
+    })
+}
+
+/// [`matmul_b`] on row-major A: C is computed in place if row-major, else in `c_rm`
+/// and scattered.
+fn run_b(
+    level: Level,
+    (m, n, k, lda, alpha, add): (usize, usize, usize, usize, f32, bool),
+    a_data: &[f32],
+    operand: BOperand,
+    c: &mut [f32],
+    (rsc, csc): (isize, isize),
+    c_rm: &mut Vec<f32>,
+) {
     let run = |c: &mut [f32], ldc: usize| match operand {
         BOperand::Rows(b, ldb) => {
             let dims = Dims {
@@ -471,18 +488,16 @@ fn matmul_b(level: Level, mut dst: MatMut<f32>, accum: Accum, a: MatRef<f32>, b:
         Some(ldc) => run(c, ldc),
         None => {
             // Column-major (or otherwise strided) C: compute row-major, then scatter.
-            let mut tmp = vec![0.0f32; m * n];
             if add {
-                for i in 0..m {
-                    for j in 0..n {
-                        tmp[i * n + j] = c[i * rsc as usize + j * csc as usize];
-                    }
-                }
+                gather(c_rm, c, m, n, rsc as usize, csc as usize);
+            } else {
+                c_rm.clear();
+                c_rm.resize(m * n, 0.0);
             }
-            run(&mut tmp, n);
+            run(c_rm, n);
             for i in 0..m {
                 for j in 0..n {
-                    c[i * rsc as usize + j * csc as usize] = tmp[i * n + j];
+                    c[i * rsc as usize + j * csc as usize] = c_rm[i * n + j];
                 }
             }
         }
@@ -500,12 +515,22 @@ enum BOperand<'a> {
     Columns(&'a [f32], usize),
 }
 
-/// A row-major copy of a strided `rows x cols` matrix.
-fn gather(data: &[f32], rows: usize, cols: usize, rs: usize, cs: usize) -> Vec<f32> {
-    (0..rows)
-        .flat_map(|i| (0..cols).map(move |j| (i, j)))
-        .map(|(i, j)| data[i * rs + j * cs])
-        .collect()
+/// A row-major copy of a strided `rows x cols` matrix, in `out`.
+fn gather<'a>(
+    out: &'a mut Vec<f32>,
+    data: &[f32],
+    rows: usize,
+    cols: usize,
+    rs: usize,
+    cs: usize,
+) -> &'a [f32] {
+    out.clear();
+    out.extend(
+        (0..rows)
+            .flat_map(|i| (0..cols).map(move |j| (i, j)))
+            .map(|(i, j)| data[i * rs + j * cs]),
+    );
+    out
 }
 
 #[cfg(test)]

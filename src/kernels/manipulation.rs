@@ -1309,6 +1309,52 @@ pub fn split<'a, T: Clone + Copy + std::fmt::Debug>(
     results
 }
 
+/// Output `index` of [`split`], into `out`. Generated code takes each output on its
+/// own, so that each borrows only its own buffer.
+pub fn split_one<'a, T: Copy + std::fmt::Debug>(
+    input: &TensorView<'_, T>,
+    axis: i64,
+    splits: &[i64],
+    index: usize,
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
+    let ndim = input.dim();
+    let axis = if axis < 0 {
+        (ndim as i64 + axis) as usize
+    } else {
+        axis as usize
+    };
+    assert!(
+        axis < ndim,
+        "Split: axis out of bounds (axis={}, ndim={}, shape={:?})",
+        axis,
+        ndim,
+        &*input.shape
+    );
+    let splits = &*resolve_split_sizes(splits, input.shape[axis]);
+    assert!(index < splits.len(), "Split: no output {index}");
+    let total: i64 = splits.iter().sum();
+    assert_eq!(
+        total, input.shape[axis] as i64,
+        "Split: splits sum mismatch"
+    );
+    let outer_dim: usize = input.shape[..axis].iter().product();
+    let inner_dim: usize = input.shape[axis + 1..].iter().product();
+    let row = input.shape[axis] * inner_dim;
+    let axis_offset = splits[..index].iter().sum::<i64>() as usize;
+    let split_size = splits[index] as usize;
+    let mut out_shape = input.shape.to_vec();
+    out_shape[axis] = split_size;
+    let copy_len = split_size * inner_dim;
+    out.clear();
+    out.reserve(outer_dim * copy_len);
+    for outer_idx in 0..outer_dim {
+        let src = outer_idx * row + axis_offset * inner_dim;
+        out.extend_from_slice(&input.data[src..src + copy_len]);
+    }
+    TensorView::from_slice(out, out_shape)
+}
+
 /// Split a tensor into multiple owned tensors along an axis.
 /// This is a convenience function that returns owned TensorViews directly,
 /// avoiding the need for cloning when using the output buffers pattern.
@@ -1751,11 +1797,21 @@ mod tests {
         let mut bufs = vec![Vec::new(); splits.len()];
         let borrowed = split(&t, 1, &splits, &mut bufs);
         assert_eq!(owned.len(), borrowed.len());
-        for (o, b) in owned.iter().zip(&borrowed) {
+        for (i, (o, b)) in owned.iter().zip(&borrowed).enumerate() {
             assert_eq!(o.shape, b.shape);
             assert_eq!(o.data, b.data);
+            // Into a buffer holding a larger tensor before.
+            let mut buf = vec![-1.0; 64];
+            let one = split_one(&t, 1, &splits, i, &mut buf);
+            assert_eq!(one.shape, b.shape);
+            assert_eq!(one.data, b.data);
         }
         assert_eq!(&*owned[0].data, &[0.0, 1.0, 2.0, 15.0, 16.0, 17.0]);
+        // Even parts when the sizes are all 0.
+        let mut buf = Vec::new();
+        let last = split_one(&t, -1, &[0, 0, 0], 2, &mut buf);
+        assert_eq!(last.shape.as_ref(), &[2, 5, 1]);
+        assert_eq!(last.data[..3], [2.0, 5.0, 8.0]);
     }
 
     #[test]

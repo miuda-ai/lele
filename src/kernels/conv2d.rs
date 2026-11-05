@@ -955,27 +955,25 @@ pub fn gather_elements<'a, 'b, T: Clone + Copy + std::fmt::Debug, U: crate::kern
     }
 
     for flat_idx in 0..total {
-        // Decompose flat_idx into multi-dimensional index in idx_shape
-        let mut remaining = flat_idx;
-        let mut coords = vec![0usize; rank];
-        for d in 0..rank {
-            coords[d] = remaining / idx_strides[d];
-            remaining %= idx_strides[d];
-        }
-
-        // Replace axis coordinate with the index value
+        // The input index of flat_idx's coordinates in idx_shape, the one on the axis
+        // replaced by the index value.
         let index_val = idx_data[flat_idx].as_f32() as i64;
         let index_val = if index_val < 0 {
             (shape[axis] as i64 + index_val) as usize
         } else {
             index_val as usize
         };
-        coords[axis] = index_val;
-
-        // Compute flat input index
+        assert!(index_val < shape[axis], "GatherElements: index out of range");
+        let mut remaining = flat_idx;
         let mut in_idx = 0;
         for d in 0..rank {
-            in_idx += coords[d] * strides[d];
+            let coord = if d == axis {
+                index_val
+            } else {
+                remaining / idx_strides[d]
+            };
+            remaining %= idx_strides[d];
+            in_idx += coord * strides[d];
         }
 
         out[flat_idx] = data[in_idx];
@@ -1463,6 +1461,32 @@ fn conv_transpose_inner<'b, 'a>(
 mod tests {
     use super::*;
     use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_close, levels};
+
+    /// The examples of the ONNX GatherElements spec, and a negative index.
+    #[test]
+    fn test_gather_elements() {
+        let gather = |data: &[f32], shape: &[usize], idx: &[i64], idx_shape: &[usize], axis| {
+            let data = TensorView::from_slice(data, shape.to_vec());
+            let idx = TensorView::from_slice(idx, idx_shape.to_vec());
+            let mut out = vec![-1.0; 64];
+            let r = gather_elements(&data, &idx, axis, &mut out);
+            (r.shape.to_vec(), r.data.to_vec())
+        };
+        let d2 = [1.0, 2.0, 3.0, 4.0];
+        assert_eq!(
+            gather(&d2, &[2, 2], &[0, 0, 1, 0], &[2, 2], 1),
+            (vec![2, 2], vec![1.0, 1.0, 4.0, 3.0])
+        );
+        let d3: Vec<f32> = (1..=9).map(|v| v as f32).collect();
+        assert_eq!(
+            gather(&d3, &[3, 3], &[1, 2, 0, 2, 0, 0], &[2, 3], 0),
+            (vec![2, 3], vec![4.0, 8.0, 3.0, 7.0, 2.0, 3.0])
+        );
+        assert_eq!(
+            gather(&d3, &[3, 3], &[-1, 0, -3], &[1, 3], -2),
+            (vec![1, 3], vec![7.0, 2.0, 3.0])
+        );
+    }
 
     /// `[channels, h, w]`, `[kh, kw]`, strides, dilations and pads `[top, left, bottom, right]`.
     type WindowCase = ([usize; 3], [usize; 2], [usize; 2], [usize; 2], [usize; 4]);

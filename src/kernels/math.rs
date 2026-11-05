@@ -1909,9 +1909,9 @@ pub fn range<'a>(
     TensorView::from_slice(out, vec![n])
 }
 pub fn range_i64<'a>(
-    start: &TensorView<'a, i64>,
-    limit: &TensorView<'a, i64>,
-    delta: &TensorView<'a, i64>,
+    start: &TensorView<'_, i64>,
+    limit: &TensorView<'_, i64>,
+    delta: &TensorView<'_, i64>,
     out: &'a mut Vec<i64>,
 ) -> TensorView<'a, i64> {
     let start_val = start.data.first().copied().unwrap_or(0);

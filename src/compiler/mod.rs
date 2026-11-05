@@ -259,7 +259,8 @@ impl Compiler {
         }
         passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);
-        let (allocator, analysis) = alloc::solve_allocation(&ir);
+        let (allocator, analysis) =
+            alloc::solve_allocation(&ir, &|name| var_types.get(&sanitize_name(name)));
         // Patterns and overrides of the products would read packed weights as stored in
         // the model.
         let pack = opt.weight_packing
@@ -344,9 +345,9 @@ impl Compiler {
         // Generate Workspace Struct
         writeln!(&mut code, "#[derive(Default)]")?;
         writeln!(&mut code, "pub struct {}Workspace {{", struct_name)?;
-        for i in 0..allocator.num_buffers {
+        for (i, ty) in allocator.buffer_types.iter().enumerate() {
             if used_buffers.contains(&i) {
-                writeln!(&mut code, "    pub buf_{}: Vec<f32>,", i)?;
+                writeln!(&mut code, "    pub buf_{}: Vec<{}>,", i, ty)?;
             }
         }
         writeln!(&mut code, "}}")?;

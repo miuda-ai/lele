@@ -140,11 +140,10 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
         Op::Range => {
             let is_i64 = (0..3).any(|i| ctx.input_type(i) == ElemType::I64);
             if is_i64 {
-                writeln!(w, "{}let mut buf_{} = Vec::<i64>::new();", tab, outputs[0])?;
                 writeln!(
                     w,
-                    "{}let {} = lele::kernels::range_i64(&{}, &{}, &{}, &mut buf_{});",
-                    tab, outputs[0], inputs[0], inputs[1], inputs[2], outputs[0]
+                    "{}let {} = lele::kernels::range_i64(&{}, &{}, &{}, {});",
+                    tab, outputs[0], inputs[0], inputs[1], inputs[2], buf_expr
                 )?;
             } else {
                 writeln!(

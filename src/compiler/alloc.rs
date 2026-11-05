@@ -1,5 +1,6 @@
 //! Liveness analysis and workspace buffer allocation.
 
+use super::generate::ElemType;
 use super::ir::{Graph, Op};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -8,6 +9,8 @@ pub struct Allocator {
     /// Workspace buffer index of each tensor, by name.
     pub tensor_to_buffer: HashMap<String, usize>,
     pub num_buffers: usize,
+    /// Element type of each buffer, that of every tensor it holds.
+    pub(crate) buffer_types: Vec<ElemType>,
 }
 
 pub(crate) struct AnalysisData {
@@ -34,7 +37,7 @@ struct Schedule {
 }
 
 impl Schedule {
-    fn visit(&mut self, g: &Graph) {
+    fn visit(&mut self, g: &Graph, ty: &dyn Fn(&str) -> ElemType) {
         let name = |v: Option<_>| v.map_or_else(String::new, |v| g.value(v).name.clone());
         for (_, node) in g.nodes() {
             let id = self.steps.len();
@@ -65,8 +68,15 @@ impl Schedule {
                 | Op::ReshapeTo { .. }
                 | Op::Identity
                 | Op::Flatten { .. }
-                | Op::Cast { .. }
                     if !inputs.is_empty() && !outputs.is_empty() =>
+                {
+                    self.aliases
+                        .insert(outputs[0].clone(), vec![inputs[0].clone()]);
+                }
+                Op::Cast { to }
+                    if !inputs.is_empty()
+                        && !outputs.is_empty()
+                        && ty(&inputs[0]).cast_is_view(*to) =>
                 {
                     self.aliases
                         .insert(outputs[0].clone(), vec![inputs[0].clone()]);
@@ -75,7 +85,7 @@ impl Schedule {
             }
             self.steps.push(Step { inputs, outputs });
             for sub in node.op.subgraphs() {
-                self.visit(sub);
+                self.visit(sub, ty);
             }
         }
     }
@@ -85,10 +95,14 @@ impl Schedule {
 ///
 /// A tensor's buffer is freed after its last reader and handed to later
 /// tensors. Views share the buffer of what they view, which therefore lives
-/// as long as the longest-lived view.
-pub(crate) fn solve_allocation(g: &Graph) -> (Allocator, AnalysisData) {
+/// as long as the longest-lived view. `ty` gives the element type of a tensor by
+/// name; a buffer only holds tensors of one type.
+pub(crate) fn solve_allocation(
+    g: &Graph,
+    ty: &dyn Fn(&str) -> ElemType,
+) -> (Allocator, AnalysisData) {
     let mut schedule = Schedule::default();
-    schedule.visit(g);
+    schedule.visit(g, ty);
     // Graph outputs are read after the last node.
     let end = schedule.steps.len();
     for &out in &g.outputs {
@@ -118,10 +132,10 @@ pub(crate) fn solve_allocation(g: &Graph) -> (Allocator, AnalysisData) {
         }
     }
 
-    let mut free_buffers: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
+    let mut free: HashMap<ElemType, BinaryHeap<Reverse<usize>>> = HashMap::new();
     let mut active: HashMap<String, usize> = HashMap::new();
     let mut all: HashMap<String, usize> = HashMap::new();
-    let mut num_buffers = 0;
+    let mut buffer_types = Vec::new();
     for (id, step) in schedule.steps.iter().enumerate() {
         // Release the buffers of tensors read for the last time before.
         let dead: Vec<(String, usize)> = active
@@ -131,7 +145,7 @@ pub(crate) fn solve_allocation(g: &Graph) -> (Allocator, AnalysisData) {
             .collect();
         for (t, b) in dead {
             active.remove(&t);
-            free_buffers.push(Reverse(b));
+            free.entry(buffer_types[b]).or_default().push(Reverse(b));
         }
         for out in &step.outputs {
             if out.is_empty() {
@@ -157,6 +171,8 @@ pub(crate) fn solve_allocation(g: &Graph) -> (Allocator, AnalysisData) {
                     reserved.extend(s.inputs.iter().filter_map(|n| all.get(n)).copied());
                 }
             }
+            let t = ty(out);
+            let free_buffers = free.entry(t).or_default();
             let mut deferred = Vec::new();
             let mut selected = None;
             while let Some(Reverse(b)) = free_buffers.pop() {
@@ -169,8 +185,8 @@ pub(crate) fn solve_allocation(g: &Graph) -> (Allocator, AnalysisData) {
             }
             free_buffers.extend(deferred.into_iter().map(Reverse));
             let b = selected.unwrap_or_else(|| {
-                num_buffers += 1;
-                num_buffers - 1
+                buffer_types.push(t);
+                buffer_types.len() - 1
             });
             active.insert(out.clone(), b);
             all.insert(out.clone(), b);
@@ -179,7 +195,8 @@ pub(crate) fn solve_allocation(g: &Graph) -> (Allocator, AnalysisData) {
     (
         Allocator {
             tensor_to_buffer: all,
-            num_buffers,
+            num_buffers: buffer_types.len(),
+            buffer_types,
         },
         AnalysisData {
             death_time,
