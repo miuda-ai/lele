@@ -103,6 +103,29 @@ where
             Cow::Owned(vec) => TensorView::from_owned(vec.clone(), self.shape.to_vec()),
         }
     }
+
+    /// [`Self::detach_or_own`] that moves owned data rather than copying it.
+    ///
+    /// # Safety
+    /// When data is borrowed, the caller must ensure the underlying storage outlives `'b`.
+    pub unsafe fn detach_or_move<'b>(self) -> TensorView<'b, T> {
+        match self.data {
+            Cow::Borrowed(_) => unsafe { self.detach_or_own() },
+            Cow::Owned(vec) => TensorView {
+                data: Cow::Owned(vec),
+                shape: Cow::Owned(self.shape.into_owned()),
+            },
+        }
+    }
+
+    /// The tensor owning its data: moved if it owns it already, copied
+    /// otherwise.
+    pub fn into_owned(self) -> TensorView<'static, T> {
+        TensorView {
+            data: Cow::Owned(self.data.into_owned()),
+            shape: Cow::Owned(self.shape.into_owned()),
+        }
+    }
 }
 
 impl<'a> TensorView<'a, f32> {
@@ -275,5 +298,27 @@ impl<'a> TensorView<'a, i32> {
             i32_vec.push(i32::from_le_bytes(chunk));
         }
         TensorView::from_owned(i32_vec, shape)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_data_moves_and_borrowed_data_is_copied_or_shared() {
+        let owned = TensorView::from_owned(vec![1.0f32, 2.0], vec![2]);
+        let at = owned.data.as_ptr();
+        let moved = unsafe { owned.detach_or_move::<'static>() };
+        assert_eq!(moved.data.as_ptr(), at);
+        assert_eq!(moved.into_owned().data.as_ptr(), at);
+
+        let elems = [3.0f32, 4.0];
+        let borrowed = TensorView::from_slice(&elems, vec![2]);
+        let shared = unsafe { borrowed.clone().detach_or_move::<'static>() };
+        assert_eq!(shared.data.as_ptr(), elems.as_ptr());
+        let copy = borrowed.into_owned();
+        assert_ne!(copy.data.as_ptr(), elems.as_ptr());
+        assert_eq!((&copy.data[..], &copy.shape[..]), (&elems[..], &[2][..]));
     }
 }

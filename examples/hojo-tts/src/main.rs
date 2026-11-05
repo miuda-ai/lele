@@ -5,13 +5,15 @@
 //!   (prompt tokens) -> [LLM autoregressive] -> speech token codes
 //!   codes -> [Decoder] -> 24kHz waveform
 //!
-//! The three ONNX sub-models are AOT-compiled to Rust by `build.rs`.
+//! `build.rs` AOT-compiles the encoder and decoder to Rust. The LLM runs by
+//! hand with a KV cache (`llm_cache`), on weights `build.rs` extracts from
+//! its ONNX model.
 
 mod audio;
 mod decoder;
 mod encoder;
-mod llm;
 mod llm_cache;
+mod llm_layout;
 mod tokenizer;
 
 use anyhow::{Context, Result, bail};
@@ -23,7 +25,7 @@ use std::time::Instant;
 
 use crate::decoder::Decoder;
 use crate::encoder::Encoder;
-use crate::llm::Llm;
+use crate::llm_cache::Llm;
 use crate::tokenizer::HojoTokenizer;
 
 const CODEC_SAMPLE_RATE: u32 = 16000;

@@ -4,6 +4,7 @@ tokenizer/
 assets/
 encoder.rs
 llm.rs
+llm_layout.rs
 decoder.rs
 encoder_weights.bin
 llm_weights.bin

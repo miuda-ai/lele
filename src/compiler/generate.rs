@@ -48,6 +48,20 @@ impl<'a> OpContext<'a> {
         })
     }
 
+    /// Whether input `i` is a variable that nothing reads after this node,
+    /// directly or through a view, so that the node may take it by value.
+    /// Only known in the top-level graph, whose liveness is analysed.
+    pub fn input_dies_here(&self, i: usize) -> bool {
+        let (Some(an), Some(name)) = (self.analysis, self.node.input.get(i)) else {
+            return false;
+        };
+        !name.is_empty()
+            && !self.weights.contains(name)
+            && self.node.input.iter().filter(|n| *n == name).count() == 1
+            // `current_id` has moved past this node.
+            && an.death_time.get(name) == Some(&(*self.current_id - 1))
+    }
+
     /// The values of input `i`, if it is an int64 or int32 weight.
     pub fn ints(&self, i: usize) -> Option<&'a [i64]> {
         self.weights.ints(self.node.input.get(i)?)
@@ -420,20 +434,29 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
         generate_nodes(
             chunk, &mut f, 2, weights, allocator, analysis, current_id, compiler, var_types,
         )?;
-        // Return — detach_or_own (zero-copy) for views of the workspace or the weights,
-        // which outlive the chunk; to_owned for everything else, views of buffers local
-        // to the chunk included, which are freed when it returns.
+        // Return — detach_or_move (zero-copy) for views of the workspace or the weights,
+        // which outlive the chunk, and for tensors owning their data, which move out;
+        // to_owned for everything else, views of buffers local to the chunk included,
+        // which are freed when it returns. A view of a tensor that moves out stays
+        // valid: moving a Vec keeps its elements where they are, and the tensor is
+        // returned as long as its views live. Copies are taken first and views
+        // detached before what they view, which then is no longer borrowed when it
+        // moves.
         let body = String::from_utf8_lossy(&f).into_owned();
-        let ret_vals: Vec<String> = chunk_outputs
+        let (mut detached, copied): (Vec<&String>, Vec<&String>) = chunk_outputs
             .iter()
-            .map(|s| {
-                if outlives_chunk(&body, s, 0) {
-                    format!("unsafe {{ {}.detach_or_own() }}", s)
-                } else {
-                    format!("{}.to_owned()", s)
-                }
-            })
-            .collect();
+            .partition(|s| outlives_chunk(&body, s, 0));
+        detached.sort_by_key(|s| std::cmp::Reverse(definition_line(&body, s)));
+        for s in &copied {
+            writeln!(&mut f, "        let {s}__ret = {s}.to_owned();")?;
+        }
+        for s in &detached {
+            writeln!(
+                &mut f,
+                "        let {s}__ret = unsafe {{ {s}.detach_or_move() }};"
+            )?;
+        }
+        let ret_vals: Vec<String> = chunk_outputs.iter().map(|s| format!("{s}__ret")).collect();
         if ret_vals.is_empty() {
             writeln!(&mut f, "        // No outputs")?;
         } else if ret_vals.len() == 1 {
@@ -494,6 +517,18 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
 /// and a slice, gather, transpose or split (which may be a view) if both do.
 /// Every definition counts (there is one per target under `cfg`). Anything else is
 /// returned as a copy.
+/// The line of `body` that defines `var`, or `None` if it is an argument of
+/// the chunk.
+fn definition_line(body: &str, var: &str) -> Option<usize> {
+    let prefix = format!("let {var} = ");
+    body.lines().map(str::trim_start).position(|l| {
+        l.starts_with(&prefix)
+            || l.strip_prefix("let (")
+                .and_then(|l| l.split_once(") ="))
+                .is_some_and(|(names, _)| names.split(',').any(|n| n.trim() == var))
+    })
+}
+
 fn outlives_chunk(body: &str, var: &str, depth: usize) -> bool {
     if depth > 64 {
         return false;
@@ -532,7 +567,11 @@ fn outlives_chunk(body: &str, var: &str, depth: usize) -> bool {
         if let Some(source) = borrowed {
             return rhs.contains("&mut ws.buf_") && outlives_chunk(body, &source, depth + 1);
         }
-        if rhs.contains("&mut ws.buf_") || rhs.starts_with("self.weight_") {
+        // A tensor owning its data moves out of the chunk.
+        if rhs.contains("&mut ws.buf_")
+            || rhs.starts_with("self.weight_")
+            || rhs.starts_with("lele::kernels::scatter_nd_owned(")
+        {
             return true;
         }
         let viewed = ["reshape", "unsqueeze", "squeeze"]
@@ -1112,6 +1151,49 @@ mod tests {
             "{code}"
         );
         assert!(code.contains("kernels::reshape(&x, &[0, 1, -1])"), "{code}");
+    }
+
+    /// A state that a ScatterND reads last is updated in place and moves out
+    /// of `forward`; one read again afterwards is copied.
+    #[test]
+    fn test_scatter_nd_takes_a_state_it_reads_last() {
+        use crate::model::onnx_proto::{GraphProto, TensorProto, ValueInfoProto};
+        let info = |name: &str| ValueInfoProto {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let node = |op: &str, input: &[&str], output: &str| NodeProto {
+            op_type: op.to_string(),
+            input: input.iter().map(|s| s.to_string()).collect(),
+            output: vec![output.to_string()],
+            ..Default::default()
+        };
+        let graph = |nodes: Vec<NodeProto>, outputs: &[&str]| GraphProto {
+            node: nodes,
+            initializer: vec![TensorProto {
+                name: "idx".to_string(),
+                data_type: DType::I64.to_onnx(),
+                dims: vec![1, 1],
+                int64_data: vec![1],
+                ..Default::default()
+            }],
+            input: vec![info("cache"), info("upd")],
+            output: outputs.iter().map(|o| info(o)).collect(),
+            ..Default::default()
+        };
+        let code = |g: &GraphProto| Compiler::new().compile(g).unwrap().code;
+        let scatter = |out: &str| node("ScatterND", &["cache", "idx", "upd"], out);
+
+        let moved = code(&graph(vec![scatter("next")], &["next"]));
+        assert!(moved.contains("kernels::scatter_nd_owned(cache, "), "{moved}");
+        assert!(moved.contains("next.detach_or_move()"), "{moved}");
+        assert!(moved.contains("res.into_owned()"), "{moved}");
+
+        let read_again = code(&graph(
+            vec![scatter("next"), node("Add", &["cache", "next"], "sum")],
+            &["next", "sum"],
+        ));
+        assert!(read_again.contains("kernels::scatter_nd(&cache, "), "{read_again}");
     }
 
     /// Elu, IsNaN and ScatterElements have code, with the attributes they were given.

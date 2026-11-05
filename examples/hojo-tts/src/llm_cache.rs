@@ -1,4 +1,4 @@
-use crate::llm::Llm;
+use crate::llm_layout as layout;
 
 const D_MODEL: usize = 512;
 const N_HEADS: usize = 4;
@@ -6,36 +6,56 @@ const D_HEAD: usize = 128;
 const D_FF: usize = 2304;
 const N_LAYERS: usize = 17;
 const VOCAB: usize = 17667;
-const LAYER_STRIDE: usize = 8388608;
-const LAYER0_Q_OFFSET: usize = 18092288;
-const EMBED_OFFSET: usize = 0;
-const NORM_WEIGHT_OFFSET: usize = 18091264;
-const QK_NORM_OFFSET: usize = 18091008;
-const INV_FREQ_OFFSET: usize = 178789744;
-const ATTN_SCALE_OFFSET: usize = 178790096;
-const LM_HEAD_OFFSET: usize = 160698624;
+const EMBED_OFFSET: usize = layout::EMBED;
+const NORM_WEIGHT_OFFSET: usize = layout::NORM;
+const QK_NORM_OFFSET: usize = layout::QK_NORM;
+const INV_FREQ_OFFSET: usize = layout::INV_FREQ;
+const ATTN_SCALE_OFFSET: usize = layout::ATTN_SCALE;
+const LM_HEAD_OFFSET: usize = layout::LM_HEAD;
 const LN_EPS: f32 = 1e-6;
 
 fn layer_q_off(n: usize) -> usize {
-    LAYER0_Q_OFFSET + n * LAYER_STRIDE
+    layout::LAYERS[n][0]
 }
 fn layer_k_off(n: usize) -> usize {
-    layer_q_off(n) + 524288
+    layout::LAYERS[n][1]
 }
 fn layer_v_off(n: usize) -> usize {
-    layer_k_off(n) + 131072
+    layout::LAYERS[n][2]
 }
 fn layer_o_off(n: usize) -> usize {
-    layer_v_off(n) + 131072
+    layout::LAYERS[n][3]
 }
 fn layer_gate_off(n: usize) -> usize {
-    layer_o_off(n) + 524288
+    layout::LAYERS[n][4]
 }
 fn layer_up_off(n: usize) -> usize {
-    layer_gate_off(n) + 2359296
+    layout::LAYERS[n][5]
 }
 fn layer_down_off(n: usize) -> usize {
-    layer_up_off(n) + 2359296
+    layout::LAYERS[n][6]
+}
+
+/// The weights the cached LLM reads, which build.rs takes from its ONNX
+/// model (`llm_weights.bin`, laid out as `llm_layout.rs` says). The f16
+/// weights are converted to f32 once, when loaded.
+pub struct Llm<'a> {
+    weights: lele::runtime::Weights<'a>,
+}
+
+impl<'a> Llm<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self {
+            weights: lele::runtime::Weights::new(data).with_f16(&layout::F16_REGIONS),
+        }
+    }
+}
+
+impl<'a> std::ops::Deref for Llm<'a> {
+    type Target = lele::runtime::Weights<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.weights
+    }
 }
 
 pub struct LlmCache {

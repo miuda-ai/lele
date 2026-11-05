@@ -610,11 +610,31 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             )?;
         }
         Op::ScatterND => {
-            writeln!(
-                w,
-                "{}let {} = lele::kernels::scatter_nd(&{}, &{}, &{}, {});",
-                tab, outputs[0], inputs[0], inputs[1], inputs[2], buf_expr
-            )?;
+            // A state, a graph input or what an earlier ScatterND made of one,
+            // read for the last time is updated in place when it owns its
+            // elements: a state passed in by value and returned is not copied.
+            // Other data is in the workspace, and copied into it.
+            let ir = ctx.ir();
+            let state = ir.input(0).is_some_and(|v| {
+                ctx.graph.inputs.contains(&v)
+                    || ctx
+                        .graph
+                        .producer(v)
+                        .is_some_and(|p| matches!(p.op, Op::ScatterND))
+            });
+            if state && ctx.input_dies_here(0) {
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::scatter_nd_owned({}, &{}, &{});",
+                    tab, outputs[0], inputs[0], inputs[1], inputs[2]
+                )?;
+            } else {
+                writeln!(
+                    w,
+                    "{}let {} = lele::kernels::scatter_nd(&{}, &{}, &{}, {});",
+                    tab, outputs[0], inputs[0], inputs[1], inputs[2], buf_expr
+                )?;
+            }
         }
         Op::Trilu { upper } => {
             // `k` is optional and defaults to the main diagonal.

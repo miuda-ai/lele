@@ -1,5 +1,6 @@
 //! Graph rewrites on the [`ir`](super::ir).
 
+mod cse;
 mod dce;
 mod fold;
 mod fuse;
@@ -7,6 +8,7 @@ mod qdq;
 mod shapes;
 mod types;
 
+pub(crate) use cse::eliminate_common_subexpressions;
 pub(crate) use dce::eliminate_dead_code;
 pub(crate) use fold::fold_constants;
 pub(crate) use fuse::fuse;

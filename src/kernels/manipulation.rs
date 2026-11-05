@@ -1696,26 +1696,54 @@ pub fn scatter_nd<'a, T: Copy + std::fmt::Debug, I: utils::AsI64 + Copy + std::f
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
     let len = data.data.len();
-    let rank = data.shape.len();
+    // SAFETY: the copy below writes every element.
+    unsafe { utils::ensure_capacity(out, len) };
+    out[..len].copy_from_slice(&data.data);
+    scatter_nd_into(&mut out[..len], &data.shape, indices, updates);
+    TensorView::from_slice(&out[..len], data.shape.to_vec())
+}
+
+/// [`scatter_nd`] of a `data` nothing reads afterwards, into data the result
+/// owns: when `data` owns its elements, the updates are written into them in
+/// place; otherwise into a copy. A state threaded through a model step by
+/// step, such as an attention cache, is then never copied.
+pub fn scatter_nd_owned<T: Copy + std::fmt::Debug, I: utils::AsI64 + Copy + std::fmt::Debug>(
+    data: TensorView<'_, T>,
+    indices: &TensorView<'_, I>,
+    updates: &TensorView<'_, T>,
+) -> TensorView<'static, T> {
+    let mut elems = data.data.into_owned();
+    scatter_nd_into(&mut elems, &data.shape, indices, updates);
+    TensorView::from_owned(elems, data.shape.into_owned())
+}
+
+/// Writes `updates` into the slices of `data`, of shape `shape`, that
+/// `indices` points to.
+fn scatter_nd_into<T: Copy + std::fmt::Debug, I: utils::AsI64 + Copy + std::fmt::Debug>(
+    data: &mut [T],
+    shape: &[usize],
+    indices: &TensorView<'_, I>,
+    updates: &TensorView<'_, T>,
+) {
     let q = *indices
         .shape
         .last()
         .expect("ScatterND indices have an axis");
-    assert!(q <= rank, "ScatterND index longer than the data's rank");
-    let slice: usize = data.shape[q..].iter().product();
+    assert!(
+        q <= shape.len(),
+        "ScatterND index longer than the data's rank"
+    );
+    let slice: usize = shape[q..].iter().product();
     let count: usize = indices.shape[..indices.shape.len() - 1].iter().product();
     assert_eq!(
         updates.data.len(),
         count * slice,
         "ScatterND updates do not match indices"
     );
-    // SAFETY: the copy below writes every element.
-    unsafe { utils::ensure_capacity(out, len) };
-    out[..len].copy_from_slice(&data.data);
     // Elements between two steps of each coordinate: a step of the last is a slice.
     let mut strides = vec![1usize; q];
     for d in (0..q.saturating_sub(1)).rev() {
-        strides[d] = strides[d + 1] * data.shape[d + 1];
+        strides[d] = strides[d + 1] * shape[d + 1];
     }
     for d in 0..q {
         strides[d] *= slice;
@@ -1725,17 +1753,16 @@ pub fn scatter_nd<'a, T: Copy + std::fmt::Debug, I: utils::AsI64 + Copy + std::f
         for d in 0..q {
             let mut c = indices.data[n * q + d].as_i64();
             if c < 0 {
-                c += data.shape[d] as i64;
+                c += shape[d] as i64;
             }
             assert!(
-                (0..data.shape[d] as i64).contains(&c),
+                (0..shape[d] as i64).contains(&c),
                 "ScatterND: index out of range"
             );
             at += c as usize * strides[d];
         }
-        out[at..at + slice].copy_from_slice(&updates.data[n * slice..(n + 1) * slice]);
+        data[at..at + slice].copy_from_slice(&updates.data[n * slice..(n + 1) * slice]);
     }
-    TensorView::from_slice(&out[..len], data.shape.to_vec())
 }
 
 /// ScatterElements: a copy of `data` where, for each position of `indices`, the
@@ -1923,6 +1950,27 @@ mod tests {
                 .to_vec(),
             [0., 0., 7., 8., 0., 0.]
         );
+    }
+
+    #[test]
+    fn test_scatter_nd_owned_updates_owned_data_in_place() {
+        let indices = TensorView::from_slice(&[1i64], vec![1, 1]);
+        let updates = TensorView::from_slice(&[5., 6.], vec![1, 2]);
+        let data = TensorView::from_owned(vec![0.0f32; 6], vec![3, 2]);
+        let at = data.data.as_ptr();
+        let r = scatter_nd_owned(data, &indices, &updates);
+        assert_eq!(r.data.to_vec(), [0., 0., 5., 6., 0., 0.]);
+        assert_eq!((r.data.as_ptr(), &r.shape[..]), (at, &[3, 2][..]));
+        // Borrowed data is copied.
+        let elems = [1.0f32; 6];
+        let r = scatter_nd_owned(
+            TensorView::from_slice(&elems, vec![3, 2]),
+            &indices,
+            &updates,
+        );
+        assert_eq!(r.data.to_vec(), [1., 1., 5., 6., 1., 1.]);
+        assert_ne!(r.data.as_ptr(), elems.as_ptr());
+        assert_eq!(elems, [1.0; 6]);
     }
 
     /// Slice, Gather, Transpose and Split return a view of a borrowed input exactly when

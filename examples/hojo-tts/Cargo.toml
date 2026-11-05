@@ -18,4 +18,5 @@ rand = "0.8"
 rand_chacha = "0.3"
 
 [build-dependencies]
+lele = { workspace = true }
 lele-build = { workspace = true }

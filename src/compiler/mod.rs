@@ -106,6 +106,9 @@ pub struct Optimizations {
     /// MatMul + Add, dynamically quantized linear layers, ...) into single
     /// operators with fused kernels.
     pub operator_fusion: bool,
+    /// Merges nodes that run the same operator with the same attributes on
+    /// the same inputs, so that each such computation runs once.
+    pub common_subexpression_elimination: bool,
     /// Stores f16 weights read only as the right operand of matrix products,
     /// or as the weights of pointwise 1-D convolutions (transposed), in the
     /// order the matmul kernel reads them
@@ -124,6 +127,7 @@ impl Optimizations {
             dead_code_elimination: true,
             qdq_fusion: true,
             operator_fusion: true,
+            common_subexpression_elimination: true,
             weight_packing: true,
         }
     }
@@ -258,6 +262,11 @@ impl Compiler {
                 // left without readers, and would each keep a buffer.
                 passes::eliminate_dead_code(&mut ir);
             }
+        }
+        if opt.common_subexpression_elimination {
+            // Runs after fusion, whose patterns may need a value to have a
+            // single reader.
+            passes::eliminate_common_subexpressions(&mut ir);
         }
         passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);
@@ -453,11 +462,12 @@ impl Compiler {
             "        let res = self.forward_with_workspace(&mut ws, {});",
             arg_names_str
         )?;
+        // Outputs owning their data, such as states updated in place, move out.
         let ret_vals_owned: Vec<String> = if graph_outputs.len() == 1 {
-            vec!["res.to_owned()".to_string()]
+            vec!["res.into_owned()".to_string()]
         } else {
             (0..graph_outputs.len())
-                .map(|i| format!("res.{}.to_owned()", i))
+                .map(|i| format!("res.{}.into_owned()", i))
                 .collect()
         };
         let ret_str_owned = if ret_vals_owned.len() == 1 {
