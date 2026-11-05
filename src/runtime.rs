@@ -348,6 +348,32 @@ impl Weights<'_> {
         kernels::conv_integer_packed(x, &w, zx, dilations, pads, strides, output_buf)
     }
 
+    /// `a` times a quantized `[k, n]` weight of integer codes, whose values are
+    /// `scale * (code - zero_point)`, read from the weights as they are stored.
+    pub fn weight_only_matmul<'c, 'd>(
+        &self,
+        a: &TensorView<'c>,
+        weight_offset: usize,
+        weight_len: usize,
+        weight_signed: bool,
+        weight_shape: (usize, usize),
+        scale: &TensorView<'c>,
+        zero_point: Option<&TensorView<'c>>,
+        output_buf: &'d mut Vec<f32>,
+    ) -> TensorView<'d> {
+        let bytes = self.weight_u8_raw(weight_offset, weight_len);
+        let codes = if weight_signed {
+            // SAFETY: `i8` and `u8` have the same size and alignment, and every
+            // byte is a valid `i8`.
+            let signed = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const i8, bytes.len()) };
+            kernels::Codes::I8(signed)
+        } else {
+            kernels::Codes::U8(bytes)
+        };
+        let zp = zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0);
+        kernels::weight_only_matmul(a, codes, weight_shape, zp, scale.data[0], output_buf)
+    }
+
     /// Linear layer on an input that is already quantized (attention).
     pub fn linear_quantized_prequant<'c, 'd>(
         &self,

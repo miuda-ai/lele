@@ -491,6 +491,11 @@ pub enum Op {
     /// weighted values in static-QDQ models). Inputs:
     /// `[a, a_scale, a_zero_point, b, b_scale, b_zero_point]`.
     QLinearMatMulAct,
+    /// `MatMul` by a quantized weight (`DequantizeLinear` of an int8 or uint8
+    /// initializer), which is read as the integers it is stored in rather than
+    /// dequantized: the activations stay f32. Inputs: `[a, w, scale, zero_point]`,
+    /// with a scalar `scale` and `zero_point`, which may be absent.
+    QWeightMatMul,
     /// `Conv` followed by an activation. Inputs are those of the `Conv`.
     ConvAct {
         conv: ConvAttrs,
@@ -792,6 +797,7 @@ impl Op {
             Op::FakeQuantizeLinear(_) => "FakeQuantizeLinear",
             Op::QLinearMatMulI8 => "QLinearMatMulI8",
             Op::QLinearMatMulAct => "QLinearMatMulAct",
+            Op::QWeightMatMul => "QWeightMatMul",
             Op::ConvAct { .. } => "ConvAct",
             Op::Silu => "Silu",
             Op::Snake => "Snake",
@@ -1002,6 +1008,7 @@ impl Op {
             | Op::Where
             | Op::QLinearMatMulI8
             | Op::QLinearMatMulAct
+            | Op::QWeightMatMul
             | Op::Silu
             | Op::Snake
             | Op::Linear => {}

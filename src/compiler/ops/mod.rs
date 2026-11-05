@@ -53,6 +53,7 @@ pub(crate) fn dispatch_builtin(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         | Op::Pad { .. }
         | Op::QLinearMatMulI8
         | Op::QLinearMatMulAct
+        | Op::QWeightMatMul
         | Op::QuantizeLinear(_)
         | Op::Reshape
         | Op::ReshapeTo { .. }

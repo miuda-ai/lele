@@ -1,0 +1,23 @@
+[package]
+name = "whisper-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "whisper"
+path = "src/main.rs"
+
+[[bin]]
+name = "whisper-live"
+path = "src/bin/live.rs"
+
+[dependencies]
+cpal = "0.18.2"
+lele = { workspace = true }
+rustfft = "6"
+serde_json = "1"
+
+[build-dependencies]
+lele-build = { workspace = true }
+serde_json = "1"

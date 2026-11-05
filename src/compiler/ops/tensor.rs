@@ -433,6 +433,32 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 buf_expr
             )?;
         }
+        Op::QWeightMatMul => {
+            // Produced by `fuse_weight_only_matmul`, so the weight is always a
+            // 2-D int8 or uint8 initializer, read from its bytes in place.
+            let Some(weight) = ctx.weight(1) else {
+                panic!(
+                    "QWeightMatMul weight {} is not a known initializer",
+                    ctx.node.input[1]
+                );
+            };
+            let zero_point = match ctx.ir().input(3) {
+                Some(_) => format!("Some(&{})", inputs[3]),
+                None => "None".to_string(),
+            };
+            writeln!(
+                w,
+                "{tab}let {} = self.weight_only_matmul(&{}, {}, {}, {}, ({}, {}), &{}, {zero_point}, {buf_expr});",
+                outputs[0],
+                inputs[0],
+                weight.offset,
+                weight.len,
+                weight.dtype == DType::I8,
+                weight.shape[0],
+                weight.shape[1],
+                inputs[2],
+            )?;
+        }
         Op::DynamicQuantizeLinear => {
             writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[0])?;
             writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[1])?;

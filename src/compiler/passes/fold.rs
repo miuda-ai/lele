@@ -409,6 +409,13 @@ fn fold_op(op: &Op, inputs: &[&Const]) -> Option<(Vec<f32>, Vec<usize>)> {
             let x = inputs.first()?;
             Some((x.data.clone(), x.shape.clone()))
         }
+        Op::Transpose { perm } => {
+            let x = inputs.first()?;
+            let xv = TensorView::from_slice(x.data.as_slice(), x.shape.clone());
+            let mut out = Vec::new();
+            let t = crate::kernels::transpose(&xv, perm.as_deref().unwrap_or(&[]), &mut out);
+            Some((t.data.to_vec(), t.shape.to_vec()))
+        }
         Op::ConstantOfShape { value } => {
             let val = value
                 .as_ref()
@@ -596,6 +603,35 @@ mod tests {
         assert_eq!(get("r").float_data, [0.25]);
         assert_eq!(get("y").float_data, [0.0, 2.0, 4.0, 6.0]);
         assert_eq!(get("y").dims, [4]);
+    }
+
+    /// A weight that is stored transposed is transposed once, whatever its
+    /// element type.
+    #[test]
+    fn folds_transpose_of_a_constant() {
+        let transposed = |perm: Option<Vec<i64>>| {
+            let mut t = node("Transpose", &["x"], "y");
+            if let Some(perm) = perm {
+                t.attribute = vec![AttributeProto {
+                    name: "perm".to_string(),
+                    ints: perm,
+                    ..Default::default()
+                }];
+            }
+            fold(GraphProto {
+                node: vec![t],
+                initializer: vec![floats("x", &[2, 3], &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0])],
+                ..Default::default()
+            })
+        };
+        // Without `perm` the axes are reversed.
+        for perm in [None, Some(vec![1, 0])] {
+            let g = transposed(perm);
+            assert!(g.node.is_empty(), "{:?}", g.node);
+            let y = g.initializer.iter().find(|t| t.name == "y").unwrap();
+            assert_eq!(y.dims, [3, 2]);
+            assert_eq!(y.float_data, [0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
+        }
     }
 
     /// A float operator on integer constants is left to run: they are held

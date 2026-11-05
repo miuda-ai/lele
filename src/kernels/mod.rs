@@ -76,7 +76,8 @@ pub use conv2d::{
     conv_transpose, conv2d, conv2d_fused, conv2d_silu, gather_elements, max_pool2d, resize_nearest,
     topk,
 };
-pub use gemm::{PackedF16, WeightElem, gemm, matmul, matmul_fused_add};
+pub use gemm::{PackedF16, WeightElem, gemm, matmul, matmul_fused_add, weight_only_matmul};
+pub use matmul::Codes;
 pub use manipulation::*;
 pub use manipulation::{split, where_op};
 pub use math::*;

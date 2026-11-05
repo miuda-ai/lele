@@ -227,6 +227,7 @@ impl Compiler {
             // Must precede folding, which would otherwise consume the int8
             // weights.
             passes::fuse_qdq_matmul(&mut ir);
+            passes::fuse_weight_only_matmul(&mut ir);
         }
         if opt.constant_folding {
             passes::fold_constants(&mut ir);

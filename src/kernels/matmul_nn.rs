@@ -57,6 +57,17 @@ pub(crate) enum BSrc<'a> {
     /// f32 packed by the caller, a block at a time, as a convolution unfolds its input
     /// ([`Packer`]).
     Packer(&'a Packer<'a>),
+    /// Integer codes of a quantized weight, row-major: element `c` is `c - zero_point`.
+    /// Widened like f16, and exactly (the codes and their zero point are small integers),
+    /// so the product is that of the widened matrix; the scale goes into `alpha`.
+    U8 {
+        codes: &'a [u8],
+        zero_point: f32,
+    },
+    I8 {
+        codes: &'a [i8],
+        zero_point: f32,
+    },
 }
 
 /// Writes the block of B `kc` deep from row `pc` and `nc` wide from column `jc`
@@ -79,10 +90,25 @@ impl<'a> BSrc<'a> {
         match self {
             BSrc::F32(b) => dst.copy_from_slice(&b[start..][..dst.len()]),
             BSrc::F16(b) => widen_f16(simd, &b[start..][..dst.len()], dst),
+            BSrc::U8 { codes, zero_point } => {
+                widen_codes(&codes[start..][..dst.len()], zero_point, dst)
+            }
+            BSrc::I8 { codes, zero_point } => {
+                widen_codes(&codes[start..][..dst.len()], zero_point, dst)
+            }
             BSrc::F16Packed(_) | BSrc::Packer(_) => {
                 unreachable!("packed B is read by the panel")
             }
         }
+    }
+}
+
+/// `dst[i] = src[i] - zero_point`: exact, whichever integer type the codes are.
+#[inline(always)]
+fn widen_codes<T: Copy + Into<f32>>(src: &[T], zero_point: f32, dst: &mut [f32]) {
+    assert_eq!(src.len(), dst.len());
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d = s.into() - zero_point;
     }
 }
 
@@ -668,26 +694,27 @@ pub(crate) const SMALL_M: usize = 4;
 /// columns of B, as `gemm_nn` does, are 5-40% slower here: B arrives in short pieces
 /// from rows far apart.) From 5 rows on, `gemm_nn` is faster.
 pub(crate) fn gemm_small_m(level: Level, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32]) {
-    let b16 = match b {
-        BSrc::F32(b) => return simd_call!(level, gemm_small_m_simd(d, a, b, c)),
-        BSrc::F16(b) => b,
-        BSrc::F16Packed(_) | BSrc::Packer(_) => unreachable!("packed B goes to gemm_nn"),
-    };
-    // f16: blocks of `WIDEN_ROWS` rows of B, widened, each a product of that depth adding
-    // into C. The blocks are a whole number of passes of every height, so the passes are
-    // those of the widened B.
+    if let BSrc::F32(b) = b {
+        return simd_call!(level, gemm_small_m_simd(d, a, b, c));
+    }
+    if matches!(b, BSrc::F16Packed(_) | BSrc::Packer(_)) {
+        unreachable!("packed B goes to gemm_nn");
+    }
+    // f16 and integer codes: blocks of `WIDEN_ROWS` rows of B, widened, each a product of
+    // that depth adding into C. The blocks are a whole number of passes of every height,
+    // so the passes are those of the widened B.
     WIDENED.with_borrow_mut(|wide| {
         wide.resize(WIDEN_ROWS.min(d.k) * d.n, 0.0);
-        simd_call!(level, gemm_small_m_f16_simd(d, a, b16, c, wide))
+        simd_call!(level, gemm_small_m_wide_simd(d, a, b, c, wide))
     })
 }
 
 #[simd]
-fn gemm_small_m_f16_simd<S: Simd>(
+fn gemm_small_m_wide_simd<S: Simd>(
     simd: S,
     d: &Dims,
     a: &[f32],
-    b: &[half::f16],
+    b: BSrc,
     c: &mut [f32],
     wide: &mut [f32],
 ) {
@@ -696,7 +723,7 @@ fn gemm_small_m_f16_simd<S: Simd>(
         let rows = WIDEN_ROWS.min(d.k - p);
         let wide = &mut wide[..rows * d.n];
         for (i, row) in wide.chunks_exact_mut(d.n).enumerate() {
-            widen_f16(simd, &b[(p + i) * d.ldb..][..d.n], row);
+            b.widen(simd, (p + i) * d.ldb, row);
         }
         let block = Dims {
             k: rows,

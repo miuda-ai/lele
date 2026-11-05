@@ -219,6 +219,137 @@ fn fuse_qdq_matmul_weight(g: &mut Graph) {
     }
 }
 
+/// `MatMul(a, DequantizeLinear(w, scale, zero_point))` with `w` an int8 or uint8
+/// 2-D initializer, or the transpose of one, and a scalar `scale` and `zero_point`,
+/// becomes a `QWeightMatMul`, which reads `w` as the integers it is stored in, a
+/// block at a time, rather than as the f32 matrix folding would leave: the
+/// weights stay a quarter the size on disk, in memory and on the bus.
+///
+/// Models that tie their output projection to the token embedding (Whisper's)
+/// store it transposed, and dequantize that copy; the transpose is done here, in
+/// integers. The weights of products whose activations are quantized as well are
+/// taken first, by [`fuse_qdq_matmul`].
+pub(crate) fn fuse_weight_only_matmul(g: &mut Graph) {
+    let numel = |t: &TensorProto| t.dims.iter().product::<i64>().max(1);
+
+    struct Rewrite {
+        matmul: NodeId,
+        dequantize: NodeId,
+        /// The `Transpose` node and its output, if the codes are its transpose.
+        transpose: Option<(NodeId, ValueId)>,
+        /// The initializer the codes are, or are the transpose of.
+        codes: ValueId,
+        inputs: Vec<Option<ValueId>>,
+    }
+    let mut rewrites = Vec::new();
+    for (mm_id, mm) in g.nodes() {
+        if !matches!(mm.op, Op::MatMul) {
+            continue;
+        }
+        let (Some(a), Some(wd)) = (mm.input(0), mm.input(1)) else {
+            continue;
+        };
+        let Some(dq_id) = g.value(wd).producer() else {
+            continue;
+        };
+        let dq = g.node(dq_id);
+        let Op::DequantizeLinear(attrs) = &dq.op else {
+            continue;
+        };
+        if g.uses(wd) != 1 || attrs.block_size != 0 {
+            continue;
+        }
+        let (Some(x), Some(scale)) = (dq.input(0), dq.input(1)) else {
+            continue;
+        };
+        if !g.data(scale).is_some_and(|t| numel(t) == 1) {
+            continue;
+        }
+        let zero_point = dq.input(2);
+        if let Some(zp) = zero_point
+            && !g.data(zp).is_some_and(|t| numel(t) == 1)
+        {
+            continue;
+        }
+
+        let (codes, transpose) = if g.data(x).is_some() {
+            (x, None)
+        } else {
+            let Some(t_id) = g.value(x).producer() else {
+                continue;
+            };
+            let t = g.node(t_id);
+            let Op::Transpose { perm } = &t.op else {
+                continue;
+            };
+            let (Some(src), true) = (
+                t.input(0),
+                g.uses(x) == 1 && matches!(perm.as_deref(), None | Some([1, 0])),
+            ) else {
+                continue;
+            };
+            (src, Some((t_id, x)))
+        };
+        let Some(w) = g.data(codes) else {
+            continue;
+        };
+        if !matches!(DType::from_onnx(w.data_type), DType::U8 | DType::I8) || w.dims.len() != 2 {
+            continue;
+        }
+
+        rewrites.push(Rewrite {
+            matmul: mm_id,
+            dequantize: dq_id,
+            transpose,
+            codes,
+            inputs: vec![
+                Some(a),
+                Some(transpose.map_or(codes, |(_, out)| out)),
+                Some(scale),
+                zero_point,
+            ],
+        });
+    }
+
+    for r in rewrites {
+        if let Some((transpose, out)) = r.transpose {
+            let src = g.data(r.codes).expect("codes without data");
+            let dtype = DType::from_onnx(src.data_type);
+            let Ok((codes, shape)) = crate::model::tensor_to_array(src) else {
+                continue;
+            };
+            let (rows, cols) = (shape[0], shape[1]);
+            let mut bytes = vec![0u8; rows * cols];
+            for row in 0..rows {
+                for col in 0..cols {
+                    let code = codes[row * cols + col];
+                    // Codes are held as f32; exact integers.
+                    bytes[col * rows + row] = if dtype == DType::I8 {
+                        code as i8 as u8
+                    } else {
+                        code as u8
+                    };
+                }
+            }
+            let name = g.value(out).name.clone();
+            g.remove_node(transpose);
+            g.add_initializer(
+                out,
+                TensorProto {
+                    name,
+                    dims: vec![cols as i64, rows as i64],
+                    data_type: dtype.to_onnx(),
+                    raw_data: bytes,
+                    ..Default::default()
+                },
+            );
+        }
+        g.set_inputs(r.matmul, r.inputs);
+        g.node_mut(r.matmul).op = Op::QWeightMatMul;
+        g.remove_node(r.dequantize);
+    }
+}
+
 /// Inputs of `QLinearMatMulI8` beyond the five it is made with: the scale and
 /// zero point of the pair that follows the product, and the bias added after
 /// it.
@@ -892,6 +1023,103 @@ mod tests {
             assert_eq!(op_types(&g), ["QLinearMatMulAct"]);
             assert_eq!(g.node[0].input, ["x", "s", "z", "v", "s", "z", "ys", "yz"]);
             assert_eq!(g.node[0].output, ["yd"]);
+        }
+    }
+
+    mod weight_only {
+        use super::*;
+
+        fn init(name: &str, dtype: DType, dims: &[i64], raw: Vec<u8>) -> TensorProto {
+            TensorProto {
+                name: name.to_string(),
+                data_type: dtype.to_onnx(),
+                dims: dims.to_vec(),
+                raw_data: raw,
+                ..Default::default()
+            }
+        }
+
+        /// `y = MatMul(a, DequantizeLinear(w))`, with `w` the `[2, 3]` codes
+        /// `1..=6` of `dtype` (and `Transpose`d first, giving `[3, 2]`, if asked).
+        fn graph(dtype: DType, transpose: bool) -> GraphProto {
+            let mut nodes = vec![];
+            let codes = if transpose {
+                nodes.push(node("Transpose", &["w"], "wt", &[]));
+                "wt"
+            } else {
+                "w"
+            };
+            nodes.push(node("DequantizeLinear", &[codes, "s", "z"], "wd", &[]));
+            nodes.push(node("MatMul", &["a", "wd"], "y", &[]));
+            GraphProto {
+                node: nodes,
+                initializer: vec![
+                    init("w", dtype, &[2, 3], vec![1, 2, 3, 4, 5, 6]),
+                    init("s", DType::F32, &[], 0.5f32.to_le_bytes().to_vec()),
+                    init("z", dtype, &[], vec![2]),
+                ],
+                output: vec![output("y")],
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn reads_the_transpose_of_a_quantized_table_in_integers() {
+            for dtype in [DType::U8, DType::I8] {
+                let g = run(graph(dtype, true), fuse_weight_only_matmul);
+                assert_eq!(op_types(&g), ["QWeightMatMul"], "{dtype:?}");
+                // The product's operands are the transposed codes, the scale
+                // and the zero point.
+                assert_eq!(g.node[0].input, ["a", "wt", "s", "z"]);
+                let wt = g.initializer.iter().find(|t| t.name == "wt").unwrap();
+                assert_eq!(DType::from_onnx(wt.data_type), dtype);
+                assert_eq!(wt.dims, [3, 2]);
+                assert_eq!(wt.raw_data, [1, 4, 2, 5, 3, 6]);
+            }
+        }
+
+        #[test]
+        fn becomes_a_weight_only_matmul() {
+            let mut ir = Graph::from_onnx(graph(DType::I8, false));
+            fuse_weight_only_matmul(&mut ir);
+            let ops: Vec<_> = ir.nodes().map(|(_, n)| n.op.clone()).collect();
+            assert!(matches!(ops[..], [Op::QWeightMatMul]), "{ops:?}");
+        }
+
+        #[test]
+        fn keeps_a_scale_per_column() {
+            let mut g = graph(DType::U8, false);
+            g.initializer[1] = init("s", DType::F32, &[3], vec![0; 12]);
+            let g = run(g, fuse_weight_only_matmul);
+            assert_eq!(op_types(&g), ["DequantizeLinear", "MatMul"]);
+        }
+
+        #[test]
+        fn keeps_weights_that_are_read_elsewhere() {
+            let mut g = graph(DType::U8, false);
+            g.node.push(node("Relu", &["wd"], "other", &[]));
+            let g = run(g, fuse_weight_only_matmul);
+            assert_eq!(op_types(&g), ["DequantizeLinear", "MatMul", "Relu"]);
+        }
+
+        #[test]
+        fn keeps_a_transposed_table_that_is_read_elsewhere() {
+            let mut g = graph(DType::U8, true);
+            g.node.push(node("Relu", &["wt"], "other", &[]));
+            let g = run(g, fuse_weight_only_matmul);
+            assert_eq!(
+                op_types(&g),
+                ["Transpose", "DequantizeLinear", "MatMul", "Relu"]
+            );
+        }
+
+        #[test]
+        fn keeps_weights_that_are_not_integers() {
+            let mut g = graph(DType::U8, false);
+            g.initializer[0] = init("w", DType::F32, &[2, 3], vec![0; 24]);
+            g.initializer[2] = init("z", DType::F32, &[], vec![0; 4]);
+            let g = run(g, fuse_weight_only_matmul);
+            assert_eq!(op_types(&g), ["DequantizeLinear", "MatMul"]);
         }
     }
 }

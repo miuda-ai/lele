@@ -95,8 +95,11 @@ impl ConvWeights {
         zero_point: &[i32],
         code: impl Fn(usize) -> f32,
     ) -> Self {
-        let &[out_channels, channels, kh, kw] = shape else {
-            panic!("ConvInteger weights of shape {shape:?}");
+        // A 1-D convolution is a 2-D one over a single row.
+        let (out_channels, channels, kh, kw) = match *shape {
+            [o, c, k] => (o, c, 1, k),
+            [o, c, h, w] => (o, c, h, w),
+            _ => panic!("ConvInteger weights of shape {shape:?}"),
         };
         assert!(
             groups > 0 && out_channels % groups == 0,
@@ -238,6 +241,39 @@ pub(crate) fn conv_integer_at<'a>(
     strides: &[i64],
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
+    if let &[batch, channels, len] = &input.shape[..] {
+        // A 1-D convolution is a 2-D one over a single row.
+        let row = TensorView::from_slice(&input.data, vec![batch, channels, 1, len]);
+        let dilations = match dilations {
+            [d] => vec![1, *d],
+            _ => dilations.to_vec(),
+        };
+        let strides = match strides {
+            [s] => vec![1, *s],
+            _ => strides.to_vec(),
+        };
+        let pads = match pads {
+            [begin, end] => vec![0, *begin, 0, *end],
+            _ => pads.to_vec(),
+        };
+        let r = conv_integer_at(
+            level,
+            &row,
+            w,
+            x_zero_point,
+            &dilations,
+            &pads,
+            &strides,
+            out,
+        );
+        let &[n, oc, 1, out_len] = &r.shape[..] else {
+            unreachable!("a 2-D ConvInteger gave {:?}", r.shape);
+        };
+        return TensorView {
+            data: r.data,
+            shape: std::borrow::Cow::Owned(vec![n, oc, out_len]),
+        };
+    }
     let &[batch, in_channels, in_h, in_w] = &input.shape[..] else {
         panic!("ConvInteger input of shape {:?}", input.shape);
     };
@@ -554,6 +590,85 @@ mod tests {
                     let what =
                         format!("{level:?} {layout:?} float depth {float_depth}, case {i}.{case}");
                     assert_eq!(&got.shape[..], &[n, oc, oh, ow], "{what}");
+                    assert_eq!(&got.data[..], &expected[..], "{what}");
+                }
+            }
+        }
+    }
+
+    /// A 1-D `ConvInteger` is the 2-D one over a single row.
+    #[test]
+    fn test_conv_integer_over_one_dimension() {
+        let mut rng = Rng::new(17);
+        // (n, c, len, oc, k, groups, dilation, pads, stride); the first two are
+        // Whisper's encoder.
+        type Case = (
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            [usize; 2],
+            usize,
+        );
+        let cases: &[Case] = &[
+            (1, 80, 60, 64, 3, 1, 1, [1, 1], 1),
+            (2, 64, 60, 64, 3, 1, 1, [1, 1], 2),
+            (1, 6, 17, 4, 3, 2, 2, [2, 0], 1),
+            (1, 3, 9, 5, 1, 1, 1, [0, 0], 1),
+            (1, 40, 12, 70, 3, 1, 1, [1, 1], 1),
+        ];
+        let runs = levels()
+            .into_iter()
+            .flat_map(|l| Layout::ALL.map(|layout| (l, layout, 0)))
+            .chain([(
+                Level::new(),
+                Layout::for_level(Level::new()),
+                EXACT_F32_DEPTH,
+            )]);
+        for (level, layout, float_depth) in runs {
+            for (i, &(n, c, len, oc, k, groups, dil, [p0, p1], stride)) in cases.iter().enumerate()
+            {
+                for signed in [false, true] {
+                    let cg = c / groups;
+                    let code = |rng: &mut Rng| {
+                        if signed {
+                            rng.f32(-128.0, 128.0).floor()
+                        } else {
+                            rng.f32(0.0, 256.0).floor()
+                        }
+                    };
+                    let x: Vec<f32> = (0..n * c * len).map(|_| code(&mut rng)).collect();
+                    let wt: Vec<f32> = (0..oc * cg * k).map(|_| code(&mut rng)).collect();
+                    let x_zp = code(&mut rng) as i32;
+                    let w_zp = [code(&mut rng) as i32];
+                    let (expected, [oh, ow]) = reference(
+                        &x,
+                        [n, c, 1, len],
+                        x_zp,
+                        &wt,
+                        [oc, cg, 1, k],
+                        &w_zp,
+                        groups,
+                        [1, dil],
+                        [0, p0, 0, p1],
+                        [1, stride],
+                    );
+                    assert_eq!(oh, 1);
+                    let w =
+                        ConvWeights::pack(layout, float_depth, &[oc, cg, k], groups, &w_zp, |i| {
+                            wt[i]
+                        });
+                    let input = TensorView::from_slice(&x, vec![n, c, len]);
+                    let (d, p, s) = ([dil as i64], [p0 as i64, p1 as i64], [stride as i64]);
+                    let mut out = Vec::new();
+                    let got = conv_integer_at(level, &input, &w, x_zp, &d, &p, &s, &mut out);
+                    let what = format!(
+                        "{level:?} {layout:?} float depth {float_depth}, case {i}, signed {signed}"
+                    );
+                    assert_eq!(&got.shape[..], &[n, oc, ow], "{what}");
                     assert_eq!(&got.data[..], &expected[..], "{what}");
                 }
             }

@@ -5,6 +5,7 @@ members = [
     "examples/sensevoice",
     "examples/silero",
     "examples/tone",
+    "examples/whisper",
     "examples/supertonic",
     "examples/supertonic3",
     "examples/yolo26",

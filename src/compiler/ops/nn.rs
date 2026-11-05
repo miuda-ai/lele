@@ -317,11 +317,17 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             } else {
                 "None".to_string()
             };
-            // A static weight is prepared once, on first use.
+            // A static weight is prepared once, on first use. A 1-D one is a
+            // 2-D one over a single row.
             match ctx.weight(1) {
                 Some(weight)
-                    if matches!(weight.dtype, DType::U8 | DType::I8) && weight.shape.len() == 4 =>
+                    if matches!(weight.dtype, DType::U8 | DType::I8)
+                        && matches!(weight.shape.len(), 3 | 4) =>
                 {
+                    let shape = match weight.shape[..] {
+                        [o, c, k] => vec![o, c, 1, k],
+                        _ => weight.shape.to_vec(),
+                    };
                     writeln!(
                         w,
                         "{}let {} = self.conv_integer_packed(&{}, {}, {}, {:?}, {}, {}, {}, {}, &{:?}, &{:?}, &{:?}, {});",
@@ -330,7 +336,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                         inputs[0],
                         weight.offset,
                         weight.len,
-                        weight.shape,
+                        shape,
                         weight.dtype == DType::I8,
                         group,
                         x_zero_point,

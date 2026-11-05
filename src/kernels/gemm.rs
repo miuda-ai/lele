@@ -1,8 +1,8 @@
 use crate::kernels::bias_act::bias_act_inplace;
 use crate::kernels::conv2d::Activation;
 use crate::kernels::matmul::{
-    Accum, MatMut, MatRef, Par, matmul as strided_matmul, matmul_f16, matmul_f16_a,
-    matmul_f16_packed, matmul_f16_packed_a,
+    Accum, Codes, MatMut, MatRef, Par, matmul as strided_matmul, matmul_codes, matmul_f16,
+    matmul_f16_a, matmul_f16_packed, matmul_f16_packed_a,
 };
 use crate::kernels::utils;
 use crate::tensor::TensorView;
@@ -208,6 +208,48 @@ pub fn matmul<'a, B: WeightElem>(
     let out = &mut out_buf[..output_len];
     if output_len > 0 {
         matmul_batches(a, b, (dims, batch_a, batch_b), Accum::Replace, out);
+    }
+    TensorView {
+        data: Cow::Borrowed(out),
+        shape: Cow::Owned(out_shape),
+    }
+}
+
+/// `a * b` with `b` a quantized `[k, n]` matrix of integer `codes`, whose values are
+/// `scale * (code - zero_point)`: the product of [`matmul`] with it widened to f32 (see
+/// [`crate::kernels::matmul::matmul_codes`]), without ever holding it in f32. `a` is
+/// `[.., k]`, its leading dims are the rows of the product.
+pub fn weight_only_matmul<'a>(
+    a: &TensorView<'_>,
+    codes: Codes<'_>,
+    (k, n): (usize, usize),
+    zero_point: f32,
+    scale: f32,
+    out_buf: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    assert_eq!(
+        a.shape.last(),
+        Some(&k),
+        "MatMul of {:?} and quantized weights [{k}, {n}]",
+        a.shape
+    );
+    assert!(
+        codes.len() >= k * n,
+        "quantized weights shorter than [{k}, {n}]"
+    );
+    let m = a.data.len() / k.max(1);
+    let mut out_shape = a.shape[..a.shape.len() - 1].to_vec();
+    out_shape.push(n);
+    // SAFETY: the product replaces every element.
+    unsafe { utils::ensure_capacity(out_buf, m * n) };
+    let out = &mut out_buf[..m * n];
+    if m * n > 0 {
+        // SAFETY: `a` holds `m * k` elements, `out` `m * n`, and `codes` `k * n`.
+        unsafe {
+            let a_mat = MatRef::<f32>::from_raw_parts(a.data.as_ptr(), m, k, k as isize, 1);
+            let out_mat = MatMut::<f32>::from_raw_parts_mut(out.as_mut_ptr(), m, n, n as isize, 1);
+            matmul_codes(out_mat, Accum::Replace, a_mat, codes, n, zero_point, scale);
+        }
     }
     TensorView {
         data: Cow::Borrowed(out),

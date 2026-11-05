@@ -77,6 +77,7 @@ pub(crate) fn follows_input(op: &Op, i: usize) -> Option<usize> {
         | Op::DequantizeLinear(_)
         | Op::QLinearMatMulI8
         | Op::QLinearMatMulAct
+        | Op::QWeightMatMul
         | Op::QLinearDynamic { .. }
         | Op::If { .. }
         | Op::Loop { .. } => None,

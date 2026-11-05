@@ -331,6 +331,64 @@ enum BMat<'a> {
     },
     /// As [`pack_f16`] lays it out.
     F16Packed(&'a [half::f16]),
+    /// Row-major integer codes, `ldb` elements between rows, less `zero_point`.
+    Codes {
+        codes: Codes<'a>,
+        ldb: usize,
+        zero_point: f32,
+    },
+}
+
+/// The integer codes of a quantized weight.
+#[derive(Clone, Copy, Debug)]
+pub enum Codes<'a> {
+    U8(&'a [u8]),
+    I8(&'a [i8]),
+}
+
+impl Codes<'_> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Codes::U8(c) => c.len(),
+            Codes::I8(c) => c.len(),
+        }
+    }
+
+    pub(crate) fn get(&self, i: usize) -> f32 {
+        match self {
+            Codes::U8(c) => c[i] as f32,
+            Codes::I8(c) => c[i] as f32,
+        }
+    }
+}
+
+/// [`matmul`] with B a quantized matrix: row-major integer `codes` of `a.ncols` rows of
+/// `dst.ncols` columns, `ldb` elements apart, whose values are
+/// `scale * (code - zero_point)`. The product is that of B widened to f32, to within
+/// the rounding of multiplying by `scale` after the sum (`alpha` is the scale): the codes
+/// are only widened a block at a time as the kernels read them, so a large B is streamed
+/// as the integers it is stored in.
+pub fn matmul_codes(
+    dst: MatMut<f32>,
+    accum: Accum,
+    a: MatRef<f32>,
+    codes: Codes<'_>,
+    ldb: usize,
+    zero_point: f32,
+    scale: f32,
+) {
+    matmul_b(
+        Level::new(),
+        dst,
+        accum,
+        a,
+        BMat::Codes {
+            codes,
+            ldb,
+            zero_point,
+        },
+        scale,
+    )
 }
 
 fn matmul_b(level: Level, mut dst: MatMut<f32>, accum: Accum, a: MatRef<f32>, b: BMat, alpha: f32) {
@@ -363,12 +421,37 @@ fn matmul_b(level: Level, mut dst: MatMut<f32>, accum: Accum, a: MatRef<f32>, b:
             // SAFETY: `b_wide` holds the `k x n` row-major elements addressed.
             BMat::F32(unsafe { MatRef::from_raw_parts(b_wide.as_ptr(), k, n, n as isize, 1) })
         }
+        BMat::Codes {
+            codes,
+            ldb,
+            zero_point,
+        } if n <= DOT_MAX_N => {
+            b_wide = (0..k)
+                .flat_map(|p| (0..n).map(move |j| codes.get(p * ldb + j) - zero_point))
+                .collect();
+            // SAFETY: `b_wide` holds the `k x n` row-major elements addressed.
+            BMat::F32(unsafe { MatRef::from_raw_parts(b_wide.as_ptr(), k, n, n as isize, 1) })
+        }
         b => b,
     };
     let b = match b {
         BMat::F16 { data, ldb } => {
             assert!(data.len() >= (k - 1) * ldb + n, "matmul: B is too short");
             Err((BSrc::F16(data), ldb))
+        }
+        BMat::Codes {
+            codes,
+            ldb,
+            zero_point,
+        } => {
+            assert!(codes.len() >= (k - 1) * ldb + n, "matmul: B is too short");
+            Err((
+                match codes {
+                    Codes::U8(codes) => BSrc::U8 { codes, zero_point },
+                    Codes::I8(codes) => BSrc::I8 { codes, zero_point },
+                },
+                ldb,
+            ))
         }
         BMat::F16Packed(data) => {
             assert!(n % PACK_COLS == 0, "matmul: packed B has {n} columns");
@@ -669,6 +752,78 @@ mod tests {
                     }
                     let what = format!("{level:?} m={m} n={n} k={k} alpha={alpha} add={add}");
                     assert_same_bits(&got, &want, &what);
+                }
+            }
+        }
+    }
+
+    /// A quantized B is read as the matrix it stands for, `code - zero_point`, scaled
+    /// by `alpha`, and the product is that of the widened matrix bit for bit, for few rows
+    /// of C and many, wide and narrow.
+    #[test]
+    fn test_matmul_codes_is_matmul_of_widened_b() {
+        let mut rng = Rng::new(9);
+        let sizes = [
+            (1, 1, 1),
+            (1, 16, 8),
+            (1, 1536, 384),
+            (1, 4000, 70),
+            (2, 40, 101),
+            (4, 37, 70),
+            (5, 10, 384),
+            (6, 16, 4),
+            (7, 24, 5),
+            (10, 384, 1536),
+            (13, 5, 40),
+            (35, 220, 1030),
+        ];
+        for level in levels() {
+            for &(m, n, k) in &sizes {
+                // B with padding between rows, as a view into a wider matrix would have.
+                let ldb = n + 3;
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let u8s: Vec<u8> = (0..k * ldb).map(|_| rng.f32(0.0, 256.0) as u8).collect();
+                let i8s: Vec<i8> = (0..k * ldb).map(|_| rng.f32(-128.0, 128.0) as i8).collect();
+                for signed in [false, true] {
+                    let (codes, zero_point) = if signed {
+                        (Codes::I8(&i8s), -7.0)
+                    } else {
+                        (Codes::U8(&u8s), 128.0)
+                    };
+                    let b32: Vec<f32> = (0..k * ldb).map(|i| codes.get(i) - zero_point).collect();
+                    for (alpha, add) in [(0.03, false), (-1.5, true)] {
+                        let c0 = rng.vec(m * n, -1.0, 1.0);
+                        let accum = || if add { Accum::Add } else { Accum::Replace };
+                        let (mut want, mut got) = (c0.clone(), c0.clone());
+                        // SAFETY: each pointer addresses the row-major elements given.
+                        unsafe {
+                            let a = || MatRef::from_raw_parts(a.as_ptr(), m, k, k as isize, 1);
+                            matmul_at(
+                                level,
+                                MatMut::from_raw_parts_mut(want.as_mut_ptr(), m, n, n as isize, 1),
+                                accum(),
+                                a(),
+                                MatRef::from_raw_parts(b32.as_ptr(), k, n, ldb as isize, 1),
+                                alpha,
+                            );
+                            matmul_b(
+                                level,
+                                MatMut::from_raw_parts_mut(got.as_mut_ptr(), m, n, n as isize, 1),
+                                accum(),
+                                a(),
+                                BMat::Codes {
+                                    codes,
+                                    ldb,
+                                    zero_point,
+                                },
+                                alpha,
+                            );
+                        }
+                        let what = format!(
+                            "{level:?} m={m} n={n} k={k} signed={signed} alpha={alpha} add={add}"
+                        );
+                        assert_same_bits(&got, &want, &what);
+                    }
                 }
             }
         }
