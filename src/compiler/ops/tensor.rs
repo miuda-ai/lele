@@ -3,8 +3,9 @@
 
 use super::super::{
     generate::{ElemType, OpContext},
-    ir::{DType, Op, ReshapeDim},
+    ir::{DType, Op, TargetDim},
 };
+use crate::model::onnx_proto::TensorProto;
 use std::io::Write;
 
 pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<()> {
@@ -95,22 +96,35 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             )?;
         }
         Op::ReshapeTo { dims } => {
-            let x = &inputs[0];
-            let dims: Vec<String> = dims
-                .iter()
-                .map(|d| match d {
-                    ReshapeDim::Fixed(n) => n.to_string(),
-                    ReshapeDim::Input(k) => format!("{x}.shape[{k}] as i64"),
-                    ReshapeDim::Infer => "-1".to_string(),
-                })
-                .collect();
             writeln!(
                 w,
                 "{}let {} = lele::kernels::reshape(&{}, &[{}]);",
                 tab,
                 outputs[0],
-                x,
-                dims.join(", ")
+                inputs[0],
+                target(dims, inputs, " as i64")
+            )?;
+        }
+        Op::ExpandTo { dims } => {
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::expand(&{}, &[{}], {});",
+                tab,
+                outputs[0],
+                inputs[0],
+                target(dims, inputs, " as i64"),
+                buf_expr
+            )?;
+        }
+        Op::ConstantOfShapeTo { value, dims } => {
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::full(&[{}], {}, {});",
+                tab,
+                outputs[0],
+                target(dims, inputs, ""),
+                fill_value(value, ctx.var_types.is_i64(&outputs[0])),
+                buf_expr
             )?;
         }
         Op::Flatten { axis } => {
@@ -243,31 +257,15 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             }
         }
         Op::ConstantOfShape { value } => {
-            let is_i64 = ctx.var_types.is_i64(&ctx.outputs[0]);
-            let val = value
-                .as_ref()
-                .map(|t| {
-                    if let Ok((data, _)) = crate::model::tensor_to_array(t)
-                        && !data.is_empty()
-                    {
-                        return data[0];
-                    }
-                    0.0
-                })
-                .unwrap_or(0.0);
-            if is_i64 {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::constant_of_shape(&{}, {}i64, {});",
-                    tab, outputs[0], inputs[0], val as i64, buf_expr
-                )?;
-            } else {
-                writeln!(
-                    w,
-                    "{}let {} = lele::kernels::constant_of_shape(&{}, {:.1}, {});",
-                    tab, outputs[0], inputs[0], val, buf_expr
-                )?;
-            }
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::constant_of_shape(&{}, {}, {});",
+                tab,
+                outputs[0],
+                inputs[0],
+                fill_value(value, ctx.var_types.is_i64(&outputs[0])),
+                buf_expr
+            )?;
         }
         Op::Slice => {
             let starts = resolve_i64_with_temp(1, ctx, w, &tab)?;
@@ -603,4 +601,37 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
         op => unreachable!("{} is not a tensor operator", op.op_type()),
     }
     Ok(())
+}
+
+/// The elements of a [`TargetDim`] target, input dimensions cast with
+/// `cast`.
+fn target(dims: &[TargetDim], inputs: &[String], cast: &str) -> String {
+    dims.iter()
+        .map(|d| match *d {
+            TargetDim::Fixed(n) => n.to_string(),
+            TargetDim::Of { input, axis } => format!("{}.shape[{axis}]{cast}", inputs[input]),
+            TargetDim::Infer => "-1".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The fill value of a `ConstantOfShape` as a literal, 0 by default.
+fn fill_value(value: &Option<TensorProto>, is_i64: bool) -> String {
+    let val = value
+        .as_ref()
+        .and_then(|t| crate::model::tensor_to_array(t).ok())
+        .and_then(|(data, _)| data.first().copied())
+        .unwrap_or(0.0);
+    if is_i64 {
+        format!("{}i64", val as i64)
+    } else if val.is_finite() {
+        format!("{val:?}")
+    } else if val.is_nan() {
+        "f32::NAN".to_string()
+    } else if val > 0.0 {
+        "f32::INFINITY".to_string()
+    } else {
+        "f32::NEG_INFINITY".to_string()
+    }
 }

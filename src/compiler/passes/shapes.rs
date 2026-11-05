@@ -1,19 +1,21 @@
 //! Shape inference, and folding of the shape computations it resolves.
 //!
-//! Exported models compute reshape targets at run time: `Shape(x)`, then
-//! `Gather`, `Unsqueeze` and `Concat` to assemble the target from `x`'s
-//! dimensions and constants. Most of those dimensions are fixed, and the
-//! others are dimensions of the tensor being reshaped. [`fold_shapes`] infers
-//! the shape of every value and the elements of small integer tensors, then
-//! replaces the integer tensors it knows completely by initializers and
-//! `Reshape`s whose target it knows up to the input's dimensions by
-//! [`Op::ReshapeTo`], leaving the computation dead.
+//! Exported models compute shapes at run time: `Shape(x)`, then `Gather`,
+//! `Unsqueeze` and `Concat` to assemble a `Reshape` or `Expand` target or a
+//! `ConstantOfShape` shape from dimensions of tensors and constants. Most of
+//! those dimensions are fixed, and the others are dimensions of tensors
+//! computed earlier. [`fold_shapes`] infers the shape of every value and the
+//! elements of small integer tensors, each either a number or a dimension of
+//! a value. It then replaces the integer tensors it knows completely by
+//! initializers, and the operators whose target it knows up to dimensions of
+//! values by [`Op::ReshapeTo`], [`Op::ExpandTo`] and
+//! [`Op::ConstantOfShapeTo`], leaving the computation dead.
 //!
 //! Inference is conservative: a dimension is only derived where lele's
 //! kernels agree with ONNX, and is [`Dim::Unknown`] otherwise.
 
 use crate::compiler::ir::{
-    Binary, ConvAttrs, DType, Dim, Graph, Node, Op, PoolAttrs, Reduction, ReshapeDim, ValueId,
+    Binary, ConvAttrs, DType, Dim, Graph, Node, Op, PoolAttrs, Reduction, TargetDim, ValueId,
 };
 use crate::model::onnx_proto::TensorProto;
 use crate::model::tensor_to_array;
@@ -24,6 +26,51 @@ type Shape = Vec<Dim>;
 /// Integer tensors with at most this many elements have them tracked.
 const MAX_ELEMS: usize = 64;
 
+/// What is known of an element of a small integer tensor.
+#[derive(Clone, Debug, PartialEq)]
+enum Elem {
+    Fixed(i64),
+    /// Dimension `axis` of a value of this graph, where it is not fixed.
+    Dim(ValueId, usize),
+    /// A symbolic dimension of a value of an enclosing graph.
+    Sym(String),
+    Unknown,
+}
+
+impl Elem {
+    fn fixed(&self) -> Option<i64> {
+        match self {
+            Elem::Fixed(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    fn from_dim(d: &Dim) -> Self {
+        match d {
+            Dim::Fixed(n) => Elem::Fixed(*n),
+            Dim::Sym(s) => Elem::Sym(s.clone()),
+            Dim::Unknown => Elem::Unknown,
+        }
+    }
+
+    /// This element as a dimension of a shape.
+    fn to_dim(&self, g: &Graph) -> Dim {
+        match self {
+            Elem::Fixed(n) => Dim::Fixed(*n),
+            Elem::Dim(v, axis) => g
+                .value(*v)
+                .shape
+                .as_ref()
+                .and_then(|s| s.get(*axis).cloned())
+                .unwrap_or(Dim::Unknown),
+            Elem::Sym(s) => Dim::Sym(s.clone()),
+            Elem::Unknown => Dim::Unknown,
+        }
+    }
+}
+
+type Elems = HashMap<ValueId, Vec<Elem>>;
+
 /// Shapes and elements of the values of enclosing graphs, by name.
 #[derive(Clone, Default)]
 struct Scope {
@@ -31,9 +78,9 @@ struct Scope {
     elems: HashMap<String, Vec<Dim>>,
 }
 
-/// Infers shapes, then folds the integer tensors and reshape targets they
-/// resolve, in `g` and its subgraphs. Expects
-/// [`infer_dtypes`](super::infer_dtypes) to have run.
+/// Infers shapes, then folds the integer tensors and targets they resolve,
+/// in `g` and its subgraphs. Expects [`infer_dtypes`](super::infer_dtypes)
+/// to have run.
 pub(crate) fn fold_shapes(g: &mut Graph) {
     fold_graph(g, &Scope::default());
 }
@@ -41,14 +88,14 @@ pub(crate) fn fold_shapes(g: &mut Graph) {
 fn fold_graph(g: &mut Graph, outer: &Scope) {
     let elems = infer(g, outer);
     fold_ints(g, &elems);
-    rewrite_reshapes(g, &elems);
+    rewrite_targets(g, &elems);
 }
 
 /// Sets the shape of every value of `g` the model leaves open or only
 /// partly states, recursing into subgraphs, and returns the elements known
 /// of small integer tensors.
-fn infer(g: &mut Graph, outer: &Scope) -> HashMap<ValueId, Vec<Dim>> {
-    let mut elems: HashMap<ValueId, Vec<Dim>> = HashMap::new();
+fn infer(g: &mut Graph, outer: &Scope) -> Elems {
+    let mut elems = Elems::new();
     let captures: Vec<ValueId> = g.captures().collect();
     for v in captures {
         let name = g.value(v).name.clone();
@@ -56,7 +103,7 @@ fn infer(g: &mut Graph, outer: &Scope) -> HashMap<ValueId, Vec<Dim>> {
             set_shape(g, v, shape.clone());
         }
         if let Some(e) = outer.elems.get(&name) {
-            elems.insert(v, e.clone());
+            elems.insert(v, e.iter().map(Elem::from_dim).collect());
         }
     }
     // An initializer of an input's name is only its default value.
@@ -76,8 +123,10 @@ fn infer(g: &mut Graph, outer: &Scope) -> HashMap<ValueId, Vec<Dim>> {
                 if let Some(shape) = &value.shape {
                     scope.shapes.insert(value.name.clone(), shape.clone());
                 }
+                // Values of this graph mean nothing to the subgraph.
                 if let Some(e) = elems.get(&v) {
-                    scope.elems.insert(value.name.clone(), e.clone());
+                    let dims = e.iter().map(|e| e.to_dim(g)).collect();
+                    scope.elems.insert(value.name.clone(), dims);
                 }
             }
             for sub in g.node_mut(id).op.subgraphs_mut() {
@@ -135,12 +184,12 @@ fn unify(a: &Dim, b: &Dim) -> Dim {
 }
 
 /// The values of an integer scalar or vector small enough to track.
-fn int_elems(t: &TensorProto) -> Option<Vec<Dim>> {
+fn int_elems(t: &TensorProto) -> Option<Vec<Elem>> {
     if !matches!(DType::from_onnx(t.data_type), DType::I64 | DType::I32) || t.dims.len() > 1 {
         return None;
     }
     let (data, _) = tensor_to_array(t).ok()?;
-    (data.len() <= MAX_ELEMS).then(|| data.iter().map(|&x| Dim::Fixed(x as i64)).collect())
+    (data.len() <= MAX_ELEMS).then(|| data.iter().map(|&x| Elem::Fixed(x as i64)).collect())
 }
 
 fn fixed(d: &Dim) -> Option<i64> {
@@ -150,9 +199,14 @@ fn fixed(d: &Dim) -> Option<i64> {
     }
 }
 
-/// Every element, if all are known.
+/// Every dimension, if all are known.
 fn all_fixed(dims: &[Dim]) -> Option<Vec<i64>> {
     dims.iter().map(fixed).collect()
+}
+
+/// Every element, if all are known.
+fn all_fixed_elems(elems: &[Elem]) -> Option<Vec<i64>> {
+    elems.iter().map(Elem::fixed).collect()
 }
 
 fn product(dims: &[Dim]) -> Option<i64> {
@@ -340,9 +394,30 @@ fn slice_len(dim: i64, start: i64, end: i64, step: i64) -> Option<i64> {
 }
 
 /// Shapes of the outputs of `node`, where they follow from its inputs.
-fn output_shapes(g: &Graph, node: &Node, elems: &HashMap<ValueId, Vec<Dim>>) -> Vec<Option<Shape>> {
+fn output_shapes(g: &Graph, node: &Node, elems: &Elems) -> Vec<Option<Shape>> {
     let shape = |i: usize| node.input(i).and_then(|v| g.value(v).shape.clone());
-    let ints = |i: usize| node.input(i).and_then(|v| all_fixed(elems.get(&v)?));
+    let ints = |i: usize| node.input(i).and_then(|v| all_fixed_elems(elems.get(&v)?));
+    // The elements of 1-D input `i` as dimensions, as many unknown ones as
+    // it has if they are not tracked.
+    let dims = |i: usize| match elems.get(&node.input(i)?) {
+        Some(e) => Some(e.iter().map(|e| e.to_dim(g)).collect::<Shape>()),
+        None => match shape(i)?.as_slice() {
+            [Dim::Fixed(n)] => Some(vec![Dim::Unknown; usize::try_from(*n).ok()?]),
+            _ => None,
+        },
+    };
+    // A target of input dimensions.
+    let target = |dims: &[TargetDim]| -> Shape {
+        dims.iter()
+            .map(|d| match *d {
+                TargetDim::Fixed(n) => Dim::Fixed(n),
+                TargetDim::Of { input, axis } => shape(input)
+                    .and_then(|s| s.get(axis).cloned())
+                    .unwrap_or(Dim::Unknown),
+                TargetDim::Infer => Dim::Unknown,
+            })
+            .collect()
+    };
     let n_out = node.outputs().len();
     let first = |s: Option<Shape>| {
         let mut out = vec![None; n_out];
@@ -419,19 +494,8 @@ fn output_shapes(g: &Graph, node: &Node, elems: &HashMap<ValueId, Vec<Dim>>) -> 
                 None => Some(x.into_iter().rev().collect()),
             }
         })),
-        Op::Reshape => first(reshape_target(
-            shape(0).as_deref(),
-            node.input(1).and_then(|v| elems.get(&v)),
-        )),
-        Op::ReshapeTo { dims } => first(shape(0).map(|x| {
-            dims.iter()
-                .map(|d| match d {
-                    ReshapeDim::Fixed(n) => Dim::Fixed(*n),
-                    ReshapeDim::Input(k) => x.get(*k).cloned().unwrap_or(Dim::Unknown),
-                    ReshapeDim::Infer => Dim::Unknown,
-                })
-                .collect()
-        })),
+        Op::Reshape => first(reshape_target(shape(0).as_deref(), dims(1))),
+        Op::ReshapeTo { dims } => first(Some(target(dims))),
         Op::Flatten { axis } => first(shape(0).and_then(|x| {
             let a = if *axis < 0 {
                 *axis + x.len() as i64
@@ -521,23 +585,30 @@ fn output_shapes(g: &Graph, node: &Node, elems: &HashMap<ValueId, Vec<Dim>>) -> 
         })),
         Op::Size => first(Some(Vec::new())),
         Op::Slice => first(shape(0).and_then(|x| {
-            let (starts, ends) = (ints(1)?, ints(2)?);
+            // Starts, ends and steps may be known only in part, or not at
+            // all; the axes they apply to have to be.
+            let n = match elems.get(&node.input(1)?) {
+                Some(starts) => starts.len(),
+                None => usize::try_from(fixed(shape(1)?.first()?)?).ok()?,
+            };
             let axes = match node.input(3) {
                 Some(_) => ints(3)?,
-                None => (0..starts.len() as i64).collect(),
+                None => (0..n as i64).collect(),
             };
-            let steps = match node.input(4) {
-                Some(_) => ints(4)?,
-                None => vec![1; starts.len()],
+            let elem = |input: usize, i: usize, default: i64| match node.input(input) {
+                Some(v) => elems.get(&v).and_then(|e| e.get(i)?.fixed()),
+                None => Some(default),
             };
             let mut out = x.clone();
-            for (i, &start) in starts.iter().enumerate() {
+            for i in 0..n {
                 let a = norm_axis(*axes.get(i)?, x.len())?;
-                let (end, step) = (*ends.get(i)?, *steps.get(i)?);
-                out[a] = match &x[a] {
-                    Dim::Fixed(n) => Dim::Fixed(slice_len(*n, start, end, step)?),
+                let known = (elem(1, i, 0), elem(2, i, 0), elem(4, i, 1));
+                out[a] = match (&x[a], known) {
+                    (Dim::Fixed(n), (Some(start), Some(end), Some(step))) => {
+                        slice_len(*n, start, end, step).map_or(Dim::Unknown, Dim::Fixed)
+                    }
                     // The whole of an unknown dimension.
-                    d if start == 0 && step == 1 && end >= i32::MAX as i64 => d.clone(),
+                    (d, (Some(0), Some(end), Some(1))) if end >= i32::MAX as i64 => d.clone(),
                     _ => Dim::Unknown,
                 };
             }
@@ -607,37 +678,79 @@ fn output_shapes(g: &Graph, node: &Node, elems: &HashMap<ValueId, Vec<Dim>>) -> 
             });
             vec![out; n_out]
         }
-        Op::ConstantOfShape { .. } => first(node.input(0).and_then(|v| elems.get(&v).cloned())),
+        Op::Range => {
+            let scalar = |i: usize| elems.get(&node.input(i)?)?.first().cloned();
+            let len = match (scalar(0), scalar(1), scalar(2)) {
+                (Some(Elem::Fixed(start)), Some(Elem::Fixed(limit)), Some(Elem::Fixed(delta)))
+                    if delta != 0 =>
+                {
+                    let span = limit - start;
+                    let up = span % delta != 0 && (span < 0) == (delta < 0);
+                    Dim::Fixed((span / delta + i64::from(up)).max(0))
+                }
+                (Some(Elem::Fixed(0)), Some(limit), Some(Elem::Fixed(1))) => limit.to_dim(g),
+                _ => Dim::Unknown,
+            };
+            first(Some(vec![len]))
+        }
+        Op::ConstantOfShape { .. } => first(dims(0)),
+        Op::ConstantOfShapeTo { dims, .. } => first(Some(target(dims))),
         Op::Constant { value } => first(Some(value.dims.iter().map(|&d| Dim::Fixed(d)).collect())),
         Op::Expand => first(
             shape(0)
-                .zip(node.input(1).and_then(|v| elems.get(&v).cloned()))
+                .zip(dims(1))
                 .map(|(x, target)| broadcast(&[&x, &target])),
         ),
-        Op::Tile => first(shape(0).zip(ints(1)).and_then(|(x, repeats)| {
+        Op::ExpandTo { dims } => first(shape(0).map(|x| broadcast(&[&x, &target(dims)]))),
+        Op::Tile => first(shape(0).and_then(|x| {
+            let repeats: Vec<Option<i64>> = match elems.get(&node.input(1)?) {
+                Some(r) => r.iter().map(Elem::fixed).collect(),
+                None => vec![None; x.len()],
+            };
             (x.len() == repeats.len()).then(|| {
                 x.iter()
                     .zip(&repeats)
-                    .map(|(d, &r)| match d {
-                        _ if r == 1 => d.clone(),
-                        Dim::Fixed(n) => Dim::Fixed(n * r),
+                    .map(|(d, r)| match (d, r) {
+                        (_, Some(1)) => d.clone(),
+                        (Dim::Fixed(n), Some(r)) => Dim::Fixed(n * r),
                         _ => Dim::Unknown,
                     })
                     .collect()
             })
         })),
-        Op::Pad { .. } => first(shape(0).zip(ints(1)).and_then(|(x, pads)| {
-            (pads.len() == 2 * x.len()).then(|| {
+        // Without `axes`, which lele does not take.
+        Op::Pad { .. } if node.input(3).is_none() => first(shape(0).and_then(|x| {
+            let rank = x.len();
+            let pads: Vec<Option<i64>> = match elems.get(&node.input(1)?) {
+                Some(pads) => pads.iter().map(Elem::fixed).collect(),
+                None => vec![None; 2 * rank],
+            };
+            (pads.len() == 2 * rank).then(|| {
                 x.iter()
                     .enumerate()
-                    .map(|(i, d)| match (d, pads[i] + pads[i + x.len()]) {
-                        (_, 0) => d.clone(),
-                        (Dim::Fixed(n), p) => Dim::Fixed(n + p),
+                    .map(|(i, d)| match (d, pads[i].zip(pads[i + rank])) {
+                        (_, Some((0, 0))) => d.clone(),
+                        (Dim::Fixed(n), Some((a, b))) => Dim::Fixed(n + a + b),
                         _ => Dim::Unknown,
                     })
                     .collect()
             })
         })),
+        Op::If {
+            then_branch,
+            else_branch,
+        } => (0..n_out)
+            .map(|i| {
+                let branch = |b: &Graph| b.value(*b.outputs.get(i)?).shape.clone();
+                let (a, b) = (branch(then_branch)?, branch(else_branch)?);
+                (a.len() == b.len()).then(|| {
+                    a.iter()
+                        .zip(&b)
+                        .map(|(a, b)| if a == b { a.clone() } else { Dim::Unknown })
+                        .collect()
+                })
+            })
+            .collect(),
         Op::Einsum { equation } if equation.replace(' ', "") == "bs,d->bsd" => {
             first(shape(0).zip(shape(1)).and_then(|(a, b)| {
                 Some(vec![
@@ -647,19 +760,15 @@ fn output_shapes(g: &Graph, node: &Node, elems: &HashMap<ValueId, Vec<Dim>>) -> 
                 ])
             }))
         }
-        Op::EmbeddingConcat { .. } => first(
-            shape(1)
-                .zip(node.input(0).and_then(|v| elems.get(&v).cloned()))
-                .and_then(|(w, fill)| {
-                    let rows = match (fixed(w.first()?), fixed(fill.first()?)) {
-                        (Some(a), Some(b)) => Dim::Fixed(a + b),
-                        _ => Dim::Unknown,
-                    };
-                    let mut out = w;
-                    out[0] = rows;
-                    Some(out)
-                }),
-        ),
+        Op::EmbeddingConcat { .. } => first(shape(1).zip(dims(0)).and_then(|(w, fill)| {
+            let rows = match (fixed(w.first()?), fixed(fill.first()?)) {
+                (Some(a), Some(b)) => Dim::Fixed(a + b),
+                _ => Dim::Unknown,
+            };
+            let mut out = w;
+            out[0] = rows;
+            Some(out)
+        })),
         _ => vec![None; n_out],
     }
 }
@@ -687,7 +796,7 @@ fn reduce(x: &[Dim], axes: &[usize], keepdims: bool) -> Shape {
 }
 
 /// The shape a `Reshape` of `x` to `target` produces.
-fn reshape_target(x: Option<&[Dim]>, target: Option<&Vec<Dim>>) -> Option<Shape> {
+fn reshape_target(x: Option<&[Dim]>, target: Option<Shape>) -> Option<Shape> {
     let target = target?;
     let mut out: Shape = target
         .iter()
@@ -716,18 +825,26 @@ fn reshape_target(x: Option<&[Dim]>, target: Option<&Vec<Dim>>) -> Option<Shape>
 
 /// Elements of output 0 of `node`, for the integer tensors it computes from
 /// tracked ones.
-fn output_elems(g: &Graph, node: &Node, elems: &HashMap<ValueId, Vec<Dim>>) -> Option<Vec<Dim>> {
+fn output_elems(g: &Graph, node: &Node, elems: &Elems) -> Option<Vec<Elem>> {
     let input = |i: usize| elems.get(&node.input(i)?);
-    let ints = |i: usize| all_fixed(input(i)?);
+    let ints = |i: usize| all_fixed_elems(input(i)?);
     match &node.op {
         Op::Shape { start, end } => {
-            let x = g.value(node.input(0)?).shape.as_ref()?;
-            let (start, end) = shape_range(x.len(), *start, *end);
-            Some(x[start..end].to_vec())
+            let x = node.input(0)?;
+            let shape = g.value(x).shape.as_ref()?;
+            let (start, end) = shape_range(shape.len(), *start, *end);
+            Some(
+                (start..end)
+                    .map(|axis| match shape[axis] {
+                        Dim::Fixed(n) => Elem::Fixed(n),
+                        _ => Elem::Dim(x, axis),
+                    })
+                    .collect(),
+            )
         }
         Op::Size => {
             let x = g.value(node.input(0)?).shape.as_ref()?;
-            Some(vec![Dim::Fixed(product(x)?)])
+            Some(vec![Elem::Fixed(product(x)?)])
         }
         Op::Cast {
             to: DType::I64 | DType::I32,
@@ -749,7 +866,7 @@ fn output_elems(g: &Graph, node: &Node, elems: &HashMap<ValueId, Vec<Dim>>) -> O
                 .collect()
         }
         Op::Concat { axis: 0 | -1 } => {
-            let parts: Option<Vec<&Vec<Dim>>> = (0..node.inputs().len()).map(input).collect();
+            let parts: Option<Vec<&Vec<Elem>>> = (0..node.inputs().len()).map(input).collect();
             Some(parts?.into_iter().flatten().cloned().collect())
         }
         Op::Slice => {
@@ -777,7 +894,7 @@ fn output_elems(g: &Graph, node: &Node, elems: &HashMap<ValueId, Vec<Dim>>) -> O
             if (a.len() != len && a.len() != 1) || (b.len() != len && b.len() != 1) {
                 return None;
             }
-            let at = |v: &Vec<Dim>, i: usize| v[if v.len() == 1 { 0 } else { i }].clone();
+            let at = |v: &Vec<Elem>, i: usize| v[if v.len() == 1 { 0 } else { i }].clone();
             Some((0..len).map(|i| arith(*op, &at(a, i), &at(b, i))).collect())
         }
         _ => None,
@@ -785,25 +902,30 @@ fn output_elems(g: &Graph, node: &Node, elems: &HashMap<ValueId, Vec<Dim>>) -> O
 }
 
 /// `a op b` for integers, as far as it is known.
-fn arith(op: Binary, a: &Dim, b: &Dim) -> Dim {
-    use Dim::Fixed;
+fn arith(op: Binary, a: &Elem, b: &Elem) -> Elem {
+    use Elem::Fixed;
     match (op, a, b) {
-        (Binary::Add, Fixed(x), Fixed(y)) => Fixed(x + y),
-        (Binary::Sub, Fixed(x), Fixed(y)) => Fixed(x - y),
-        (Binary::Mul, Fixed(x), Fixed(y)) => Fixed(x * y),
-        // Integer division truncates.
-        (Binary::Div, Fixed(x), Fixed(y)) if *y != 0 => Fixed(x / y),
         (Binary::Add | Binary::Sub, d, Fixed(0))
         | (Binary::Add, Fixed(0), d)
         | (Binary::Mul | Binary::Div, d, Fixed(1))
         | (Binary::Mul, Fixed(1), d) => d.clone(),
-        _ => Dim::Unknown,
+        (_, Fixed(x), Fixed(y)) => {
+            let r = match op {
+                Binary::Add => x.checked_add(*y),
+                Binary::Sub => x.checked_sub(*y),
+                Binary::Mul => x.checked_mul(*y),
+                // Integer division truncates.
+                _ => x.checked_div(*y),
+            };
+            r.map_or(Elem::Unknown, Fixed)
+        }
+        _ => Elem::Unknown,
     }
 }
 
 /// Replaces the integer tensors of `g` whose shape and elements are known
 /// by initializers.
-fn fold_ints(g: &mut Graph, elems: &HashMap<ValueId, Vec<Dim>>) {
+fn fold_ints(g: &mut Graph, elems: &Elems) {
     for id in g.node_ids() {
         let node = g.node(id);
         if node.outputs().len() != 1 || matches!(node.op, Op::Constant { .. }) {
@@ -814,12 +936,16 @@ fn fold_ints(g: &mut Graph, elems: &HashMap<ValueId, Vec<Dim>>) {
         };
         let value = g.value(v);
         let (Some(values), Some(dims)) = (
-            elems.get(&v).and_then(|e| all_fixed(e)),
+            elems.get(&v).and_then(|e| all_fixed_elems(e)),
             value.shape.as_deref().and_then(all_fixed),
         ) else {
             continue;
         };
-        if dims.iter().product::<i64>() != values.len() as i64 || g.outputs.contains(&v) {
+        // Empty tensors are not written to the weights file.
+        if values.is_empty()
+            || dims.iter().product::<i64>() != values.len() as i64
+            || g.outputs.contains(&v)
+        {
             continue;
         }
         let tensor = match value.dtype {
@@ -842,12 +968,21 @@ fn fold_ints(g: &mut Graph, elems: &HashMap<ValueId, Vec<Dim>>) {
     }
 }
 
-/// Replaces `Reshape`s whose target is computed at run time but known up to
-/// dimensions of the input by [`Op::ReshapeTo`].
-fn rewrite_reshapes(g: &mut Graph, elems: &HashMap<ValueId, Vec<Dim>>) {
+/// Replaces `Reshape`, `Expand` and `ConstantOfShape` nodes whose target is
+/// computed at run time but known up to dimensions of values by
+/// [`Op::ReshapeTo`], [`Op::ExpandTo`] and [`Op::ConstantOfShapeTo`].
+fn rewrite_targets(g: &mut Graph, elems: &Elems) {
     for id in g.node_ids() {
         let node = g.node(id);
-        let (Op::Reshape, Some(x), Some(target)) = (&node.op, node.input(0), node.input(1)) else {
+        let (data, target) = match node.op {
+            Op::Reshape | Op::Expand => match node.input(0) {
+                Some(x) => (Some(x), node.input(1)),
+                None => continue,
+            },
+            Op::ConstantOfShape { .. } => (None, node.input(0)),
+            _ => continue,
+        };
+        let Some(target) = target else {
             continue;
         };
         // Constant targets are left as they are.
@@ -857,31 +992,101 @@ fn rewrite_reshapes(g: &mut Graph, elems: &HashMap<ValueId, Vec<Dim>>) {
         if g.data(target).is_some() || constant {
             continue;
         }
-        let (Some(target), Some(x_shape)) = (elems.get(&target), g.value(x).shape.as_ref()) else {
-            continue;
-        };
-        let dims: Vec<ReshapeDim> = target
-            .iter()
-            .enumerate()
-            .map(|(i, d)| match d {
-                Dim::Fixed(0) => match x_shape.get(i) {
-                    Some(Dim::Fixed(n)) => ReshapeDim::Fixed(*n),
-                    Some(_) => ReshapeDim::Input(i),
-                    None => ReshapeDim::Infer,
-                },
-                Dim::Fixed(n) if *n > 0 => ReshapeDim::Fixed(*n),
-                Dim::Sym(s) => match x_shape.iter().position(|d| *d == Dim::Sym(s.clone())) {
-                    Some(k) => ReshapeDim::Input(k),
-                    None => ReshapeDim::Infer,
-                },
-                _ => ReshapeDim::Infer,
-            })
-            .collect();
-        if dims.iter().filter(|d| **d == ReshapeDim::Infer).count() > 1 {
+        // Fusion makes `Concat([weight, ConstantOfShape(...)])` an
+        // `EmbeddingConcat`.
+        let concat = node.output(0).is_some_and(|out| {
+            g.value(out)
+                .consumers()
+                .iter()
+                .any(|&c| matches!(g.node(c).op, Op::Concat { .. }))
+        });
+        if data.is_none() && concat {
             continue;
         }
+        let Some(target) = elems.get(&target) else {
+            continue;
+        };
+        let reshape = matches!(node.op, Op::Reshape);
+        let mut inputs: Vec<ValueId> = data.into_iter().collect();
+        let dims: Option<Vec<TargetDim>> = target
+            .iter()
+            .enumerate()
+            .map(|(i, e)| target_dim(g, e, i, reshape, &mut inputs))
+            .collect();
+        let Some(dims) = dims else {
+            continue;
+        };
+        if dims.iter().filter(|d| **d == TargetDim::Infer).count() > 1 {
+            continue;
+        }
+        let op = match &node.op {
+            Op::Reshape => Op::ReshapeTo { dims },
+            Op::Expand => Op::ExpandTo { dims },
+            Op::ConstantOfShape { value } => Op::ConstantOfShapeTo {
+                value: value.clone(),
+                dims,
+            },
+            _ => unreachable!(),
+        };
         let proto = node.proto.clone();
-        g.fuse(&[id], Op::ReshapeTo { dims }, proto, vec![Some(x)]);
+        g.fuse(&[id], op, proto, inputs.into_iter().map(Some).collect());
+    }
+}
+
+/// Element `i` of a target as a [`TargetDim`], taking dimensions from
+/// `inputs` and adding to them the values whose dimensions it needs. The
+/// first input is the tensor reshaped or expanded, if any. `reshape` reads
+/// the target as `Reshape` does, where 0 copies the input's dimension and -1
+/// infers one; elsewhere a dimension that is not known fails.
+fn target_dim(
+    g: &Graph,
+    e: &Elem,
+    i: usize,
+    reshape: bool,
+    inputs: &mut Vec<ValueId>,
+) -> Option<TargetDim> {
+    let dim = |v: ValueId, axis: usize| {
+        let shape = g.value(v).shape.as_ref()?;
+        shape.get(axis).cloned()
+    };
+    // An input with dimension `d`, by value for a symbolic one.
+    let find = |inputs: &[ValueId], d: &Dim| {
+        inputs.iter().enumerate().find_map(|(input, &v)| {
+            let shape = g.value(v).shape.as_ref()?;
+            let axis = shape.iter().position(|s| s == d)?;
+            Some(TargetDim::Of { input, axis })
+        })
+    };
+    let unknown = reshape.then_some(TargetDim::Infer);
+    match e {
+        Elem::Fixed(0) if reshape => {
+            let x = *inputs.first()?;
+            Some(match dim(x, i) {
+                Some(Dim::Fixed(n)) => TargetDim::Fixed(n),
+                Some(_) => TargetDim::Of { input: 0, axis: i },
+                None => TargetDim::Infer,
+            })
+        }
+        Elem::Fixed(n) if *n >= 0 => Some(TargetDim::Fixed(*n)),
+        Elem::Fixed(_) => unknown,
+        Elem::Dim(v, axis) => {
+            if let Some(input) = inputs.iter().position(|u| u == v) {
+                return Some(TargetDim::Of { input, axis: *axis });
+            }
+            // A symbolic dimension an input already has.
+            if let Some(d @ Dim::Sym(_)) = dim(*v, *axis)
+                && let Some(t) = find(inputs, &d)
+            {
+                return Some(t);
+            }
+            inputs.push(*v);
+            Some(TargetDim::Of {
+                input: inputs.len() - 1,
+                axis: *axis,
+            })
+        }
+        Elem::Sym(s) => find(inputs, &Dim::Sym(s.clone())).or(unknown),
+        Elem::Unknown => unknown,
     }
 }
 
@@ -995,8 +1200,9 @@ mod tests {
         let Op::ReshapeTo { dims } = &ops[0] else {
             panic!("{ops:?}");
         };
-        use ReshapeDim::*;
-        assert_eq!(dims, &[Input(0), Input(1), Fixed(12), Fixed(64)]);
+        use TargetDim::*;
+        let x = |axis| Of { input: 0, axis };
+        assert_eq!(dims, &[x(0), x(1), Fixed(12), Fixed(64)]);
         let y = g.find_value("y").unwrap();
         assert_eq!(
             g.value(y).shape,
@@ -1055,23 +1261,90 @@ mod tests {
         assert_eq!(g.value(y).shape, Some(vec![Dim::Fixed(2), Dim::Fixed(2)]));
     }
 
-    /// Unknown dimensions stay unknown: `Shape` of an input of shape
-    /// `[?, 3]` is not folded.
-    #[test]
-    fn keeps_shape_of_unknown_dimensions() {
-        let mut x = input("x", &["n", "3"]);
+    /// An input of shape `[?, 3]`.
+    fn input_of_unknown_rows(name: &str) -> ValueInfoProto {
+        let mut x = input(name, &["n", "3"]);
         if let Some(type_proto::Value::TensorType(t)) =
             x.r#type.as_mut().and_then(|t| t.value.as_mut())
         {
             t.shape.as_mut().unwrap().dim[0].value = None;
         }
+        x
+    }
+
+    /// Unknown dimensions stay unknown: `Shape` of an input of shape
+    /// `[?, 3]` is not folded.
+    #[test]
+    fn keeps_shape_of_unknown_dimensions() {
         let g = run(GraphProto {
             node: vec![node("Shape", &["x"], &["s"])],
-            input: vec![x],
+            input: vec![input_of_unknown_rows("x")],
             output: vec![output("s")],
             ..Default::default()
         });
         assert_eq!(g.nodes().count(), 1);
+    }
+
+    /// `Expand` and `ConstantOfShape` to the shape of another tensor take
+    /// its dimensions, unknown ones included, instead of calling `Shape`.
+    #[test]
+    fn expand_and_constant_of_shape_take_dimensions_of_other_inputs() {
+        let mut g = run(GraphProto {
+            node: vec![
+                node("Shape", &["x"], &["s"]),
+                node("Expand", &["y", "s"], &["e"]),
+                node("ConstantOfShape", &["s"], &["z"]),
+            ],
+            input: vec![input_of_unknown_rows("x"), input("y", &["1", "1"])],
+            output: vec![output("e"), output("z")],
+            ..Default::default()
+        });
+        super::super::eliminate_dead_code(&mut g);
+        let (x, y) = (g.find_value("x").unwrap(), g.find_value("y").unwrap());
+        let nodes: Vec<_> = g
+            .nodes()
+            .map(|(_, n)| (n.op.clone(), n.inputs().to_vec()))
+            .collect();
+        use TargetDim::*;
+        let rows = |input| Of { input, axis: 0 };
+        assert_eq!(nodes.len(), 2, "{nodes:?}");
+        assert!(matches!(&nodes[0].0, Op::ExpandTo { dims } if *dims == [rows(1), Fixed(3)]));
+        assert_eq!(nodes[0].1, [Some(y), Some(x)]);
+        assert!(
+            matches!(&nodes[1].0, Op::ConstantOfShapeTo { dims, .. } if *dims == [rows(0), Fixed(3)])
+        );
+        assert_eq!(nodes[1].1, [Some(x)]);
+        let e = g.find_value("e").unwrap();
+        assert_eq!(g.value(e).shape, Some(vec![Dim::Unknown, Dim::Fixed(3)]));
+    }
+
+    /// `Range(0, n, 1)` has `n` elements, and a `Slice` with bounds known
+    /// only at run time keeps the dimensions it does not slice.
+    #[test]
+    fn infers_range_and_partly_known_slice() {
+        let scalar = |name: &str, v: i64| TensorProto {
+            dims: vec![],
+            ..ints(name, &[v])
+        };
+        let g = run(GraphProto {
+            node: vec![
+                node("Shape", &["x"], &["s"]),
+                node("Gather", &["s", "zero"], &["n"]),
+                node("Range", &["zero", "n", "one"], &["r"]),
+                node("Slice", &["x", "start", "end", "axis"], &["y"]),
+            ],
+            input: vec![
+                input("x", &["n", "8"]),
+                input("start", &["1"]),
+                input("end", &["1"]),
+            ],
+            output: vec![output("r"), output("y")],
+            initializer: vec![scalar("zero", 0), scalar("one", 1), ints("axis", &[1])],
+            ..Default::default()
+        });
+        let shape = |name: &str| g.value(g.find_value(name).unwrap()).shape.clone().unwrap();
+        assert_eq!(shape("r"), [Dim::Sym("n".into())]);
+        assert_eq!(shape("y"), [Dim::Sym("n".into()), Dim::Unknown]);
     }
 
     #[test]

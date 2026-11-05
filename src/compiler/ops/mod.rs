@@ -40,9 +40,11 @@ pub(crate) fn dispatch_builtin(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         | Op::Concat { .. }
         | Op::Constant { .. }
         | Op::ConstantOfShape { .. }
+        | Op::ConstantOfShapeTo { .. }
         | Op::DequantizeLinear(_)
         | Op::DynamicQuantizeLinear
         | Op::Expand
+        | Op::ExpandTo { .. }
         | Op::FakeQuantizeLinear(_)
         | Op::Flatten { .. }
         | Op::Gather { .. }

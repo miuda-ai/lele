@@ -16,7 +16,7 @@
 mod op;
 
 pub use op::{
-    Activation, Binary, ConvAttrs, DType, Op, PoolAttrs, QuantAttrs, Reduction, ReshapeDim, Unary,
+    Activation, Binary, ConvAttrs, DType, Op, PoolAttrs, QuantAttrs, Reduction, TargetDim, Unary,
 };
 
 use crate::model::onnx_proto::{

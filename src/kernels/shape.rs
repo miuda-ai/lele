@@ -250,10 +250,18 @@ where
     T: crate::kernels::utils::AsI64 + Copy + std::fmt::Debug,
 {
     let shape: Vec<usize> = input.data.iter().map(|&x| x.as_i64() as usize).collect();
+    full(&shape, value, out)
+}
+/// A tensor of shape `shape` with every element `value`.
+pub fn full<'b, V: Clone + std::fmt::Debug>(
+    shape: &[usize],
+    value: V,
+    out: &'b mut Vec<V>,
+) -> TensorView<'b, V> {
     let size: usize = shape.iter().product();
     out.clear();
     out.resize(size, value);
-    TensorView::from_slice(out, shape)
+    TensorView::from_slice(out, shape.to_vec())
 }
 pub fn unsqueeze<'a, T: Clone + std::fmt::Debug>(
     input: &TensorView<'a, T>,

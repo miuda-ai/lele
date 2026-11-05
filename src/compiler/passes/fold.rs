@@ -1,8 +1,9 @@
 //! Constant folding.
 
-use crate::compiler::ir::{DType, Graph, Op, QuantAttrs};
+use crate::compiler::ir::{Binary, DType, Graph, Op, QuantAttrs, Unary};
 use crate::model::onnx_proto::TensorProto;
 use crate::model::tensor_to_array;
+use crate::tensor::TensorView;
 use std::collections::{HashMap, HashSet};
 
 /// A tensor known at compile time. Values are held as f32 whatever the
@@ -76,7 +77,8 @@ fn fold_graph(g: &mut Graph, inherited: &Consts) {
             continue;
         };
         let dtype = output_dtype(&node.op, &inputs);
-        let Some((data, shape)) = fold_op(&node.op, &inputs) else {
+        // Empty tensors are not written to the weights file.
+        let Some((data, shape)) = fold_op(&node.op, &inputs).filter(|(d, _)| !d.is_empty()) else {
             continue;
         };
 
@@ -139,12 +141,98 @@ fn quantize_output_dtype(attrs: &QuantAttrs, zero_point: Option<&Const>) -> DTyp
         .unwrap_or(DType::U8)
 }
 
+/// Float results up to this many elements are folded even where they are
+/// larger than every input.
+const MAX_GROWN: usize = 1 << 12;
+
+type UnaryKernel = for<'a, 'b> fn(&TensorView<'b>, &'a mut Vec<f32>) -> TensorView<'a>;
+type BinaryKernel =
+    for<'a, 'b> fn(&TensorView<'b>, &TensorView<'b>, &'a mut Vec<f32>) -> TensorView<'a>;
+
+/// The kernel code generation calls for float `op`.
+fn unary_kernel(op: Unary) -> Option<UnaryKernel> {
+    use crate::kernels as k;
+    Some(match op {
+        Unary::Ceil => k::ceil,
+        Unary::Cos => k::cos,
+        Unary::Erf => k::erf,
+        Unary::Exp => k::exp,
+        Unary::Floor => k::floor,
+        Unary::Log => k::log,
+        Unary::Neg => k::neg,
+        Unary::Reciprocal => k::reciprocal,
+        Unary::Relu => k::relu,
+        Unary::Round => k::round,
+        Unary::Sigmoid => k::math::sigmoid,
+        Unary::Sin => k::sin,
+        Unary::Softplus => k::softplus,
+        Unary::Sqrt => k::sqrt,
+        Unary::Tanh => k::tanh_kernel,
+        Unary::Not => return None,
+    })
+}
+
+/// The kernel code generation calls for float `op`, for arithmetic.
+fn binary_kernel(op: Binary) -> Option<BinaryKernel> {
+    use crate::kernels as k;
+    Some(match op {
+        Binary::Add => k::add,
+        Binary::Div => k::div,
+        Binary::Mul => k::mul,
+        Binary::Pow => k::pow,
+        Binary::PRelu => k::prelu,
+        Binary::Sub => k::sub,
+        _ => return None,
+    })
+}
+
+fn view(c: &Const) -> TensorView<'_> {
+    TensorView::from_slice(c.data.as_slice(), c.shape.clone())
+}
+
+/// Evaluates float `op` on known `inputs` with the kernel the generated code
+/// would run, so that the result is the same.
+fn fold_float(op: &Op, inputs: &[&Const]) -> Option<(Vec<f32>, Vec<usize>)> {
+    if inputs.iter().any(|c| c.dtype != DType::F32) {
+        return None;
+    }
+    let mut out = Vec::new();
+    let result = match op {
+        Op::Unary(op) => unary_kernel(*op)?(&view(inputs.first()?), &mut out),
+        Op::Binary(op) => {
+            let (a, b) = (inputs.first()?, inputs.get(1)?);
+            binary_kernel(*op)?(&view(a), &view(b), &mut out)
+        }
+        Op::Range => {
+            let [start, limit, delta] = inputs else {
+                return None;
+            };
+            let (s, l, d) = (
+                start.data.first()?,
+                limit.data.first()?,
+                delta.data.first()?,
+            );
+            let len = ((l - s) / d).ceil();
+            if !(0.0..=MAX_GROWN as f32).contains(&len) {
+                return None;
+            }
+            crate::kernels::range(&view(start), &view(limit), &view(delta), &mut out)
+        }
+        _ => return None,
+    };
+    let largest = inputs.iter().map(|c| c.data.len()).max().unwrap_or(0);
+    if result.data.len() > largest.max(MAX_GROWN) {
+        return None;
+    }
+    Some((result.data.to_vec(), result.shape.to_vec()))
+}
+
 /// Evaluates `op` on known `inputs`. Returns the data and shape of its first
 /// output, or `None` if the operator or this use of it is not supported.
 fn fold_op(op: &Op, inputs: &[&Const]) -> Option<(Vec<f32>, Vec<usize>)> {
     match op {
+        Op::Unary(_) | Op::Binary(_) | Op::Range => fold_float(op, inputs),
         Op::DequantizeLinear(attrs) | Op::QuantizeLinear(attrs) => {
-            use crate::tensor::TensorView;
             let (x, scale) = (inputs.first()?, inputs.get(1)?);
             let zp = inputs.get(2);
             let block_size = attrs.block_size as usize;
@@ -461,6 +549,71 @@ mod tests {
     fn keeps_slice_with_other_steps() {
         // Folding used to ignore `steps` and return every element.
         let g = fold(slice(2));
+        assert_eq!(g.node.len(), 1);
+    }
+
+    fn floats(name: &str, dims: &[i64], v: &[f32]) -> TensorProto {
+        TensorProto {
+            name: name.to_string(),
+            data_type: DType::F32.to_onnx(),
+            dims: dims.to_vec(),
+            float_data: v.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn node(op: &str, inputs: &[&str], output: &str) -> NodeProto {
+        NodeProto {
+            op_type: op.to_string(),
+            input: inputs.iter().map(|s| s.to_string()).collect(),
+            output: vec![output.to_string()],
+            ..Default::default()
+        }
+    }
+
+    /// Rotary embedding frequencies: `1 / sqrt(d)` and `Range(0, 4, 1) * 2`
+    /// on constants become initializers.
+    #[test]
+    fn folds_float_arithmetic() {
+        let g = fold(GraphProto {
+            node: vec![
+                node("Sqrt", &["d"], "s"),
+                node("Reciprocal", &["s"], "r"),
+                node("Range", &["zero", "four", "one"], "i"),
+                node("Mul", &["i", "two"], "y"),
+            ],
+            initializer: vec![
+                floats("d", &[1], &[16.0]),
+                floats("zero", &[], &[0.0]),
+                floats("four", &[], &[4.0]),
+                floats("one", &[], &[1.0]),
+                floats("two", &[], &[2.0]),
+            ],
+            ..Default::default()
+        });
+        assert!(g.node.is_empty(), "{:?}", g.node);
+        let get = |name: &str| g.initializer.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(get("r").float_data, [0.25]);
+        assert_eq!(get("y").float_data, [0.0, 2.0, 4.0, 6.0]);
+        assert_eq!(get("y").dims, [4]);
+    }
+
+    /// A float operator on integer constants is left to run: they are held
+    /// as f32 here.
+    #[test]
+    fn keeps_arithmetic_on_integers() {
+        let ints = |name: &str| TensorProto {
+            name: name.to_string(),
+            data_type: DType::I64.to_onnx(),
+            dims: vec![1],
+            int64_data: vec![3],
+            ..Default::default()
+        };
+        let g = fold(GraphProto {
+            node: vec![node("Div", &["a", "b"], "y")],
+            initializer: vec![ints("a"), ints("b")],
+            ..Default::default()
+        });
         assert_eq!(g.node.len(), 1);
     }
 

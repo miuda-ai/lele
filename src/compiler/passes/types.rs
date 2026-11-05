@@ -65,6 +65,7 @@ pub(crate) fn follows_input(op: &Op, i: usize) -> Option<usize> {
         | Op::Cast { .. }
         | Op::Constant { .. }
         | Op::ConstantOfShape { .. }
+        | Op::ConstantOfShapeTo { .. }
         | Op::ConvInteger(_)
         | Op::DynamicQuantizeLinear
         | Op::EmbeddingConcat { .. }
@@ -98,7 +99,9 @@ fn output_dtype(op: &Op, i: usize, input: &dyn Fn(usize) -> DType) -> DType {
     match op {
         Op::Cast { to } => *to,
         Op::Constant { value } => DType::from_onnx(value.data_type),
-        Op::ConstantOfShape { value } | Op::EmbeddingConcat { value } => tensor_type(value),
+        Op::ConstantOfShape { value }
+        | Op::ConstantOfShapeTo { value, .. }
+        | Op::EmbeddingConcat { value } => tensor_type(value),
         Op::Shape { .. } | Op::Size | Op::ArgMax { .. } | Op::TopK { .. } => I64,
         Op::ConvInteger(_) | Op::MatMulInteger => I32,
         Op::DynamicQuantizeLinear => [U8, F32, U8].get(i).copied().unwrap_or(Undefined),

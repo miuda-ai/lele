@@ -186,13 +186,19 @@ impl Activation {
     }
 }
 
-/// One dimension of an [`Op::ReshapeTo`] target.
+/// One dimension of a shape known at compile time up to dimensions of the
+/// node's inputs: the target of [`Op::ReshapeTo`], [`Op::ExpandTo`] and
+/// [`Op::ConstantOfShapeTo`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReshapeDim {
+pub enum TargetDim {
     Fixed(i64),
-    /// Dimension `k` of the input.
-    Input(usize),
-    /// Whatever the element count leaves; at most one per target.
+    /// Dimension `axis` of input `input`.
+    Of {
+        input: usize,
+        axis: usize,
+    },
+    /// Whatever the element count leaves; only in [`Op::ReshapeTo`], at
+    /// most once.
     Infer,
 }
 
@@ -503,9 +509,21 @@ pub enum Op {
         value: Option<TensorProto>,
     },
     /// `Reshape` to a target known at compile time up to dimensions of the
-    /// input. Inputs: `[x]`.
+    /// inputs. Inputs: `[x, ...]`, then the tensors other than `x` whose
+    /// dimensions the target takes.
     ReshapeTo {
-        dims: Vec<ReshapeDim>,
+        dims: Vec<TargetDim>,
+    },
+    /// `Expand` to a target known at compile time up to dimensions of the
+    /// inputs. Inputs as in [`Op::ReshapeTo`].
+    ExpandTo {
+        dims: Vec<TargetDim>,
+    },
+    /// `ConstantOfShape` of a shape known at compile time up to dimensions
+    /// of the inputs, which are the tensors it takes them from.
+    ConstantOfShapeTo {
+        value: Option<TensorProto>,
+        dims: Vec<TargetDim>,
     },
 
     /// Any operator without a typed variant yet. Its graph attributes are
@@ -756,6 +774,8 @@ impl Op {
             Op::QLinearDynamic { .. } => "QLinearDynamic",
             Op::EmbeddingConcat { .. } => "EmbeddingConcat",
             Op::ReshapeTo { .. } => "ReshapeTo",
+            Op::ExpandTo { .. } => "ExpandTo",
+            Op::ConstantOfShapeTo { .. } => "ConstantOfShapeTo",
             Op::Onnx { op_type, .. } => op_type,
         }
     }
@@ -809,19 +829,10 @@ impl Op {
                 set_attr_t(attrs, "value", value)
             }
             Op::Conv(conv) => conv.write(attrs),
-            Op::ReshapeTo { dims } => {
-                // `shape` holds the fixed sizes, -1 to infer and 0 where
-                // `input_axes` names the input dimension to take.
-                let (shape, input_axes) = dims
-                    .iter()
-                    .map(|d| match *d {
-                        ReshapeDim::Fixed(n) => (n, -1),
-                        ReshapeDim::Input(k) => (0, k as i64),
-                        ReshapeDim::Infer => (-1, -1),
-                    })
-                    .unzip();
-                set_attr_ints(attrs, "shape", Some(shape));
-                set_attr_ints(attrs, "input_axes", Some(input_axes));
+            Op::ReshapeTo { dims } | Op::ExpandTo { dims } => write_target(attrs, &dims),
+            Op::ConstantOfShapeTo { value, dims } => {
+                set_attr_t(attrs, "value", value);
+                write_target(attrs, &dims);
             }
             Op::ConvAct { conv, act } => {
                 conv.write(attrs);
@@ -1041,6 +1052,28 @@ fn set_attr_t(attrs: &mut Vec<AttributeProto>, name: &str, value: Option<TensorP
         Some(t) => set_attr(attrs, name, 4 /* TENSOR */, |a| a.t = Some(t)),
         None => attrs.retain(|a| a.name != name),
     }
+}
+
+/// Writes a [`TargetDim`] target: `shape` holds the fixed sizes, -1 to
+/// infer and 0 where `dim_inputs` and `dim_axes` name the input dimension to
+/// take.
+fn write_target(attrs: &mut Vec<AttributeProto>, dims: &[TargetDim]) {
+    let mut shape = Vec::new();
+    let mut inputs = Vec::new();
+    let mut axes = Vec::new();
+    for d in dims {
+        let (n, input, axis) = match *d {
+            TargetDim::Fixed(n) => (n, -1, -1),
+            TargetDim::Of { input, axis } => (0, input as i64, axis as i64),
+            TargetDim::Infer => (-1, -1, -1),
+        };
+        shape.push(n);
+        inputs.push(input);
+        axes.push(axis);
+    }
+    set_attr_ints(attrs, "shape", Some(shape));
+    set_attr_ints(attrs, "dim_inputs", Some(inputs));
+    set_attr_ints(attrs, "dim_axes", Some(axes));
 }
 
 fn set_attr_g(attrs: &mut Vec<AttributeProto>, name: &str, graph: Graph) {
