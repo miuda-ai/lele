@@ -1,4 +1,5 @@
 mod image;
+#[rustfmt::skip]
 mod yolo26seg;
 
 use image::{Image, postprocess_segmentation};

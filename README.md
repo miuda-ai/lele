@@ -180,17 +180,14 @@ class_name = "MyModel"
 
 ```rust
 // build.rs
-use lele_build::{config::ModelConfig, *};
-
-fn main() {
-    let cfg = ModelConfig::load("model.toml").unwrap();
-    if need_regenerate_with_model("MyModel", "src/gen", "model.toml", None) {
-        // Download + generate
-    }
+fn main() -> lele_build::Result {
+    // Downloads the model and writes src/mymodel.rs and src/mymodel_weights.bin,
+    // unless they are newer than model.toml and the model.
+    lele_build::build_model("model.toml", "src")
 }
 ```
 
-Set `HF_ENDPOINT` to use a mirror. Set `LELE_SKIP_MODEL_GEN=1` to skip generation. If download fails, a compiling stub is generated so `cargo build` always succeeds.
+`build_models` does the same for several models listed in one `model.toml`. Set `HF_ENDPOINT` to use a mirror, `LELE_SKIP_MODEL_GEN=1` to skip generation, and `LELE_FORCE_REGEN=1` to regenerate. If a download or the code generation fails, the build fails with the error.
 
 ### Running Examples
 

@@ -44,7 +44,11 @@ pub(crate) fn handle_activation_ops(
                 .find(|a| a.name == "axis")
                 .map(|a| a.i)
                 .unwrap_or(-1);
-            let kernel = if op == "Softmax" { "softmax" } else { "log_softmax" };
+            let kernel = if op == "Softmax" {
+                "softmax"
+            } else {
+                "log_softmax"
+            };
             writeln!(
                 w,
                 "{}let {} = lele::kernels::{}(&{}, {}, {});",

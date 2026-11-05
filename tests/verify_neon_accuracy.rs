@@ -1,8 +1,9 @@
-use lele::kernels::{math, norm};
+#![cfg(target_arch = "aarch64")]
+
+use lele::kernels::norm;
 use lele::tensor::TensorView;
 use std::borrow::Cow;
 
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn test_layernorm_accuracy() {
     let norm_size = 10;

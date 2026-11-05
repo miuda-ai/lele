@@ -1,9 +1,14 @@
-mod image;
+#[rustfmt::skip]
 mod dict;
+mod image;
+#[rustfmt::skip]
 mod ppocrdet;
+#[rustfmt::skip]
 mod ppocrrec;
 
-use image::{Image, det_preprocess, det_postprocess, crop_text_region, rec_preprocess, rec_postprocess};
+use image::{
+    Image, crop_text_region, det_postprocess, det_preprocess, rec_postprocess, rec_preprocess,
+};
 use lele::tensor::TensorView;
 use std::env;
 use std::time::Instant;
@@ -60,11 +65,11 @@ fn main() {
         det_input.ratio_w,
         img.height,
         img.width,
-        0.2,   // thresh
-        0.4,   // box_thresh
-        1.4,   // unclip_ratio
-        3000,  // max_candidates
-        3,     // min_size
+        0.2,  // thresh
+        0.4,  // box_thresh
+        1.4,  // unclip_ratio
+        3000, // max_candidates
+        3,    // min_size
     );
     println!(
         "Detected {} text regions in {:.2}ms\n",
@@ -94,8 +99,7 @@ fn main() {
         }
 
         let (chw, resized_w) = rec_preprocess(&region, rw, rh, img_h);
-        let rec_tv =
-            TensorView::from_owned(chw, vec![1, 3, img_h, resized_w]);
+        let rec_tv = TensorView::from_owned(chw, vec![1, 3, img_h, resized_w]);
 
         // Warmup on first
         if i == 0 {
@@ -134,6 +138,14 @@ fn main() {
 
     println!("\n--- Timing Summary ---");
     println!("  Detection:  {:.2}ms", det_time);
-    println!("  Recognition: {:.2}ms total ({:.2}ms avg for {} regions)", total_rec_time, total_rec_time / results.len().max(1) as f64, results.len());
-    println!("  Total:       {:.2}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "  Recognition: {:.2}ms total ({:.2}ms avg for {} regions)",
+        total_rec_time,
+        total_rec_time / results.len().max(1) as f64,
+        results.len()
+    );
+    println!(
+        "  Total:       {:.2}ms",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
 }

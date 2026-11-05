@@ -112,13 +112,9 @@ pub fn apply_mel_bank(
     let n_freqs = power_spectrum.len();
     assert_eq!(mel_filters.len(), n_mels * n_freqs);
     assert_eq!(output.len(), n_mels);
-    for i in 0..n_mels {
-        let mut sum = 0.0;
-        let row_offset = i * n_freqs;
-        for j in 0..n_freqs {
-            sum += mel_filters[row_offset + j] * power_spectrum[j];
-        }
-        output[i] = sum;
+    for (i, out) in output.iter_mut().enumerate() {
+        let row = &mel_filters[i * n_freqs..][..n_freqs];
+        *out = row.iter().zip(power_spectrum).map(|(&w, &p)| w * p).sum();
     }
 }
 pub fn log_compress(input: &mut [f32], eps: f32) {

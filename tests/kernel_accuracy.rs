@@ -225,7 +225,7 @@ fn test_dynamic_quantize_accuracy() {
     let dequant: Vec<f32> = quantized
         .data
         .iter()
-        .map(|&q| (q as f32 - zp_val) * scale_val)
+        .map(|&q| (q - zp_val) * scale_val)
         .collect();
 
     let max_error: f32 = x

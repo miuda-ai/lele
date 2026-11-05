@@ -29,7 +29,9 @@ pub(crate) fn exp<S: Simd>(x: f32x16<S>) -> f32x16<S> {
     ];
 
     let simd = x.simd;
-    let x = x.max(f32x16::splat(simd, -87.3)).min(f32x16::splat(simd, 88.0));
+    let x = x
+        .max(f32x16::splat(simd, -87.3))
+        .min(f32x16::splat(simd, 88.0));
     let n = (x * f32x16::splat(simd, LOG2E)).round_ties_even();
     let r = (-n).mul_add(f32x16::splat(simd, LN2_HI), x);
     let r = (-n).mul_add(f32x16::splat(simd, LN2_LO), r);
@@ -77,7 +79,13 @@ pub(crate) fn tanh<S: Simd>(x: f32x16<S>) -> f32x16<S> {
 #[inline(always)]
 pub(crate) fn erf<S: Simd>(x: f32x16<S>) -> f32x16<S> {
     const P: f32 = 0.3275911;
-    const A: [f32; 5] = [0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429];
+    const A: [f32; 5] = [
+        0.254829592,
+        -0.284496736,
+        1.421413741,
+        -1.453152027,
+        1.061405429,
+    ];
 
     let simd = x.simd;
     let one = f32x16::splat(simd, 1.0);
@@ -118,8 +126,8 @@ pub(crate) fn gelu<S: Simd>(x: f32x16<S>) -> f32x16<S> {
 pub(crate) fn fast_gelu<S: Simd>(x: f32x16<S>) -> f32x16<S> {
     let simd = x.simd;
     let x3 = (x * x) * x;
-    let inner = f32x16::splat(simd, 0.7978845608028654)
-        * f32x16::splat(simd, 0.044715).mul_add(x3, x);
+    let inner =
+        f32x16::splat(simd, 0.7978845608028654) * f32x16::splat(simd, 0.044715).mul_add(x3, x);
     (x * f32x16::splat(simd, 0.5)) * (f32x16::splat(simd, 1.0) + tanh(inner))
 }
 
@@ -235,7 +243,10 @@ mod tests {
     #[test]
     fn test_exp_saturates_outside_its_range() {
         for level in levels() {
-            let x = [-1000.0, -200.0, -88.0, -87.3, 88.0, 89.0, 500.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            let x = [
+                -1000.0, -200.0, -88.0, -87.3, 88.0, 89.0, 500.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0,
+            ];
             let got = exp_of(level, &x);
             for (i, &g) in got.iter().enumerate().take(7) {
                 assert!(g.is_finite() && g > 0.0, "{level:?} x={}: got {g}", x[i]);

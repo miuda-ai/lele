@@ -44,7 +44,13 @@ fn gemm_dot_simd<S: Simd>(simd: S, d: &DotDims, a: &[f32], bt: &[f32], c: &mut [
             let cols = NB.min(d.n - j);
             macro_rules! tile {
                 ($r:literal, $c:literal) => {
-                    dot_tile::<S, $r, $c>(simd, d, &a[i * d.lda..], &bt[j * d.ldbt..], &mut c[i * d.ldc + j..])
+                    dot_tile::<S, $r, $c>(
+                        simd,
+                        d,
+                        &a[i * d.lda..],
+                        &bt[j * d.ldbt..],
+                        &mut c[i * d.ldc + j..],
+                    )
                 };
             }
             match (rows, cols) {

@@ -1,4 +1,6 @@
-use crate::model::onnx_proto::{type_proto, tensor_shape_proto, GraphProto, NodeProto, TensorProto};
+use crate::model::onnx_proto::{
+    GraphProto, NodeProto, TensorProto, tensor_shape_proto, type_proto,
+};
 use crate::model::tensor_to_array;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -475,10 +477,7 @@ impl Compiler {
                 }
                 if !dims.is_empty() && !has_dynamic {
                     let shape_usize: Vec<usize> = dims.iter().map(|&d| d as usize).collect();
-                    constants.insert(
-                        inp.name.clone(),
-                        (dims, shape_usize, 7),
-                    );
+                    constants.insert(inp.name.clone(), (dims, shape_usize, 7));
                 }
             }
         }
@@ -495,11 +494,8 @@ impl Compiler {
         }
         let mut folded_indices = std::collections::HashSet::new();
         let mut new_initializers = Vec::new();
-        let graph_input_names: std::collections::HashSet<&str> = graph
-            .input
-            .iter()
-            .map(|i| i.name.as_str())
-            .collect();
+        let graph_input_names: std::collections::HashSet<&str> =
+            graph.input.iter().map(|i| i.name.as_str()).collect();
         // 3. Simple single-pass folding (can be iterative but single-pass handles most ONNX patterns which are DAG)
         for (i, node) in graph.node.iter().enumerate() {
             let mut all_inputs_const = true;
@@ -916,12 +912,7 @@ impl Compiler {
                 let (_, shape, _) = &constants[&node.input[0]];
                 // opset-15 `start`/`end` slice the reported shape.
                 let rank = shape.len() as i64;
-                let attr = |name: &str| {
-                    node.attribute
-                        .iter()
-                        .find(|a| a.name == name)
-                        .map(|a| a.i)
-                };
+                let attr = |name: &str| node.attribute.iter().find(|a| a.name == name).map(|a| a.i);
                 let clamp = |v: i64| (if v < 0 { v + rank } else { v }).clamp(0, rank) as usize;
                 let start = clamp(attr("start").unwrap_or(0));
                 let end = clamp(attr("end").unwrap_or(rank)).max(start);
@@ -1141,7 +1132,9 @@ impl Compiler {
                         // PyTorch's exporter stores the fill value in
                         // `raw_data`; reading only the typed fields folded
                         // `ConstantOfShape(value=1)` to zeros.
-                        tensor_to_array(t).ok().and_then(|(d, _)| d.first().copied())
+                        tensor_to_array(t)
+                            .ok()
+                            .and_then(|(d, _)| d.first().copied())
                     })
                     .unwrap_or(0.0);
                 let shape: Vec<usize> = data.iter().map(|&x| x as usize).collect();
@@ -1343,18 +1336,13 @@ impl Compiler {
                     .flat_map(|&idx| nodes[idx].output.iter().map(|s| s.as_str()))
                     .collect();
 
-                let mut safe = true;
-                for j in i..=add_idx {
-                    if !chain_set.contains(&j)
-                        && nodes[j]
+                let safe = (i..=add_idx).zip(&nodes[i..=add_idx]).all(|(j, node)| {
+                    chain_set.contains(&j)
+                        || !node
                             .input
                             .iter()
                             .any(|inp| chain_outputs.contains(inp.as_str()))
-                    {
-                        safe = false;
-                        break;
-                    }
-                }
+                });
                 if safe {
                     chains.push(chain);
                     in_chain.extend(chain.iter());
@@ -1538,16 +1526,13 @@ impl Compiler {
             &mut code,
             "            let cache = self.quantized_weights_cache.borrow();"
         )?;
+        // A single `if let` with `filter`: let chains would need edition 2024,
+        // and the generated code also builds in edition 2021 crates.
         writeln!(
             &mut code,
-            "            if let Some((cached_scale, qw)) = cache.get(&key) {{"
+            "            if let Some((_, qw)) = cache.get(&key).filter(|(cached_scale, _)| cached_scale.len() == scale.data.len() && cached_scale.iter().zip(scale.data.iter()).all(|(a, b)| a.to_bits() == b.to_bits())) {{"
         )?;
-        writeln!(
-            &mut code,
-            "                if cached_scale.len() == scale.data.len() && cached_scale.iter().zip(scale.data.iter()).all(|(a, b)| a.to_bits() == b.to_bits()) {{"
-        )?;
-        writeln!(&mut code, "                    return qw.clone();")?;
-        writeln!(&mut code, "                }}")?;
+        writeln!(&mut code, "                return qw.clone();")?;
         writeln!(&mut code, "            }}")?;
         writeln!(&mut code, "        }}")?;
         writeln!(
@@ -1608,14 +1593,15 @@ impl Compiler {
             &mut code,
             "    #[allow(dead_code)]\n    fn get_conv_weights(&self, offset: usize, len: usize, shape: [usize; 4], groups: usize, signed: bool, zero_point: &[f32]) -> std::sync::Arc<lele::kernels::ConvWeights> {{"
         )?;
-        writeln!(&mut code, "        let key = (offset, len, groups, signed);")?;
         writeln!(
             &mut code,
-            "        if let Some((z, w)) = self.conv_weights_cache.borrow().get(&key) {{"
+            "        let key = (offset, len, groups, signed);"
         )?;
-        writeln!(&mut code, "            if z.as_slice() == zero_point {{")?;
-        writeln!(&mut code, "                return w.clone();")?;
-        writeln!(&mut code, "            }}")?;
+        writeln!(
+            &mut code,
+            "        if let Some((_, w)) = self.conv_weights_cache.borrow().get(&key).filter(|(z, _)| z.as_slice() == zero_point) {{"
+        )?;
+        writeln!(&mut code, "            return w.clone();")?;
         writeln!(&mut code, "        }}")?;
         writeln!(
             &mut code,
@@ -1967,44 +1953,44 @@ fn collect_weights(
                 }
             }
 
-            if let Ok((bytes, shape, data_type)) = crate::model::tensor_to_vec_u8(t) {
-                if !bytes.is_empty() {
-                    // Compute content hash for deduplication
-                    let hash = compute_hash(&bytes);
+            if let Ok((bytes, shape, data_type)) = crate::model::tensor_to_vec_u8(t)
+                && !bytes.is_empty()
+            {
+                // Compute content hash for deduplication
+                let hash = compute_hash(&bytes);
 
-                    // Check if we already have identical weight content
-                    if let Some(&(existing_offset, existing_len)) = content_hash_map.get(&hash) {
-                        // Reuse existing offset, but keep current weight's shape and dtype
-                        if let Some(out_name) = node.output.first() {
-                            offset_map.push((
-                                out_name.clone(),
-                                existing_offset,
-                                existing_len,
-                                shape,
-                                data_type,
-                            ));
-                        }
-                    } else {
-                        // New weight: align, write, and record
-                        let remainder = *current_offset % 16;
-                        if remainder != 0 {
-                            let padding = 16 - remainder;
-                            bin_data.write_all(&vec![0u8; padding])?;
-                            *current_offset += padding;
-                        }
+                // Check if we already have identical weight content
+                if let Some(&(existing_offset, existing_len)) = content_hash_map.get(&hash) {
+                    // Reuse existing offset, but keep current weight's shape and dtype
+                    if let Some(out_name) = node.output.first() {
+                        offset_map.push((
+                            out_name.clone(),
+                            existing_offset,
+                            existing_len,
+                            shape,
+                            data_type,
+                        ));
+                    }
+                } else {
+                    // New weight: align, write, and record
+                    let remainder = *current_offset % 16;
+                    if remainder != 0 {
+                        let padding = 16 - remainder;
+                        bin_data.write_all(&vec![0u8; padding])?;
+                        *current_offset += padding;
+                    }
 
-                        bin_data.write_all(&bytes)?;
-                        if let Some(out_name) = node.output.first() {
-                            offset_map.push((
-                                out_name.clone(),
-                                *current_offset,
-                                bytes.len(),
-                                shape.clone(),
-                                data_type,
-                            ));
-                            content_hash_map.insert(hash, (*current_offset, bytes.len()));
-                            *current_offset += bytes.len();
-                        }
+                    bin_data.write_all(&bytes)?;
+                    if let Some(out_name) = node.output.first() {
+                        offset_map.push((
+                            out_name.clone(),
+                            *current_offset,
+                            bytes.len(),
+                            shape.clone(),
+                            data_type,
+                        ));
+                        content_hash_map.insert(hash, (*current_offset, bytes.len()));
+                        *current_offset += bytes.len();
                     }
                 }
             }
@@ -2012,7 +1998,14 @@ fn collect_weights(
         // 3. Recurse
         for attr in &node.attribute {
             if let Some(g) = &attr.g {
-                collect_weights(g, bin_data, offset_map, current_offset, int64_map, content_hash_map)?;
+                collect_weights(
+                    g,
+                    bin_data,
+                    offset_map,
+                    current_offset,
+                    int64_map,
+                    content_hash_map,
+                )?;
             }
         }
     }
@@ -2061,7 +2054,12 @@ mod qdq_fusion_tests {
     #[test]
     fn fuses_matching_quantize_dequantize_pair() {
         let mut g = graph(vec![
-            node("QuantizeLinear", &["x", "s", "z"], "q", &[("output_dtype", 2)]),
+            node(
+                "QuantizeLinear",
+                &["x", "s", "z"],
+                "q",
+                &[("output_dtype", 2)],
+            ),
             node("DequantizeLinear", &["q", "s", "z"], "y", &[]),
         ]);
         Compiler::fuse_qdq(&mut g);
@@ -2333,7 +2331,12 @@ mod qdq_matmul_fusion_tests {
     fn nodes() -> Vec<NodeProto> {
         vec![
             node("DequantizeLinear", &["xq", "a_scale", "a_zp"], "a", &[]),
-            node("DequantizeLinear", &["w", "w_scale", "w_zp"], "wd", &[("axis", 1)]),
+            node(
+                "DequantizeLinear",
+                &["w", "w_scale", "w_zp"],
+                "wd",
+                &[("axis", 1)],
+            ),
             node("MatMul", &["a", "wd"], "y", &[]),
         ]
     }
@@ -2422,7 +2425,13 @@ mod qdq_matmul_fusion_tests {
         let mut g = graph(n);
         Compiler::fuse_qdq_matmul(&mut g);
         assert!(op_types(&g).contains(&"MatMul"));
-        assert_eq!(op_types(&g).iter().filter(|o| **o == "DequantizeLinear").count(), 2);
+        assert_eq!(
+            op_types(&g)
+                .iter()
+                .filter(|o| **o == "DequantizeLinear")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -2548,9 +2557,16 @@ mod conv_pattern_tests {
                 .lines()
                 .find(|l| l.contains("lele::kernels::conv2d"))
                 .unwrap_or_else(|| panic!("{next}: no conv2d call in\n{}", result.code));
-            assert!(call.contains("&[1, 2], 4, &[1, 2, 1, 2], &[2, 1]"), "{next}: {call}");
+            assert!(
+                call.contains("&[1, 2], 4, &[1, 2, 1, 2], &[2, 1]"),
+                "{next}: {call}"
+            );
             // Both went through their fused pattern.
-            let fused = if next == "Relu" { "conv2d_fused(" } else { "Some(&self.weight_f32" };
+            let fused = if next == "Relu" {
+                "conv2d_fused("
+            } else {
+                "Some(&self.weight_f32"
+            };
             assert!(call.contains(fused), "{next}: {call}");
         }
     }

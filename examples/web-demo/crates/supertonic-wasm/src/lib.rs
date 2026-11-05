@@ -157,7 +157,7 @@ impl SupertonicEngine {
             let max_len = text_ids_vec[0].len();
             let mut text_ids_i64 = vec![0i64; max_len];
             for (i, &id) in text_ids_vec[0].iter().enumerate() {
-                text_ids_i64[i] = id as i64;
+                text_ids_i64[i] = id;
             }
 
             let text_ids_shape = [bsz, max_len];

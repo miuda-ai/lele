@@ -128,9 +128,14 @@ fn connected_components(binary: &[u8], w: usize, h: usize) -> (Vec<i32>, i32) {
                 let y = idx / w;
                 // 8-connectivity
                 for &dxy in &[
-                    (-1i32, -1i32), (0, -1), (1, -1),
-                    (-1, 0), (1, 0),
-                    (-1, 1), (0, 1), (1, 1),
+                    (-1i32, -1i32),
+                    (0, -1),
+                    (1, -1),
+                    (-1, 0),
+                    (1, 0),
+                    (-1, 1),
+                    (0, 1),
+                    (1, 1),
                 ] {
                     let nx = x as i32 + dxy.0;
                     let ny = y as i32 + dxy.1;
@@ -156,7 +161,11 @@ fn convex_hull(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
         return points.to_vec();
     }
     let mut pts: Vec<(f64, f64)> = points.to_vec();
-    pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.partial_cmp(&b.1).unwrap()));
+    pts.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap()
+            .then(a.1.partial_cmp(&b.1).unwrap())
+    });
     pts.dedup();
     let n = pts.len();
     if n < 3 {
@@ -252,10 +261,22 @@ fn min_area_rect(points: &[(f64, f64)]) -> [(f64, f64); 4] {
     let hw = best_w / 2.0;
     let hh = best_h / 2.0;
     [
-        (best_cx - hw * best_ux - hh * vx, best_cy - hw * best_uy - hh * vy),
-        (best_cx + hw * best_ux - hh * vx, best_cy + hw * best_uy - hh * vy),
-        (best_cx + hw * best_ux + hh * vx, best_cy + hw * best_uy + hh * vy),
-        (best_cx - hw * best_ux + hh * vx, best_cy - hw * best_uy + hh * vy),
+        (
+            best_cx - hw * best_ux - hh * vx,
+            best_cy - hw * best_uy - hh * vy,
+        ),
+        (
+            best_cx + hw * best_ux - hh * vx,
+            best_cy + hw * best_uy - hh * vy,
+        ),
+        (
+            best_cx + hw * best_ux + hh * vx,
+            best_cy + hw * best_uy + hh * vy,
+        ),
+        (
+            best_cx - hw * best_ux + hh * vx,
+            best_cy - hw * best_uy + hh * vy,
+        ),
     ]
 }
 
@@ -276,7 +297,8 @@ fn expand_box(box_pts: &[(f64, f64); 4], distance: f64) -> [(f64, f64); 4] {
         let mut n1x = e1y / l1;
         let mut n1y = -e1x / l1;
         if (n1x * (box_pts[i].0 - cx) + n1y * (box_pts[i].1 - cy)) < 0.0 {
-            n1x = -n1x; n1y = -n1y;
+            n1x = -n1x;
+            n1y = -n1y;
         }
 
         // Normal of edge i->next
@@ -286,14 +308,21 @@ fn expand_box(box_pts: &[(f64, f64); 4], distance: f64) -> [(f64, f64); 4] {
         let mut n2x = e2y / l2;
         let mut n2y = -e2x / l2;
         if (n2x * (box_pts[i].0 - cx) + n2y * (box_pts[i].1 - cy)) < 0.0 {
-            n2x = -n2x; n2y = -n2y;
+            n2x = -n2x;
+            n2y = -n2y;
         }
 
         // Intersection of offset lines
-        let p1 = (box_pts[prev].0 + n1x * distance, box_pts[prev].1 + n1y * distance);
+        let p1 = (
+            box_pts[prev].0 + n1x * distance,
+            box_pts[prev].1 + n1y * distance,
+        );
         let p2 = (box_pts[i].0 + n1x * distance, box_pts[i].1 + n1y * distance);
         let p3 = (box_pts[i].0 + n2x * distance, box_pts[i].1 + n2y * distance);
-        let p4 = (box_pts[next].0 + n2x * distance, box_pts[next].1 + n2y * distance);
+        let p4 = (
+            box_pts[next].0 + n2x * distance,
+            box_pts[next].1 + n2y * distance,
+        );
 
         let d = (p1.0 - p2.0) * (p3.1 - p4.1) - (p1.1 - p2.1) * (p3.0 - p4.0);
         if d.abs() < 1e-10 {
@@ -346,8 +375,12 @@ pub fn det_postprocess(
             if labels[idx] == label {
                 let x = idx % out_w;
                 pts.push((x as f64, (idx / out_w) as f64));
-                if x < min_x { min_x = x; }
-                if x > max_x { max_x = x; }
+                if x < min_x {
+                    min_x = x;
+                }
+                if x > max_x {
+                    max_x = x;
+                }
                 score_sum += pred[idx] as f64;
                 count += 1;
             }
@@ -371,7 +404,11 @@ pub fn det_postprocess(
         // Compute area/perimeter for unclip distance
         let area = rw * rh;
         let perimeter = 2.0 * (rw + rh);
-        let distance = if perimeter > 0.0 { area / perimeter * unclip_ratio } else { 0.0 };
+        let distance = if perimeter > 0.0 {
+            area / perimeter * unclip_ratio
+        } else {
+            0.0
+        };
 
         let expanded = expand_box(&rect, distance);
         let final_rect = min_area_rect(&expanded.to_vec());
@@ -459,7 +496,12 @@ pub fn rec_preprocess(region: &[u8], rw: usize, rh: usize, img_h: usize) -> (Vec
 }
 
 /// CTC decode: argmax, deduplicate, skip blanks.
-pub fn rec_postprocess(output: &[f32], seq_len: usize, num_classes: usize, dict: &[&str]) -> (String, f32) {
+pub fn rec_postprocess(
+    output: &[f32],
+    seq_len: usize,
+    num_classes: usize,
+    dict: &[&str],
+) -> (String, f32) {
     let mut prev: i32 = -1;
     let mut text = String::new();
     let mut conf_sum = 0.0f32;
@@ -485,5 +527,12 @@ pub fn rec_postprocess(output: &[f32], seq_len: usize, num_classes: usize, dict:
         prev = best_idx as i32;
     }
 
-    (text, if conf_n > 0 { conf_sum / conf_n as f32 } else { 0.0 })
+    (
+        text,
+        if conf_n > 0 {
+            conf_sum / conf_n as f32
+        } else {
+            0.0
+        },
+    )
 }

@@ -92,7 +92,7 @@ fn bias_silu_simd<S: Simd>(simd: S, data: &mut [f32], bias: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::test_util::{assert_close, levels, Rng, AWKWARD_LENS};
+    use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_close, levels};
 
     fn reference(x: f32, bias: f32, act: Activation) -> f64 {
         let v = x as f64 + bias as f64;

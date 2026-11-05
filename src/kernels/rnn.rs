@@ -30,7 +30,18 @@ pub fn lstm<'b, 'a>(
     out_h: &'a mut Vec<f32>,
     out_c: &'a mut Vec<f32>,
 ) -> (TensorView<'a>, TensorView<'a>, TensorView<'a>) {
-    lstm_at(Level::new(), input, w, r, bias, initial_h, initial_c, out_y, out_h, out_c);
+    lstm_at(
+        Level::new(),
+        input,
+        w,
+        r,
+        bias,
+        initial_h,
+        initial_c,
+        out_y,
+        out_h,
+        out_c,
+    );
     let hs = out_h.len();
     let seq_len = out_y.len() / hs.max(1);
     (
@@ -91,7 +102,17 @@ pub fn gru<'b, 'a>(
     out_y: &'a mut Vec<f32>,
     out_h: &'a mut Vec<f32>,
 ) -> (TensorView<'a>, TensorView<'a>) {
-    gru_at(Level::new(), input, w, r, bias, initial_h, linear_before_reset, out_y, out_h);
+    gru_at(
+        Level::new(),
+        input,
+        w,
+        r,
+        bias,
+        initial_h,
+        linear_before_reset,
+        out_y,
+        out_h,
+    );
     let hs = out_h.len();
     let seq_len = out_y.len() / hs.max(1);
     (
@@ -174,7 +195,15 @@ fn add_bias(x: &mut [f32], bw: &[f32], br: &[f32]) {
 }
 
 /// `out = x·wᵀ` for row-major `x` (`rows x k`), `w` (`n x k`) and `out`.
-fn mul_transposed(level: Level, out: &mut [f32], x: &[f32], rows: usize, w: &[f32], n: usize, k: usize) {
+fn mul_transposed(
+    level: Level,
+    out: &mut [f32],
+    x: &[f32],
+    rows: usize,
+    w: &[f32],
+    n: usize,
+    k: usize,
+) {
     assert!(x.len() >= rows * k && w.len() >= n * k && out.len() >= rows * n);
     // SAFETY: the asserts above keep every view inside its slice.
     let (a, b, c) = unsafe {
@@ -230,7 +259,10 @@ fn gru_reset<S: Simd>(simd: S, zr: &mut [f32], h: &[f32], rh: &mut [f32]) {
     for k in (0..n).step_by(16) {
         let e = n.min(k + 16);
         store(vm::sigmoid(load(simd, &z[k..e])), &mut z[k..e]);
-        store(vm::sigmoid(load(simd, &r[k..e])) * load(simd, &h[k..e]), &mut rh[k..e]);
+        store(
+            vm::sigmoid(load(simd, &r[k..e])) * load(simd, &h[k..e]),
+            &mut rh[k..e],
+        );
     }
 }
 
@@ -257,10 +289,16 @@ fn gru_cell_linear<S: Simd>(simd: S, zr: &[f32], rh: &[f32], rb: &[f32], x: &[f3
     for k in (0..n).step_by(16) {
         let e = n.min(k + 16);
         let reset = vm::sigmoid(load(simd, &r[k..e]));
-        let pre = reset.mul_add(load(simd, &rh[k..e]) + load(simd, &rb[k..e]), load(simd, &x[k..e]));
+        let pre = reset.mul_add(
+            load(simd, &rh[k..e]) + load(simd, &rb[k..e]),
+            load(simd, &x[k..e]),
+        );
         let cand = vm::tanh(pre);
         let z = vm::sigmoid(load(simd, &z[k..e]));
-        store(flush_subnormals(z.mul_add(load(simd, &h[k..e]) - cand, cand)), &mut h[k..e]);
+        store(
+            flush_subnormals(z.mul_add(load(simd, &h[k..e]) - cand, cand)),
+            &mut h[k..e],
+        );
     }
 }
 
@@ -271,7 +309,9 @@ fn gru_cell_linear<S: Simd>(simd: S, zr: &[f32], rh: &[f32], rb: &[f32], x: &[f3
 #[inline(always)]
 fn flush_subnormals<S: Simd>(v: f32x16<S>) -> f32x16<S> {
     let zero = f32x16::splat(v.simd, 0.0);
-    v.abs().simd_lt(f32x16::splat(v.simd, f32::MIN_POSITIVE)).select(zero, v)
+    v.abs()
+        .simd_lt(f32x16::splat(v.simd, f32::MIN_POSITIVE))
+        .select(zero, v)
 }
 
 /// Up to 16 elements of `x`, the missing lanes 0.
@@ -317,7 +357,14 @@ mod tests {
             .collect()
     }
 
-    fn lstm_ref(x: &[f32], w: &[f32], r: &[f32], b: &[f32], h0: &[f32], c0: &[f32]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    fn lstm_ref(
+        x: &[f32],
+        w: &[f32],
+        r: &[f32],
+        b: &[f32],
+        h0: &[f32],
+        c0: &[f32],
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let hs = h0.len();
         let is = w.len() / (4 * hs);
         let mut h: Vec<f64> = h0.iter().map(|&v| v as f64).collect();
@@ -331,7 +378,12 @@ mod tests {
                 wx[j] + rh[j] + b[j] as f64 + b[4 * hs + j] as f64
             };
             for k in 0..hs {
-                let (i, o, f, g) = (sigmoid(pre(0, k)), sigmoid(pre(1, k)), sigmoid(pre(2, k)), pre(3, k).tanh());
+                let (i, o, f, g) = (
+                    sigmoid(pre(0, k)),
+                    sigmoid(pre(1, k)),
+                    sigmoid(pre(2, k)),
+                    pre(3, k).tanh(),
+                );
                 c[k] = f * c[k] + i * g;
                 h[k] = o * c[k].tanh();
             }
@@ -351,11 +403,17 @@ mod tests {
             let (wx, rh) = (mv(w, &xt), mv(r_zr, &h));
             let bw = |j: usize| b[j] as f64;
             let br = |j: usize| b[3 * hs + j] as f64;
-            let z: Vec<f64> = (0..hs).map(|k| sigmoid(wx[k] + rh[k] + bw(k) + br(k))).collect();
-            let rg: Vec<f64> = (0..hs).map(|k| sigmoid(wx[hs + k] + rh[hs + k] + bw(hs + k) + br(hs + k))).collect();
+            let z: Vec<f64> = (0..hs)
+                .map(|k| sigmoid(wx[k] + rh[k] + bw(k) + br(k)))
+                .collect();
+            let rg: Vec<f64> = (0..hs)
+                .map(|k| sigmoid(wx[hs + k] + rh[hs + k] + bw(hs + k) + br(hs + k)))
+                .collect();
             let rec = if linear {
                 let rh = mv(r_h, &h);
-                (0..hs).map(|k| rg[k] * (rh[k] + br(2 * hs + k))).collect::<Vec<_>>()
+                (0..hs)
+                    .map(|k| rg[k] * (rh[k] + br(2 * hs + k)))
+                    .collect::<Vec<_>>()
             } else {
                 let scaled: Vec<f64> = (0..hs).map(|k| rg[k] * h[k]).collect();
                 let rh = mv(r_h, &scaled);
@@ -378,7 +436,8 @@ mod tests {
     }
 
     /// Hidden sizes below, at and around the vector width.
-    const CASES: &[(usize, usize, usize)] = &[(1, 3, 1), (4, 5, 7), (3, 16, 16), (5, 9, 33), (2, 40, 20)];
+    const CASES: &[(usize, usize, usize)] =
+        &[(1, 3, 1), (4, 5, 7), (3, 16, 16), (5, 9, 33), (2, 40, 20)];
 
     #[test]
     fn test_lstm_matches_reference_at_every_level() {
@@ -402,7 +461,18 @@ mod tests {
             for level in levels() {
                 let (mut y, mut h, mut c) = (Vec::new(), Vec::new(), Vec::new());
                 let (xv, wv, rv, bv, hv, cv) = &views;
-                lstm_at(level, xv, wv, rv, Some(bv), Some(hv), Some(cv), &mut y, &mut h, &mut c);
+                lstm_at(
+                    level,
+                    xv,
+                    wv,
+                    rv,
+                    Some(bv),
+                    Some(hv),
+                    Some(cv),
+                    &mut y,
+                    &mut h,
+                    &mut c,
+                );
                 let what = format!("{level:?} seq={seq} hidden={hs}");
                 assert_close(&y, &y_ref, &format!("{what} Y"));
                 assert_close(&h, &h_ref, &format!("{what} Y_h"));
@@ -432,8 +502,19 @@ mod tests {
                 for level in levels() {
                     let (mut y, mut h) = (Vec::new(), Vec::new());
                     let (xv, wv, rv, bv, hv) = &views;
-                    gru_at(level, xv, wv, rv, Some(bv), Some(hv), linear, &mut y, &mut h);
-                    let what = format!("{level:?} seq={seq} hidden={hs} linear_before_reset={linear}");
+                    gru_at(
+                        level,
+                        xv,
+                        wv,
+                        rv,
+                        Some(bv),
+                        Some(hv),
+                        linear,
+                        &mut y,
+                        &mut h,
+                    );
+                    let what =
+                        format!("{level:?} seq={seq} hidden={hs} linear_before_reset={linear}");
                     assert_close(&y, &y_ref, &format!("{what} Y"));
                     assert_close(&h, &y_ref[(seq - 1) * hs..], &format!("{what} Y_h"));
                 }
@@ -455,7 +536,11 @@ mod tests {
         let mut b = vec![0.0f32; 8 * hs];
         b[..3 * hs].fill(-100.0);
         b[3 * hs..4 * hs].fill(1.0);
-        let (w, r, ones) = (vec![0.0f32; 4 * hs * is], vec![0.0f32; 4 * hs * hs], vec![1.0f32; hs]);
+        let (w, r, ones) = (
+            vec![0.0f32; 4 * hs * is],
+            vec![0.0f32; 4 * hs * hs],
+            vec![1.0f32; hs],
+        );
         let views = (
             TensorView::from_slice(&x, vec![seq, 1, is]),
             TensorView::from_slice(&w, vec![1, 4 * hs, is]),
@@ -466,12 +551,27 @@ mod tests {
         for level in levels() {
             let (mut y, mut h, mut c) = (Vec::new(), Vec::new(), Vec::new());
             let (xv, wv, rv, bv, ov) = &views;
-            lstm_at(level, xv, wv, rv, Some(bv), Some(ov), Some(ov), &mut y, &mut h, &mut c);
+            lstm_at(
+                level,
+                xv,
+                wv,
+                rv,
+                Some(bv),
+                Some(ov),
+                Some(ov),
+                &mut y,
+                &mut h,
+                &mut c,
+            );
             no_subnormals(&y, &format!("{level:?} LSTM Y"));
             no_subnormals(&c, &format!("{level:?} LSTM Y_c"));
         }
         // GRU: z = σ(0) and a zero candidate halve h0 = 1e-38 to 5e-39.
-        let (w, r, b) = (vec![0.0f32; 3 * hs * is], vec![0.0f32; 3 * hs * hs], vec![0.0f32; 6 * hs]);
+        let (w, r, b) = (
+            vec![0.0f32; 3 * hs * is],
+            vec![0.0f32; 3 * hs * hs],
+            vec![0.0f32; 6 * hs],
+        );
         let h0 = vec![1e-38f32; hs];
         let views = (
             TensorView::from_slice(&x, vec![seq, 1, is]),
@@ -484,7 +584,17 @@ mod tests {
             for level in levels() {
                 let (mut y, mut h) = (Vec::new(), Vec::new());
                 let (xv, wv, rv, bv, hv) = &views;
-                gru_at(level, xv, wv, rv, Some(bv), Some(hv), linear, &mut y, &mut h);
+                gru_at(
+                    level,
+                    xv,
+                    wv,
+                    rv,
+                    Some(bv),
+                    Some(hv),
+                    linear,
+                    &mut y,
+                    &mut h,
+                );
                 no_subnormals(&y, &format!("{level:?} GRU linear_before_reset={linear} Y"));
             }
         }

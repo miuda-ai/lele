@@ -131,7 +131,11 @@ fn tiled(level: Level, op: Op, small_first: bool, full: &[f32], small: &[f32], o
     if tile < 16 {
         for (f, o) in full.chunks_exact(tile).zip(out.chunks_exact_mut(tile)) {
             for ((o, &x), &s) in o.iter_mut().zip(f).zip(small) {
-                *o = if small_first { scalar(op, s, x) } else { scalar(op, x, s) };
+                *o = if small_first {
+                    scalar(op, s, x)
+                } else {
+                    scalar(op, x, s)
+                };
             }
         }
         return;
@@ -147,21 +151,53 @@ fn tiled(level: Level, op: Op, small_first: bool, full: &[f32], small: &[f32], o
 /// `out = full op small` with `small[i]` applied to the `i`-th run of `inner`
 /// elements of `full` (`small` repeats from the start when it runs out), or
 /// `small op full` if `small_first`.
-fn rows(level: Level, op: Op, small_first: bool, full: &[f32], small: &[f32], inner: usize, out: &mut [f32]) {
+fn rows(
+    level: Level,
+    op: Op,
+    small_first: bool,
+    full: &[f32],
+    small: &[f32],
+    inner: usize,
+    out: &mut [f32],
+) {
     if inner < 16 {
-        for (i, (f, o)) in full.chunks_exact(inner).zip(out.chunks_exact_mut(inner)).enumerate() {
+        for (i, (f, o)) in full
+            .chunks_exact(inner)
+            .zip(out.chunks_exact_mut(inner))
+            .enumerate()
+        {
             let s = small[i % small.len()];
             for (o, &x) in o.iter_mut().zip(f) {
-                *o = if small_first { scalar(op, s, x) } else { scalar(op, x, s) };
+                *o = if small_first {
+                    scalar(op, s, x)
+                } else {
+                    scalar(op, x, s)
+                };
             }
         }
         return;
     }
     match op {
-        Op::Add => simd_call!(level, max = Avx2, add_rows(small_first, full, small, inner, out)),
-        Op::Sub => simd_call!(level, max = Avx2, sub_rows(small_first, full, small, inner, out)),
-        Op::Mul => simd_call!(level, max = Avx2, mul_rows(small_first, full, small, inner, out)),
-        Op::Div => simd_call!(level, max = Avx2, div_rows(small_first, full, small, inner, out)),
+        Op::Add => simd_call!(
+            level,
+            max = Avx2,
+            add_rows(small_first, full, small, inner, out)
+        ),
+        Op::Sub => simd_call!(
+            level,
+            max = Avx2,
+            sub_rows(small_first, full, small, inner, out)
+        ),
+        Op::Mul => simd_call!(
+            level,
+            max = Avx2,
+            mul_rows(small_first, full, small, inner, out)
+        ),
+        Op::Div => simd_call!(
+            level,
+            max = Avx2,
+            div_rows(small_first, full, small, inner, out)
+        ),
     }
 }
 
@@ -181,7 +217,10 @@ macro_rules! zip_map {
         let (chunks_b, _) = b.as_chunks::<16>();
         let (chunks_out, _) = out.as_chunks_mut::<16>();
         for ((va, vb), vo) in chunks_a.iter().zip(chunks_b).zip(chunks_out) {
-            let ($x, $y) = (f32x16::load_array_ref(simd, va), f32x16::load_array_ref(simd, vb));
+            let ($x, $y) = (
+                f32x16::load_array_ref(simd, va),
+                f32x16::load_array_ref(simd, vb),
+            );
             ($body).store_array(vo);
         }
         if !tail.is_empty() {
@@ -220,7 +259,13 @@ macro_rules! scalar_map {
 macro_rules! kernels {
     ($tiled:ident, $rows:ident, |$x:ident, $y:ident| $body:expr) => {
         #[simd]
-        fn $tiled<S: Simd>(simd: S, small_first: bool, full: &[f32], small: &[f32], out: &mut [f32]) {
+        fn $tiled<S: Simd>(
+            simd: S,
+            small_first: bool,
+            full: &[f32],
+            small: &[f32],
+            out: &mut [f32],
+        ) {
             let tile = small.len();
             if full.len() == tile && !small_first {
                 // Equal shapes: no tiles to count (that is two integer divisions).
@@ -273,7 +318,7 @@ kernels!(div_tiled, div_rows, |x, y| x / y);
 mod tests {
     use super::*;
     use crate::kernels::test_util::{
-        assert_same_bits, binary_inputs, binary_shapes, broadcast_reference, levels, BINARY_OPS,
+        BINARY_OPS, assert_same_bits, binary_inputs, binary_shapes, broadcast_reference, levels,
     };
 
     fn op_of(name: &str) -> Op {
@@ -295,7 +340,9 @@ mod tests {
                     let mut out = Vec::new();
                     let what = format!("{level:?} {name} {a_shape:?} {b_shape:?}");
                     // Shapes that are not one block are left to the generic code.
-                    if let Some(shape) = binary_f32(level, op_of(name), &a, a_shape, &b, b_shape, &mut out) {
+                    if let Some(shape) =
+                        binary_f32(level, op_of(name), &a, a_shape, &b, b_shape, &mut out)
+                    {
                         assert_eq!(shape, want_shape, "{what}: shape");
                         assert_same_bits(&out, &want, &what);
                     }
@@ -330,18 +377,26 @@ mod tests {
             }
         }
         // Both operands broadcast, or a dimension of 1 inside the block.
-        for (a_shape, b_shape) in [(&[4, 1, 5][..], &[1, 6, 1][..]), (&[2, 3, 1, 5], &[2, 1, 4, 1])] {
+        for (a_shape, b_shape) in [
+            (&[4, 1, 5][..], &[1, 6, 1][..]),
+            (&[2, 3, 1, 5], &[2, 1, 4, 1]),
+        ] {
             let a = vec![1.0; a_shape.iter().product()];
             let b = vec![2.0; b_shape.iter().product()];
             let mut out = Vec::new();
-            assert!(binary_f32(Level::new(), Op::Add, &a, a_shape, &b, b_shape, &mut out).is_none());
+            assert!(
+                binary_f32(Level::new(), Op::Add, &a, a_shape, &b, b_shape, &mut out).is_none()
+            );
         }
     }
 
     #[test]
     fn test_other_types_are_not_handled() {
         let (a, b) = (vec![1i64, 2, 3], vec![4i64, 5, 6]);
-        let (ta, tb) = (TensorView::from_slice(&a, vec![3]), TensorView::from_slice(&b, vec![3]));
+        let (ta, tb) = (
+            TensorView::from_slice(&a, vec![3]),
+            TensorView::from_slice(&b, vec![3]),
+        );
         assert!(try_f32(Op::Add, &ta, &tb, &mut Vec::new()).is_none());
     }
 }

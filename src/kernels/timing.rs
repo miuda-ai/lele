@@ -60,7 +60,9 @@ pub fn reset_scope() {
 pub fn print_scope() {
     SCOPE_TIMINGS.with(|m| {
         let map = m.borrow();
-        if map.is_empty() { return; }
+        if map.is_empty() {
+            return;
+        }
         let total_ns: u64 = map.values().sum();
         let mut entries: Vec<_> = map.iter().collect();
         entries.sort_by(|a, b| b.1.cmp(a.1));
