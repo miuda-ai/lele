@@ -4,5 +4,6 @@ pub mod features;
 pub mod kernels;
 #[cfg(feature = "compiler")]
 pub mod model;
+pub mod runtime;
 pub mod tensor;
 pub use kernels::*;
