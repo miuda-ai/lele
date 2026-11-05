@@ -312,6 +312,7 @@ pub(crate) fn conv_integer_at<'a>(
     };
     let e = Epilogue {
         scale: 1.0,
+        requant: None,
         bias: None,
         relu: false,
     };

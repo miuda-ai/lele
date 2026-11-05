@@ -233,6 +233,54 @@ impl QWeights {
         Self::pack(layout, k, n, |i| codes[i] as i32, shift, zero_point, scale)
     }
 
+    /// As [`QWeights::new`], from a row-major `k x n` activation on the `u8` grid of `scale`
+    /// and `zero_point` (it came out of a `QuantizeLinear` -> `DequantizeLinear` pair): each
+    /// value is quantized back to its code, as [`quantize_rows_at`] quantizes A. Packed in
+    /// `layout`, at `level`.
+    pub(crate) fn from_grid(
+        level: Level,
+        layout: Layout,
+        b: &[f32],
+        k: usize,
+        n: usize,
+        scale: f32,
+        zero_point: i32,
+    ) -> Self {
+        assert_eq!(b.len(), k * n);
+        let packed = match layout {
+            Layout::Pairs => {
+                let pairs = k.div_ceil(2);
+                let mut data = AlignedI32::zeroed(n.div_ceil(NR) * pairs * NR);
+                simd_call!(
+                    level,
+                    pack_grid_pairs_simd(b, k, n, scale, zero_point, &mut data)
+                );
+                Packed::Pairs { pairs, data }
+            }
+            Layout::Dot(dot) => Packed::Dot(simd_call!(
+                level,
+                pack_grid_quads_simd(dot, b, k, n, scale, zero_point)
+            )),
+            Layout::Float => {
+                let mut codes = vec![0.0; k * n];
+                simd_call!(
+                    level,
+                    quantize_rows_f32_simd(b, k * n, scale, zero_point, 0, &mut codes)
+                );
+                let code = |i: usize| codes[i] as i32;
+                return Self::pack(layout, k, n, code, 128, &[zero_point], &[scale]);
+            }
+        };
+        let mut col_scale = vec![0.0; n.div_ceil(qgemm_dot::NR) * qgemm_dot::NR];
+        col_scale[..n].fill(scale);
+        Self {
+            k,
+            n,
+            packed,
+            scale: col_scale,
+        }
+    }
+
     /// `code(i)` is element `i` of the row-major codes; `shift` brings them into `i8` (0
     /// for `i8` codes, 128 for `u8`), which the quads need.
     fn pack(
@@ -305,14 +353,52 @@ impl QWeights {
 }
 
 /// What happens to the integer sums on the way out:
-/// `C[i][j] = relu?(sum * (scale * column scale of B) + bias[j])`.
+/// `C[i][j] = relu?(requant?(sum * (scale * column scale of B)) + bias[j])`.
 pub(crate) struct Epilogue<'a> {
     /// The scale of A.
     pub scale: f32,
+    /// Snap the products onto a `u8` grid, if any.
+    pub requant: Option<Requant>,
     /// `n` values to add, if any.
     pub bias: Option<&'a [f32]>,
     pub relu: bool,
 }
+
+/// A `u8` `QuantizeLinear` -> `DequantizeLinear` round trip of a product, as static-QDQ
+/// graphs follow every product with:
+/// `(clamp(round_ties_even(x / scale) + zero_point, 0, 255) - zero_point) * scale`, each
+/// step rounded as `fake_quantize_linear` rounds it.
+#[derive(Clone, Copy, Debug)]
+pub struct Requant {
+    pub scale: f32,
+    pub zero_point: i32,
+}
+
+impl Requant {
+    #[inline(always)]
+    pub(crate) fn apply(self, x: f32) -> f32 {
+        let z = self.zero_point as f32;
+        (((x / self.scale).round_ties_even() + z).clamp(0.0, 255.0) - z) * self.scale
+    }
+}
+
+/// [`Requant::apply`] on a vector (`f32x8` or `f32x16`), or `x` as it is without one.
+macro_rules! requant {
+    ($simd:expr, $vec:ident, $requant:expr, $x:expr) => {
+        match $requant {
+            Some(r) => {
+                let (s, z) = (
+                    $vec::splat($simd, r.scale),
+                    $vec::splat($simd, r.zero_point as f32),
+                );
+                let (lo, hi) = ($vec::splat($simd, 0.0), $vec::splat($simd, 255.0));
+                ((($x / s).round_ties_even() + z).max(lo).min(hi) - z) * s
+            }
+            None => $x,
+        }
+    };
+}
+pub(crate) use requant;
 
 /// `C = epilogue(A * B)` for B in the pairs layout. A is `m` rows of `w.pairs()` packed
 /// pairs, `lda` apart, as [`quantize_rows_at`] writes them; C is `m x n`, row-major.
@@ -377,6 +463,7 @@ fn qgemm_simd<S: Simd>(
                 ldc: w.n,
                 scale: e.scale,
                 col_scale: w.scale[j..][..NR].try_into().unwrap(),
+                requant: e.requant,
                 bias: e.bias.map(|b| &b[j..w.n.min(j + NR)]),
                 relu: e.relu,
             };
@@ -425,6 +512,7 @@ struct Tile<'a> {
     ldc: usize,
     scale: f32,
     col_scale: &'a [f32; NR],
+    requant: Option<Requant>,
     /// `width` values.
     bias: Option<&'a [f32]>,
     relu: bool,
@@ -506,7 +594,8 @@ fn finish<S: Simd, const R: usize>(simd: S, t: &Tile, acc: [[i32x8<S>; 2]; R], c
     let zero = f32x8::splat(simd, 0.0);
     for r in 0..R {
         let vals: [f32x8<S>; 2] = core::array::from_fn(|v| {
-            let x = simd.cvt_f32_i32x8(acc[r][v]) * col_scale[v] + bias[v];
+            let x = simd.cvt_f32_i32x8(acc[r][v]) * col_scale[v];
+            let x = requant!(simd, f32x8, t.requant, x) + bias[v];
             if t.relu { x.max(zero) } else { x }
         });
         let row = &mut c[r * t.ldc..][..t.width];
@@ -589,6 +678,144 @@ fn madd<S: Simd>(simd: S, a: i16x16<S>, b: i16x16<S>) -> i32x8<S> {
             });
             i32x8::from_slice(simd, &out)
         }
+    }
+}
+
+/// `clamp(round_ties_even(x / scale) + zero_point, 0, 255)`: ONNX `QuantizeLinear` to `u8`.
+#[inline(always)]
+fn quantize_u8(x: f32, scale: f32, zero_point: i32) -> i32 {
+    let q = (x / scale)
+        .round_ties_even()
+        .clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+    q.saturating_add(zero_point).clamp(0, 255)
+}
+
+/// Packs the row-major `k x n` activation `b`, quantized to `u8` and centered on
+/// `zero_point`, into the pairs layout ([`Packed::Pairs`]): rows `2p` and `2p + 1` of B
+/// become pair row `p` of every panel. `data` must be zeroed (the padding past `k` and `n`).
+#[simd]
+fn pack_grid_pairs_simd<S: Simd>(
+    simd: S,
+    b: &[f32],
+    k: usize,
+    n: usize,
+    scale: f32,
+    zero_point: i32,
+    data: &mut [i32],
+) {
+    use fearless_simd::prelude::*;
+    let pairs = k.div_ceil(2);
+    let sv = f32x8::splat(simd, scale);
+    let zv = i32x8::splat(simd, zero_point);
+    let (lo, hi) = (i32x8::splat(simd, 0), i32x8::splat(simd, 255));
+    let low_half = i32x8::splat(simd, 0xffff);
+    // Centered codes of 8 values of B.
+    macro_rules! codes {
+        ($x:expr) => {{
+            let q = simd.cvt_i32_f32x8((f32x8::from_slice(simd, $x) / sv).round_ties_even()) + zv;
+            simd.min_i32x8(simd.max_i32x8(q, lo), hi) - zv
+        }};
+    }
+    let whole = n / 8 * 8;
+    for p in 0..pairs {
+        let even = &b[2 * p * n..][..n];
+        let odd = (2 * p + 1 < k).then(|| &b[(2 * p + 1) * n..][..n]);
+        for j in (0..whole).step_by(8) {
+            let q0 = codes!(&even[j..][..8]);
+            let q1 = match odd {
+                Some(odd) => codes!(&odd[j..][..8]),
+                None => lo,
+            };
+            let pair = simd.or_i32x8(simd.and_i32x8(q0, low_half), simd.shl_i32x8(q1, 16));
+            pair.store_slice(&mut data[((j / NR) * pairs + p) * NR + j % NR..][..8]);
+        }
+        for j in whole..n {
+            let code = |x: f32| quantize_u8(x, scale, zero_point) - zero_point;
+            let hi = odd.map_or(0, |odd| code(odd[j]));
+            data[((j / NR) * pairs + p) * NR + j % NR] = pack_pair(code(even[j]), hi);
+        }
+    }
+}
+
+/// Packs the row-major `k x n` activation `b`, quantized to `u8`, for `dot`, as
+/// [`qgemm_dot::pack`] packs codes shifted by 128 into `i8`: rows `4q..4q + 4` of B become
+/// quad row `q` of every panel.
+#[simd]
+fn pack_grid_quads_simd<S: Simd>(
+    simd: S,
+    dot: Dot,
+    b: &[f32],
+    k: usize,
+    n: usize,
+    scale: f32,
+    zero_point: i32,
+) -> QuadWeights {
+    use fearless_simd::prelude::*;
+    let (nr, quads) = (dot.nr(), k.div_ceil(4));
+    let mut data = AlignedI32::zeroed(n.div_ceil(nr) * quads * nr);
+    let padded = n.div_ceil(qgemm_dot::NR) * qgemm_dot::NR;
+    let (mut col_sums, mut dot_bias) = (vec![0; padded], vec![0; padded]);
+    let sv = f32x8::splat(simd, scale);
+    let zv = i32x8::splat(simd, zero_point);
+    let (lo, hi) = (i32x8::splat(simd, 0), i32x8::splat(simd, 255));
+    let (shift, byte) = (i32x8::splat(simd, 128), i32x8::splat(simd, 0xff));
+    // Codes of 8 values of B.
+    macro_rules! codes {
+        ($x:expr) => {{
+            let q = simd.cvt_i32_f32x8((f32x8::from_slice(simd, $x) / sv).round_ties_even()) + zv;
+            simd.min_i32x8(simd.max_i32x8(q, lo), hi)
+        }};
+    }
+    let whole = n / 8 * 8;
+    for q in 0..quads {
+        let rows: [Option<&[f32]>; 4] =
+            core::array::from_fn(|t| (4 * q + t < k).then(|| &b[(4 * q + t) * n..][..n]));
+        for j in (0..whole).step_by(8) {
+            let (mut word, mut sum, mut shifted) = (lo, lo, lo);
+            for (t, row) in rows.iter().enumerate() {
+                if let Some(row) = row {
+                    let c = codes!(&row[j..][..8]);
+                    let s = c - shift;
+                    word =
+                        simd.or_i32x8(word, simd.shl_i32x8(simd.and_i32x8(s, byte), 8 * t as u32));
+                    sum = sum + c - zv;
+                    shifted += s;
+                }
+            }
+            word.store_slice(&mut data[((j / nr) * quads + q) * nr + j % nr..][..8]);
+            let sums = &mut col_sums[j..][..8];
+            (i32x8::from_slice(simd, sums) + sum).store_slice(sums);
+            if dot == Dot::Sdot {
+                let bias = &mut dot_bias[j..][..8];
+                // `128 * shifted`.
+                (i32x8::from_slice(simd, bias) - simd.shl_i32x8(shifted, 7)).store_slice(bias);
+            }
+        }
+        for j in whole..n {
+            let mut word = 0;
+            for (t, row) in rows.iter().enumerate() {
+                if let Some(row) = row {
+                    let c = quantize_u8(row[j], scale, zero_point);
+                    word |= ((c - 128) as i8 as u8 as i32) << (8 * t);
+                    col_sums[j] += c - zero_point;
+                    if dot == Dot::Sdot {
+                        dot_bias[j] -= 128 * (c - 128);
+                    }
+                }
+            }
+            data[((j / nr) * quads + q) * nr + j % nr] = word;
+        }
+    }
+    let mut row_sum_factor = vec![0; padded];
+    row_sum_factor[..n].fill(128 - zero_point);
+    QuadWeights {
+        dot,
+        quads,
+        data,
+        row_term: n > 0 && zero_point != 128,
+        row_sum_factor,
+        col_sums,
+        dot_bias,
     }
 }
 
@@ -688,19 +915,35 @@ pub fn qlinear_dynamic<'a>(
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
     let (scale, zero_point) = dynamic_quant_params(&x.data);
-    quantized_matmul(x, scale, zero_point, zero_point, w, bias, relu, out)
+    let e = Epilogue {
+        scale,
+        requant: None,
+        bias,
+        relu,
+    };
+    quantized_matmul(x, zero_point, zero_point, w, &e, out)
 }
 
-/// `x * dequantize(w)` for an `x` already on the grid of `scale` and `zero_point` (it came
-/// out of a `QuantizeLinear` -> `DequantizeLinear` pair): a static-QDQ linear layer.
+/// `requant?(x * dequantize(w)) + bias`, a static-QDQ linear layer, for an `x` that goes
+/// through a `QuantizeLinear` -> `DequantizeLinear` pair of `scale` and `zero_point` (or
+/// came out of one: it is quantized either way). With `requant`, the product goes through
+/// the pair that follows it, before the bias is added.
 pub fn qlinear_static<'a>(
     x: &TensorView<'_, f32>,
     scale: f32,
     zero_point: i32,
     w: &QWeights,
+    requant: Option<Requant>,
+    bias: Option<&[f32]>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
-    quantized_matmul(x, scale, zero_point, zero_point, w, None, false, out)
+    let e = Epilogue {
+        scale,
+        requant,
+        bias,
+        relu: false,
+    };
+    quantized_matmul(x, zero_point, zero_point, w, &e, out)
 }
 
 /// ONNX `MatMulInteger` against a prepared B (whose scale should be 1): `a` holds `u8`
@@ -711,7 +954,13 @@ pub fn mat_mul_integer_qweights<'a>(
     w: &QWeights,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
-    quantized_matmul(a, 1.0, 0, a_zero_point, w, None, false, out)
+    let e = Epilogue {
+        scale: 1.0,
+        requant: None,
+        bias: None,
+        relu: false,
+    };
+    quantized_matmul(a, 0, a_zero_point, w, &e, out)
 }
 
 /// ONNX `MatMulInteger` with both operands given at run time as `f32` holding codes (`a`
@@ -750,6 +999,7 @@ pub fn mat_mul_integer_f32<'a>(
     let scale = scale.unwrap_or(&[1.0]);
     let e = Epilogue {
         scale: 1.0,
+        requant: None,
         bias,
         relu,
     };
@@ -791,6 +1041,110 @@ pub fn mat_mul_integer_f32<'a>(
     } else {
         b.shape[..bd - 2].to_vec()
     };
+    shape.extend([m, n]);
+    TensorView::from_slice(out, shape)
+}
+
+/// `a * b` for two activations that each came out of a `u8` `QuantizeLinear` ->
+/// `DequantizeLinear` pair (scalar scales and zero points), as static-QDQ attention
+/// multiplies its queries by its keys and its probabilities by its values: both are
+/// quantized back to their codes and multiplied in integers, then scaled once by
+/// `a_scale * b_scale`.
+///
+/// `a` and `b` need not be on their grids: they are quantized as their `QuantizeLinear`s
+/// would. With `requant`, the product goes through the `QuantizeLinear` ->
+/// `DequantizeLinear` pair that follows it.
+///
+/// `a` is `[..., m, k]` and `b` `[..., k, n]`, their batch axes equal or either one
+/// batch; B is packed once per batch. Other broadcasts multiply the dequantized values in
+/// `f32`.
+pub fn qmatmul_acts<'a>(
+    a: &TensorView<'_, f32>,
+    a_scale: f32,
+    a_zero_point: i32,
+    b: &TensorView<'_, f32>,
+    b_scale: f32,
+    b_zero_point: i32,
+    requant: Option<Requant>,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a, f32> {
+    let (ad, bd) = (a.shape.len(), b.shape.len());
+    let (batch_a, batch_b) = (
+        &a.shape[..ad.saturating_sub(2)],
+        &b.shape[..bd.saturating_sub(2)],
+    );
+    let (count_a, count_b) = (
+        batch_a.iter().product::<usize>(),
+        batch_b.iter().product::<usize>(),
+    );
+    let simple = batch_a == batch_b || count_a == 1 || count_b == 1;
+    if ad < 2 || bd < 2 || count_a == 0 || count_b == 0 || !simple {
+        let on_grid = |x: &TensorView<'_, f32>, scale, zero_point| {
+            let r = Requant { scale, zero_point };
+            let data: Vec<f32> = x.data.iter().map(|&v| r.apply(v)).collect();
+            TensorView::from_owned(data, x.shape.to_vec())
+        };
+        let (a, b) = (
+            on_grid(a, a_scale, a_zero_point),
+            on_grid(b, b_scale, b_zero_point),
+        );
+        let shape = crate::kernels::matmul(&a, &b, out).shape.to_vec();
+        if let Some(r) = requant {
+            let len = shape.iter().product();
+            out[..len].iter_mut().for_each(|v| *v = r.apply(*v));
+        }
+        return TensorView::from_slice(out, shape);
+    }
+    let (m, k, n) = (a.shape[ad - 2], a.shape[ad - 1], b.shape[bd - 1]);
+    assert_eq!(
+        b.shape[bd - 2],
+        k,
+        "MatMul of {:?} and {:?}",
+        a.shape,
+        b.shape
+    );
+    let batch = count_a.max(count_b);
+    // SAFETY: every batch of C is written whole below before any is read.
+    unsafe { crate::kernels::utils::ensure_capacity(out, batch * m * n) };
+    let level = Level::new();
+    let layout = Layout::for_level(level);
+    let e = Epilogue {
+        scale: a_scale,
+        requant,
+        bias: None,
+        relu: false,
+    };
+    let pack_b = |b: &[f32]| QWeights::from_grid(level, layout, b, k, n, b_scale, b_zero_point);
+    let product = |w: &QWeights, a: &[f32], rows: usize, c: &mut [f32]| {
+        run_at(
+            level,
+            w,
+            a,
+            rows,
+            a_scale,
+            a_zero_point,
+            a_zero_point,
+            &e,
+            c,
+        )
+    };
+    if count_b == 1 {
+        // One B for every batch of A: all their rows in one product.
+        let w = pack_b(&b.data[..k * n]);
+        product(&w, &a.data, count_a * m, &mut out[..batch * m * n]);
+    } else {
+        for i in 0..batch {
+            let w = pack_b(&b.data[i * k * n..][..k * n]);
+            let a = &a.data[if count_a == 1 { 0 } else { i * m * k }..][..m * k];
+            product(&w, a, m, &mut out[i * m * n..][..m * n]);
+        }
+    }
+    // The batch axes broadcast: one side's are all 1 or both are the same.
+    let rank = batch_a.len().max(batch_b.len());
+    let dim = |s: &[usize], i: usize| (i + s.len()).checked_sub(rank).map_or(1, |i| s[i]);
+    let mut shape: Vec<usize> = (0..rank)
+        .map(|i| dim(batch_a, i).max(dim(batch_b, i)))
+        .collect();
     shape.extend([m, n]);
     TensorView::from_slice(out, shape)
 }
@@ -893,7 +1247,7 @@ fn sgemm(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, c: &mut [f32]) {
     }
 }
 
-/// `c[i][j] = relu?(c[i][j] * e.scale * col_scale[j] + bias[j])`, in place.
+/// `c[i][j] = relu?(requant?(c[i][j] * e.scale * col_scale[j]) + bias[j])`, in place.
 #[simd]
 fn epilogue_simd<S: Simd>(
     simd: S,
@@ -913,27 +1267,27 @@ fn epilogue_simd<S: Simd>(
             let b = e
                 .bias
                 .map_or(zero, |b| f32x8::from_slice(simd, &b[8 * i..][..8]));
-            let x = f32x8::from_slice(simd, o) * s + b;
+            let x = f32x8::from_slice(simd, o) * s;
+            let x = requant!(simd, f32x8, e.requant, x) + b;
             (if e.relu { x.max(zero) } else { x }).store_slice(o);
         }
         let done = chunks.len() * 8;
         for (j, o) in rest.iter_mut().enumerate() {
-            let x = *o * (e.scale * col_scale[done + j]) + e.bias.map_or(0.0, |b| b[done + j]);
+            let x = *o * (e.scale * col_scale[done + j]);
+            let x = e.requant.map_or(x, |r| r.apply(x)) + e.bias.map_or(0.0, |b| b[done + j]);
             *o = if e.relu { x.max(0.0) } else { x };
         }
     }
 }
 
-/// Quantizes `x` with `scale`, `zero_point` and `center` (as [`quantize_rows_at`]) and
-/// multiplies it by `w`, with `scale` the scale of the result's A.
+/// Quantizes `x` with `e.scale`, `zero_point` and `center` (as [`quantize_rows_at`]) and
+/// multiplies it by `w`, with `e.scale` the scale of the result's A.
 fn quantized_matmul<'a>(
     x: &TensorView<'_, f32>,
-    scale: f32,
     zero_point: i32,
     center: i32,
     w: &QWeights,
-    bias: Option<&[f32]>,
-    relu: bool,
+    e: &Epilogue,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a, f32> {
     crate::kernels::enable_flush_denormals();
@@ -951,10 +1305,10 @@ fn quantized_matmul<'a>(
         w,
         &x.data,
         m,
-        scale,
+        e.scale,
         zero_point,
         center,
-        &Epilogue { scale, bias, relu },
+        e,
         out,
     );
     let mut shape = x.shape.to_vec();
@@ -1061,8 +1415,17 @@ mod tests {
                     let (sa, za) = (rng.f32(0.01, 0.05), rng.f32(0.0, 256.0) as i32);
                     let bias = rng.vec(n, -1.0, 1.0);
                     let relu = case == 1;
+                    // Case 2 snaps the products onto a grid about as fine as their spread
+                    // (but not where the f32 GEMM rounds the sums: a rounding could cross a
+                    // step).
+                    let requant =
+                        (case == 2 && !(layout == Layout::Float && k > 258)).then(|| Requant {
+                            scale: sa * 0.05 * 128.0 * (k as f32).sqrt().max(1.0) / 40.0,
+                            zero_point: 120,
+                        });
                     let e = Epilogue {
                         scale: sa,
+                        requant,
                         bias: (case != 3).then_some(&bias[..]),
                         relu,
                     };
@@ -1085,7 +1448,13 @@ mod tests {
                                 })
                                 .sum();
                             let s = sa * ws[if per_col { j } else { 0 }];
-                            let mut v = sum as i32 as f32 * s + e.bias.map_or(0.0, |b| b[j]);
+                            let mut v = sum as i32 as f32 * s;
+                            if let Some(r) = requant {
+                                let z = r.zero_point as f32;
+                                let q = ((v / r.scale).round_ties_even() + z).clamp(0.0, 255.0);
+                                v = (q - z) * r.scale;
+                            }
+                            v += e.bias.map_or(0.0, |b| b[j]);
                             if relu {
                                 v = v.max(0.0);
                             }
@@ -1190,12 +1559,38 @@ mod tests {
             sa,
             za,
             &w,
+            None,
+            None,
             &mut out,
         );
         let want = matmul(&|i, kk| x[i * k + kk] as f64, &|kk, j| {
             w_i8(kk, j) * ws[j] as f64
         });
         assert_close(&got.data, &want, 1e-5, "QDQ");
+
+        // The same, fused with the activation's QuantizeLinear -> DequantizeLinear pair
+        // before it, and the product's and a bias after: bit for bit the unfused chain.
+        let unfused = got.data.to_vec();
+        let r = Requant {
+            scale: 0.07,
+            zero_point: 131,
+        };
+        let raw_x: Vec<f32> = x.iter().map(|&v| v + rng.f32(-0.4, 0.4) * sa).collect();
+        let got = qlinear_static(
+            &TensorView::from_slice(&raw_x, vec![batch, m, k]),
+            sa,
+            za,
+            &w,
+            Some(r),
+            Some(&bias),
+            &mut out,
+        );
+        let chain: Vec<f32> = unfused
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| r.apply(v) + bias[i % n])
+            .collect();
+        assert_same_bits(&got.data, &chain, "fused QDQ");
 
         // Dynamic: anything in, quantized to its own range; bias and ReLU.
         let x = rng.vec(rows * k, -2.0, 3.0);
@@ -1226,6 +1621,210 @@ mod tests {
         .map(|(i, &v)| (v + bias[i % n] as f64).max(0.0))
         .collect();
         assert_close(&got.data, &exact, 0.05, "dynamic vs f32");
+    }
+
+    /// B packed from values on (and off) a `u8` grid multiplies exactly as B packed from
+    /// their codes, in every layout at every level.
+    #[test]
+    fn test_weights_from_grid_match_weights_from_codes() {
+        let mut rng = Rng::new(17);
+        for (level, layout) in levels()
+            .into_iter()
+            .flat_map(|l| Layout::ALL.map(|layout| (l, layout)))
+        {
+            for &(m, k, n) in &[
+                (1, 1, 1),
+                (3, 2, 8),
+                (7, 5, 17),
+                (6, 64, 400),
+                (13, 33, 23),
+                (2, 400, 64),
+            ] {
+                for &(scale, zp) in &[(0.02f32, 128), (0.003, 0), (0.05, 255), (0.01, 37)] {
+                    // Mostly on the grid, as QDQ activations are; some off it and out of range.
+                    let b: Vec<f32> = (0..k * n)
+                        .map(|i| match i % 5 {
+                            4 => rng.f32(-8.0, 8.0),
+                            _ => scale * (rng.f32(0.0, 256.0).floor() - zp as f32),
+                        })
+                        .collect();
+                    let codes: Vec<u8> =
+                        b.iter().map(|&v| quantize_u8(v, scale, zp) as u8).collect();
+                    let w = QWeights::from_grid(level, layout, &b, k, n, scale, zp);
+                    assert_eq!(w.layout(), layout);
+                    let want_w =
+                        QWeights::with_layout(layout, &codes, k, n, false, &[zp], &[scale]);
+                    let (sa, za) = (rng.f32(0.01, 0.05), rng.f32(0.0, 256.0) as i32);
+                    let x: Vec<f32> = (0..m * k)
+                        .map(|_| sa * (rng.f32(0.0, 256.0).floor() - za as f32))
+                        .collect();
+                    let e = Epilogue {
+                        scale: sa,
+                        requant: None,
+                        bias: None,
+                        relu: false,
+                    };
+                    let (mut got, mut want) = (vec![f32::NAN; m * n], vec![f32::NAN; m * n]);
+                    run_at(level, &w, &x, m, sa, za, za, &e, &mut got);
+                    run_at(level, &want_w, &x, m, sa, za, za, &e, &mut want);
+                    let what = format!("{level:?} {layout:?} {m}x{k}x{n} scale {scale} zp {zp}");
+                    assert_same_bits(&got, &want, &what);
+                }
+            }
+        }
+    }
+
+    /// `qmatmul_acts` against the product of the dequantized operands in f64, over the
+    /// batch shapes it multiplies in integers.
+    #[test]
+    fn test_qmatmul_acts_matches_the_dequantized_product() {
+        let mut rng = Rng::new(19);
+        let (m, k, n) = (5, 37, 21);
+        let ((sa, za), (sb, zb)) = ((0.03f32, 100), (0.02f32, 131));
+        let cases: [(&[usize], &[usize], &[usize]); 4] = [
+            (&[2, 3], &[2, 3], &[2, 3]),
+            (&[1, 3], &[], &[1, 3]),
+            (&[4], &[1, 1], &[1, 4]),
+            (&[], &[2], &[2]),
+        ];
+        for (batch_a, batch_b, batch_out) in cases {
+            let on_grid = |rng: &mut Rng, len: usize, s: f32, z: i32| -> Vec<f32> {
+                (0..len)
+                    .map(|_| s * (rng.f32(0.0, 256.0).floor() - z as f32))
+                    .collect()
+            };
+            let (count_a, count_b) = (
+                batch_a.iter().product::<usize>(),
+                batch_b.iter().product::<usize>(),
+            );
+            let a = on_grid(&mut rng, count_a * m * k, sa, za);
+            let b = on_grid(&mut rng, count_b * k * n, sb, zb);
+            let shape = |batch: &[usize], r: usize, c: usize| [batch, &[r, c]].concat();
+            let mut out = Vec::new();
+            let got = qmatmul_acts(
+                &TensorView::from_slice(&a, shape(batch_a, m, k)),
+                sa,
+                za,
+                &TensorView::from_slice(&b, shape(batch_b, k, n)),
+                sb,
+                zb,
+                None,
+                &mut out,
+            );
+            assert_eq!(
+                got.shape.as_ref(),
+                shape(batch_out, m, n),
+                "{batch_a:?} x {batch_b:?}"
+            );
+            let unfused = got.data.to_vec();
+            // Off the grids by less than half a step, and with the product's own pair:
+            // bit for bit the chain of the pairs around the product.
+            let off = |x: &[f32], s: f32, rng: &mut Rng| -> Vec<f32> {
+                x.iter().map(|&v| v + rng.f32(-0.4, 0.4) * s).collect()
+            };
+            let (raw_a, raw_b) = (off(&a, sa, &mut rng), off(&b, sb, &mut rng));
+            let r = Requant {
+                scale: 0.3,
+                zero_point: 140,
+            };
+            let mut fused_out = Vec::new();
+            let fused = qmatmul_acts(
+                &TensorView::from_slice(&raw_a, shape(batch_a, m, k)),
+                sa,
+                za,
+                &TensorView::from_slice(&raw_b, shape(batch_b, k, n)),
+                sb,
+                zb,
+                Some(r),
+                &mut fused_out,
+            );
+            let chain: Vec<f32> = unfused.iter().map(|&v| r.apply(v)).collect();
+            assert_same_bits(
+                &fused.data,
+                &chain,
+                &format!("fused {batch_a:?} x {batch_b:?}"),
+            );
+            // Batch `i` of the output reads batch `i` of a side with as many, or its only one.
+            let (rank, count) = (batch_out.len(), batch_out.iter().product::<usize>());
+            let index = |batch: &[usize], i: usize| {
+                let (mut i, mut idx, mut stride) = (i, 0, 1);
+                for d in (0..rank).rev() {
+                    let (o, dim) = (
+                        batch_out[d],
+                        (d + batch.len()).checked_sub(rank).map_or(1, |d| batch[d]),
+                    );
+                    if dim != 1 {
+                        idx += (i % o) * stride;
+                    }
+                    stride *= dim;
+                    i /= o;
+                }
+                idx
+            };
+            let mut want = vec![0.0f64; count * m * n];
+            for bi in 0..count {
+                let (ia, ib) = (index(batch_a, bi), index(batch_b, bi));
+                for i in 0..m {
+                    for j in 0..n {
+                        want[(bi * m + i) * n + j] = (0..k)
+                            .map(|kk| {
+                                a[(ia * m + i) * k + kk] as f64 * b[(ib * k + kk) * n + j] as f64
+                            })
+                            .sum();
+                    }
+                }
+            }
+            assert_close(
+                &got.data,
+                &want,
+                1e-5,
+                &format!("{batch_a:?} x {batch_b:?}"),
+            );
+        }
+    }
+
+    /// The epilogues' round trip is `fake_quantize_linear`'s, bit for bit, so folding the
+    /// pair after a product into it changes nothing.
+    #[test]
+    fn test_requant_is_fake_quantize_linear() {
+        let mut rng = Rng::new(23);
+        let x: Vec<f32> = (0..1000)
+            .map(|i| rng.f32(-30.0, 30.0) * (i % 7) as f32)
+            .collect();
+        for &(scale, zero_point) in &[(0.07f32, 131), (0.3, 0), (0.011, 255), (1.0, 128)] {
+            let r = Requant { scale, zero_point };
+            let mut fq = Vec::new();
+            let want = crate::kernels::fake_quantize_linear(
+                &TensorView::from_slice(&x, vec![x.len()]),
+                &TensorView::from_slice(&[scale], vec![]),
+                Some(&TensorView::from_slice(&[zero_point as f32], vec![])),
+                1,
+                0,
+                0.0,
+                255.0,
+                &mut fq,
+            );
+            let got: Vec<f32> = x.iter().map(|&v| r.apply(v)).collect();
+            assert_same_bits(
+                &got,
+                &want.data,
+                &format!("scale {scale} zero point {zero_point}"),
+            );
+            for level in levels() {
+                let mut c = x.clone();
+                let e = Epilogue {
+                    scale: 1.0,
+                    requant: Some(r),
+                    bias: None,
+                    relu: false,
+                };
+                simd_call!(
+                    level,
+                    epilogue_simd(1, x.len(), &vec![1.0; x.len()], &e, &mut c)
+                );
+                assert_same_bits(&c, &want.data, &format!("{level:?} scale {scale}"));
+            }
+        }
     }
 
     #[test]

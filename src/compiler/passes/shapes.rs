@@ -465,7 +465,9 @@ fn output_shapes(g: &Graph, node: &Node, elems: &Elems) -> Vec<Option<Shape>> {
         Op::QLinearDynamic { .. } => {
             first(shape(0).zip(shape(1)).and_then(|(a, b)| matmul(&a, &b)))
         }
-        Op::QLinearMatMulI8 => first(shape(0).zip(shape(3)).and_then(|(a, b)| matmul(&a, &b))),
+        Op::QLinearMatMulI8 | Op::QLinearMatMulAct => {
+            first(shape(0).zip(shape(3)).and_then(|(a, b)| matmul(&a, &b)))
+        }
         Op::Gemm {
             trans_a, trans_b, ..
         } => first(shape(0).zip(shape(1)).and_then(|(a, b)| {

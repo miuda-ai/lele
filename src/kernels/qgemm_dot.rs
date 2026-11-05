@@ -29,7 +29,7 @@
 //! 16 for `sdot` (24 128-bit ones, of Neon's 32 registers). A whole panel's depth is one
 //! block, read from L2.
 
-use crate::kernels::qgemm::{AlignedI32, Epilogue};
+use crate::kernels::qgemm::{AlignedI32, Epilogue, Requant, requant};
 use fearless_simd::{Level, Simd, f32x16, i32x16};
 use fearless_simd_macros::simd;
 
@@ -299,6 +299,7 @@ fn qgemm_simd<S: Simd>(
             col_term: &col_term,
             row_sum_factor: w.row_term.then_some(&factor),
             bias: &bias,
+            requant: e.requant,
             relu: e.relu,
         };
         let b = &w.data[jp * kq * nr..][..kq * nr];
@@ -339,6 +340,7 @@ struct Tile<'a> {
     scale: &'a [f32; NR],
     col_term: &'a [i32; NR],
     row_sum_factor: Option<&'a [i32; NR]>,
+    requant: Option<Requant>,
     bias: &'a [f32; NR],
     relu: bool,
 }
@@ -417,7 +419,8 @@ fn finish<S: Simd, const R: usize, const V: usize>(
             if let Some(f) = &factor {
                 sum = sum + simd.mul_i32x16(rs, f[v]);
             }
-            let x = simd.cvt_f32_i32x16(sum) * scale[v] + bias[v];
+            let x = simd.cvt_f32_i32x16(sum) * scale[v];
+            let x = requant!(simd, f32x16, t.requant, x) + bias[v];
             if t.relu { x.max(zero) } else { x }
         });
         let row = &mut c[r * t.ldc..][..t.width];

@@ -5,6 +5,7 @@ use super::super::{
     generate::{ElemType, OpContext},
     ir::{DType, Op, TargetDim},
 };
+use crate::compiler::passes::{ACT_REQUANT, I8_BIAS, I8_REQUANT};
 use crate::model::onnx_proto::TensorProto;
 use std::io::Write;
 
@@ -402,19 +403,33 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 );
             };
             let (offset, len, shape) = (weight.offset, weight.len, &weight.shape);
+            // `fold_qdq_into_matmuls` may have given it the pair after the
+            // product, the bias added after that, or both.
+            let requant = requant_expr(ctx, inputs, I8_REQUANT);
+            let bias = match ctx.ir().input(I8_BIAS) {
+                Some(_) => format!("Some(&{})", inputs[I8_BIAS]),
+                None => "None".to_string(),
+            };
             writeln!(
                 w,
-                "{}let {} = self.qmatmul_i8(&{}, &{}, &{}, {}, {}, {}, {}, &{}, {});",
-                tab,
+                "{tab}let {} = self.qmatmul_i8(&{}, &{}, &{}, {offset}, {len}, {}, {}, &{}, {requant}, {bias}, {buf_expr});",
+                outputs[0], inputs[0], inputs[1], inputs[2], shape[0], shape[1], inputs[4],
+            )?;
+        }
+        Op::QLinearMatMulAct => {
+            // Produced by `fuse_qdq_matmul`: the scales are scalar f32 and the
+            // zero points scalar uint8.
+            writeln!(
+                w,
+                "{tab}let {} = lele::kernels::qmatmul_acts(&{}, {}.data[0], {}.data[0] as i32, &{}, {}.data[0], {}.data[0] as i32, {}, {});",
                 outputs[0],
                 inputs[0],
                 inputs[1],
                 inputs[2],
-                offset,
-                len,
-                shape[0],
-                shape[1],
+                inputs[3],
                 inputs[4],
+                inputs[5],
+                requant_expr(ctx, inputs, ACT_REQUANT),
                 buf_expr
             )?;
         }
@@ -583,6 +598,19 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
 
 /// The elements of a [`TargetDim`] target, input dimensions cast with
 /// `cast`.
+/// The `Option<Requant>` of an integer matmul whose inputs `slot` and `slot + 1`
+/// are the scale and zero point of the pair after its product, if it has them.
+fn requant_expr(ctx: &OpContext, inputs: &[String], slot: usize) -> String {
+    match ctx.ir().input(slot) {
+        Some(_) => format!(
+            "Some(lele::kernels::Requant {{ scale: {}.data[0], zero_point: {}.data[0] as i32 }})",
+            inputs[slot],
+            inputs[slot + 1]
+        ),
+        None => "None".to_string(),
+    }
+}
+
 fn target(dims: &[TargetDim], inputs: &[String], cast: &str) -> String {
     dims.iter()
         .map(|d| match *d {

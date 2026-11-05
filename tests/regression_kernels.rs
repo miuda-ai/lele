@@ -1993,7 +1993,15 @@ fn test_qmatmul_i8_matches_dequantized_matmul() {
         let scale_view = TensorView::from_slice(std::slice::from_ref(&a_scale), vec![]);
         let zp_view = TensorView::from_slice(std::slice::from_ref(&a_zp), vec![]);
         let mut got_buf = Vec::new();
-        let got = lele::kernels::qmatmul_i8(&a_view, &scale_view, &zp_view, &qw, &mut got_buf);
+        let got = lele::kernels::qmatmul_i8(
+            &a_view,
+            &scale_view,
+            &zp_view,
+            &qw,
+            None,
+            None,
+            &mut got_buf,
+        );
 
         assert_eq!(got.shape.as_ref(), &[m, n]);
         // The integer path accumulates exactly and scales once at the end, so
@@ -2022,7 +2030,15 @@ fn test_qmatmul_i8_handles_batched_activations() {
     let scale_view = TensorView::from_slice(std::slice::from_ref(&a_scale), vec![]);
     let zp_view = TensorView::from_slice(std::slice::from_ref(&a_zp), vec![]);
     let mut got_buf = Vec::new();
-    let got = lele::kernels::qmatmul_i8(&a_view, &scale_view, &zp_view, &qw, &mut got_buf);
+    let got = lele::kernels::qmatmul_i8(
+        &a_view,
+        &scale_view,
+        &zp_view,
+        &qw,
+        None,
+        None,
+        &mut got_buf,
+    );
 
     assert_eq!(got.shape.as_ref(), &[batch, m, n]);
     for (i, (&g, &e)) in got.data.iter().zip(expected.data.iter()).enumerate() {
@@ -2049,7 +2065,15 @@ fn test_qmatmul_i8_accepts_per_tensor_weight_scale() {
     let scale_view = TensorView::from_slice(std::slice::from_ref(&a_scale), vec![]);
     let zp_view = TensorView::from_slice(std::slice::from_ref(&a_zp), vec![]);
     let mut got_buf = Vec::new();
-    let got = lele::kernels::qmatmul_i8(&a_view, &scale_view, &zp_view, &qw, &mut got_buf);
+    let got = lele::kernels::qmatmul_i8(
+        &a_view,
+        &scale_view,
+        &zp_view,
+        &qw,
+        None,
+        None,
+        &mut got_buf,
+    );
 
     for (i, (&g, &e)) in got.data.iter().zip(expected.data.iter()).enumerate() {
         assert!(
@@ -2057,6 +2081,25 @@ fn test_qmatmul_i8_accepts_per_tensor_weight_scale() {
             "per-tensor qmatmul_i8 differs at {i}: got {g}, want {e}"
         );
     }
+}
+
+#[test]
+fn test_qmatmul_i8_takes_a_vector_as_one_row() {
+    let (k, n) = (20usize, 24usize);
+    let (a, a_scale, a_zp, raw, w_scale, _) = qdq_layer(1, k, n);
+    let qw = lele::kernels::prepare_quantized_weights(&raw, k, n, &w_scale);
+    let scale_view = TensorView::from_slice(std::slice::from_ref(&a_scale), vec![]);
+    let zp_view = TensorView::from_slice(std::slice::from_ref(&a_zp), vec![]);
+    let product = |shape: Vec<usize>, buf: &mut Vec<f32>| {
+        let a_view = TensorView::from_slice(&a, shape);
+        let got = lele::kernels::qmatmul_i8(&a_view, &scale_view, &zp_view, &qw, None, None, buf);
+        (got.shape.to_vec(), got.data.to_vec())
+    };
+    let (mut vector_buf, mut row_buf) = (Vec::new(), Vec::new());
+    let (vector_shape, vector) = product(vec![k], &mut vector_buf);
+    let (row_shape, row) = product(vec![1, k], &mut row_buf);
+    assert_eq!((vector_shape, row_shape), (vec![n], vec![1, n]));
+    assert_eq!(vector, row);
 }
 
 #[test]

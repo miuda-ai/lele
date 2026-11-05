@@ -487,6 +487,10 @@ pub enum Op {
     /// `MatMul` of a uint8-quantized activation against a symmetric int8
     /// weight. Inputs: `[a, a_scale, a_zero_point, w, w_scale]`.
     QLinearMatMulI8,
+    /// `MatMul` of two uint8-quantized activations (attention's scores and
+    /// weighted values in static-QDQ models). Inputs:
+    /// `[a, a_scale, a_zero_point, b, b_scale, b_zero_point]`.
+    QLinearMatMulAct,
     /// `Conv` followed by an activation. Inputs are those of the `Conv`.
     ConvAct {
         conv: ConvAttrs,
@@ -787,6 +791,7 @@ impl Op {
             Op::Loop { .. } => "Loop",
             Op::FakeQuantizeLinear(_) => "FakeQuantizeLinear",
             Op::QLinearMatMulI8 => "QLinearMatMulI8",
+            Op::QLinearMatMulAct => "QLinearMatMulAct",
             Op::ConvAct { .. } => "ConvAct",
             Op::Silu => "Silu",
             Op::Snake => "Snake",
@@ -996,6 +1001,7 @@ impl Op {
             | Op::Unary(_)
             | Op::Where
             | Op::QLinearMatMulI8
+            | Op::QLinearMatMulAct
             | Op::Silu
             | Op::Snake
             | Op::Linear => {}

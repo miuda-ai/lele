@@ -246,6 +246,7 @@ impl Compiler {
         if opt.qdq_fusion {
             // Runs after folding so that only the activation pairs are left.
             passes::fuse_qdq(&mut ir);
+            passes::fold_qdq_into_matmuls(&mut ir);
         }
         if opt.operator_fusion {
             // Some fusions apply to f32 alone.

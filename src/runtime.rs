@@ -374,8 +374,10 @@ impl Weights<'_> {
         )
     }
 
-    /// Static-QDQ matmul: activation already on the quantization grid, weight
-    /// kept in int8 so an integer GEMM can run where the hardware supports one.
+    /// Static-QDQ matmul: weight kept in int8 so an integer GEMM can run where
+    /// the hardware supports one, with the product's own `QuantizeLinear` ->
+    /// `DequantizeLinear` pair and bias, if any, applied as it is written
+    /// ([`kernels::qmatmul_i8`]).
     pub fn qmatmul_i8<'c, 'd>(
         &self,
         input: &TensorView<'c>,
@@ -386,10 +388,12 @@ impl Weights<'_> {
         weight_k: usize,
         weight_n: usize,
         weight_scale: &TensorView<'c>,
+        requant: Option<kernels::Requant>,
+        bias: Option<&TensorView<'c>>,
         output_buf: &'d mut Vec<f32>,
     ) -> TensorView<'d> {
         let qw = self.get_quantized_weight(weight_offset, weight_len, weight_k, weight_n, weight_scale);
-        kernels::qmatmul_i8(input, input_scale, input_zero_point, &qw, output_buf)
+        kernels::qmatmul_i8(input, input_scale, input_zero_point, &qw, requant, bias, output_buf)
     }
 
     pub fn linear<'c, 'd, B: kernels::WeightElem>(
