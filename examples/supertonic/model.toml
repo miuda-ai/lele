@@ -33,4 +33,3 @@ dest = "voice_styles/M1.json"
 
 [codegen]
 class_name = "Supertonic"
-custom_methods = []

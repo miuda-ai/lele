@@ -1,7 +1,7 @@
 //! Code generation for control flow.
 
 use super::super::{
-    generate::{ElemType, Nodes, OpContext, generate_nodes, lower_nodes, weight_expr},
+    generate::{ElemType, Nodes, OpContext, generate_nodes, lower_nodes},
     ir::{Graph, Op},
     sanitize_name,
 };
@@ -30,7 +30,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 let name = sanitize_name(&branch.value(o).name);
                 match weights.get(&name) {
                     Some(weight) => {
-                        let weight = weight_expr(weight, var_types.get(&name));
+                        let weight = weight.expr(var_types.get(&name));
                         format!("{weight}.to_owned()")
                     }
                     None => format!("{name}.to_owned()"),

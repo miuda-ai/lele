@@ -337,9 +337,8 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                         _ => weight.shape.to_vec(),
                     };
                     let n = ctx.weights.conv_weights(format!(
-                        "weights.pack_conv_weights({}, {}, {:?}, {}, {}, &{zero_point})",
-                        weight.offset,
-                        weight.len,
+                        "weights.pack_conv_weights({}, {:?}, {}, {}, &{zero_point})",
+                        weight.bytes(),
                         shape,
                         group,
                         weight.dtype == DType::I8,

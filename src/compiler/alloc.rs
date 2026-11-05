@@ -172,11 +172,10 @@ impl Schedule {
 /// tensors. Views share the buffer of what they view, which therefore lives
 /// as long as the longest-lived view. `ty` gives the element type of a tensor by
 /// name; a buffer only holds tensors of one type. A node never writes into a
-/// buffer it reads, nor into one the `lookback` nodes before it read.
+/// buffer it reads.
 pub(crate) fn solve_allocation(
     g: &Graph,
     ty: &dyn Fn(&str) -> ElemType,
-    lookback: usize,
 ) -> (Allocator, AnalysisData) {
     let mut schedule = Schedule::default();
     schedule.visit(g, ty);
@@ -244,15 +243,12 @@ pub(crate) fn solve_allocation(
                 all.insert(out.clone(), b);
                 continue;
             }
-            // Never write into a buffer this node reads, nor one the `lookback`
-            // nodes before it read: a user pattern may generate a whole run of
-            // nodes at once.
-            let mut reserved = HashSet::new();
-            for prev in 0..=lookback {
-                if let Some(s) = id.checked_sub(prev).map(|i| &schedule.steps[i]) {
-                    reserved.extend(s.inputs.iter().filter_map(|n| all.get(n)).copied());
-                }
-            }
+            let reserved: HashSet<usize> = step
+                .inputs
+                .iter()
+                .filter_map(|n| all.get(n))
+                .copied()
+                .collect();
             let t = ty(out);
             let free_buffers = free.entry(t).or_default();
             let size = schedule.sizes.get(out);
@@ -361,17 +357,15 @@ mod tests {
             // A copy: `a` is free once read.
             ("Relu", &["a"]),
         ] {
-            // A chain long enough to pass the nodes whose inputs are never
-            // overwritten, and the allocator's 8-node look-back window.
-            let chain: Vec<String> = (0..12).map(|i| format!("b{i}")).collect();
+            let chain: Vec<String> = (0..8).map(|i| format!("b{i}")).collect();
             let mut nodes = vec![node("Relu", &["x"], "a"), node(op, inputs, "v")];
             nodes.push(node("Relu", &["x"], &chain[0]));
             for w in chain.windows(2) {
                 nodes.push(node("Relu", &[&w[0]], &w[1]));
             }
-            nodes.push(node("Add", &["v", &chain[11]], "y"));
+            nodes.push(node("Add", &["v", &chain[7]], "y"));
             let g = graph(nodes, "y");
-            let (alloc, _) = solve_allocation(&g, &|_| ElemType::F32, 8);
+            let (alloc, _) = solve_allocation(&g, &|_| ElemType::F32);
             let buffer = |t: &str| alloc.tensor_to_buffer[t];
             let reused = chain.iter().any(|t| buffer(t) == buffer("a"));
             assert_eq!(reused, op == "Relu", "{op}");
@@ -392,9 +386,9 @@ mod tests {
     }
 
     /// A buffer is handed to the next node after its tensor's last reader,
-    /// unless one of the `lookback` nodes before read it.
+    /// which never writes into it.
     #[test]
-    fn test_buffers_are_reused_after_the_lookback() {
+    fn test_buffers_are_reused_after_the_last_reader() {
         let g = graph(
             vec![
                 node("Relu", &["x"], "a"),
@@ -403,12 +397,10 @@ mod tests {
             ],
             "c",
         );
-        for (lookback, reused) in [(0, true), (1, false)] {
-            let (alloc, _) = solve_allocation(&g, &|_| ElemType::F32, lookback);
-            let buffer = |t: &str| alloc.tensor_to_buffer[t];
-            assert_eq!(buffer("c") == buffer("a"), reused, "lookback {lookback}");
-            assert_ne!(buffer("b"), buffer("a"));
-        }
+        let (alloc, _) = solve_allocation(&g, &|_| ElemType::F32);
+        let buffer = |t: &str| alloc.tensor_to_buffer[t];
+        assert_eq!(buffer("c"), buffer("a"));
+        assert_ne!(buffer("b"), buffer("a"));
     }
 
     /// A shape of numbers and symbolic dimensions.
@@ -468,7 +460,7 @@ mod tests {
                 let v = g.find_value(name).unwrap();
                 g.value_mut(v).shape = Some(dims(&shape));
             }
-            let (alloc, _) = solve_allocation(&g, &|_| ElemType::F32, 0);
+            let (alloc, _) = solve_allocation(&g, &|_| ElemType::F32);
             let buffer = |t: &str| alloc.tensor_to_buffer[t];
             assert_eq!(buffer("c"), buffer("b"), "{big:?}");
             assert_eq!(buffer("d"), buffer("a"), "{big:?}");

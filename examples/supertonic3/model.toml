@@ -69,4 +69,3 @@ dest = "voice_styles/F5.json"
 
 [codegen]
 class_name = "Supertonic"
-custom_methods = []

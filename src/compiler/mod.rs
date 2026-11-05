@@ -3,35 +3,14 @@ pub(crate) use self::alloc::AnalysisData;
 use crate::model::onnx_proto::{GraphProto, NodeProto};
 use std::collections::HashMap;
 use std::io::Write;
-/// Handler callback for custom operator code generation.
-/// Args:
-/// - node: The ONNX NodeProto
-/// - inputs: List of Rust variable names for inputs (e.g. `["op_1_out", "state_in"]`)
-/// - outputs: List of Rust variable names for outputs (e.g. `["op_5_out"]`)
-/// - buffer: The code string to access the output buffer (e.g. `"&mut ws.buf_3"` or `"&mut buf_X"`)
-/// - writer: The output writer
-/// - indent: Current indentation level
-pub type OpHandler = Box<
-    dyn Fn(&NodeProto, &[String], &[String], &str, &mut dyn Write, usize) -> std::io::Result<()>,
->;
-pub type PatternMatcher = Box<dyn Fn(&[&NodeProto]) -> Option<usize>>;
-/// Weights by sanitized name, as `(byte offset, byte length, shape, ONNX data
-/// type)`.
-pub type WeightTable = HashMap<String, (usize, usize, Vec<usize>, i32)>;
-pub type PatternGenerator = Box<
-    dyn Fn(
-        &[&NodeProto],
-        &WeightTable,
-        Option<&Allocator>,
-        &mut dyn Write,
-        usize,
-    ) -> std::io::Result<()>,
->;
-pub struct Pattern {
-    pub name: String,
-    pub matcher: PatternMatcher,
-    pub generator: PatternGenerator,
-}
+/// Code generation for the nodes of an operator type, registered with
+/// [`Compiler::with_override`]: writes the code computing the node
+/// [`Codegen`] describes.
+pub type OpHandler = Box<dyn Fn(&Codegen, &mut dyn Write) -> std::io::Result<()>>;
+/// A rewrite of the graph, registered with
+/// [`Compiler::with_pass_before_fusion`] or
+/// [`Compiler::with_pass_after_fusion`].
+pub type Pass = Box<dyn Fn(&mut ir::Graph)>;
 pub struct CompilationResult {
     pub code: String,
     pub weights: Vec<u8>,
@@ -62,9 +41,11 @@ pub mod generate;
 pub mod ir;
 pub mod ops;
 mod passes;
+mod pattern;
 mod specialize;
 mod weights;
 
+pub use generate::Codegen;
 pub use specialize::InputValue;
 
 pub(crate) use generate::*;
@@ -122,8 +103,9 @@ pub struct Optimizations {
     /// or as the weights of pointwise 1-D convolutions (transposed), in the
     /// order the matmul kernel reads them
     /// ([`pack_f16`](crate::kernels::matmul::pack_f16)), so that each product
-    /// streams its weight from start to end. Not done when patterns are
-    /// registered, whose generators read weights as stored in the model.
+    /// streams its weight from start to end. Not done for the weights a
+    /// product with an [override](Compiler::with_override) reads, which
+    /// reads them as stored in the model.
     pub weight_packing: bool,
 }
 
@@ -146,7 +128,8 @@ impl Optimizations {
 pub struct Compiler {
     pub(crate) overrides: HashMap<String, OpHandler>,
     pub(crate) model_name: String,
-    pub(crate) patterns: Vec<Pattern>,
+    pub(crate) passes_before_fusion: Vec<Pass>,
+    pub(crate) passes_after_fusion: Vec<Pass>,
     pub(crate) custom_methods: Vec<String>,
     pub(crate) specialization: specialize::Specialization,
     pub optimizations: Optimizations,
@@ -166,7 +149,8 @@ impl Compiler {
         Self {
             overrides: HashMap::new(),
             model_name: "Model".to_string(),
-            patterns: Vec::new(),
+            passes_before_fusion: Vec::new(),
+            passes_after_fusion: Vec::new(),
             custom_methods: Vec::new(),
             specialization: Default::default(),
             optimizations: Optimizations::default(),
@@ -181,35 +165,59 @@ impl Compiler {
         *self.shared_weights.borrow_mut() = Some(shared);
         self
     }
-    /// Register a custom code generator for an operator type.
-    /// The handler closure will be called instead of the default generation logic.
+    /// Generates the nodes of operator type `op` with `handler` instead of
+    /// lele's kernels.
     pub fn with_override<F>(mut self, op: &str, handler: F) -> Self
     where
-        F: Fn(&NodeProto, &[String], &[String], &str, &mut dyn Write, usize) -> std::io::Result<()>
-            + 'static,
+        F: Fn(&Codegen, &mut dyn Write) -> std::io::Result<()> + 'static,
     {
         self.overrides.insert(op.to_string(), Box::new(handler));
         self
     }
-    /// Register a pattern matcher and generator.
-    pub fn with_pattern<M, G>(mut self, name: &str, matcher: M, generator: G) -> Self
+
+    /// Runs `pass` on the graph before lele fuses operators, after folding
+    /// and simplification; passes run in the order they are registered.
+    /// With [`Optimizations::operator_fusion`] off, `pass` runs all the same.
+    pub fn with_pass_before_fusion<F>(mut self, pass: F) -> Self
     where
-        M: Fn(&[&NodeProto]) -> Option<usize> + 'static,
-        G: Fn(
-                &[&NodeProto],
-                &WeightTable,
-                Option<&Allocator>,
-                &mut dyn Write,
-                usize,
-            ) -> std::io::Result<()>
-            + 'static,
+        F: Fn(&mut ir::Graph) + 'static,
     {
-        self.patterns.push(Pattern {
-            name: name.to_string(),
-            matcher: Box::new(matcher),
-            generator: Box::new(generator),
-        });
+        self.passes_before_fusion.push(Box::new(pass));
         self
+    }
+
+    /// Runs `pass` on the graph after lele fuses operators, before common
+    /// subexpressions are merged and weights packed; passes run in the order
+    /// they are registered.
+    pub fn with_pass_after_fusion<F>(mut self, pass: F) -> Self
+    where
+        F: Fn(&mut ir::Graph) + 'static,
+    {
+        self.passes_after_fusion.push(Box::new(pass));
+        self
+    }
+
+    /// Replaces each run of nodes `matcher` finds by one node of operator
+    /// type `name`, which `generator` generates
+    /// ([`with_override`](Self::with_override)). The matching runs as a pass
+    /// before fusion ([`with_pass_before_fusion`](Self::with_pass_before_fusion)).
+    ///
+    /// `matcher` is called with every node, in execution order, and returns
+    /// the nodes of the run that node is part of, if any. The node replacing
+    /// them runs where the last of them ran. It reads what they read of other
+    /// nodes, the graph inputs and weights, and produces what of theirs is
+    /// read by other nodes or is a graph output, both in the order the run
+    /// reads or produces them first. A run is left as it is if it holds a
+    /// node with a subgraph, or if a node outside it reads one of its
+    /// results before its last node runs.
+    pub fn with_pattern<M, G>(self, name: &str, matcher: M, generator: G) -> Self
+    where
+        M: Fn(&ir::Graph, ir::NodeId) -> Option<Vec<ir::NodeId>> + 'static,
+        G: Fn(&Codegen, &mut dyn Write) -> std::io::Result<()> + 'static,
+    {
+        let op_type = name.to_string();
+        self.with_pass_before_fusion(move |g| pattern::fuse_matches(g, &op_type, &matcher))
+            .with_override(name, generator)
     }
     /// Add a custom method to the implementation block.
     pub fn with_custom_method(mut self, code: &str) -> Self {
@@ -319,6 +327,12 @@ impl Compiler {
             passes::fuse_qdq(&mut ir);
             passes::fold_qdq_into_matmuls(&mut ir);
         }
+        if !self.passes_before_fusion.is_empty() {
+            passes::infer_dtypes(&mut ir);
+        }
+        for pass in &self.passes_before_fusion {
+            pass(&mut ir);
+        }
         if opt.operator_fusion {
             // Some fusions apply to f32 alone.
             passes::infer_dtypes(&mut ir);
@@ -328,6 +342,12 @@ impl Compiler {
                 // left without readers, and would each keep a buffer.
                 passes::eliminate_dead_code(&mut ir);
             }
+        }
+        if !self.passes_after_fusion.is_empty() {
+            passes::infer_dtypes(&mut ir);
+        }
+        for pass in &self.passes_after_fusion {
+            pass(&mut ir);
         }
         if opt.common_subexpression_elimination {
             // Runs after fusion, whose patterns may need a value to have a
@@ -340,24 +360,19 @@ impl Compiler {
         // tell apart.
         passes::bypass_view_casts(&mut ir, &|name| var_types.get(&sanitize_name(name)));
         let var_types = variable_types(&ir);
-        // A user pattern generates a whole run of nodes at once, and may read
-        // the inputs of its first nodes after writing the outputs of later ones.
-        let lookback = if self.patterns.is_empty() { 0 } else { 8 };
         let (allocator, analysis) =
-            alloc::solve_allocation(&ir, &|name| var_types.get(&sanitize_name(name)), lookback);
-        // Patterns and overrides of the products would read packed weights as stored in
-        // the model.
-        let pack = opt.weight_packing
-            && self.patterns.is_empty()
-            && !["MatMul", "Linear", "Conv"].iter().any(|op| self.overrides.contains_key(*op));
+            alloc::solve_allocation(&ir, &|name| var_types.get(&sanitize_name(name)));
+        if opt.weight_packing {
+            // Overrides read weights as stored in the model.
+            passes::pack_weights(&mut ir, &|node| {
+                self.overrides.contains_key(node.op.op_type())
+            });
+        }
         // Start from a previously compiled blob when weights are shared. The
         // shared bytes stay where they are; anything new is appended after them,
         // so the resulting file is a superset of the first model's weights.
-        let weights = weights::Weights::collect_shared(
-            &ir,
-            pack,
-            self.shared_weights.borrow_mut().take(),
-        );
+        let weights =
+            weights::Weights::collect_shared(&ir, self.shared_weights.borrow_mut().take());
         let (graph_inputs, graph_outputs) = (ir.input_infos(), ir.output_infos());
         let (ids, protos) = lower_nodes(&ir);
         let protos: Vec<&NodeProto> = protos.iter().collect();
@@ -491,6 +506,11 @@ impl Compiler {
         // i64, are widened once, here, not on every read; those the kernels
         // take as they are stored are left so.
         let mut weights_expr = "lele::runtime::Weights::new(data)".to_string();
+        let read_code = [all_code.as_str()]
+            .into_iter()
+            .chain(self.custom_methods.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
         use ir::DType;
         for (dtype, ty) in [
             (DType::F16, "f16"),
@@ -499,15 +519,7 @@ impl Compiler {
             (DType::I32, "i32_i64"),
             (DType::Bool, "bool_i64"),
         ] {
-            let read: Vec<_> = weights
-                .regions(dtype)
-                .into_iter()
-                .filter(|(offset, len)| {
-                    let read = format!("self.weight_{ty}({offset}, {len},");
-                    all_code.contains(&read)
-                        || self.custom_methods.iter().any(|m| m.contains(&read))
-                })
-                .collect();
+            let read = weights.read_through(dtype, &format!("weight_{ty}"), &read_code);
             if !read.is_empty() {
                 weights_expr += &format!(".with_{ty}(&{read:?})");
             }
@@ -635,7 +647,7 @@ impl Compiler {
             .map(|o| {
                 let name = sanitize_name(&o.name);
                 if let Some(weight) = weights.get(&o.name) {
-                    weight_expr(weight, var_types.get(&name))
+                    weight.expr(var_types.get(&name))
                 } else {
                     name
                 }

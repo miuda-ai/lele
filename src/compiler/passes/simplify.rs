@@ -3,8 +3,8 @@
 
 use super::cse::replace_uses;
 use super::fold::exact_ints;
-use super::fuse::{constant, constant_tensor};
 use crate::compiler::generate::ElemType;
+use crate::compiler::ir::matching::{constant, constant_tensor};
 use crate::compiler::ir::{Binary, Dim, Graph, NodeId, Op, TargetDim, ValueId};
 
 /// Removes the nodes of `g` and its subgraphs whose output is their input:

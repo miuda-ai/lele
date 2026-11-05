@@ -13,6 +13,7 @@
 //! patterns, which all work on `NodeProto`s, see the rewritten graph without
 //! changes.
 
+pub mod matching;
 mod op;
 
 pub use op::{
@@ -39,6 +40,19 @@ pub enum Dim {
     Unknown,
 }
 
+/// How the contents of an initializer are laid out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Layout {
+    /// As ONNX stores a tensor: its elements in row-major order.
+    #[default]
+    Stored,
+    /// An f16 matrix `[k, n]` as [`pack_f16`](crate::kernels::matmul::pack_f16)
+    /// lays it out, or the f16 weights `[m, k, 1]` of a pointwise `Conv` as
+    /// it lays out their transpose `[k, m]`. Only the matrix product kernels
+    /// read such data, and passes leave it alone.
+    PackedF16,
+}
+
 /// A tensor: a graph input, an initializer, a node output, or a value a
 /// subgraph captures from an enclosing graph.
 #[derive(Clone, Debug)]
@@ -49,6 +63,8 @@ pub struct Value {
     pub shape: Option<Vec<Dim>>,
     /// Contents of an initializer.
     pub data: Option<TensorProto>,
+    /// How `data` is laid out.
+    pub layout: Layout,
     producer: Option<NodeId>,
     /// One entry per use, so a node that reads the value twice is listed
     /// twice. A node whose subgraph reads the value is listed once.
@@ -62,6 +78,7 @@ impl Value {
             dtype: DType::Undefined,
             shape: None,
             data: None,
+            layout: Layout::Stored,
             producer: None,
             consumers: Vec::new(),
         }
@@ -331,6 +348,22 @@ impl Graph {
         self.initializers.push(v);
     }
 
+    /// Replaces the contents of initializer `v` by `tensor`, laid out as ONNX
+    /// stores it. Its readers then read `tensor`; a weight nothing reads is
+    /// not written to the weights file.
+    ///
+    /// # Panics
+    /// If `v` is not an initializer.
+    pub fn set_data(&mut self, v: ValueId, mut tensor: TensorProto) {
+        let value = &mut self.values[v.0 as usize];
+        assert!(value.data.is_some(), "{} is not an initializer", value.name);
+        tensor.name = value.name.clone();
+        value.dtype = DType::from_onnx(tensor.data_type);
+        value.shape = Some(tensor.dims.iter().map(|&d| Dim::Fixed(d)).collect());
+        value.data = Some(tensor);
+        value.layout = Layout::Stored;
+    }
+
     /// Adds an initializer holding `tensor`, named `name` or, if a value has
     /// that name, `name` with a number appended.
     pub fn new_initializer(&mut self, name: &str, mut tensor: TensorProto) -> ValueId {
@@ -502,17 +535,37 @@ impl Graph {
         proto: NodeProto,
         inputs: Vec<Option<ValueId>>,
     ) -> NodeId {
-        let last = *nodes
-            .iter()
-            .max_by_key(|&&n| self.order.iter().position(|&o| o == n))
-            .expect("nothing to fuse");
+        let last = self.last_of(nodes);
         let outputs = self.node(last).outputs.clone();
+        self.fuse_with_outputs(nodes, op, proto, inputs, outputs)
+    }
+
+    /// [`Graph::fuse`] producing `outputs`, which must be outputs of
+    /// `nodes`. Nothing outside `nodes` may read their other outputs, nor
+    /// read one of `outputs` before the last of `nodes` runs.
+    pub fn fuse_with_outputs(
+        &mut self,
+        nodes: &[NodeId],
+        op: Op,
+        proto: NodeProto,
+        inputs: Vec<Option<ValueId>>,
+        outputs: Vec<Option<ValueId>>,
+    ) -> NodeId {
+        let last = self.last_of(nodes);
         for &n in nodes {
             self.remove_node(n);
         }
         let id = self.insert_node(last, op, proto, inputs, outputs);
         self.order.retain(|&n| n != last);
         id
+    }
+
+    /// The node of `nodes` that runs last.
+    fn last_of(&self, nodes: &[NodeId]) -> NodeId {
+        *nodes
+            .iter()
+            .max_by_key(|&&n| self.order.iter().position(|&o| o == n))
+            .expect("nothing to fuse")
     }
 
     /// Removes `node`. Its outputs are left without a producer.

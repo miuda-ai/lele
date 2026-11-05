@@ -31,4 +31,3 @@ dest = "assets/zh1.wav"
 
 [codegen]
 class_name = "Hojo"
-custom_methods = []

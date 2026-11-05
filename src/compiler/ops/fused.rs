@@ -1,7 +1,7 @@
 //! Code generation for the operators the fusion passes create.
 
 use super::super::{
-    generate::{ElemType, OpContext, weight_expr},
+    generate::{ElemType, OpContext},
     ir::{Activation, ConvAttrs, DType, Op},
 };
 use std::io::Write;
@@ -158,9 +158,8 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                     if matches!(weight.dtype, DType::U8 | DType::I8) && weight.shape.len() == 2 =>
                 {
                     let n = ctx.weights.qweights(format!(
-                        "weights.pack_qweights({}, {}, {}, {}, {}, &{zero_point}, &{scale})",
-                        weight.offset,
-                        weight.len,
+                        "weights.pack_qweights({}, {}, {}, {}, &{zero_point}, &{scale})",
+                        weight.bytes(),
                         weight.shape[0],
                         weight.shape[1],
                         weight.dtype == DType::I8,
@@ -200,7 +199,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             });
             // Weights are read as the type of the fill value.
             let operand = |i: usize, ty: ElemType| match ctx.weight(i) {
-                Some(weight) => weight_expr(weight, ty),
+                Some(weight) => weight.expr(ty),
                 None => inputs[i].clone(),
             };
             let shape = operand(0, ElemType::I64);

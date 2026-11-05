@@ -2,7 +2,7 @@
 //! quantization.
 
 use super::super::{
-    generate::{ElemType, OpContext, weight_expr},
+    generate::{ElemType, OpContext},
     ir::{DType, Op, TargetDim},
 };
 use crate::compiler::passes::{self, ACT_REQUANT, I8_BIAS, I8_REQUANT};
@@ -185,8 +185,10 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
         {
             writeln!(
                 w,
-                "{tab}let {} = lele::kernels::gather_widened(&self.weight_{ty}_stored({}, {}, &{:?}), &{}, {axis}, {buf_expr});",
-                outputs[0], table.offset, table.len, table.shape, inputs[1],
+                "{tab}let {} = lele::kernels::gather_widened(&{}, &{}, {axis}, {buf_expr});",
+                outputs[0],
+                table.read(&format!("weight_{ty}_stored")),
+                inputs[1],
             )?;
         }
         Op::Gather { axis } => {
@@ -410,8 +412,10 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 );
             };
             let n = ctx.weights.qweights(format!(
-                "weights.pack_qweights({}, {}, {}, {}, true, &lele::scalar(0.0f32), &{scale})",
-                weight.offset, weight.len, weight.shape[0], weight.shape[1],
+                "weights.pack_qweights({}, {}, {}, true, &lele::scalar(0.0f32), &{scale})",
+                weight.bytes(),
+                weight.shape[0],
+                weight.shape[1],
             ));
             // `fold_qdq_into_matmuls` may have given it the pair after the
             // product, the bias added after that, or both.
@@ -458,11 +462,10 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             };
             writeln!(
                 w,
-                "{tab}let {} = self.weight_only_matmul(&{}, {}, {}, {}, ({}, {}), &{}, {zero_point}, {buf_expr});",
+                "{tab}let {} = self.weight_only_matmul(&{}, {}, {}, ({}, {}), &{}, {zero_point}, {buf_expr});",
                 outputs[0],
                 inputs[0],
-                weight.offset,
-                weight.len,
+                weight.bytes(),
                 weight.dtype == DType::I8,
                 weight.shape[0],
                 weight.shape[1],
@@ -509,7 +512,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 && matches!(weight.dtype, DType::I64 | DType::F32 | DType::F16)
                 && weight.scalar.is_some()
             {
-                let weight = weight_expr(weight, ElemType::of(weight.dtype));
+                let weight = weight.expr(ElemType::of(weight.dtype));
                 writeln!(w, "{}let {} = {};", tab, outputs[0], weight)?;
             } else if let Some(weight) = ctx.weights.get(&ctx.node.output[0]) {
                 let weight_fn = match weight.dtype {
@@ -520,11 +523,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                     DType::F16 => "weight_f16",
                     _ => "weight_f32",
                 };
-                writeln!(
-                    w,
-                    "{}let {} = self.{}({}, {}, &{:?});",
-                    tab, outputs[0], weight_fn, weight.offset, weight.len, weight.shape
-                )?;
+                writeln!(w, "{}let {} = {};", tab, outputs[0], weight.read(weight_fn))?;
             } else if let Some((ints, shape)) = ctx.weights.int64.get(&ctx.node.output[0]) {
                 let floats: Vec<String> =
                     ints.iter().map(|&x| format!("{:.1}", x as f32)).collect();

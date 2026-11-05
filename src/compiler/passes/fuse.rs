@@ -5,12 +5,12 @@
 //! back. Every intermediate tensor must be read by the chain alone, so
 //! removing the chain cannot leave another reader without its input.
 
-use super::fold::{exact_ints, f16_values};
+use super::fold::exact_ints;
+use crate::compiler::ir::matching::{constant, constant_tensor, other_operand, sole_producer};
 use crate::compiler::ir::{
     Activation, Binary, DType, Dim, Graph, NodeId, Op, Reduction, Unary, ValueId,
 };
 use crate::model::onnx_proto::{NodeProto, TensorProto};
-use crate::model::tensor_to_array;
 
 /// Runs every fusion on `g` and its subgraphs.
 pub(crate) fn fuse(g: &mut Graph) {
@@ -56,49 +56,9 @@ fn reduce_mean(op: &Op) -> bool {
     )
 }
 
-/// The node producing `v` if `is_match` accepts its operator and its only
-/// reader is the chain being fused.
-fn sole_producer(g: &Graph, v: Option<ValueId>, is_match: impl Fn(&Op) -> bool) -> Option<NodeId> {
-    let v = v?;
-    let id = g.value(v).producer()?;
-    (is_match(&g.node(id).op) && g.uses(v) == 1).then_some(id)
-}
-
-/// A compile-time constant: an initializer or a `Constant`.
-pub(super) fn constant_tensor(g: &Graph, v: Option<ValueId>) -> Option<&TensorProto> {
-    let v = v?;
-    match g.data(v) {
-        Some(t) => Some(t),
-        None => match &g.producer(v)?.op {
-            Op::Constant { value } => Some(value),
-            _ => None,
-        },
-    }
-}
-
-/// The values of a compile-time constant, float16 ones (which
-/// `tensor_to_array` does not read) included.
-pub(super) fn constant(g: &Graph, v: Option<ValueId>) -> Option<Vec<f32>> {
-    let t = constant_tensor(g, v)?;
-    if DType::from_onnx(t.data_type) == DType::F16 {
-        return Some(f16_values(t));
-    }
-    tensor_to_array(t).ok().map(|(data, _)| data)
-}
-
 /// Whether `v` is a constant scalar close to `expected`.
 fn is_scalar(g: &Graph, v: Option<ValueId>, expected: f32) -> bool {
     constant(g, v).is_some_and(|d| d.len() == 1 && (d[0] - expected).abs() <= 1e-3 * expected.abs())
-}
-
-/// The operand of binary node `id` that is not `v`, if `v` is one of them.
-fn other_operand(g: &Graph, id: NodeId, v: ValueId) -> Option<Option<ValueId>> {
-    let node = g.node(id);
-    match (node.input(0), node.input(1)) {
-        (Some(a), b) if a == v => Some(b),
-        (a, Some(b)) if b == v => Some(a),
-        _ => None,
-    }
 }
 
 /// The `op` nodes, whose operands callers try in both orders. A fusion

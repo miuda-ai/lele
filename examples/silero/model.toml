@@ -9,7 +9,6 @@ dest = "model.onnx"
 [codegen]
 class_name = "SileroVad"
 model_file = "model.onnx"
-custom_methods = []
 
 # One stream of 16 kHz audio, in chunks of 512 samples.
 [codegen.shapes]

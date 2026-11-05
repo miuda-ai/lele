@@ -52,9 +52,8 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                     if matches!(b.dtype, DType::U8 | DType::I8) && b.shape.len() == 2 =>
                 {
                     let n = ctx.weights.qweights(format!(
-                        "weights.pack_qweights({}, {}, {}, {}, {}, &{zero_point}, &lele::scalar(1.0f32))",
-                        b.offset,
-                        b.len,
+                        "weights.pack_qweights({}, {}, {}, {}, &{zero_point}, &lele::scalar(1.0f32))",
+                        b.bytes(),
                         b.shape[0],
                         b.shape[1],
                         b.dtype == DType::I8,
@@ -179,8 +178,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             let n_fft = ctx.ints(3).map_or(512, |ints| ints[0] as usize);
             let window = if ctx.node.input.len() > 2 && !ctx.node.input[2].is_empty() {
                 if let Some(window) = ctx.weight(2) {
-                    let (o, l, s) = (window.offset, window.len, &window.shape);
-                    format!("Some(&self.weight_f32({}, {}, &{:?}))", o, l, s)
+                    format!("Some(&{})", window.read("weight_f32"))
                 } else {
                     format!("Some(&{})", inputs[2])
                 }

@@ -54,4 +54,3 @@ dest = "codec/codec_browser_onnx_meta.json"
 
 [codegen]
 class_name = "MossTtsNano"
-custom_methods = []

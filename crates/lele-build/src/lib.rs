@@ -97,6 +97,8 @@ pub mod config {
         pub class_name: String,
         #[serde(default)]
         pub model_file: Option<String>,
+        /// Rust methods emitted into every generated model of this config
+        /// (e.g. SenseVoice's `embedding_concat`).
         #[serde(default)]
         pub custom_methods: Vec<String>,
         /// The inputs the model is compiled for.
@@ -493,9 +495,14 @@ pub fn generate_model_code(
     model_path: impl AsRef<Path>,
     class_name: &str,
     output_dir: impl AsRef<Path>,
-    _custom_methods: &[String],
 ) -> Result {
-    generate_model_code_for(model_path, class_name, output_dir, &Default::default())
+    generate_model_code_for(
+        model_path,
+        class_name,
+        output_dir,
+        &Default::default(),
+        &[],
+    )
 }
 
 /// [`generate_model_code`] compiling the model for `inputs`, which must all
@@ -505,12 +512,13 @@ pub fn generate_model_code_for(
     class_name: &str,
     output_dir: impl AsRef<Path>,
     inputs: &config::InputConfig,
+    custom_methods: &[String],
 ) -> Result {
     let model_path = model_path.as_ref();
     println!("cargo:warning=Generating code for {}...", class_name);
     compile_model_for(model_path, class_name, output_dir.as_ref(), |_| {
         inputs.clone()
-    })
+    }, custom_methods)
     .map(|_| ())
     .context(|| {
         format!(
@@ -528,6 +536,7 @@ fn compile_model_for(
     class_name: &str,
     output_dir: &Path,
     inputs: impl FnOnce(&lele::model::onnx_proto::GraphProto) -> config::InputConfig,
+    custom_methods: &[String],
 ) -> std::result::Result<config::InputConfig, Box<dyn std::error::Error>> {
     use lele::compiler::Compiler;
     use lele::model::OnnxModel;
@@ -536,11 +545,14 @@ fn compile_model_for(
     let graph = model.graph().ok_or("Missing graph in ONNX model")?;
 
     let inputs = inputs(graph);
-    let compiler = inputs.apply(
+    let mut compiler = inputs.apply(
         Compiler::new()
             .with_name(class_name)
             .with_default_optimizations(),
     );
+    for method in custom_methods {
+        compiler = compiler.with_custom_method(method);
+    }
 
     let result = compiler.compile(graph)?;
 
@@ -588,7 +600,13 @@ pub fn build_model(model_toml: &str, output_dir: impl AsRef<Path>) -> Result {
     }
 
     fetch_model_files(&config.model, config_dir(model_toml))?;
-    generate_model_code_for(model_file, &codegen.class_name, output_dir, &codegen.inputs)
+    generate_model_code_for(
+        model_file,
+        &codegen.class_name,
+        output_dir,
+        &codegen.inputs,
+        &codegen.custom_methods,
+    )
 }
 
 /// Builds several models from the files `model_toml` lists: fetches them into
@@ -623,11 +641,18 @@ pub fn build_models(
     let config = config::ModelConfig::load(model_toml)?;
     fetch_model_files(&config.model, config_dir(model_toml))?;
     let inputs = &config.codegen.inputs;
+    let custom_methods = &config.codegen.custom_methods;
     let mut applied = Vec::new();
     for (onnx, class_name) in stale {
         println!("cargo:warning=Generating code for {}...", class_name);
         let model = Path::new(onnx);
-        let used = compile_model_for(model, class_name, output_dir, |g| inputs.for_graph(g))
+        let used = compile_model_for(
+            model,
+            class_name,
+            output_dir,
+            |g| inputs.for_graph(g),
+            &custom_methods,
+        )
             .context(|| format!("generating code for {class_name} from {onnx}"))?;
         applied.push(used);
     }

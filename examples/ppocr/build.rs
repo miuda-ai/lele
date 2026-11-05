@@ -32,7 +32,7 @@ fn download_and_generate(spec: &ModelSpec) -> Result {
         return Ok(());
     }
     fetch_from_hf_hub(spec.repo, spec.file, Some("main"), dest_path)?;
-    generate_model_code(dest_path, spec.class_name, "src", &[])
+    generate_model_code(dest_path, spec.class_name, "src")
 }
 
 fn download_rec_yaml_and_gen_dict() -> Result {

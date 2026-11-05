@@ -243,7 +243,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         println!("cargo:warning=Generating code for {}...", class_name);
-        if let Err(e) = generate_model_code(onnx, class_name, output_dir, &[]) {
+        if let Err(e) = generate_model_code(onnx, class_name, output_dir) {
             println!("cargo:warning=Failed to generate code for {}: {}", class_name, e);
             generate_custom_stub(class_name, output_dir, &e.to_string())?;
         }

@@ -1,5 +1,6 @@
 //! Constant folding.
 
+use crate::compiler::ir::matching::f16_values;
 use crate::compiler::ir::{Binary, DType, Graph, Op, QuantAttrs, Reduction, Unary};
 use crate::model::onnx_proto::TensorProto;
 use crate::model::tensor_to_array;
@@ -39,24 +40,6 @@ impl Const {
             dtype,
         })
     }
-}
-
-/// The values of a float16 tensor, which `tensor_to_array` does not read:
-/// its bits, raw or one per element of `int32_data`.
-pub(super) fn f16_values(t: &TensorProto) -> Vec<f32> {
-    let bits: Vec<u16> = if t.raw_data.is_empty() {
-        t.int32_data.iter().map(|&x| x as u16).collect()
-    } else {
-        t.raw_data
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&b| u16::from_le_bytes(b))
-            .collect()
-    };
-    bits.into_iter()
-        .map(|b| half::f16::from_bits(b).to_f32())
-        .collect()
 }
 
 /// Whether lele computes tensors of `t` as integers (in i64).
