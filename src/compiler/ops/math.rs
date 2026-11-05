@@ -25,7 +25,11 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
         Op::MatMul => writeln!(
             w,
             "{}let {} = lele::kernels::matmul(&{}, &{}, {});",
-            tab, outputs[0], inputs[0], inputs[1], buf_expr
+            tab,
+            outputs[0],
+            inputs[0],
+            ctx.matmul_weight(1),
+            buf_expr
         )?,
         Op::MatMulInteger => {
             // MatMulInteger expects u8 inputs.

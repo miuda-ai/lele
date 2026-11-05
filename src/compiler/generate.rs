@@ -52,6 +52,19 @@ impl<'a> OpContext<'a> {
     pub fn ints(&self, i: usize) -> Option<&'a [i64]> {
         self.weights.ints(self.node.input.get(i)?)
     }
+
+    /// Input `i` as a weight operand of the matrix products (`matmul`,
+    /// `linear`, `conv1d_pointwise`): an f16 weight is passed as stored, for
+    /// the kernel to widen as it reads it.
+    pub fn matmul_weight(&self, i: usize) -> String {
+        match self.weight(i) {
+            Some(w) if w.dtype == DType::F16 => format!(
+                "self.weight_f16_raw({}, {}, &{:?})",
+                w.offset, w.len, w.shape
+            ),
+            _ => self.inputs[i].clone(),
+        }
+    }
 }
 
 /// Element type of the `TensorView` holding a value in generated code.

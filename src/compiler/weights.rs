@@ -83,6 +83,20 @@ impl Weights {
         self.int64.get(name).map(|(ints, _)| ints.as_slice())
     }
 
+    /// Byte offset and length of every f16 weight, in file order, for the
+    /// runtime to convert once at load.
+    pub(crate) fn f16_regions(&self) -> Vec<(usize, usize)> {
+        let mut regions: Vec<_> = self
+            .lookup
+            .values()
+            .filter(|w| w.dtype == DType::F16)
+            .map(|w| (w.offset, w.len))
+            .collect();
+        regions.sort_unstable();
+        regions.dedup();
+        regions
+    }
+
     /// Whether the tensor `name` is read from the weights rather than
     /// computed.
     pub(crate) fn contains(&self, name: &str) -> bool {

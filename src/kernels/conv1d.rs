@@ -3,6 +3,7 @@ use crate::kernels::conv1d_direct::{
     Depthwise, Kernel3, SingleChannel, depthwise, kernel3, single_channel,
 };
 use crate::kernels::conv2d::Activation;
+use crate::kernels::gemm::WeightElem;
 use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul};
 use crate::kernels::utils;
 use crate::tensor::TensorView;
@@ -31,6 +32,86 @@ fn bias_relu_rows(
         None if relu => bias_act_inplace(out, 0.0, act),
         None => {}
     }
+}
+
+/// A `Conv` of kernel 1, one group, stride and dilation 1 and no padding, of an input
+/// `[batch, in_channels, len]` with more than one channel (the case [`conv1d`] computes
+/// as a matrix product), whose weights `[out_channels, in_channels, 1]` may be f16: they
+/// are widened as they are read, and the result is that of [`conv1d`] on the widened
+/// weights, bit for bit.
+pub fn conv1d_pointwise<'a, W: WeightElem>(
+    input: &TensorView<'_>,
+    weights: &TensorView<'_, W>,
+    bias: Option<&TensorView<'_>>,
+    relu: bool,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let [batch, in_channels, len] = input.shape[..] else {
+        panic!("conv1d_pointwise: input of shape {:?}", input.shape);
+    };
+    let [out_channels, w_in, 1] = weights.shape[..] else {
+        panic!("conv1d_pointwise: weights of shape {:?}", weights.shape);
+    };
+    assert!(
+        w_in == in_channels && in_channels > 1,
+        "conv1d_pointwise: {in_channels} input channels against weights of {w_in}"
+    );
+    utils::ensure_capacity(out, batch * out_channels * len);
+    pointwise(
+        input,
+        &weights.data,
+        bias,
+        relu,
+        (batch, in_channels, out_channels, len),
+        out,
+    )
+}
+
+/// Per batch, `weights[out_channels, in_channels] x input[in_channels, len]`, then the
+/// bias and ReLU. `out` is the output's length.
+fn pointwise<'a, W: WeightElem>(
+    input: &TensorView<'_>,
+    weights: &[W],
+    bias: Option<&TensorView<'_>>,
+    relu: bool,
+    (batch_size, in_channels, out_channels, len): (usize, usize, usize, usize),
+    out: &'a mut [f32],
+) -> TensorView<'a> {
+    let total = batch_size * out_channels * len;
+    assert!(
+        weights.len() >= out_channels * in_channels
+            && input.data.len() >= batch_size * in_channels * len
+    );
+    let out_slice = &mut out[..total];
+    for b in 0..batch_size {
+        // SAFETY: the operands hold the elements addressed (asserted above).
+        unsafe {
+            let b_mat = MatRef::<f32>::from_raw_parts(
+                input.data.as_ptr().add(b * in_channels * len),
+                in_channels,
+                len,
+                len as isize,
+                1,
+            );
+            let c = MatMut::<f32>::from_raw_parts_mut(
+                out_slice.as_mut_ptr().add(b * out_channels * len),
+                out_channels,
+                len,
+                len as isize,
+                1,
+            );
+            W::matmul_left_into(
+                c,
+                Accum::Replace,
+                weights.as_ptr(),
+                out_channels,
+                in_channels,
+                b_mat,
+            );
+        }
+    }
+    bias_relu_rows(out, bias, relu, out_channels, len);
+    TensorView::from_slice(out, vec![batch_size, out_channels, len])
 }
 
 pub fn conv1d<'b, 'a>(
@@ -204,40 +285,14 @@ fn conv1d_fused_at<'b, 'a>(
         && pad_left == 0
         && pad_right == 0
     {
-        let out_slice = &mut out[..total_output_size];
-        for b in 0..batch_size {
-            let a_offset = b * out_channels * output_len;
-            let in_offset = b * in_channels * input_len;
-
-            unsafe {
-                let a = MatRef::<f32>::from_raw_parts(
-                    weights.data.as_ptr(),
-                    out_channels,
-                    in_channels,
-                    in_channels as isize,
-                    1,
-                );
-                let b_mat = MatRef::<f32>::from_raw_parts(
-                    input.data.as_ptr().add(in_offset),
-                    in_channels,
-                    output_len,
-                    output_len as isize,
-                    1,
-                );
-                let c = MatMut::<f32>::from_raw_parts_mut(
-                    out_slice.as_mut_ptr().add(a_offset),
-                    out_channels,
-                    output_len,
-                    output_len as isize,
-                    1,
-                );
-                matmul(c, Accum::Replace, a, b_mat, 1.0f32, Par::Seq);
-            }
-        }
-
-        bias_relu_rows(out, bias, relu, out_channels, output_len);
-
-        return TensorView::from_slice(out, vec![batch_size, out_channels, output_len]);
+        return pointwise(
+            input,
+            &weights.data,
+            bias,
+            relu,
+            (batch_size, in_channels, out_channels, input_len),
+            out,
+        );
     }
 
     let unfolded_size = unfolded_rows * output_len;
@@ -365,7 +420,50 @@ fn conv1d_fused_at<'b, 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernels::test_util::{Rng, assert_same_bits};
     use crate::tensor::TensorView;
+
+    /// `conv1d_pointwise` is `conv1d` for f32 weights, and for f16 weights `conv1d` of
+    /// the widened ones, bit for bit: lengths through the dot products and the packed
+    /// kernels, with and without bias and ReLU.
+    #[test]
+    fn test_conv1d_pointwise_matches_conv1d() {
+        let mut rng = Rng::new(9);
+        for (batch, cin, cout, len) in [
+            (1, 384, 768, 10),
+            (2, 3, 5, 1),
+            (1, 16, 7, 40),
+            (2, 33, 20, 13),
+        ] {
+            let input = rng.vec(batch * cin * len, -1.0, 1.0);
+            let w16: Vec<half::f16> = rng
+                .vec(cout * cin, -1.0, 1.0)
+                .iter()
+                .map(|&x| half::f16::from_f32(x))
+                .collect();
+            let w32: Vec<f32> = w16.iter().map(|x| x.to_f32()).collect();
+            let bias = rng.vec(cout, -0.5, 0.5);
+            let x = TensorView::from_slice(&input, vec![batch, cin, len]);
+            let (t16, t32) = (
+                TensorView::from_slice(&w16, vec![cout, cin, 1]),
+                TensorView::from_slice(&w32, vec![cout, cin, 1]),
+            );
+            let tb = TensorView::from_slice(&bias, vec![cout]);
+            for (b, relu) in [(None, false), (Some(&tb), true)] {
+                let mut want = Vec::new();
+                let want = conv1d_fused(&x, &t32, b, &[1], 1, &[0, 0], &[1], relu, &mut want);
+                let what = format!("[{batch},{cin},{len}] -> {cout} relu={relu}");
+                let mut got = Vec::new();
+                let got = conv1d_pointwise(&x, &t32, b, relu, &mut got);
+                assert_eq!(got.shape, want.shape);
+                assert_same_bits(&got.data, &want.data, &format!("f32 {what}"));
+                let mut got = Vec::new();
+                let got = conv1d_pointwise(&x, &t16, b, relu, &mut got);
+                assert_same_bits(&got.data, &want.data, &format!("f16 {what}"));
+            }
+        }
+    }
+
     #[test]
     fn test_conv1d_grouped() {
         let input_data = vec![1.0; 6];

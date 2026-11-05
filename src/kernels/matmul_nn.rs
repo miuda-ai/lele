@@ -39,6 +39,60 @@ const KC: usize = 512;
 /// Panels of B per column block: the packed block stays in L2 while the rows of A pass.
 const PANELS: usize = 8;
 
+/// B as stored. f16 is widened to f32 as it is packed, or (with few rows of C) a block of
+/// rows at a time, and from then on read exactly as f32 would be, so the product is the
+/// same, bit for bit, as that of the widened matrix.
+#[derive(Clone, Copy)]
+pub(crate) enum BSrc<'a> {
+    F32(&'a [f32]),
+    F16(&'a [half::f16]),
+}
+
+impl<'a> BSrc<'a> {
+    fn f32(self) -> Option<&'a [f32]> {
+        match self {
+            BSrc::F32(b) => Some(b),
+            BSrc::F16(_) => None,
+        }
+    }
+
+    /// Widens elements `start..start + dst.len()` into `dst`.
+    #[inline(always)]
+    fn widen<S: Simd>(self, simd: S, start: usize, dst: &mut [f32]) {
+        match self {
+            BSrc::F32(b) => dst.copy_from_slice(&b[start..][..dst.len()]),
+            BSrc::F16(b) => widen_f16(simd, &b[start..][..dst.len()], dst),
+        }
+    }
+}
+
+/// `src` widened into `dst`, eight at a time with F16C's `vcvtph2ps` where the level has
+/// it (fearless_simd's AVX2 level enables F16C), with `half` elsewhere. Widening is exact.
+#[inline(always)]
+fn widen_f16<S: Simd>(simd: S, src: &[half::f16], dst: &mut [f32]) {
+    assert_eq!(src.len(), dst.len());
+    #[cfg(target_arch = "x86_64")]
+    if matches!(simd.level(), Level::Avx2(_) | Level::Avx512(_)) {
+        use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm256_cvtph_ps, _mm256_storeu_ps};
+        let (eights, rest) = src.as_chunks::<8>();
+        for (i, h) in eights.iter().enumerate() {
+            // SAFETY: the level enables F16C and AVX; the load reads the 16 bytes of `h`
+            // and the store writes 8 elements of `dst`, which is as long as `src`.
+            unsafe {
+                let h = _mm_loadu_si128(h.as_ptr() as *const __m128i);
+                _mm256_storeu_ps(dst.as_mut_ptr().add(8 * i), _mm256_cvtph_ps(h));
+            }
+        }
+        for (d, s) in dst[8 * eights.len()..].iter_mut().zip(rest) {
+            *d = s.to_f32();
+        }
+        return;
+    }
+    let _ = simd;
+    use half::slice::HalfFloatSliceExt;
+    src.convert_to_f32_slice(dst);
+}
+
 /// A row-major problem: `A` is `m x k` with `lda` between rows, `B` is `k x n`, `C` is `m x n`.
 #[derive(Clone, Copy)]
 pub(crate) struct Dims {
@@ -59,7 +113,11 @@ fn block_depth(k: usize) -> usize {
     k.div_ceil(k.div_ceil(KC))
 }
 
-pub(crate) fn gemm_nn(level: Level, d: &Dims, a: &[f32], b: &[f32], c: &mut [f32]) {
+pub(crate) fn gemm_nn(level: Level, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32]) {
+    debug_assert!(
+        b.f32().is_some() || !d.b_cols,
+        "f16 B is only taken row-major"
+    );
     PACKED.with_borrow_mut(|bpack| {
         // Every entry used is written first, so the buffer only has to be long enough.
         let len = PANELS * block_depth(d.k) * NR;
@@ -81,14 +139,10 @@ const PACKED_PANEL: u8 = 1;
 const PACK_NOW: u8 = 2;
 
 #[simd]
-fn gemm_nn_simd<S: Simd>(
-    simd: S,
-    d: &Dims,
-    a: &[f32],
-    b: &[f32],
-    c: &mut [f32],
-    bpack: &mut [f32],
-) {
+fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32], bpack: &mut [f32]) {
+    // f16 is packed whole, and the panels an f32 B would be read in place from are read
+    // from the packed copy the same way (a narrow panel sums in another order packed).
+    let b32 = b.f32();
     let depth = block_depth(d.k);
     let lanes = by_lanes(simd);
     let mr = if lanes { LANE_MR } else { MR };
@@ -124,7 +178,7 @@ fn gemm_nn_simd<S: Simd>(
                 kc,
                 jc,
                 nc,
-                first_prepacked,
+                if b32.is_some() { first_prepacked } else { 0 },
                 bpack,
             );
             let mut ir = 0;
@@ -136,8 +190,8 @@ fn gemm_nn_simd<S: Simd>(
                     let width = NR.min(d.n - j);
                     let c = &mut c[ir * d.ldc + j..];
                     let slot = &mut bpack[jp * kc * NR..][..kc * NR];
-                    // (Only for a row-major B, in the branches below that read it.)
-                    let in_place = || &b[pc * d.ldb + j..];
+                    // (Only for a row-major f32 B, in the branches below that read it.)
+                    let in_place = || &b32.expect("f16 B is packed")[pc * d.ldb + j..];
                     macro_rules! tile {
                         ($mode:expr, $src:expr, $lds:expr, $dst:expr) => {{
                             let t = Tile {
@@ -178,6 +232,8 @@ fn gemm_nn_simd<S: Simd>(
                     }
                     if jp >= first_prepacked || (pack && ir > 0) {
                         tile!(PACKED_PANEL, slot, NR, &mut [])
+                    } else if b32.is_none() {
+                        tile!(IN_PLACE, slot, NR, &mut [])
                     } else if pack {
                         tile!(PACK_NOW, in_place(), d.ldb, slot)
                     } else {
@@ -200,7 +256,7 @@ fn gemm_nn_simd<S: Simd>(
 #[inline(always)]
 fn pack_b<S: Simd>(
     simd: S,
-    b: &[f32],
+    b: BSrc,
     ldb: usize,
     b_cols: bool,
     pc: usize,
@@ -217,10 +273,13 @@ fn pack_b<S: Simd>(
         let width = NR.min(jc + nc - j);
         if !b_cols {
             for (p, row) in panel.as_chunks_mut::<NR>().0.iter_mut().enumerate() {
-                row[..width].copy_from_slice(&b[(pc + p) * ldb + j..][..width]);
+                b.widen(simd, (pc + p) * ldb + j, &mut row[..width]);
                 row[width..].fill(0.0);
             }
-        } else if width == NR {
+            continue;
+        }
+        let b = b.f32().expect("f16 B is only taken row-major");
+        if width == NR {
             // 4x4 blocks: four depths of four columns, transposed in registers.
             let quads = kc / 4;
             for jq in 0..NR / 4 {
@@ -527,8 +586,52 @@ pub(crate) const SMALL_M: usize = 4;
 /// time, each pass adding them into C (which stays in L1). (Tiles of C walking down the
 /// columns of B, as `gemm_nn` does, are 5-40% slower here: B arrives in short pieces
 /// from rows far apart.) From 5 rows on, `gemm_nn` is faster.
-pub(crate) fn gemm_small_m(level: Level, d: &Dims, a: &[f32], b: &[f32], c: &mut [f32]) {
-    simd_call!(level, gemm_small_m_simd(d, a, b, c))
+pub(crate) fn gemm_small_m(level: Level, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32]) {
+    let b16 = match b {
+        BSrc::F32(b) => return simd_call!(level, gemm_small_m_simd(d, a, b, c)),
+        BSrc::F16(b) => b,
+    };
+    // f16: blocks of `WIDEN_ROWS` rows of B, widened, each a product of that depth adding
+    // into C. The blocks are a whole number of passes of every height, so the passes are
+    // those of the widened B.
+    WIDENED.with_borrow_mut(|wide| {
+        wide.resize(WIDEN_ROWS.min(d.k) * d.n, 0.0);
+        simd_call!(level, gemm_small_m_f16_simd(d, a, b16, c, wide))
+    })
+}
+
+#[simd]
+fn gemm_small_m_f16_simd<S: Simd>(
+    simd: S,
+    d: &Dims,
+    a: &[f32],
+    b: &[half::f16],
+    c: &mut [f32],
+    wide: &mut [f32],
+) {
+    let mut p = 0;
+    while p < d.k {
+        let rows = WIDEN_ROWS.min(d.k - p);
+        let wide = &mut wide[..rows * d.n];
+        for (i, row) in wide.chunks_exact_mut(d.n).enumerate() {
+            widen_f16(simd, &b[(p + i) * d.ldb..][..d.n], row);
+        }
+        let block = Dims {
+            k: rows,
+            ldb: d.n,
+            add: d.add || p > 0,
+            ..*d
+        };
+        gemm_small_m_simd(simd, &block, &a[p..], wide, c);
+        p += rows;
+    }
+}
+
+/// Rows of an f16 B `gemm_small_m` widens at a time: a multiple of every pass height.
+const WIDEN_ROWS: usize = 48;
+
+thread_local! {
+    static WIDENED: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[simd]

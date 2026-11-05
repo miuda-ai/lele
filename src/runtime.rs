@@ -19,6 +19,11 @@ type ConvWeightCache = HashMap<(usize, usize, usize, bool), (Vec<f32>, Arc<ConvW
 /// weight, so it happens once per tensor and is cached for the life of the model.
 pub struct Weights<'a> {
     data: &'a [u8],
+    /// The f16 weights [`Self::with_f16`] converted, one after another.
+    f16: Vec<f32>,
+    /// Byte offset of each converted f16 weight and where it starts in
+    /// `f16`, by offset.
+    f16_index: Vec<(usize, usize)>,
     quantized_weights_cache: RefCell<QuantizedWeightCache>,
     qweights_cache: RefCell<QWeightCache>,
     conv_weights_cache: RefCell<ConvWeightCache>,
@@ -28,10 +33,37 @@ impl<'a> Weights<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self {
             data,
+            f16: Vec::new(),
+            f16_index: Vec::new(),
             quantized_weights_cache: RefCell::default(),
             qweights_cache: RefCell::default(),
             conv_weights_cache: RefCell::default(),
         }
+    }
+
+    /// Converts the f16 weights at `(byte offset, byte length)` to f32 once,
+    /// so that [`Self::weight_f16`] reads them without converting on every
+    /// call.
+    pub fn with_f16(mut self, regions: &[(usize, usize)]) -> Self {
+        use half::slice::HalfFloatSliceExt;
+        let mut regions = regions.to_vec();
+        regions.sort_unstable();
+        regions.dedup();
+        self.f16 = vec![0.0; regions.iter().map(|&(_, len)| len / 2).sum()];
+        self.f16_index.reserve(regions.len());
+        let mut start = 0;
+        for (offset, len) in regions {
+            let halves: Vec<half::f16> = self.data[offset..offset + len]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&b| half::f16::from_le_bytes(b))
+                .collect();
+            halves.convert_to_f32_slice(&mut self.f16[start..start + halves.len()]);
+            self.f16_index.push((offset, start));
+            start += halves.len();
+        }
+        self
     }
 
     pub fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {
@@ -70,8 +102,37 @@ impl<'a> Weights<'a> {
         TensorView::from_bytes_i8(&self.data[offset..offset + len], shape.to_vec())
     }
 
-    pub fn weight_f16(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
-        TensorView::from_bytes_f16(&self.data[offset..offset + len], shape.to_vec())
+    /// An f16 weight as f32: borrowed if [`Self::with_f16`] converted it,
+    /// converted now otherwise.
+    pub fn weight_f16(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'_, f32> {
+        match self.f16_index.binary_search_by_key(&offset, |&(o, _)| o) {
+            Ok(i) => {
+                let start = self.f16_index[i].1;
+                TensorView {
+                    data: std::borrow::Cow::Borrowed(&self.f16[start..start + len / 2]),
+                    shape: std::borrow::Cow::Borrowed(shape),
+                }
+            }
+            Err(_) => TensorView::from_bytes_f16(&self.data[offset..offset + len], shape.to_vec()),
+        }
+    }
+
+    /// An f16 weight as stored, for kernels that widen it as they read it
+    /// (the B operand of [`Self::linear`] and `kernels::matmul`).
+    pub fn weight_f16_raw(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, half::f16> {
+        let bytes = &self.data[offset..offset + len];
+        // SAFETY: `f16` is two bytes, and every bit pattern is a valid one.
+        let (head, halves, tail) = unsafe { bytes.align_to::<half::f16>() };
+        let data = if head.is_empty() && tail.is_empty() {
+            std::borrow::Cow::Borrowed(halves)
+        } else {
+            let halves = bytes.as_chunks::<2>().0.iter().map(|&b| half::f16::from_le_bytes(b));
+            std::borrow::Cow::Owned(halves.collect())
+        };
+        TensorView {
+            data,
+            shape: std::borrow::Cow::Borrowed(shape),
+        }
     }
 
     /// Raw bytes of a weight, for prepared weights that skip the f32 conversion.
@@ -314,10 +375,10 @@ impl Weights<'_> {
         kernels::qmatmul_i8(input, input_scale, input_zero_point, &qw, output_buf)
     }
 
-    pub fn linear<'c, 'd>(
+    pub fn linear<'c, 'd, B: kernels::WeightElem>(
         &self,
         input: &TensorView<'c>,
-        weight: &TensorView<'c>,
+        weight: &TensorView<'c, B>,
         bias: &TensorView<'c>,
         output_buf: &'d mut Vec<f32>,
     ) -> TensorView<'d> {
@@ -360,5 +421,35 @@ fn embedding_concat<'d, T: Clone + std::fmt::Debug>(shape: &TensorView<'_, i64>,
     TensorView {
         data: std::borrow::Cow::Borrowed(output_buf),
         shape: std::borrow::Cow::Owned(out_shape),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use half::f16;
+
+    /// f16 weights converted at load read the same as converted per call,
+    /// and those not listed are still converted per call.
+    #[test]
+    fn f16_weights_converted_at_load_match() {
+        let values = [0.5f32, -1.25, 3.0, 65504.0, 6.0e-8, -0.0, 1.0e-3, 7.5];
+        let mut data = vec![0u8; 16];
+        data.extend(values.iter().flat_map(|&x| f16::from_f32(x).to_le_bytes()));
+        let (a, b) = ((16, 8), (24, 8));
+        let shape = [4];
+        let lazy = Weights::new(&data);
+        let loaded = Weights::new(&data).with_f16(&[b, a, a]);
+        let partial = Weights::new(&data).with_f16(&[a]);
+        for (offset, len) in [a, b] {
+            let want = lazy.weight_f16(offset, len, &shape);
+            let got = loaded.weight_f16(offset, len, &shape);
+            assert!(matches!(got.data, std::borrow::Cow::Borrowed(_)));
+            assert_eq!(got.shape.as_ref(), &shape);
+            let bits = |v: &TensorView| v.data.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&want));
+            assert_eq!(bits(&partial.weight_f16(offset, len, &shape)), bits(&want));
+        }
+        assert!(matches!(partial.weight_f16(b.0, b.1, &shape).data, std::borrow::Cow::Owned(_)));
     }
 }

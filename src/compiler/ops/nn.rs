@@ -93,6 +93,28 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             } else {
                 "None".to_string()
             };
+            // An f16 pointwise conv1d (the case `conv1d` computes as a matrix
+            // product) takes its weights as stored, widening them as it reads them.
+            let ones = |v: &[i64]| v.iter().all(|&x| x == 1);
+            if let Some(weight) = ctx.weight(1)
+                && weight.dtype == DType::F16
+                && matches!(weight.shape[..], [_, in_channels, 1] if in_channels > 1)
+                && group == 1
+                && ones(&strides)
+                && ones(&dilations)
+                && pads.iter().all(|&p| p == 0)
+            {
+                return writeln!(
+                    w,
+                    "{}let {} = lele::kernels::conv1d_pointwise(&{}, &{}, {}, false, {});",
+                    tab,
+                    outputs[0],
+                    inputs[0],
+                    ctx.matmul_weight(1),
+                    bias_arg,
+                    buf_expr
+                );
+            }
             // Determine conv1d vs conv2d based on weight tensor rank
             let weight_rank = ctx.weight(1).map(|weight| weight.shape.len()).unwrap_or(3);
             let kernel_fn = if weight_rank >= 4 { "conv2d" } else { "conv1d" };

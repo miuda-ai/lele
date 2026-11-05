@@ -43,7 +43,10 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
         Op::Linear => writeln!(
             w,
             "{tab}let {} = self.linear(&{}, &{}, &{}, {buf});",
-            outputs[0], inputs[0], inputs[1], inputs[2]
+            outputs[0],
+            inputs[0],
+            ctx.matmul_weight(1),
+            inputs[2]
         )?,
         Op::ConvAct { conv, act } => {
             let weight_shape = ctx
