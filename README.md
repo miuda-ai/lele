@@ -206,6 +206,8 @@ fn main() -> lele_build::Result {
 ./run_hojo_tts.sh "text"     # Hojo-TTS-Light voice cloning
 cd examples/moss-tts-nano && cargo run --release -- "text"  # MOSS-TTS-Nano
 cd examples/ppocr && cargo run --release -- image.png      # PP-OCRv6 OCR
+cargo run --release -p tone-example --bin tone -- in.wav    # T-one ASR (8 kHz WAV)
+cargo run --release -p tone-example --bin tone-live         # T-one, live from the microphone
 ```
 
 ## Supported Models
@@ -214,6 +216,7 @@ cd examples/ppocr && cargo run --release -- image.png      # PP-OCRv6 OCR
 |-------|------|---------|
 | **SenseVoiceSmall** | ASR | Multilingual speech recognition |
 | **Silero VAD** | VAD | Streaming voice activity detection |
+| **T-one** | ASR | Streaming Russian telephony speech recognition (8 kHz, CTC) |
 | **Supertonic 2** | TTS | 5 languages |
 | **Supertonic 3** | TTS | 31 languages, expression tags (`<laugh>`, `<breath>`, `<sigh>`) |
 | **Hojo-TTS-Light** | TTS | 0.08B bilingual ZH/EN, voice cloning (encoder → AR-LLM → decoder) |

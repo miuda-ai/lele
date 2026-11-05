@@ -1,0 +1,20 @@
+[package]
+name = "tone-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "tone"
+path = "src/main.rs"
+
+[[bin]]
+name = "tone-live"
+path = "src/bin/live.rs"
+
+[dependencies]
+cpal = "0.18.2"
+lele = { workspace = true }
+
+[build-dependencies]
+lele-build = { workspace = true }

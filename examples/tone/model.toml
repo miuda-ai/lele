@@ -1,0 +1,15 @@
+# T-one: streaming CTC ASR for Russian telephony (71M, 8 kHz).
+# https://github.com/voicekit-team/T-one
+[model]
+source = "hf-hub"
+repo = "t-tech/T-one"
+revision = "main"
+
+[[model.files]]
+file = "model.onnx"
+dest = "model.onnx"
+
+[codegen]
+class_name = "TOne"
+model_file = "model.onnx"
+custom_methods = []
