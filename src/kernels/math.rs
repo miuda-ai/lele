@@ -49,6 +49,24 @@ fn sigmoid_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
     vm::map!(simd, src, out, vm::sigmoid)
 }
 
+fn sin_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, sin_simd(src, out))
+}
+
+#[simd]
+fn sin_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::sin)
+}
+
+fn cos_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, cos_simd(src, out))
+}
+
+#[simd]
+fn cos_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::cos)
+}
+
 fn silu_into(level: Level, src: &[f32], out: &mut [f32]) {
     simd_call!(level, max = Avx2, silu_simd(src, out))
 }
@@ -1165,6 +1183,215 @@ pub fn not<'b, 'a, T: ElementOps>(
         shape: std::borrow::Cow::Owned(input.shape.to_vec()),
     }
 }
+/// The [outer, reduced, inner] sizes of `shape` with `axes` (sorted, without
+/// duplicates) reduced, if the axes are adjacent and none is empty. Then each
+/// output sums `reduced` elements `inner` apart, which the reductions add up
+/// without computing a multi-dimensional index per element.
+fn adjacent_axes(shape: &[usize], axes: &[usize]) -> Option<(usize, usize, usize)> {
+    let (&first, &last) = (axes.first()?, axes.last()?);
+    let reduced: usize = shape[first..=last].iter().product();
+    (last - first + 1 == axes.len() && reduced > 0).then(|| {
+        let outer = shape[..first].iter().product();
+        (outer, reduced, shape[last + 1..].iter().product())
+    })
+}
+
+/// `shape` with `axes` removed, or set to 1 with `keepdims`.
+fn reduced_shape(shape: &[usize], axes: &[usize], keepdims: bool) -> Vec<usize> {
+    let mut out = Vec::with_capacity(shape.len());
+    for (d, &n) in shape.iter().enumerate() {
+        if !axes.contains(&d) {
+            out.push(n);
+        } else if keepdims {
+            out.push(1);
+        }
+    }
+    out
+}
+
+/// The sum of `run`, in the order the reductions add a contiguous run.
+fn sum_run<T: Copy + std::ops::AddAssign>(run: &[T], zero: T) -> T {
+    // Eight independent accumulators: f32 addition is not associative, so a
+    // single one would keep the loop serial on the add latency.
+    let mut acc = [zero; 8];
+    let (chunks, rest) = run.as_chunks::<8>();
+    for c in chunks {
+        for (a, &v) in acc.iter_mut().zip(c) {
+            *a += v;
+        }
+    }
+    let [mut s, mut s1, mut s2, mut s3, s4, s5, s6, s7] = acc;
+    s += s4;
+    s1 += s5;
+    s2 += s6;
+    s3 += s7;
+    s += s1;
+    s2 += s3;
+    s += s2;
+    for &v in rest {
+        s += v;
+    }
+    s
+}
+
+/// SimAM attention over the planes of the last `axes` axes of `input`:
+/// `x * sigmoid(d / ((Σd / n + lambda) * scale) + shift)` with `d = (x - mean)²`
+/// and `n` a scalar (models pass the plane size less one). Each step rounds as
+/// the `ReduceMean`, `Sub`, `Pow`, `ReduceSum`, `Div`, `Add`, `Mul`, `Div`,
+/// `Add`, `Sigmoid` and `Mul` it replaces do, so the result is theirs bit for
+/// bit, in one pass over each plane where they take eleven over the tensor.
+pub fn simam<'a>(
+    input: &TensorView<'_>,
+    n: &TensorView<'_>,
+    axes: usize,
+    lambda: f32,
+    scale: f32,
+    shift: f32,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let rank = input.shape.len();
+    assert!((1..=rank).contains(&axes), "simam: {axes} axes of a rank-{rank} input");
+    let [n] = n.data[..] else {
+        panic!("simam: n of {} elements", n.data.len())
+    };
+    let plane: usize = input.shape[rank - axes..].iter().product();
+    let len = input.data.len();
+    // SAFETY: every plane is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
+    if plane > 0 {
+        let inv_plane = 1.0f32 / plane as f32;
+        let level = Level::new();
+        for (x, o) in input.data.chunks_exact(plane).zip(out.chunks_exact_mut(plane)) {
+            let mean = sum_run(x, 0.0) * inv_plane;
+            for (o, &x) in o.iter_mut().zip(x) {
+                let d = x - mean;
+                *o = d * d;
+            }
+            let denom = (sum_run(o, 0.0) / n + lambda) * scale;
+            simd_call!(level, max = Avx2, simam_plane_simd(x, o, denom, shift));
+        }
+    }
+    TensorView {
+        data: Cow::Borrowed(&out[..len]),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
+}
+
+/// `d = x * sigmoid(d / denom + shift)` over a plane.
+#[simd]
+fn simam_plane_simd<S: Simd>(simd: S, x: &[f32], d: &mut [f32], denom: f32, shift: f32) {
+    use fearless_simd::{f32x16, prelude::*};
+    let (denom, shift) = (f32x16::splat(simd, denom), f32x16::splat(simd, shift));
+    // (A macro, not a closure: a closure would not get the target features.)
+    macro_rules! gate {
+        ($x:expr, $d:expr) => {{
+            let e = f32x16::load_array_ref(simd, $d) / denom + shift;
+            (f32x16::load_array_ref(simd, $x) * vm::sigmoid(e)).store_array($d);
+        }};
+    }
+    let (xs, x_tail) = x.as_chunks::<16>();
+    let (ds, d_tail) = d.as_chunks_mut::<16>();
+    for (x, d) in xs.iter().zip(ds) {
+        gate!(x, d);
+    }
+    if !x_tail.is_empty() {
+        let (mut x, mut d) = ([0.0; 16], [0.0; 16]);
+        x[..x_tail.len()].copy_from_slice(x_tail);
+        d[..x_tail.len()].copy_from_slice(d_tail);
+        gate!(&x, &mut d);
+        d_tail.copy_from_slice(&d[..x_tail.len()]);
+    }
+}
+
+/// Snake activation, `x + beta * sin(alpha * x)^2`, with `alpha` and `beta` of
+/// one element per channel (the second to last axis of `input`) or a single
+/// one. Each step rounds as the `Mul`, `Sin`, `Pow`, `Mul` and `Add` it
+/// replaces do, so the result is theirs bit for bit, in one pass where they
+/// take five.
+pub fn snake<'a>(
+    input: &TensorView<'_>,
+    alpha: &TensorView<'_>,
+    beta: &TensorView<'_>,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let rank = input.shape.len();
+    let width = input.shape.last().copied().unwrap_or(1);
+    let channels = if rank >= 2 { input.shape[rank - 2] } else { 1 };
+    for (name, p) in [("alpha", alpha), ("beta", beta)] {
+        assert!(
+            p.data.len() == 1 || p.data.len() == channels,
+            "snake: {} {name} for {channels} channels",
+            p.data.len()
+        );
+    }
+    let len = input.data.len();
+    // SAFETY: every row is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
+    if width > 0 {
+        let level = Level::new();
+        let rows = input.data.chunks_exact(width).zip(out.chunks_exact_mut(width));
+        for (r, (x, o)) in rows.enumerate() {
+            let at = |p: &TensorView<'_>| p.data[if p.data.len() == 1 { 0 } else { r % channels }];
+            simd_call!(level, max = Avx2, snake_row_simd(x, o, at(alpha), at(beta)));
+        }
+    }
+    TensorView {
+        data: Cow::Borrowed(&out[..len]),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
+}
+
+/// `out = x + beta * sin(alpha * x)^2` over a row.
+#[simd]
+fn snake_row_simd<S: Simd>(simd: S, x: &[f32], out: &mut [f32], alpha: f32, beta: f32) {
+    use fearless_simd::{f32x16, prelude::*};
+    let (a, b) = (f32x16::splat(simd, alpha), f32x16::splat(simd, beta));
+    // (A macro, not a closure: a closure would not get the target features.)
+    macro_rules! snake {
+        ($x:expr, $o:expr) => {{
+            let x = f32x16::load_array_ref(simd, $x);
+            let s = vm::sin(x * a);
+            (x + b * (s * s)).store_array($o);
+        }};
+    }
+    let (xs, x_tail) = x.as_chunks::<16>();
+    let (os, o_tail) = out.as_chunks_mut::<16>();
+    for (x, o) in xs.iter().zip(os) {
+        snake!(x, o);
+    }
+    if !x_tail.is_empty() {
+        let (mut x, mut o) = ([0.0; 16], [0.0; 16]);
+        x[..x_tail.len()].copy_from_slice(x_tail);
+        snake!(&x, &mut o);
+        o_tail.copy_from_slice(&o[..x_tail.len()]);
+    }
+}
+
+/// Writes the sums of `data` (as [outer, reduced, inner]) over its middle axis
+/// to `out` (as [outer, inner]).
+fn sum_adjacent<T: Copy + std::ops::AddAssign>(
+    data: &[T],
+    (outer, reduced, inner): (usize, usize, usize),
+    zero: T,
+    out: &mut [T],
+) {
+    let out = &mut out[..outer * inner];
+    if inner == 1 {
+        for (dst, run) in out.iter_mut().zip(data.chunks_exact(reduced)) {
+            *dst = sum_run(run, zero);
+        }
+    } else {
+        for (dst, block) in out.chunks_exact_mut(inner).zip(data.chunks_exact(reduced * inner)) {
+            dst.fill(zero);
+            for row in block.chunks_exact(inner) {
+                for (d, &v) in dst.iter_mut().zip(row) {
+                    *d += v;
+                }
+            }
+        }
+    }
+}
+
 pub fn reduce_mean<'b, 'a>(
     input: &TensorView<'b>,
     axes: &[i64],
@@ -1186,37 +1413,14 @@ pub fn reduce_mean<'b, 'a>(
     resolved_axes.sort();
     resolved_axes.dedup();
 
-    // Fast path: the reduced axes are the trailing ones, so each output is the
-    // sum of one contiguous run. This is what pooling asks for — the last axis,
-    // or [H, W] of an NCHW tensor — and the generic path below costs a
-    // multi-dimensional index computation per element.
-    if !resolved_axes.is_empty() && resolved_axes[0] + resolved_axes.len() == dims {
-        let inner: usize = input.shape[resolved_axes[0]..].iter().product();
-        let outer: usize = input.shape[..resolved_axes[0]].iter().product();
-        let mut out_shape: Vec<usize> = input.shape[..resolved_axes[0]].to_vec();
-        if keepdims {
-            out_shape.resize(dims, 1);
-        }
-        let scale = 1.0f32 / inner as f32;
-        // SAFETY: every element is written below before any is read.
-        unsafe { utils::ensure_capacity(out, outer) };
-        for (o, dst) in out.iter_mut().enumerate() {
-            let run = &input.data[o * inner..(o + 1) * inner];
-            // Eight independent accumulators: f32 addition is not associative,
-            // so a single one would keep the loop serial on the add latency.
-            let mut acc = [0.0f32; 8];
-            let (chunks, rest) = run.as_chunks::<8>();
-            for c in chunks {
-                for (a, &v) in acc.iter_mut().zip(c) {
-                    *a += v;
-                }
-            }
-            let mut s =
-                ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
-            for &v in rest {
-                s += v;
-            }
-            *dst = s * scale;
+    if let Some(sizes) = adjacent_axes(&input.shape, &resolved_axes) {
+        let scale = 1.0f32 / sizes.1 as f32;
+        let out_shape = reduced_shape(&input.shape, &resolved_axes, keepdims);
+        // SAFETY: `sum_adjacent` writes every element before any is read.
+        unsafe { utils::ensure_capacity(out, sizes.0 * sizes.2) };
+        sum_adjacent(&input.data, sizes, 0.0, out);
+        for x in out.iter_mut() {
+            *x *= scale;
         }
         return TensorView {
             data: Cow::Borrowed(out),
@@ -1308,6 +1512,17 @@ pub fn reduce_sum<'b, 'a, T: ElementOps + std::ops::AddAssign>(
         .collect();
     resolved_axes.sort();
     resolved_axes.dedup();
+    let zero = T::from_f32(0.0);
+    if let Some(sizes) = adjacent_axes(&input.shape, &resolved_axes) {
+        let out_shape = reduced_shape(&input.shape, &resolved_axes, keepdims);
+        // SAFETY: `sum_adjacent` writes every element before any is read.
+        unsafe { utils::ensure_capacity(out, sizes.0 * sizes.2) };
+        sum_adjacent(&input.data, sizes, zero, out);
+        return TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(out_shape),
+        };
+    }
     let mut out_shape = Vec::new();
     let mut reduce_mask = vec![false; dims];
     for &ax in &resolved_axes {
@@ -1324,7 +1539,6 @@ pub fn reduce_sum<'b, 'a, T: ElementOps + std::ops::AddAssign>(
     if out.len() != out_numel {
         out.resize(out_numel, T::from_f32(0.0));
     }
-    let zero = T::from_f32(0.0);
     for v in out.iter_mut() {
         *v = zero;
     }
@@ -1934,24 +2148,10 @@ pub fn range_i64<'a>(
     TensorView::from_slice(out, vec![n])
 }
 pub fn sin<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let numel = input.data.len();
-    // SAFETY: every element is written below before any is read.
-    unsafe { utils::ensure_capacity(out, numel) };
-    let out_slice = out.as_mut_slice();
-    for i in 0..numel {
-        out_slice[i] = input.data[i].sin();
-    }
-    TensorView::from_slice(out, input.shape.to_vec())
+    unary(input, out, sin_into)
 }
 pub fn cos<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let numel = input.data.len();
-    // SAFETY: every element is written below before any is read.
-    unsafe { utils::ensure_capacity(out, numel) };
-    let out_slice = out.as_mut_slice();
-    for i in 0..numel {
-        out_slice[i] = input.data[i].cos();
-    }
-    TensorView::from_slice(out, input.shape.to_vec())
+    unary(input, out, cos_into)
 }
 pub fn exp<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     unary(input, out, exp_into)
@@ -2973,6 +3173,82 @@ mod tests {
             .collect();
         for (a, b) in res.data.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-6, "mismatch: got {} expected {}", a, b);
+        }
+    }
+
+    /// `snake` is the chain it replaces, bit for bit, over rows around the vector
+    /// width, with per-channel and single parameters, and inputs down to
+    /// subnormals.
+    #[test]
+    fn test_snake_is_the_unfused_chain() {
+        use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_same_bits};
+        let mut rng = Rng::new(14);
+        let channels = 3;
+        for &w in AWKWARD_LENS {
+            let shape = vec![2, channels, w];
+            let mut data = rng.vec(2 * channels * w, -4.0, 4.0);
+            for (i, x) in data.iter_mut().enumerate().step_by(5) {
+                *x = [0.0, -1e-40, 3e-20, 1e-5, f32::MIN_POSITIVE][i % 5] * (*x).signum();
+            }
+            let x = TensorView::from_slice(&data, shape.clone());
+            let per_channel = [rng.vec(channels, 0.1, 3.0), rng.vec(channels, 0.2, 2.0)];
+            for [alpha, beta] in [per_channel.clone(), [vec![0.7], vec![1.3]]] {
+                let a = TensorView::from_slice(&alpha, vec![1, alpha.len(), 1]);
+                let b = TensorView::from_slice(&beta, vec![1, beta.len(), 1]);
+                let two = 2.0f32;
+                let two = TensorView::from_slice(std::slice::from_ref(&two), vec![]);
+                let mut bufs: [Vec<f32>; 5] = Default::default();
+                let [b0, b1, b2, b3, b4] = &mut bufs;
+                let scaled = mul(&x, &a, b0);
+                let s = sin(&scaled, b1);
+                let squared = pow(&s, &two, b2);
+                let t = mul(&b, &squared, b3);
+                let want = add(&x, &t, b4);
+                let mut out = vec![5.0; 7];
+                let got = snake(&x, &a, &b, &mut out);
+                assert_eq!(got.shape, want.shape);
+                let what = format!("width {w}, {} alphas", alpha.len());
+                assert_same_bits(&got.data, &want.data, &what);
+            }
+        }
+    }
+
+    /// `simam` is the chain it replaces, bit for bit, over planes of one and two
+    /// axes around the vector widths.
+    #[test]
+    fn test_simam_is_the_unfused_chain() {
+        use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_same_bits};
+        let mut rng = Rng::new(13);
+        let (lambda, scale, shift) = (1e-4, 4.0, 0.5);
+        for &w in AWKWARD_LENS {
+            for (shape, axes) in [(vec![2, 3, w], 1), (vec![1, 2, 3, w], 2)] {
+                let data = rng.vec(shape.iter().product(), -3.0, 3.0);
+                let x = TensorView::from_slice(&data, shape.clone());
+                let reduced: Vec<i64> = (shape.len() - axes..shape.len()).map(|a| a as i64).collect();
+                let plane: usize = shape[shape.len() - axes..].iter().product();
+                let n_val = plane as f32 - 1.0;
+                let n = TensorView::from_slice(std::slice::from_ref(&n_val), vec![]);
+                fn scalar(v: &f32) -> TensorView<'_> {
+                    TensorView::from_slice(std::slice::from_ref(v), vec![])
+                }
+                let mut bufs: [Vec<f32>; 11] = Default::default();
+                let [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10] = &mut bufs;
+                let mean = reduce_mean(&x, &reduced, true, b0);
+                let centered = sub(&x, &mean, b1);
+                let d = pow(&centered, &scalar(&2.0), b2);
+                let sum = reduce_sum(&d, &reduced, true, b3);
+                let var = div(&sum, &n, b4);
+                let biased = add(&var, &scalar(&lambda), b5);
+                let denom = mul(&biased, &scalar(&scale), b6);
+                let energy = div(&d, &denom, b7);
+                let shifted = add(&energy, &scalar(&shift), b8);
+                let gate = sigmoid(&shifted, b9);
+                let want = mul(&x, &gate, b10);
+                let mut out = vec![7.0; 3];
+                let got = simam(&x, &n, axes, lambda, scale, shift, &mut out);
+                assert_eq!(got.shape, want.shape);
+                assert_same_bits(&got.data, &want.data, &format!("shape {shape:?} axes {axes}"));
+            }
         }
     }
 }

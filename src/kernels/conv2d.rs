@@ -1,6 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::kernels::bias_act::bias_act_inplace;
 use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul as strided_matmul};
+use crate::kernels::matmul_nn;
 use crate::kernels::simd::simd_call;
 use crate::kernels::timing;
 use crate::kernels::utils;
@@ -98,10 +99,10 @@ pub fn conv2d_fused<'b, 'a>(
 
 /// Most bytes of unfolded input per band of output rows: about half of L2, so the
 /// columns are written and read back from cache.
-const IM2COL_BYTES: usize = 512 * 1024;
+pub(crate) const IM2COL_BYTES: usize = 512 * 1024;
 
 /// `band_bytes` bounds the unfolded input per band ([`IM2COL_BYTES`]; smaller in tests).
-fn conv2d_activation<'b, 'a>(
+pub(crate) fn conv2d_activation<'b, 'a>(
     level: Level,
     input: &TensorView<'b>,
     weights: &TensorView<'b>,
@@ -338,9 +339,37 @@ fn conv2d_activation<'b, 'a>(
 
     let col_rows = in_channels_per_group * kernel_h * kernel_w;
     let col_cols = out_h * out_w;
-    // The output is computed in bands of whole rows whose columns fit in L2, so the
-    // unfolded input is written and read back from cache, not memory.
-    let band_rows = (band_bytes / (col_rows * out_w * 4)).clamp(1, out_h);
+    // Beyond a few rows and columns of C, the product packs its blocks of the
+    // columns itself, straight from the input (`pack_columns`), so they are never
+    // unfolded whole: one copy of the input, which stays in cache, where unfolding
+    // and then packing made two, through a buffer larger than L2. (Not where the
+    // product goes to Accelerate, or would take dot products for few columns.)
+    let packed = !cfg!(all(target_arch = "aarch64", target_os = "macos"))
+        && out_channels_per_group > matmul_nn::SMALL_M
+        && col_cols > crate::kernels::matmul::DOT_MAX_N;
+    // The output is computed in bands of whole rows, whose unfolded columns or,
+    // packed, part of the output fit in L2.
+    let row_bytes = if packed {
+        out_channels_per_group * out_w * 4
+    } else {
+        col_rows * out_w * 4
+    };
+    let band_rows = (band_bytes / row_bytes).clamp(1, out_h);
+    let window = Window {
+        channels: in_channels_per_group,
+        in_h,
+        in_w,
+        kernel_h,
+        kernel_w,
+        stride_h,
+        stride_w,
+        dilation_h,
+        dilation_w,
+        pad_top,
+        pad_left,
+        out_h,
+        out_w,
+    };
 
     // Reuse thread-local im2col buffer to avoid repeated allocation
     thread_local! {
@@ -348,7 +377,7 @@ fn conv2d_activation<'b, 'a>(
     }
     COL_BUF.with(|buf_cell| {
         let mut col_buf_ref = buf_cell.borrow_mut();
-        let needed = col_rows * band_rows * out_w;
+        let needed = if packed { 0 } else { col_rows * band_rows * out_w };
         if col_buf_ref.len() < needed {
             col_buf_ref.resize(needed, 0.0);
         }
@@ -359,9 +388,49 @@ fn conv2d_activation<'b, 'a>(
                 let out_ch_start = g * out_channels_per_group;
                 let w_offset = out_ch_start * col_rows;
                 let o_offset = (n * out_channels + out_ch_start) * col_cols;
+                // Bias and activation while the band is in cache.
+                let finish_band = |out: &mut [f32], band_offset: usize, band_cols: usize| {
+                    for oc in 0..out_channels_per_group {
+                        let bias_val = bias.map_or(0.0, |b| b.data[out_ch_start + oc]);
+                        if bias_val != 0.0 || act != Activation::None {
+                            let start = band_offset + oc * col_cols;
+                            bias_act_inplace(&mut out[start..start + band_cols], bias_val, act);
+                        }
+                    }
+                };
                 for oh_start in (0..out_h).step_by(band_rows) {
                     let oh_end = (oh_start + band_rows).min(out_h);
                     let band_cols = (oh_end - oh_start) * out_w;
+                    let band_offset = o_offset + oh_start * out_w;
+                    if packed {
+                        let input = &input_data[(n * in_channels + in_ch_start) * in_h * in_w..];
+                        let pack = |block, panels: &mut [f32]| {
+                            simd_call!(
+                                level,
+                                pack_columns(input, &window, oh_start, block, panels)
+                            )
+                        };
+                        let d = matmul_nn::Dims {
+                            m: out_channels_per_group,
+                            n: band_cols,
+                            k: col_rows,
+                            lda: col_rows,
+                            ldb: 0,
+                            ldc: col_cols,
+                            alpha: 1.0,
+                            add: false,
+                            b_cols: false,
+                        };
+                        matmul_nn::gemm_nn(
+                            level,
+                            &d,
+                            &weight_data[w_offset..],
+                            matmul_nn::BSrc::Packer(&pack),
+                            &mut out[band_offset..],
+                        );
+                        finish_band(out, band_offset, band_cols);
+                        continue;
+                    }
                     let col_buf = &mut col_buf_ref[..col_rows * band_cols];
                     im2col(
                         level,
@@ -384,7 +453,6 @@ fn conv2d_activation<'b, 'a>(
                         out_w,
                         col_buf,
                     );
-                    let band_offset = o_offset + oh_start * out_w;
                     // weights [out_channels_per_group, col_rows] x columns [col_rows, band_cols]
                     // = the band of the output, rows `col_cols` apart.
                     unsafe {
@@ -411,14 +479,7 @@ fn conv2d_activation<'b, 'a>(
                         );
                         strided_matmul(out_mat, Accum::Replace, w_mat, col_mat, 1.0, Par::Seq);
                     }
-                    // Bias and activation while the band is in cache.
-                    for oc in 0..out_channels_per_group {
-                        let bias_val = bias.map_or(0.0, |b| b.data[out_ch_start + oc]);
-                        if bias_val != 0.0 || act != Activation::None {
-                            let start = band_offset + oc * col_cols;
-                            bias_act_inplace(&mut out[start..start + band_cols], bias_val, act);
-                        }
-                    }
+                    finish_band(out, band_offset, band_cols);
                 }
             }
         }
@@ -522,10 +583,8 @@ fn im2col(
                 let col_row_offset = col_row * spatial_cols;
                 // Output column `ow` reads input column `ow * stride_w + shift - pad_left`.
                 let shift = kw * dilation_w;
-                let ow_start = pad_left.saturating_sub(shift).div_ceil(stride_w).min(out_w);
-                let ow_end = (in_w + pad_left)
-                    .saturating_sub(shift)
-                    .div_ceil(stride_w)
+                let ow_start = div_ceil_by(pad_left.saturating_sub(shift), stride_w).min(out_w);
+                let ow_end = div_ceil_by((in_w + pad_left).saturating_sub(shift), stride_w)
                     .clamp(ow_start, out_w);
                 for oh in out_rows.clone() {
                     let ih = (oh * stride_h + kh * dilation_h) as isize - pad_top as isize;
@@ -552,6 +611,107 @@ fn im2col(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// `x.div_ceil(s)`, without a division for the strides of 1 and 2: unfolding
+/// computes one per row of columns, which for a short output is a large share of
+/// the work.
+#[inline(always)]
+fn div_ceil_by(x: usize, s: usize) -> usize {
+    match s {
+        1 => x,
+        2 => x.div_ceil(2),
+        s => x.div_ceil(s),
+    }
+}
+
+/// Packs the block `(pc, kc, jc, nc)` of the columns `im2col` would unfold for
+/// the output rows from `oh_start` of window `w` over `input` (from its first
+/// channel) into `panels`, as `matmul_nn::Packer` does.
+#[simd]
+fn pack_columns<S: Simd>(
+    simd: S,
+    input: &[f32],
+    w: &Window,
+    oh_start: usize,
+    (pc, kc, jc, nc): (usize, usize, usize, usize),
+    panels: &mut [f32],
+) {
+    let (in_h, in_w, out_w, pad_left) = (w.in_h, w.in_w, w.out_w, w.pad_left);
+    // Integer division is slow next to copying a few elements: the row's channel
+    // and kernel position, and each segment's output position, are stepped.
+    let taps = w.kernel_h * w.kernel_w;
+    let (mut c, tap) = (pc / taps, pc % taps);
+    let (mut kh, mut kw) = (tap / w.kernel_w, tap % w.kernel_w);
+    let (first_oh, first_ow) = (oh_start + jc / out_w, jc % out_w);
+    // Each row of the block is put together here, then copied into the panels
+    // whole vectors at a time. Its pieces are written in order eight elements at a
+    // time, the last running on into the slack: rounding up rather than calling
+    // `memcpy` or `memset` for a few elements, which costs more than copying them.
+    // What runs on is overwritten by the next piece, or is past the block.
+    const NR: usize = matmul_nn::NR;
+    let mut row = [0.0f32; matmul_nn::BLOCK_COLS + 8];
+    let zero = |row: &mut [f32], at: usize, len: usize| {
+        for chunk in row[at..].as_chunks_mut::<8>().0.iter_mut().take(len.div_ceil(8)) {
+            *chunk = [0.0; 8];
+        }
+    };
+    for p in 0..kc {
+        let plane = &input[c * in_h * in_w..][..in_h * in_w];
+        // Output column `ow` reads input column `ow * stride_w + shift - pad_left`:
+        // those in range are copied, the rest zeroed.
+        let shift = kw * w.dilation_w;
+        let ow_start = div_ceil_by(pad_left.saturating_sub(shift), w.stride_w).min(out_w);
+        let ow_end =
+            div_ceil_by((in_w + pad_left).saturating_sub(shift), w.stride_w).clamp(ow_start, out_w);
+        // The block's columns, a segment of an output row at a time: `len` from
+        // column `ow` of output row `oh`, at column `at` of the block.
+        let (mut oh, mut ow, mut at) = (first_oh, first_ow, 0);
+        while at < nc {
+            let len = (out_w - ow).min(nc - at);
+            let ih = (oh * w.stride_h + kh * w.dilation_h) as isize - w.pad_top as isize;
+            if ih < 0 || ih >= in_h as isize {
+                zero(&mut row, at, len);
+            } else {
+                let lo = ow_start.clamp(ow, ow + len);
+                let hi = ow_end.clamp(lo, ow + len);
+                zero(&mut row, at, lo - ow);
+                if hi > lo {
+                    let src = &plane[ih as usize * in_w + lo * w.stride_w + shift - pad_left..];
+                    let (dst, n) = (&mut row[at + lo - ow..], hi - lo);
+                    match w.stride_w {
+                        // Rounded up where the input has the elements.
+                        1 if src.len() >= n.div_ceil(8) * 8 => {
+                            let (dst, src) = (dst.as_chunks_mut::<8>().0, src.as_chunks::<8>().0);
+                            for (d, s) in dst.iter_mut().zip(src).take(n.div_ceil(8)) {
+                                *d = *s;
+                            }
+                        }
+                        1 => dst[..n].copy_from_slice(&src[..n]),
+                        2 => copy_stride2_simd(simd, src, &mut dst[..n]),
+                        s => {
+                            for (i, d) in dst[..n].iter_mut().enumerate() {
+                                *d = src[i * s];
+                            }
+                        }
+                    }
+                }
+                zero(&mut row, at + hi - ow, ow + len - hi);
+            }
+            (oh, ow, at) = (oh + 1, 0, at + len);
+        }
+        for (jp, part) in row.as_chunks::<NR>().0[..nc.div_ceil(NR)].iter().enumerate() {
+            *panels[(jp * kc + p) * NR..].first_chunk_mut::<NR>().unwrap() = *part;
+        }
+        // The next row's kernel position and channel.
+        kw += 1;
+        if kw == w.kernel_w {
+            (kw, kh) = (0, kh + 1);
+            if kh == w.kernel_h {
+                (kh, c) = (0, c + 1);
             }
         }
     }
@@ -1512,6 +1672,10 @@ mod tests {
         ([2, 3, 3], [3, 3], [1, 1], [1, 1], [1, 1, 1, 1]),
         ([1, 3, 70], [7, 7], [1, 1], [1, 1], [3, 3, 3, 3]),
         ([2, 4, 34], [2, 2], [1, 1], [1, 1], [0, 0, 1, 1]),
+        // Deeper than one depth block of the product (576 = 2 x 288), and wider
+        // than one block of columns.
+        ([64, 4, 150], [3, 3], [1, 1], [1, 1], [1, 1, 1, 1]),
+        ([64, 4, 150], [3, 3], [2, 2], [1, 1], [1, 1, 1, 1]),
     ];
 
     fn out_dims(case: &WindowCase) -> (usize, usize) {
@@ -1599,7 +1763,8 @@ mod tests {
 
     /// Dense and grouped convolution over the window cases (im2col on every path:
     /// row-contiguous, strided and dilated columns, and 1x1), in one band and in
-    /// bands of one or a few output rows.
+    /// bands of one or a few output rows, with few output channels per group (the
+    /// columns unfolded) and more (packed by the product, block by block).
     #[test]
     fn test_conv2d_matches_reference() {
         let mut rng = Rng::new(12);
@@ -1607,9 +1772,9 @@ mod tests {
             let ([c, h, w], [kh, kw], strides, dilations, pads) = *case;
             let (oh_n, ow_n) = out_dims(case);
             let batch = 2;
-            for groups in [1, 2].into_iter().filter(|g| c % g == 0) {
-                let (cg, oc) = (c / groups, 4 * groups);
-                let ocg = oc / groups;
+            let shapes = [1, 2].into_iter().flat_map(|g| [(g, 4), (g, 7)]);
+            for (groups, ocg) in shapes.filter(|&(g, _)| c % g == 0) {
+                let (cg, oc) = (c / groups, ocg * groups);
                 let x = rng.vec(batch * c * h * w, -1.0, 1.0);
                 let wt = rng.vec(oc * cg * kh * kw, -1.0, 1.0);
                 let b = rng.vec(oc, -1.0, 1.0);
@@ -1653,7 +1818,7 @@ mod tests {
                         &mut out,
                     );
                     assert_eq!(got.shape.as_ref(), &[batch, oc, oh_n, ow_n]);
-                    let what = format!("{case:?} groups {groups} band {band_bytes}");
+                    let what = format!("{case:?} groups {groups} of {ocg} band {band_bytes}");
                     assert_close(&got.data, &want, 1e-5, &what);
                 }
             }

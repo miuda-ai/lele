@@ -42,6 +42,8 @@ pub(crate) const NR: usize = 8 * NV;
 const KC: usize = 512;
 /// Panels of B per column block: the packed block stays in L2 while the rows of A pass.
 const PANELS: usize = 8;
+/// Most columns of B a [`Packer`] is asked for at a time.
+pub(crate) const BLOCK_COLS: usize = PANELS * NR;
 
 /// B as stored. f16 is widened to f32 as it is packed, or (with few rows of C) a block of
 /// rows at a time, and from then on read exactly as f32 would be, so the product is the
@@ -52,7 +54,16 @@ pub(crate) enum BSrc<'a> {
     F16(&'a [half::f16]),
     /// f16 in panel order ([`pack_f16`]), `n` a multiple of `NR`.
     F16Packed(&'a [half::f16]),
+    /// f32 packed by the caller, a block at a time, as a convolution unfolds its input
+    /// ([`Packer`]).
+    Packer(&'a Packer<'a>),
 }
+
+/// Writes the block of B `kc` deep from row `pc` and `nc` wide from column `jc`
+/// (`pc, kc, jc, nc`) into the panels `gemm_nn` reads: `nc.div_ceil(NR)` panels in
+/// turn, each `kc` rows of `NR`, so that row `p` of panel `jp` starts at
+/// `(jp * kc + p) * NR`. Columns past `nc` are not read.
+pub(crate) type Packer<'a> = dyn Fn((usize, usize, usize, usize), &mut [f32]) + 'a;
 
 impl<'a> BSrc<'a> {
     fn f32(self) -> Option<&'a [f32]> {
@@ -68,7 +79,9 @@ impl<'a> BSrc<'a> {
         match self {
             BSrc::F32(b) => dst.copy_from_slice(&b[start..][..dst.len()]),
             BSrc::F16(b) => widen_f16(simd, &b[start..][..dst.len()], dst),
-            BSrc::F16Packed(_) => unreachable!("packed B is widened by the panel"),
+            BSrc::F16Packed(_) | BSrc::Packer(_) => {
+                unreachable!("packed B is read by the panel")
+            }
         }
     }
 }
@@ -192,7 +205,7 @@ fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32], b
             // Panels that cannot be loaded in place are packed up front: all of a
             // transposed B, and a last panel narrower than the vectors its tiles load
             // (they load one vector up to 8 columns, two above). The rest load in place.
-            let first_prepacked = if d.b_cols {
+            let first_prepacked = if d.b_cols || matches!(b, BSrc::Packer(_)) {
                 0
             } else if nc % NR == 0 || nc % NR == 8 {
                 panels
@@ -210,6 +223,8 @@ fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32], b
                 if lanes {
                     widen_f16(simd, block16, &mut bpack[..len]);
                 }
+            } else if let BSrc::Packer(pack) = b {
+                pack((pc, kc, jc, nc), &mut bpack[..panels * kc * NR]);
             } else {
                 pack_b(
                     simd,
@@ -656,7 +671,7 @@ pub(crate) fn gemm_small_m(level: Level, d: &Dims, a: &[f32], b: BSrc, c: &mut [
     let b16 = match b {
         BSrc::F32(b) => return simd_call!(level, gemm_small_m_simd(d, a, b, c)),
         BSrc::F16(b) => b,
-        BSrc::F16Packed(_) => unreachable!("packed B goes to gemm_nn"),
+        BSrc::F16Packed(_) | BSrc::Packer(_) => unreachable!("packed B goes to gemm_nn"),
     };
     // f16: blocks of `WIDEN_ROWS` rows of B, widened, each a product of that depth adding
     // into C. The blocks are a whole number of passes of every height, so the passes are

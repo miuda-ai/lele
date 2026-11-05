@@ -494,11 +494,24 @@ pub enum Op {
     },
     /// `x * sigmoid(x)`.
     Silu,
+    /// Snake activation, `x + beta * sin(alpha * x)^2` with one `alpha` and
+    /// `beta` per channel (the second to last axis of `x`). Inputs:
+    /// `[x, alpha, beta]`.
+    Snake,
     /// `x / (ReduceL2(x, last axis) * scale + epsilon) * gamma` (ScaleNorm).
     /// Inputs: `[x, gamma]`.
     ScaleNorm {
         scale: f32,
         epsilon: f32,
+    },
+    /// SimAM attention over the planes of the last `axes` axes:
+    /// `x * sigmoid(d / (scale * (ReduceSum(d) / n + lambda)) + shift)` with
+    /// `d = (x - ReduceMean(x))^2`. Inputs: `[x, n]`, `n` a scalar.
+    SimAm {
+        axes: usize,
+        lambda: f32,
+        scale: f32,
+        shift: f32,
     },
     /// `MatMul` + `Add`. Inputs: `[a, b, bias]`.
     Linear,
@@ -776,7 +789,9 @@ impl Op {
             Op::QLinearMatMulI8 => "QLinearMatMulI8",
             Op::ConvAct { .. } => "ConvAct",
             Op::Silu => "Silu",
+            Op::Snake => "Snake",
             Op::ScaleNorm { .. } => "ScaleNorm",
+            Op::SimAm { .. } => "SimAm",
             Op::Linear => "Linear",
             Op::QLinearDynamic { .. } => "QLinearDynamic",
             Op::EmbeddingConcat { .. } => "EmbeddingConcat",
@@ -930,6 +945,17 @@ impl Op {
                 set_attr_f(attrs, "scale", scale, 1.0);
                 set_attr_f(attrs, "epsilon", epsilon, 0.0);
             }
+            Op::SimAm {
+                axes,
+                lambda,
+                scale,
+                shift,
+            } => {
+                set_attr_i(attrs, "axes", axes as i64, 0);
+                set_attr_f(attrs, "lambda", lambda, 0.0);
+                set_attr_f(attrs, "scale", scale, 1.0);
+                set_attr_f(attrs, "shift", shift, 0.0);
+            }
             Op::QuantizeLinear(a) | Op::DequantizeLinear(a) | Op::FakeQuantizeLinear(a) => {
                 a.write(attrs)
             }
@@ -971,6 +997,7 @@ impl Op {
             | Op::Where
             | Op::QLinearMatMulI8
             | Op::Silu
+            | Op::Snake
             | Op::Linear => {}
         }
     }

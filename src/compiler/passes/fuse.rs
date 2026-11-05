@@ -6,7 +6,7 @@
 //! removing the chain cannot leave another reader without its input.
 
 use crate::compiler::ir::{
-    Activation, Binary, DType, Graph, NodeId, Op, Reduction, Unary, ValueId,
+    Activation, Binary, DType, Dim, Graph, NodeId, Op, Reduction, Unary, ValueId,
 };
 use crate::model::onnx_proto::{NodeProto, TensorProto};
 use crate::model::tensor_to_array;
@@ -15,6 +15,8 @@ use crate::model::tensor_to_array;
 pub(crate) fn fuse(g: &mut Graph) {
     fuse_layer_norm(g);
     fuse_scale_norm(g);
+    fuse_simam(g);
+    fuse_snake(g);
     fuse_gelu(g);
     fuse_silu(g);
     fuse_conv_bias(g);
@@ -69,9 +71,20 @@ fn constant_tensor(g: &Graph, v: Option<ValueId>) -> Option<&TensorProto> {
     }
 }
 
-/// The values of a compile-time constant.
+/// The values of a compile-time constant, float16 ones (which
+/// `tensor_to_array` does not read) included.
 fn constant(g: &Graph, v: Option<ValueId>) -> Option<Vec<f32>> {
-    tensor_to_array(constant_tensor(g, v)?).ok().map(|(data, _)| data)
+    let t = constant_tensor(g, v)?;
+    if DType::from_onnx(t.data_type) == DType::F16 {
+        // The bits, raw or one per element of `int32_data`.
+        let bits: Vec<u16> = if t.raw_data.is_empty() {
+            t.int32_data.iter().map(|&x| x as u16).collect()
+        } else {
+            t.raw_data.as_chunks::<2>().0.iter().map(|&b| u16::from_le_bytes(b)).collect()
+        };
+        return Some(bits.into_iter().map(|b| half::f16::from_bits(b).to_f32()).collect());
+    }
+    tensor_to_array(t).ok().map(|(data, _)| data)
 }
 
 /// Whether `v` is a constant scalar close to `expected`.
@@ -107,17 +120,39 @@ fn named_after(g: &Graph, id: NodeId) -> NodeProto {
     }
 }
 
+/// The axes reduction `id` reduces, if it keeps them and they are constant.
+fn kept_axes(g: &Graph, id: NodeId) -> Option<Vec<i64>> {
+    let node = g.node(id);
+    let Op::Reduce {
+        axes,
+        keepdims: true,
+        ..
+    } = &node.op
+    else {
+        return None;
+    };
+    match axes {
+        Some(axes) => Some(axes.clone()),
+        None => Some(constant(g, node.input(1))?.iter().map(|&x| x as i64).collect()),
+    }
+}
+
 /// Whether reduction `id` is over the last axis alone, keeping it.
 fn reduces_last_axis(g: &Graph, id: NodeId) -> bool {
-    let node = g.node(id);
-    let Op::Reduce { axes, keepdims, .. } = &node.op else {
-        return false;
-    };
-    let axes = match axes {
-        Some(axes) => Some(axes.iter().map(|&x| x as f32).collect()),
-        None => constant(g, node.input(1)),
-    };
-    axes.as_deref() == Some(&[-1.0]) && *keepdims
+    kept_axes(g, id).as_deref() == Some(&[-1])
+}
+
+/// How many axes reduction `id` reduces of its input `x`, if it keeps them
+/// and they are the last ones (positive axes need the rank of `x`).
+fn kept_trailing_axes(g: &Graph, id: NodeId, x: ValueId) -> Option<usize> {
+    let rank = g.value(x).shape.as_ref().map(|s| s.len() as i64);
+    let mut axes = kept_axes(g, id)?
+        .into_iter()
+        .map(|a| if a < 0 { Some(a) } else { Some(a - rank?) })
+        .collect::<Option<Vec<i64>>>()?;
+    axes.sort();
+    let k = axes.len() as i64;
+    (k > 0 && axes.iter().zip(-k..).all(|(&a, b)| a == b)).then_some(k as usize)
 }
 
 /// `x - mean(x)`, normalized by `sqrt(mean((x - mean(x))^2) + eps)`, then
@@ -224,6 +259,140 @@ fn fuse_scale_norm(g: &mut Graph) {
         if let Some((nodes, inputs, scale, epsilon)) = fused {
             let proto = named_after(g, mul);
             g.fuse(&nodes, Op::ScaleNorm { scale, epsilon }, proto, inputs.to_vec());
+        }
+    }
+}
+
+/// SimAM attention, `x * sigmoid(d / ((ReduceSum(d) / n + lambda) * scale) + shift)`
+/// with `d = Pow(x - ReduceMean(x), 2)`, both reductions over the same last
+/// axes, constant scalars `lambda`, `scale` and `shift` and the operands of each
+/// `Add`, `Mul` in either order → `SimAm`.
+fn fuse_simam(g: &mut Graph) {
+    let scalar = |g: &Graph, v| {
+        constant(g, v).and_then(|c| match c[..] {
+            [c] if c.is_finite() => Some(c),
+            _ => None,
+        })
+    };
+    // The operand of commutative node `id` other than a constant scalar, and
+    // the scalar.
+    let with_scalar = |g: &Graph, id: NodeId| {
+        (0..2).find_map(|j| Some((g.node(id).input(j), scalar(g, g.node(id).input(1 - j))?)))
+    };
+    for mul in binary_nodes(g, Binary::Mul) {
+        if !g.contains(mul) {
+            continue;
+        }
+        let fused = (0..2).find_map(|k| {
+            let node = g.node(mul);
+            let x = node.input(1 - k)?;
+            let sigmoid = sole_producer(g, node.input(k), unary(Unary::Sigmoid))?;
+            let add_shift = sole_producer(g, g.node(sigmoid).input(0), binary(Binary::Add))?;
+            let (energy, shift) = with_scalar(g, add_shift)?;
+            let div = sole_producer(g, energy, binary(Binary::Div))?;
+            let (d, denom) = (g.node(div).input(0)?, g.node(div).input(1));
+            let mul_scale = sole_producer(g, denom, binary(Binary::Mul))?;
+            let (biased, scale) = with_scalar(g, mul_scale)?;
+            let add_lambda = sole_producer(g, biased, binary(Binary::Add))?;
+            let (var, lambda) = with_scalar(g, add_lambda)?;
+            let div_n = sole_producer(g, var, binary(Binary::Div))?;
+            let (sum_d, n) = (g.node(div_n).input(0), g.node(div_n).input(1));
+            let sum = sole_producer(g, sum_d, |op| {
+                matches!(
+                    op,
+                    Op::Reduce {
+                        reduction: Reduction::Sum,
+                        ..
+                    }
+                )
+            })?;
+            // `d` is read by the ReduceSum and the Div.
+            let pow = g.value(d).producer()?;
+            if g.node(sum).input(0) != Some(d)
+                || g.uses(d) != 2
+                || !binary(Binary::Pow)(&g.node(pow).op)
+                || !is_scalar(g, g.node(pow).input(1), 2.0)
+            {
+                return None;
+            }
+            let sub = sole_producer(g, g.node(pow).input(0), binary(Binary::Sub))?;
+            let mean = sole_producer(g, g.node(sub).input(1), reduce_mean)?;
+            let axes = kept_trailing_axes(g, mean, x)?;
+            let n_is_scalar = g
+                .value(n?)
+                .shape
+                .as_ref()
+                .is_some_and(|s| s.iter().all(|d| *d == Dim::Fixed(1)));
+            if g.node(sub).input(0) != Some(x)
+                || g.node(mean).input(0) != Some(x)
+                || kept_trailing_axes(g, sum, d) != Some(axes)
+                || g.value(x).dtype != DType::F32
+                || g.value(n?).dtype != DType::F32
+                || !n_is_scalar
+            {
+                return None;
+            }
+            let nodes = [mean, sub, pow, sum, div_n, add_lambda, mul_scale, div, add_shift, sigmoid, mul];
+            let op = Op::SimAm {
+                axes,
+                lambda,
+                scale,
+                shift,
+            };
+            Some((nodes, op, [Some(x), n]))
+        });
+        if let Some((nodes, op, inputs)) = fused {
+            let proto = named_after(g, mul);
+            g.fuse(&nodes, op, proto, inputs.to_vec());
+        }
+    }
+}
+
+/// `x + beta * Pow(Sin(alpha * x), 2)` with constant `alpha` and `beta` of one
+/// element per channel (the second to last axis of `x`: shaped `[.., C, 1]`
+/// with leading 1s) or a single one, and the operands of each `Mul` and the
+/// `Add` in either order → `Snake`.
+fn fuse_snake(g: &mut Graph) {
+    // A constant per channel, or one value.
+    let per_channel = |g: &Graph, v: Option<ValueId>| {
+        let t = constant_tensor(g, v)?;
+        let dims = &t.dims;
+        let ok = dims.iter().product::<i64>() == 1
+            || (dims.len() >= 2
+                && dims[dims.len() - 1] == 1
+                && dims[..dims.len() - 2].iter().all(|&d| d == 1));
+        (ok && constant(g, v)?.iter().all(|c| c.is_finite())).then_some(v)
+    };
+    for add in binary_nodes(g, Binary::Add) {
+        if !g.contains(add) {
+            continue;
+        }
+        let fused = (0..2).find_map(|k| {
+            let node = g.node(add);
+            let x = node.input(1 - k)?;
+            let mul_beta = sole_producer(g, node.input(k), binary(Binary::Mul))?;
+            let (squared, beta) = (0..2).find_map(|j| {
+                let beta = per_channel(g, g.node(mul_beta).input(1 - j))?;
+                Some((g.node(mul_beta).input(j), beta))
+            })?;
+            let pow = sole_producer(g, squared, binary(Binary::Pow))?;
+            let sin = sole_producer(g, g.node(pow).input(0), unary(Unary::Sin))?;
+            let mul_alpha = sole_producer(g, g.node(sin).input(0), binary(Binary::Mul))?;
+            let alpha = (0..2).find_map(|j| {
+                let alpha = per_channel(g, g.node(mul_alpha).input(1 - j))?;
+                (g.node(mul_alpha).input(j) == Some(x)).then_some(alpha)
+            })?;
+            // (f16 activations are computed in f32, as the unfused kernels did.)
+            if !is_scalar(g, g.node(pow).input(1), 2.0)
+                || !matches!(g.value(x).dtype, DType::F32 | DType::F16)
+            {
+                return None;
+            }
+            Some(([mul_alpha, sin, pow, mul_beta, add], [Some(x), alpha, beta]))
+        });
+        if let Some((nodes, inputs)) = fused {
+            let proto = named_after(g, add);
+            g.fuse(&nodes, Op::Snake, proto, inputs.to_vec());
         }
     }
 }
@@ -665,6 +834,98 @@ mod tests {
     /// T-one's ScaleNorm: `gamma * (x / (ReduceL2(x) * scale + eps))`, of an
     /// f32 `x` (a Cast, so its type is known), with the operands of each `Mul`
     /// and `Add` in either order.
+    #[test]
+    fn fuses_simam() {
+        let reduce = |op: &str, input: &str, output: &str, axes: &[i64]| {
+            let mut n = node(op, &[input], output);
+            n.attribute.push(crate::model::onnx_proto::AttributeProto {
+                name: "axes".to_string(),
+                ints: axes.to_vec(),
+                ..Default::default()
+            });
+            n
+        };
+        let nodes = |swap: bool, sum_axes: &[i64]| {
+            let mut cast = node("Cast", &["input"], "x");
+            cast.attribute.push(crate::model::onnx_proto::AttributeProto {
+                name: "to".to_string(),
+                i: 1,
+                ..Default::default()
+            });
+            let order = |a: &'static str, b: &'static str| if swap { [b, a] } else { [a, b] };
+            vec![
+                cast,
+                reduce("ReduceMean", "x", "mean", &[-2, -1]),
+                node("Sub", &["x", "mean"], "centered"),
+                node("Pow", &["centered", "two"], "d"),
+                reduce("ReduceSum", "d", "sum", sum_axes),
+                node("Div", &["sum", "n"], "var"),
+                node("Add", &order("var", "lambda"), "biased"),
+                node("Mul", &order("biased", "four"), "denom"),
+                node("Div", &["d", "denom"], "energy"),
+                node("Add", &order("energy", "half"), "shifted"),
+                node("Sigmoid", &["shifted"], "gate"),
+                node("Mul", &order("x", "gate"), "y"),
+            ]
+        };
+        let constants = vec![
+            scalar("two", 2.0),
+            scalar("n", 15.0),
+            scalar("lambda", 1e-4),
+            scalar("four", 4.0),
+            scalar("half", 0.5),
+        ];
+        for swap in [false, true] {
+            assert_eq!(fused(nodes(swap, &[-2, -1]), constants.clone()), ["Cast", "SimAm"]);
+        }
+        // A sum over other axes than the mean's is left.
+        assert_eq!(fused(nodes(false, &[-1]), constants).len(), 12);
+    }
+
+    #[test]
+    fn fuses_snake() {
+        let nodes = |swap: bool| {
+            let mut cast = node("Cast", &["input"], "x");
+            cast.attribute.push(crate::model::onnx_proto::AttributeProto {
+                name: "to".to_string(),
+                i: 1,
+                ..Default::default()
+            });
+            let order = |a: &'static str, b: &'static str| if swap { [b, a] } else { [a, b] };
+            vec![
+                cast,
+                node("Mul", &order("x", "alpha"), "scaled"),
+                node("Sin", &["scaled"], "s"),
+                node("Pow", &["s", "two"], "squared"),
+                node("Mul", &order("beta", "squared"), "t"),
+                node("Add", &order("x", "t"), "y"),
+            ]
+        };
+        // Per channel in f16, as Hojo-TTS stores them.
+        let f16s = |name: &str, dims: Vec<i64>, v: f32| TensorProto {
+            name: name.to_string(),
+            data_type: DType::F16.to_onnx(),
+            raw_data: (0..dims.iter().product::<i64>())
+                .flat_map(|_| half::f16::from_f32(v).to_le_bytes())
+                .collect(),
+            dims,
+            ..Default::default()
+        };
+        let constants = |alpha_dims: Vec<i64>| {
+            vec![
+                f16s("alpha", alpha_dims, 0.5),
+                f16s("beta", vec![1, 4, 1], 2.0),
+                f16s("two", vec![], 2.0),
+            ]
+        };
+        for swap in [false, true] {
+            assert_eq!(fused(nodes(swap), constants(vec![1, 4, 1])), ["Cast", "Snake"]);
+        }
+        assert_eq!(fused(nodes(false), constants(vec![1])), ["Cast", "Snake"]);
+        // One alpha per column, not per channel, is left.
+        assert_eq!(fused(nodes(false), constants(vec![1, 1, 4])).len(), 6);
+    }
+
     #[test]
     fn fuses_scale_norm() {
         let nodes = |swap: bool| {

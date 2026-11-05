@@ -1011,6 +1011,56 @@ mod tests {
         );
     }
 
+    /// A 1D Conv fused with its Relu borrows its input, which later nodes may
+    /// still read (it used to be moved), and keeps both of its pads.
+    #[test]
+    fn test_fused_conv1d_relu_borrows_its_input() {
+        use crate::model::onnx_proto::{AttributeProto, GraphProto, TensorProto, ValueInfoProto};
+        let info = |name: &str| ValueInfoProto {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let node = |op: &str, input: &[&str], output: &[&str], attribute: Vec<AttributeProto>| {
+            NodeProto {
+                op_type: op.to_string(),
+                input: input.iter().map(|s| s.to_string()).collect(),
+                output: output.iter().map(|s| s.to_string()).collect(),
+                attribute,
+                ..Default::default()
+            }
+        };
+        let pads = AttributeProto {
+            name: "pads".to_string(),
+            ints: vec![0, 1],
+            ..Default::default()
+        };
+        let graph = GraphProto {
+            node: vec![
+                node("Conv", &["x", "w"], &["c"], vec![pads]),
+                node("Relu", &["c"], &["r"], vec![]),
+                node("Mul", &["x", "x"], &["m"], vec![]),
+            ],
+            initializer: vec![TensorProto {
+                name: "w".to_string(),
+                data_type: DType::F32.to_onnx(),
+                dims: vec![2, 2, 2],
+                raw_data: [0.5f32; 8].iter().flat_map(|x| x.to_le_bytes()).collect(),
+                ..Default::default()
+            }],
+            input: vec![info("x")],
+            output: ["r", "m"].map(info).to_vec(),
+            ..Default::default()
+        };
+        let code = Compiler::new()
+            .with_default_optimizations()
+            .compile(&graph)
+            .unwrap()
+            .code;
+        let line = code.lines().find(|l| l.contains("let r = ")).unwrap_or_else(|| panic!("{code}"));
+        assert!(line.contains("lele::kernels::conv1d_fused(&x, "), "{line}");
+        assert!(line.contains("&[0, 1], &[1], true, "), "{line}");
+    }
+
     /// An `If` branch that returns one of its initializers reads it through
     /// the weight accessor of its type; it used to call a nonexistent
     /// `self.weight`.

@@ -2,7 +2,7 @@ use crate::kernels::bias_act::bias_act_inplace;
 use crate::kernels::conv1d_direct::{
     Depthwise, Kernel3, SingleChannel, depthwise, kernel3, single_channel,
 };
-use crate::kernels::conv2d::Activation;
+use crate::kernels::conv2d::{Activation, IM2COL_BYTES, conv2d_activation};
 use crate::kernels::gemm::WeightElem;
 use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul};
 use crate::kernels::utils;
@@ -154,10 +154,12 @@ pub fn conv1d_fused<'b, 'a>(
         pads,
         strides,
         relu,
+        IM2COL_BYTES,
         out,
     )
 }
 
+/// `unfold_bytes` bounds the input unfolded whole ([`IM2COL_BYTES`]; others in tests).
 fn conv1d_fused_at<'b, 'a>(
     level: Level,
     input: &TensorView<'b>,
@@ -168,6 +170,7 @@ fn conv1d_fused_at<'b, 'a>(
     pads: &[i64],
     strides: &[i64],
     relu: bool,
+    unfold_bytes: usize,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     let in_shape = &input.shape;
@@ -312,6 +315,21 @@ fn conv1d_fused_at<'b, 'a>(
     }
 
     let unfolded_size = unfolded_rows * output_len;
+    if unfolded_size * 4 > unfold_bytes {
+        // Larger than cache, unfolded whole the input would be written out to
+        // memory and read back: as one row of a 2D convolution, it is unfolded a
+        // block at a time as the product reads it. (Smaller, the 2D convolution's
+        // bookkeeping per row of columns would cost more than unfolding.)
+        return conv1d_as_2d(
+            level,
+            (&input.data, [batch_size, in_channels, input_len]),
+            weights,
+            bias,
+            (dilation, group, pad_left, pad_right, stride),
+            relu,
+            out,
+        );
+    }
 
     thread_local! {
         static SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -431,6 +449,50 @@ fn conv1d_fused_at<'b, 'a>(
 
         TensorView::from_slice(out, vec![batch_size, out_channels, output_len])
     })
+}
+
+/// [`conv1d_fused_at`] as the convolution of a `[batch, channels, 1, len]` input.
+/// The input is `[batch, in_channels, len]` (`dims`), the weights
+/// `[out_channels, in_channels / group, kernel]`.
+fn conv1d_as_2d<'a>(
+    level: Level,
+    (input, dims): (&[f32], [usize; 3]),
+    weights: &TensorView<'_>,
+    bias: Option<&TensorView<'_>>,
+    (dilation, group, pad_left, pad_right, stride): (usize, i64, usize, usize, usize),
+    relu: bool,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let [batch_size, in_channels, input_len] = dims;
+    let [out_channels, in_channels_per_group, kernel_size] = weights.shape[..] else {
+        unreachable!("weights of shape {:?}", weights.shape)
+    };
+    let input = TensorView::from_slice(
+        &input[..batch_size * in_channels * input_len],
+        vec![batch_size, in_channels, 1, input_len],
+    );
+    let weights = TensorView::from_slice(
+        &weights.data[..out_channels * in_channels_per_group * kernel_size],
+        vec![out_channels, in_channels_per_group, 1, kernel_size],
+    );
+    let act = if relu { Activation::Relu } else { Activation::None };
+    let pads = [0, pad_left as i64, 0, pad_right as i64];
+    let (dilations, strides) = ([1, dilation as i64], [1, stride as i64]);
+    let output_len = conv2d_activation(
+        level,
+        &input,
+        &weights,
+        bias,
+        &dilations,
+        group,
+        &pads,
+        &strides,
+        act,
+        IM2COL_BYTES,
+        out,
+    )
+    .shape[3];
+    TensorView::from_slice(out, vec![batch_size, out_channels, output_len])
 }
 
 #[cfg(test)]
@@ -659,6 +721,24 @@ mod tests {
                 group: 5,
                 ..case(5, 5, 47, 3, 1, [1, 1])
             },
+            // As Hojo-TTS's encoder (a DAC encoder) has them: dilated residual
+            // convolutions, a strided downsampling one, more than four output
+            // channels per group, and deeper than one block of the product.
+            Case {
+                dilation: 3,
+                ..case(8, 8, 150, 7, 1, [9, 9])
+            },
+            Case {
+                dilation: 9,
+                ..case(8, 8, 150, 7, 1, [27, 27])
+            },
+            case(8, 16, 151, 4, 2, [1, 1]),
+            Case {
+                group: 2,
+                dilation: 2,
+                ..case(8, 14, 90, 5, 1, [4, 4])
+            },
+            case(74, 7, 40, 7, 1, [3, 3]),
             case(3, 5, 40, 3, 2, [1, 1]),
             case(4, 6, 40, 5, 1, [2, 2]),
             case(4, 6, 40, 3, 1, [0, 2]),
@@ -733,30 +813,36 @@ mod tests {
             let input = TensorView::from_slice(&x, vec![c.batch, c.in_ch, c.len]);
             let weights = TensorView::from_slice(&w, vec![c.out_ch, c.in_ch / c.group, c.kernel]);
             let bias_view = TensorView::from_slice(&bias, vec![c.out_ch]);
-            for has_bias in [false, true] {
-                for relu in [false, true] {
-                    let bias_arg = has_bias.then_some(&bias_view);
-                    let mut out = Vec::new();
-                    let got = conv1d_fused_at(
-                        level,
-                        &input,
-                        &weights,
-                        bias_arg,
-                        &[c.dilation as i64],
-                        c.group as i64,
-                        &[c.pads[0] as i64, c.pads[1] as i64],
-                        &[c.stride as i64],
-                        relu,
-                        &mut out,
-                    );
-                    let want = reference(&c, &x, &w, has_bias.then_some(&bias[..]), relu);
-                    crate::kernels::test_util::assert_close(
-                        &got.data,
-                        &want,
-                        1e-5,
-                        &format!("{level:?} {c:?} bias {has_bias} relu {relu}"),
-                    );
-                }
+            // Unfolded whole, and (no input being small enough) as a 2D convolution.
+            for (has_bias, relu, unfold_bytes) in [false, true]
+                .into_iter()
+                .flat_map(|b| [(b, false), (b, true)])
+                .flat_map(|(b, r)| [(b, r, IM2COL_BYTES), (b, r, 0)])
+            {
+                let bias_arg = has_bias.then_some(&bias_view);
+                let mut out = Vec::new();
+                let got = conv1d_fused_at(
+                    level,
+                    &input,
+                    &weights,
+                    bias_arg,
+                    &[c.dilation as i64],
+                    c.group as i64,
+                    &[c.pads[0] as i64, c.pads[1] as i64],
+                    &[c.stride as i64],
+                    relu,
+                    unfold_bytes,
+                    &mut out,
+                );
+                let want = reference(&c, &x, &w, has_bias.then_some(&bias[..]), relu);
+                // f32 rounding grows with the length of the dot products.
+                let terms = (c.in_ch / c.group * c.kernel).max(64);
+                crate::kernels::test_util::assert_close(
+                    &got.data,
+                    &want,
+                    1e-5 * terms as f64 / 64.0,
+                    &format!("{level:?} {c:?} bias {has_bias} relu {relu} unfold {unfold_bytes}"),
+                );
             }
         }
     }

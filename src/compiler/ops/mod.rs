@@ -77,7 +77,9 @@ pub(crate) fn dispatch_builtin(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         | Op::Linear
         | Op::QLinearDynamic { .. }
         | Op::ScaleNorm { .. }
-        | Op::Silu => fused::generate(ctx, w)?,
+        | Op::SimAm { .. }
+        | Op::Silu
+        | Op::Snake => fused::generate(ctx, w)?,
         Op::Loop { .. } | Op::Onnx { .. } => return Ok(false),
     }
     Ok(true)

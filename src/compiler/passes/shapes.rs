@@ -442,7 +442,9 @@ fn output_shapes(g: &Graph, node: &Node, elems: &Elems) -> Vec<Option<Shape>> {
         | Op::LogSoftmax { .. }
         | Op::QuantizeLinear(_)
         | Op::ScaleNorm { .. }
+        | Op::SimAm { .. }
         | Op::Silu
+        | Op::Snake
         | Op::Softmax { .. } => first(shape(0)),
         Op::DynamicQuantizeLinear => {
             let mut out = vec![shape(0), Some(Vec::new()), Some(Vec::new())];

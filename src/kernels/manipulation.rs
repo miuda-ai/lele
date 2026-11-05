@@ -887,170 +887,107 @@ pub fn pad<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         // ONNX default constant value is 0
         unsafe { std::mem::zeroed() }
     };
+    let mode = match mode {
+        "edge" => PadMode::Edge,
+        "reflect" => PadMode::Reflect,
+        _ => PadMode::Constant,
+    };
+    if mode == PadMode::Reflect {
+        // Reflection excludes the edge, so it reaches at most `dim - 1` elements in.
+        for d in 0..rank {
+            let end_pad = p[d + rank];
+            assert!(
+                p[d].max(end_pad) < input.shape[d] || p[d].max(end_pad) == 0,
+                "Pad: reflect pads of {} and {end_pad} on an axis of {}",
+                p[d],
+                input.shape[d]
+            );
+        }
+    }
+    if rank == 0 {
+        out[..total].copy_from_slice(&input.data);
+        return TensorView::from_slice(out, new_shape);
+    }
+    if input.data.is_empty() {
+        // Nothing to extend: only a constant is defined.
+        out[..total].fill(fill_val);
+        return TensorView::from_slice(out, new_shape);
+    }
 
-    // First copy input data into correct position, then handle padding
-    out.fill(fill_val);
-    // Copy input data into the center
-    if rank == 1 {
-        let start = p[0];
-        out[start..start + input.shape[0]].copy_from_slice(&input.data);
-    } else if rank == 2 {
-        for i in 0..input.shape[0] {
-            let dst_row = i + p[0];
-            let dst_start = dst_row * new_shape[1] + p[1];
-            let src_start = i * input.shape[1];
-            out[dst_start..dst_start + input.shape[1]]
-                .copy_from_slice(&input.data[src_start..src_start + input.shape[1]]);
+    // The output a row (of the last axis) at a time: the row of the input it
+    // comes from, or none (a constant row), then its two ends by mode.
+    let last = rank - 1;
+    let (n_in, n_out) = (input.shape[last], new_shape[last]);
+    let (left, right) = (p[last], p[last + rank]);
+    let in_strides = utils::compute_strides(&input.shape);
+    let mut coords = vec![0usize; last];
+    for dst in out[..total].chunks_exact_mut(n_out.max(1)) {
+        // Where the row lies in the input, axis by axis.
+        let mut src = Some(0);
+        for d in 0..last {
+            let (c, begin, n) = (coords[d], p[d], input.shape[d]);
+            let i = if c < begin {
+                match mode {
+                    PadMode::Constant => None,
+                    PadMode::Edge => Some(0),
+                    PadMode::Reflect => Some(begin - c),
+                }
+            } else if c >= begin + n {
+                match mode {
+                    PadMode::Constant => None,
+                    PadMode::Edge => Some(n - 1),
+                    PadMode::Reflect => Some(2 * (n - 1) - (c - begin)),
+                }
+            } else {
+                Some(c - begin)
+            };
+            src = src.zip(i).map(|(s, i)| s + i * in_strides[d]);
         }
-    } else if rank == 3 {
-        for i in 0..input.shape[0] {
-            for j in 0..input.shape[1] {
-                let dst_row = i + p[0];
-                let dst_col = j + p[1];
-                let dst_start = (dst_row * new_shape[1] + dst_col) * new_shape[2] + p[2];
-                let src_start = (i * input.shape[1] + j) * input.shape[2];
-                let copy_len = input.shape[2];
-                out[dst_start..dst_start + copy_len]
-                    .copy_from_slice(&input.data[src_start..src_start + copy_len]);
-            }
-        }
-    } else if rank == 4 {
-        for n in 0..input.shape[0] {
-            for c in 0..input.shape[1] {
-                for h in 0..input.shape[2] {
-                    let dst_n = n + p[0];
-                    let dst_c = c + p[1];
-                    let dst_h = h + p[2];
-                    let dst_start = (((dst_n * new_shape[1] + dst_c) * new_shape[2] + dst_h)
-                        * new_shape[3])
-                        + p[3];
-                    let src_start =
-                        ((n * input.shape[1] + c) * input.shape[2] + h) * input.shape[3];
-                    let copy_len = input.shape[3];
-                    out[dst_start..dst_start + copy_len]
-                        .copy_from_slice(&input.data[src_start..src_start + copy_len]);
+        match src {
+            None => dst.fill(fill_val),
+            Some(s) => {
+                let row = &input.data[s..][..n_in];
+                dst[left..left + n_in].copy_from_slice(row);
+                let (head, rest) = dst.split_at_mut(left);
+                let tail = &mut rest[n_in..];
+                match mode {
+                    PadMode::Constant => {
+                        head.fill(fill_val);
+                        tail.fill(fill_val);
+                    }
+                    PadMode::Edge => {
+                        head.fill(row[0]);
+                        tail.fill(row[n_in - 1]);
+                    }
+                    // Mirrored about the first and last elements, which are not
+                    // repeated: `[1, 2, 3, 4]` pads to `[.., 3, 2 | 1, 2, 3, 4 | 3, 2, ..]`.
+                    PadMode::Reflect => {
+                        for (k, x) in head.iter_mut().enumerate() {
+                            *x = row[left - k];
+                        }
+                        for (k, x) in tail[..right].iter_mut().enumerate() {
+                            *x = row[n_in - 2 - k];
+                        }
+                    }
                 }
             }
         }
-    } else {
-        panic!("Pad: Rank {} not fully implemented", rank);
-    }
-    // For edge mode, replicate edge values into padding regions
-    if mode == "edge" {
-        pad_edge_inplace(out, &input.shape, &new_shape, &p, rank);
-    } else if mode == "reflect" {
-        pad_reflect_inplace(out, &input.shape, &new_shape, &p, rank);
+        for d in (0..last).rev() {
+            coords[d] += 1;
+            if coords[d] < new_shape[d] {
+                break;
+            }
+            coords[d] = 0;
+        }
     }
     TensorView::from_slice(out, new_shape)
 }
 
-/// Fill padding regions with edge (nearest) values for "edge" mode.
-/// `out` already has the input data copied into the center region.
-fn pad_edge_inplace<T: Clone + Copy>(
-    out: &mut [T],
-    input_shape: &[usize],
-    new_shape: &[usize],
-    p: &[usize],
-    rank: usize,
-) {
-    // General n-dimensional edge padding via coordinate mapping
-    let total: usize = new_shape.iter().product();
-    let strides = utils::compute_strides(new_shape);
-
-    // For each output element, clamp coordinates to the input range
-    // to find the nearest edge value
-    let mut coords = vec![0usize; rank];
-    for idx in 0..total {
-        // Check if this position is in the center (already filled)
-        let mut in_center = true;
-        for d in 0..rank {
-            if coords[d] < p[d] || coords[d] >= p[d] + input_shape[d] {
-                in_center = false;
-                break;
-            }
-        }
-        if !in_center {
-            // Clamp coordinates to input region and read that value
-            let mut src_idx = 0;
-            for d in 0..rank {
-                let clamped = if coords[d] < p[d] {
-                    p[d]
-                } else if coords[d] >= p[d] + input_shape[d] {
-                    p[d] + input_shape[d] - 1
-                } else {
-                    coords[d]
-                };
-                src_idx += clamped * strides[d];
-            }
-            out[idx] = out[src_idx];
-        }
-        // Advance coordinates
-        for d in (0..rank).rev() {
-            coords[d] += 1;
-            if coords[d] < new_shape[d] {
-                break;
-            }
-            coords[d] = 0;
-        }
-    }
-}
-
-fn pad_reflect_inplace<T: Clone + Copy>(
-    out: &mut [T],
-    input_shape: &[usize],
-    new_shape: &[usize],
-    p: &[usize],
-    rank: usize,
-) {
-    // Reflection excludes the edge, so it reaches at most `dim - 1` elements in.
-    for d in 0..rank {
-        let end_pad = new_shape[d] - input_shape[d] - p[d];
-        assert!(
-            p[d].max(end_pad) < input_shape[d] || p[d].max(end_pad) == 0,
-            "Pad: reflect pads of {} and {end_pad} on an axis of {}",
-            p[d],
-            input_shape[d]
-        );
-    }
-    let total: usize = new_shape.iter().product();
-    let strides = utils::compute_strides(new_shape);
-    let mut coords = vec![0usize; rank];
-    for idx in 0..total {
-        let mut in_center = true;
-        for d in 0..rank {
-            if coords[d] < p[d] || coords[d] >= p[d] + input_shape[d] {
-                in_center = false;
-                break;
-            }
-        }
-        if !in_center {
-            let mut src_idx = 0;
-            for d in 0..rank {
-                let c = coords[d];
-                let pad_begin = p[d];
-                let pad_end = p[d] + input_shape[d];
-                // Mirrored about the first and last elements, which are not
-                // repeated: `[1, 2, 3, 4]` pads to `[.., 3, 2 | 1, 2, 3, 4 | 3, 2, ..]`.
-                let reflected = if c < pad_begin {
-                    pad_begin + (pad_begin - c)
-                } else if c >= pad_end {
-                    let past = c - pad_end;
-                    pad_end - 2 - past
-                } else {
-                    c
-                };
-                src_idx += reflected * strides[d];
-            }
-            out[idx] = out[src_idx];
-        }
-        for d in (0..rank).rev() {
-            coords[d] += 1;
-            if coords[d] < new_shape[d] {
-                break;
-            }
-            coords[d] = 0;
-        }
-    }
+#[derive(Clone, Copy, PartialEq)]
+enum PadMode {
+    Constant,
+    Edge,
+    Reflect,
 }
 
 pub fn gather<'b, 'a, T, I>(

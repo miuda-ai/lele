@@ -810,6 +810,64 @@ fn test_pad_reflect_1d_horizontal() {
     assert_close(&result.data, &expected, 1e-6, "pad_const_1d");
 }
 
+/// Every mode at ranks 1 to 4 against each output element mapped back to the
+/// input on its own (clamped, mirrored, or the constant), into a buffer that
+/// held a larger tensor, with pads on one axis or several and short pad lists.
+/// (Reflect pads stay shorter than their axes.)
+#[test]
+fn test_pad_matches_reference() {
+    let cases: &[(&[usize], &[i64])] = &[
+        (&[5], &[2, 3]),
+        (&[3, 4], &[1, 0, 2, 3]),
+        (&[3, 4], &[1, 2]),
+        (&[1, 3, 7], &[0, 0, 5, 0, 0, 6]),
+        (&[2, 3, 4], &[1, 2, 1, 1, 0, 2]),
+        (&[2, 2, 3, 4], &[0, 1, 2, 1, 1, 0, 1, 3]),
+    ];
+    for &(shape, pads) in cases {
+        let rank = shape.len();
+        let n: usize = shape.iter().product();
+        let data: Vec<f32> = (0..n).map(|i| i as f32 + 1.0).collect();
+        let x = TensorView::from_slice(&data, shape.to_vec());
+        // Pads for every axis, the leading ones 0 if the list is short.
+        let half = pads.len() / 2;
+        let mut p = vec![0usize; 2 * rank];
+        for i in 0..half {
+            p[rank - half + i] = pads[i] as usize;
+            p[2 * rank - half + i] = pads[half + i] as usize;
+        }
+        let out_shape: Vec<usize> = (0..rank).map(|d| shape[d] + p[d] + p[d + rank]).collect();
+        let strides: Vec<usize> = (0..rank).map(|d| shape[d + 1..].iter().product()).collect();
+        let cv = TensorView::from_slice(&[-7.0f32], vec![1]);
+        for mode in ["constant", "edge", "reflect"] {
+            let mut want = Vec::new();
+            for idx in 0..out_shape.iter().product::<usize>() {
+                let mut rest = idx;
+                let mut src = Some(0);
+                for d in (0..rank).rev() {
+                    let c = rest % out_shape[d];
+                    rest /= out_shape[d];
+                    let (c, b, len) = (c as i64, p[d] as i64, shape[d] as i64);
+                    let i = c - b;
+                    let i = match mode {
+                        _ if (0..len).contains(&i) => Some(i),
+                        "edge" => Some(i.clamp(0, len - 1)),
+                        "reflect" if i < 0 => Some(-i),
+                        "reflect" => Some(2 * (len - 1) - i),
+                        _ => None,
+                    };
+                    src = src.zip(i).map(|(s, i)| s + i as usize * strides[d]);
+                }
+                want.push(src.map_or(-7.0, |s| data[s]));
+            }
+            let mut out = vec![9.0f32; 1000];
+            let got = pad(&x, pads, Some(&cv), mode, &mut out);
+            assert_eq!(got.shape.as_ref(), out_shape.as_slice(), "{shape:?} {pads:?} {mode}");
+            assert_eq!(got.data.as_ref(), want.as_slice(), "{shape:?} {pads:?} {mode}");
+        }
+    }
+}
+
 #[test]
 fn test_pad_constant_mode() {
     let input = vec![1.0, 2.0, 3.0, 4.0];
@@ -2160,10 +2218,10 @@ fn ref_reduce(
 }
 
 #[test]
-fn test_reduce_mean_axis_combinations() {
-    // The trailing-axes cases take a contiguous-run fast path and the rest fall
-    // through to the general coordinate walk; both must agree with the
-    // reference, and the fast path must still report the right shape.
+fn test_reduce_axis_combinations() {
+    // Adjacent axes take a fast path and the rest fall through to the general
+    // coordinate walk; both must agree with the reference, and the fast path
+    // must still report the right shape.
     let shape = vec![2usize, 3, 4, 5];
     let data: Vec<f32> = (0..2 * 3 * 4 * 5)
         .map(|i| (i % 29) as f32 * 0.37 - 4.0)
@@ -2197,6 +2255,25 @@ fn test_reduce_mean_axis_combinations() {
                 1e-4,
                 &format!("reduce_mean axes {axes:?} keepdims={keepdims}"),
             );
+
+            let got = reduce_sum(&t, axes, keepdims, &mut buf);
+            let (want_shape, want) = ref_reduce(&shape, &data, axes, keepdims, false);
+            assert_eq!(got.shape.as_ref(), want_shape.as_slice());
+            assert_close(
+                &got.data,
+                &want,
+                1e-4,
+                &format!("reduce_sum axes {axes:?} keepdims={keepdims}"),
+            );
+
+            let ints: Vec<i64> = (0..data.len() as i64).map(|i| i % 29 - 7).collect();
+            let mut ibuf = Vec::new();
+            let got = reduce_sum(&TensorView::from_slice(&ints, shape.clone()), axes, keepdims, &mut ibuf);
+            let floats: Vec<f32> = ints.iter().map(|&x| x as f32).collect();
+            let (want_shape, want) = ref_reduce(&shape, &floats, axes, keepdims, false);
+            assert_eq!(got.shape.as_ref(), want_shape.as_slice());
+            let want: Vec<i64> = want.iter().map(|&x| x as i64).collect();
+            assert_eq!(&got.data[..], &want[..], "reduce_sum i64 axes {axes:?} keepdims={keepdims}");
         }
     }
 }

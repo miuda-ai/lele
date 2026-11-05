@@ -505,7 +505,7 @@ fn run_b(
 }
 
 /// At most this many columns of C are computed as dot products.
-const DOT_MAX_N: usize = 12;
+pub(crate) const DOT_MAX_N: usize = 12;
 
 /// B as the kernels take it: row-major, or its transpose row-major (so its columns are
 /// contiguous), each with the elements between rows.

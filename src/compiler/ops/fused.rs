@@ -34,6 +34,21 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             "{tab}let {} = lele::kernels::scale_norm(&{}, &{}, {scale:?}, {epsilon:?}, {buf});",
             outputs[0], inputs[0], inputs[1]
         )?,
+        Op::Snake => writeln!(
+            w,
+            "{tab}let {} = lele::kernels::snake(&{}, &{}, &{}, {buf});",
+            outputs[0], inputs[0], inputs[1], inputs[2]
+        )?,
+        Op::SimAm {
+            axes,
+            lambda,
+            scale,
+            shift,
+        } => writeln!(
+            w,
+            "{tab}let {} = lele::kernels::simam(&{}, &{}, {axes}, {lambda:?}, {scale:?}, {shift:?}, {buf});",
+            outputs[0], inputs[0], inputs[1]
+        )?,
         Op::Gelu { approximate } => {
             let kernel = match approximate.as_deref() {
                 None | Some("none") => "gelu_erf",
@@ -111,10 +126,17 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                     outputs[0], inputs[0], inputs[1], dilations, pads, strides,
                 )?;
             } else {
+                // Pads are [begin, end], or [begin, _, end, _] as computed above.
                 writeln!(
                     w,
-                    "{tab}let {} = self.conv1d_relu({}, {}, {bias}, {}, {}, {groups}, {}, {buf});",
-                    outputs[0], inputs[0], inputs[1], strides[0], dilations[0], pads[0] as usize,
+                    "{tab}let {} = lele::kernels::conv1d_fused(&{}, &{}, {bias}, &[{}], {groups}, &[{}, {}], &[{}], true, {buf});",
+                    outputs[0],
+                    inputs[0],
+                    inputs[1],
+                    dilations[0],
+                    pads[0],
+                    pads[pads.len() / 2],
+                    strides[0],
                 )?;
             }
         }
