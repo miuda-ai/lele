@@ -152,86 +152,40 @@ fn fold_graph(g: &mut Graph, inherited: &Consts) {
         let Some(inputs) = inputs else {
             continue;
         };
-        let Some(out) = node.output(0) else {
-            continue;
-        };
         let dtype = output_dtype(&node.op, &inputs);
+        let held_ints = |data: &[f32]| is_integer(dtype).then(|| ints_held_exactly(data)).flatten();
         let folded = match fold_int(&node.op, &inputs) {
             Some((ints, shape)) => {
-                Some((ints.iter().map(|&x| x as f32).collect(), Some(ints), shape))
+                Some(vec![(ints.iter().map(|&x| x as f32).collect(), Some(ints), shape)])
             }
-            None => fold_op(&node.op, &inputs).map(|(data, shape)| {
-                let ints = is_integer(dtype)
-                    .then(|| ints_held_exactly(&data))
-                    .flatten();
-                (data, ints, shape)
+            None => fold_outputs(&node.op, &inputs, node.outputs().len()).map(|outputs| {
+                outputs
+                    .into_iter()
+                    .map(|(data, shape)| {
+                        let ints = held_ints(&data);
+                        (data, ints, shape)
+                    })
+                    .collect()
             }),
         };
-        // Empty tensors are not written to the weights file.
-        let Some((data, ints, shape)) = folded.filter(|(d, _, _)| !d.is_empty()) else {
+        // Every output, none empty: empty tensors are not written to the
+        // weights file.
+        let outputs: Option<Vec<_>> = folded.and_then(|folded| {
+            let outputs = node.outputs();
+            (folded.len() == outputs.len() && folded.iter().all(|(d, _, _)| !d.is_empty()))
+                .then(|| outputs.iter().copied().zip(folded).collect())
+        });
+        let Some(outputs) = outputs.filter(|o: &Vec<_>| o.iter().all(|(v, _)| v.is_some())) else {
             continue;
         };
-
-        let name = g.value(out).name.clone();
-        let dims = shape.iter().map(|&s| s as i64).collect();
-        // A float16 result is stored as such where it holds float16 values
-        // (a transpose or slice of float16 weights); computed in f32, it is
-        // stored in f32, as the generated code would have held it.
-        let half = |x: &f32| half::f16::from_f32(*x);
-        let dtype = match dtype {
-            DType::F16 if !data.iter().all(|x| half(x).to_f32() == *x) => DType::F32,
-            dtype => dtype,
-        };
-        let exact = || {
-            ints.clone()
-                .unwrap_or_else(|| data.iter().map(|&x| x as i64).collect())
-        };
-        let tensor = if dtype == DType::I64 {
-            TensorProto {
-                name: name.clone(),
-                dims,
-                data_type: DType::I64.to_onnx(),
-                int64_data: exact(),
-                ..Default::default()
-            }
-        } else if dtype == DType::Bool && ints.is_some() {
-            TensorProto {
-                name: name.clone(),
-                dims,
-                data_type: DType::Bool.to_onnx(),
-                raw_data: exact().iter().map(|&x| (x != 0) as u8).collect(),
-                ..Default::default()
-            }
-        } else if dtype == DType::F16 {
-            TensorProto {
-                name: name.clone(),
-                dims,
-                data_type: DType::F16.to_onnx(),
-                raw_data: data
-                    .iter()
-                    .flat_map(|x| half(x).to_bits().to_le_bytes())
-                    .collect(),
-                ..Default::default()
-            }
-        } else {
-            // Every other type is stored as float.
-            TensorProto {
-                name: name.clone(),
-                dims,
-                data_type: DType::F32.to_onnx(),
-                float_data: data.clone(),
-                ..Default::default()
-            }
-        };
-        let c = Const {
-            data,
-            ints,
-            shape,
-            dtype,
-        };
-        consts.insert(name, c);
         g.remove_node(id);
-        g.add_initializer(out, tensor);
+        for (out, (data, ints, shape)) in outputs {
+            let out = out.unwrap();
+            let name = g.value(out).name.clone();
+            let (tensor, c) = stored(&name, dtype, data, ints, shape);
+            consts.insert(name, c);
+            g.add_initializer(out, tensor);
+        }
     }
 
     // 4. Subgraphs, which see everything known here.
@@ -240,6 +194,75 @@ fn fold_graph(g: &mut Graph, inherited: &Consts) {
             fold_graph(sub, &consts);
         }
     }
+}
+
+/// The initializer holding a folded result of `dtype`, and the constant it
+/// stands for.
+fn stored(
+    name: &str,
+    dtype: DType,
+    data: Vec<f32>,
+    ints: Option<Vec<i64>>,
+    shape: Vec<usize>,
+) -> (TensorProto, Const) {
+    let dims = shape.iter().map(|&s| s as i64).collect();
+    // A float16 result is stored as such where it holds float16 values
+    // (a transpose or slice of float16 weights); computed in f32, it is
+    // stored in f32, as the generated code would have held it.
+    let half = |x: &f32| half::f16::from_f32(*x);
+    let dtype = match dtype {
+        DType::F16 if !data.iter().all(|x| half(x).to_f32() == *x) => DType::F32,
+        dtype => dtype,
+    };
+    let exact = || {
+        ints.clone()
+            .unwrap_or_else(|| data.iter().map(|&x| x as i64).collect())
+    };
+    let name = name.to_string();
+    let tensor = if dtype == DType::I64 {
+        TensorProto {
+            name,
+            dims,
+            data_type: DType::I64.to_onnx(),
+            int64_data: exact(),
+            ..Default::default()
+        }
+    } else if dtype == DType::Bool && ints.is_some() {
+        TensorProto {
+            name,
+            dims,
+            data_type: DType::Bool.to_onnx(),
+            raw_data: exact().iter().map(|&x| (x != 0) as u8).collect(),
+            ..Default::default()
+        }
+    } else if dtype == DType::F16 {
+        TensorProto {
+            name,
+            dims,
+            data_type: DType::F16.to_onnx(),
+            raw_data: data
+                .iter()
+                .flat_map(|x| half(x).to_bits().to_le_bytes())
+                .collect(),
+            ..Default::default()
+        }
+    } else {
+        // Every other type is stored as float.
+        TensorProto {
+            name,
+            dims,
+            data_type: DType::F32.to_onnx(),
+            float_data: data.clone(),
+            ..Default::default()
+        }
+    };
+    let c = Const {
+        data,
+        ints,
+        shape,
+        dtype,
+    };
+    (tensor, c)
 }
 
 /// ONNX type of `op`'s output: that of the first input unless the operator
@@ -435,6 +458,61 @@ fn fold_int(op: &Op, inputs: &[&Const]) -> Option<(Vec<i64>, Vec<usize>)> {
             let values = (0..n as i64).map(|i| start + i * delta).collect();
             (values, vec![n])
         }
+        Op::Gather { axis } => {
+            let (x, indices) = (inputs.first()?, inputs.get(1)?);
+            gather(ints(0)?, &x.shape, ints(1)?, &indices.shape, *axis)?
+        }
+        Op::Reduce {
+            reduction,
+            axes,
+            keepdims,
+        } => {
+            let (x, values) = (inputs.first()?, ints(0)?);
+            let (f, init): (fn(i64, i64) -> Option<i64>, i64) = match reduction {
+                Reduction::Sum => (i64::checked_add, 0),
+                Reduction::Prod => (i64::checked_mul, 1),
+                Reduction::Max => (|a, b| Some(a.max(b)), i64::MIN),
+                Reduction::Mean | Reduction::L2 => return None,
+            };
+            let axes = match inputs.get(1) {
+                Some(_) => ints(1)?.to_vec(),
+                None => axes.clone().unwrap_or_default(),
+            };
+            let rank = x.shape.len() as i64;
+            // No axes reduce all, as the kernels do.
+            let mut reduced = vec![axes.is_empty(); x.shape.len()];
+            for a in axes {
+                let a = if a < 0 { a + rank } else { a };
+                *reduced.get_mut(usize::try_from(a).ok()?)? = true;
+            }
+            // Each input element's output index, from its coordinates along
+            // the kept axes.
+            let kept: Vec<usize> = (0..x.shape.len())
+                .map(|d| if reduced[d] { 1 } else { x.shape[d] })
+                .collect();
+            let mut out = vec![init; kept.iter().product()];
+            for (flat, &v) in values.iter().enumerate() {
+                let (mut rest, mut at, mut stride) = (flat, 0, 1);
+                for d in (0..x.shape.len()).rev() {
+                    let coord = rest % x.shape[d];
+                    rest /= x.shape[d];
+                    if !reduced[d] {
+                        at += coord * stride;
+                        stride *= kept[d];
+                    }
+                }
+                out[at] = f(out[at], v)?;
+            }
+            let shape = if *keepdims {
+                kept
+            } else {
+                (0..x.shape.len())
+                    .filter(|&d| !reduced[d])
+                    .map(|d| x.shape[d])
+                    .collect()
+            };
+            (out, shape)
+        }
         Op::Reshape => {
             let (x, target) = (inputs.first()?, ints(1)?);
             let values = x.ints.clone()?;
@@ -521,6 +599,35 @@ fn fold_int(op: &Op, inputs: &[&Const]) -> Option<(Vec<i64>, Vec<usize>)> {
     (values.len() <= largest.max(MAX_GROWN)).then_some((values, shape))
 }
 
+/// `Gather` of `data` of `shape` at `indices` of `index_shape` along `axis`,
+/// if the axis and every index are in range.
+fn gather<T: Copy>(
+    data: &[T],
+    shape: &[usize],
+    indices: &[i64],
+    index_shape: &[usize],
+    axis: i64,
+) -> Option<(Vec<T>, Vec<usize>)> {
+    let rank = shape.len() as i64;
+    let axis = usize::try_from(if axis < 0 { axis + rank } else { axis }).ok()?;
+    let n = *shape.get(axis)?;
+    let outer: usize = shape[..axis].iter().product();
+    let inner: usize = shape[axis + 1..].iter().product();
+    let rows: Vec<usize> = indices
+        .iter()
+        .map(|&i| usize::try_from(if i < 0 { i + n as i64 } else { i }).ok().filter(|&i| i < n))
+        .collect::<Option<_>>()?;
+    let mut out = Vec::with_capacity(outer * rows.len() * inner);
+    for o in 0..outer {
+        for &r in &rows {
+            let at = (o * n + r) * inner;
+            out.extend_from_slice(data.get(at..at + inner)?);
+        }
+    }
+    let out_shape = [&shape[..axis], index_shape, &shape[axis + 1..]].concat();
+    Some((out, out_shape))
+}
+
 /// `f` of the elements of `inputs` at each position of their broadcast
 /// shape, if their values are all known exactly, they broadcast, the result
 /// is not much larger than they are, and `f` gives a value everywhere.
@@ -580,6 +687,94 @@ fn elementwise(
         out.push(f(&args)?);
     }
     Some((out, shape))
+}
+
+/// Evaluates float `MatMul` or `Gemm` `op` on known `inputs` with the kernel
+/// the generated code would run, if their shapes fit and the product is not
+/// much larger than they are.
+fn fold_product(op: &Op, inputs: &[&Const]) -> Option<(Vec<f32>, Vec<usize>)> {
+    if !inputs.iter().all(|c| matches!(c.dtype, DType::F32 | DType::F16)) {
+        return None;
+    }
+    let (a, b) = (inputs.first()?, inputs.get(1)?);
+    let (ra, rb) = (a.shape.len(), b.shape.len());
+    let mut out = Vec::new();
+    let t = match op {
+        Op::MatMul => {
+            // Of matrices, `b` one matrix or a stack of `a`'s shape.
+            let fits = ra >= 2
+                && rb >= 2
+                && a.shape[ra - 1] == b.shape[rb - 2]
+                && (rb == 2 || a.shape[..ra - 2] == b.shape[..rb - 2]);
+            if !fits {
+                return None;
+            }
+            let len = a.data.len() / a.shape[ra - 1] * b.shape[rb - 1];
+            if len > a.data.len().max(b.data.len()).max(MAX_GROWN) {
+                return None;
+            }
+            crate::kernels::matmul(&view(a), &view(b), &mut out)
+        }
+        Op::Gemm {
+            alpha,
+            beta,
+            trans_a,
+            trans_b,
+        } => {
+            let ([m0, k0], [k1, n1]) = (a.shape[..].try_into().ok()?, b.shape[..].try_into().ok()?);
+            let (m, k) = if *trans_a { (k0, m0) } else { (m0, k0) };
+            let (kb, n) = if *trans_b { (n1, k1) } else { (k1, n1) };
+            let c = inputs.get(2);
+            // `c` broadcasts to the product's shape.
+            let c_fits = c.is_none_or(|c| {
+                c.shape.len() <= 2
+                    && c.shape.iter().rev().zip([n, m]).all(|(&d, want)| d == 1 || d == want)
+            });
+            if k != kb || !c_fits || m * n > a.data.len().max(b.data.len()).max(MAX_GROWN) {
+                return None;
+            }
+            let c = c.map(|c| view(c));
+            crate::kernels::gemm(&view(a), &view(b), c.as_ref(), *alpha, *beta, *trans_a, *trans_b, &mut out)
+        }
+        _ => return None,
+    };
+    Some((t.data.to_vec(), t.shape.to_vec()))
+}
+
+/// Evaluates `op` on known `inputs` into its `outputs` outputs: the data and
+/// shape of each, or `None` if the operator or this use of it is not
+/// supported.
+fn fold_outputs(
+    op: &Op,
+    inputs: &[&Const],
+    outputs: usize,
+) -> Option<Vec<(Vec<f32>, Vec<usize>)>> {
+    let Op::Split { axis, split } = op else {
+        return fold_op(op, inputs).map(|out| vec![out]);
+    };
+    let x = view(inputs.first()?);
+    // Without sizes, the kernel splits evenly.
+    let sizes = match inputs.get(1) {
+        Some(c) => c.ints.clone()?,
+        None => split.clone().unwrap_or_else(|| vec![0; outputs]),
+    };
+    let rank = x.shape.len() as i64;
+    let a = usize::try_from(if *axis < 0 { axis + rank } else { *axis }).ok()?;
+    let dim = *x.shape.get(a)? as i64;
+    let fits = match sizes.iter().all(|&s| s == 0) {
+        true => outputs > 0 && dim % outputs as i64 == 0,
+        false => sizes.len() == outputs && sizes.iter().all(|&s| s > 0) && sizes.iter().sum::<i64>() == dim,
+    };
+    if !fits {
+        return None;
+    }
+    (0..outputs)
+        .map(|i| {
+            let mut out = Vec::new();
+            let part = crate::kernels::split_one(&x, *axis, &sizes, i, &mut out);
+            Some((part.data.to_vec(), part.shape.to_vec()))
+        })
+        .collect()
 }
 
 /// Evaluates `op` on known `inputs`. Returns the data and shape of its first
@@ -684,26 +879,57 @@ fn fold_op(op: &Op, inputs: &[&Const]) -> Option<(Vec<f32>, Vec<usize>)> {
             }
             Some((x.data.clone(), new_shape))
         }
-        Op::Concat { axis: axis_attr } => {
+        Op::Concat { axis } => {
             let first = inputs.first()?;
-            let axis = |shape: &[usize]| {
-                if *axis_attr < 0 {
-                    (shape.len() as i64 + axis_attr) as usize
-                } else {
-                    *axis_attr as usize
-                }
-            };
-            let mut target_shape = first.shape.clone();
-            let axis0 = axis(&target_shape);
-            target_shape[axis0] = inputs.iter().map(|c| c.shape[axis(&c.shape)]).sum();
-            // Only appends: 1-D, or 2-D along rows.
-            if target_shape.len() == 1 || (target_shape.len() == 2 && axis0 == 0) {
-                let merged = inputs.iter().flat_map(|c| c.data.iter().copied()).collect();
-                Some((merged, target_shape))
-            } else {
-                None
+            let rank = first.shape.len() as i64;
+            let a = usize::try_from(if *axis < 0 { axis + rank } else { *axis }).ok()?;
+            // Of one rank, and of one size along every other axis.
+            let fits = a < first.shape.len()
+                && inputs.iter().all(|c| {
+                    c.shape.len() == first.shape.len()
+                        && (0..c.shape.len()).all(|d| d == a || c.shape[d] == first.shape[d])
+                });
+            if !fits {
+                return None;
             }
+            let views: Vec<TensorView> = inputs.iter().map(|c| view(c)).collect();
+            let mut out = Vec::new();
+            let t = crate::kernels::concat(&views.iter().collect::<Vec<_>>(), *axis, &mut out);
+            Some((t.data.to_vec(), t.shape.to_vec()))
         }
+        Op::Tile => {
+            let (x, repeats) = (inputs.first()?, inputs.get(1)?.ints.as_deref()?);
+            if repeats.len() != x.shape.len() || repeats.iter().any(|&r| r < 0) {
+                return None;
+            }
+            let len = x.data.len() * repeats.iter().product::<i64>() as usize;
+            if len > x.data.len().max(MAX_GROWN) {
+                return None;
+            }
+            let mut out = Vec::new();
+            let t = crate::kernels::tile(&view(x), repeats, &mut out);
+            Some((t.data.to_vec(), t.shape.to_vec()))
+        }
+        Op::Expand => {
+            let (x, target) = (inputs.first()?, inputs.get(1)?.ints.as_deref()?);
+            // The shapes broadcast both ways.
+            let rank = x.shape.len().max(target.len());
+            let pad = |s: &[usize]| [vec![1; rank - s.len()], s.to_vec()].concat();
+            let target: Vec<usize> = target.iter().map(|&d| usize::try_from(d).ok()).collect::<Option<_>>()?;
+            let shape = pad(&x.shape)
+                .into_iter()
+                .zip(pad(&target))
+                .map(|(a, b)| (a == b || a == 1 || b == 1).then_some(a.max(b)))
+                .collect::<Option<Vec<_>>>()?;
+            if shape.iter().product::<usize>() > x.data.len().max(MAX_GROWN) {
+                return None;
+            }
+            let mut out = Vec::new();
+            let shape: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
+            let t = crate::kernels::expand(&view(x), &shape, &mut out);
+            Some((t.data.to_vec(), t.shape.to_vec()))
+        }
+        Op::MatMul | Op::Gemm { .. } => fold_product(op, inputs),
         Op::Slice => {
             // Supports 1-D and 2-D data, unit steps.
             let (x, starts, ends) = (inputs.first()?, inputs.get(1)?, inputs.get(2)?);
@@ -763,6 +989,12 @@ fn fold_op(op: &Op, inputs: &[&Const]) -> Option<(Vec<f32>, Vec<usize>)> {
         Op::Cast { .. } => {
             let x = inputs.first()?;
             Some((x.data.clone(), x.shape.clone()))
+        }
+        // Integer tables are gathered exactly by `fold_int`.
+        Op::Gather { axis } => {
+            let (x, indices) = (inputs.first()?, inputs.get(1)?);
+            let (data, shape) = gather(&x.data, &x.shape, indices.ints.as_deref()?, &indices.shape, *axis)?;
+            (data.len() <= x.data.len().max(MAX_GROWN)).then_some((data, shape))
         }
         Op::Transpose { perm } => {
             let x = inputs.first()?;
@@ -1044,6 +1276,157 @@ mod tests {
             int64_data: v.to_vec(),
             ..Default::default()
         }
+    }
+
+    /// Integer reductions fold exactly, over all axes where none are given,
+    /// as torch's unbiased variance takes `n - 1` of a dimension; a product
+    /// that overflows stays.
+    #[test]
+    fn folds_integer_reductions() {
+        let reduce = |op: &str, input: &[&str], out: &str, axes: &[i64], keepdims: i64| {
+            let mut n = node(op, input, out);
+            n.attribute.push(AttributeProto {
+                name: "keepdims".to_string(),
+                i: keepdims,
+                r#type: 2, // INT
+                ..Default::default()
+            });
+            if !axes.is_empty() {
+                n.attribute.push(AttributeProto {
+                    name: "axes".to_string(),
+                    ints: axes.to_vec(),
+                    r#type: 7, // INTS
+                    ..Default::default()
+                });
+            }
+            n
+        };
+        let mut cast = node("Cast", &["n"], "nf");
+        cast.attribute.push(AttributeProto {
+            name: "to".to_string(),
+            i: DType::F32.to_onnx() as i64,
+            r#type: 2, // INT
+            ..Default::default()
+        });
+        let g = fold(GraphProto {
+            node: vec![
+                reduce("ReduceProd", &["dims"], "n", &[], 0),
+                cast,
+                node("Sub", &["nf", "one"], "y"),
+                reduce("ReduceSum", &["m"], "rows", &[1], 1),
+                reduce("ReduceMax", &["m", "last"], "max", &[], 0),
+                reduce("ReduceProd", &["huge"], "overflow", &[], 0),
+            ],
+            initializer: vec![
+                ints("dims", &[1], &[576]),
+                floats("one", &[], &[1.0]),
+                ints("m", &[2, 3], &[1, 5, 2, -4, -9, 3]),
+                ints("last", &[1], &[-1]),
+                ints("huge", &[2], &[1 << 40, 1 << 40]),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(
+            g.node.iter().map(|n| n.op_type.as_str()).collect::<Vec<_>>(),
+            ["ReduceProd"]
+        );
+        let get = |name: &str| g.initializer.iter().find(|t| t.name == name).unwrap();
+        assert_eq!((&get("y").dims, &get("y").float_data), (&vec![], &vec![575.0]));
+        assert_eq!((&get("rows").dims, &get("rows").int64_data), (&vec![2, 1], &vec![8, -10]));
+        assert_eq!((&get("max").dims, &get("max").int64_data), (&vec![2], &vec![5, 3]));
+    }
+
+    /// Gathers from constant tables at constant indices fold, float ones (as
+    /// SenseVoice's embedding of its fixed prompt) and integer ones exactly;
+    /// an index out of range stays.
+    #[test]
+    fn folds_gathers_of_constants() {
+        let mut columns = node("Gather", &["m", "last"], "c");
+        columns.attribute.push(AttributeProto {
+            name: "axis".to_string(),
+            i: 1,
+            r#type: 2, // INT
+            ..Default::default()
+        });
+        let big = (1 << 40) + 1;
+        let g = fold(GraphProto {
+            node: vec![
+                node("Gather", &["table", "ids"], "e"),
+                columns,
+                node("Gather", &["table", "far"], "out_of_range"),
+            ],
+            initializer: vec![
+                floats("table", &[3, 2], &[0.5, 1.5, 2.5, 3.5, 4.5, 5.5]),
+                ints("ids", &[1, 2], &[2, -3]),
+                ints("m", &[2, 2], &[1, big, 3, 4]),
+                ints("last", &[], &[-1]),
+                ints("far", &[1], &[3]),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(
+            g.node.iter().map(|n| n.op_type.as_str()).collect::<Vec<_>>(),
+            ["Gather"]
+        );
+        let get = |name: &str| g.initializer.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(*get("e"), floats("e", &[1, 2, 2], &[4.5, 5.5, 0.5, 1.5]));
+        assert_eq!(*get("c"), ints("c", &[2], &[big, 4]));
+    }
+
+    /// Supertonic 3's style tokens: expanded to the shape they have, a
+    /// product of constants, split in two
+    /// along the last axis (every output folds) and joined back along the
+    /// first; a `Gemm` and a `Tile` of constants fold too.
+    #[test]
+    fn folds_products_splits_concats_and_tiles() {
+        let attrs = |n: &mut NodeProto, ints: &[(&str, i64)]| {
+            for &(name, i) in ints {
+                n.attribute.push(AttributeProto {
+                    name: name.to_string(),
+                    i,
+                    r#type: 2, // INT
+                    ..Default::default()
+                });
+            }
+        };
+        let mut split = node("Split", &["p"], "p0");
+        split.output.push("p1".to_string());
+        attrs(&mut split, &[("axis", -1)]);
+        let mut concat = node("Concat", &["p0", "p1"], "j");
+        attrs(&mut concat, &[("axis", 0)]);
+        let mut gemm = node("Gemm", &["w", "a2", "bias"], "gm");
+        attrs(&mut gemm, &[("transA", 1)]);
+        let g = fold(GraphProto {
+            node: vec![
+                node("Expand", &["a0", "ones"], "a"),
+                node("MatMul", &["a", "w"], "p"),
+                split,
+                concat,
+                gemm,
+                node("Tile", &["w", "reps"], "t"),
+            ],
+            initializer: vec![
+                // Expanded to its own shape, as the style tokens are.
+                floats("a0", &[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                ints("ones", &[3], &[1, 1, 1]),
+                floats("w", &[3, 2], &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0]),
+                floats("a2", &[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                floats("bias", &[2], &[0.5, -0.5]),
+                ints("reps", &[2], &[1, 2]),
+            ],
+            ..Default::default()
+        });
+        assert!(g.node.is_empty(), "{:?}", g.node);
+        let get = |name: &str| g.initializer.iter().find(|t| t.name == name).unwrap();
+        // [[1, 2, 3], [4, 5, 6]] x w = [[4, 5], [10, 11]].
+        assert_eq!(*get("p0"), floats("p0", &[1, 2, 1], &[4.0, 10.0]));
+        assert_eq!(*get("j"), floats("j", &[2, 2, 1], &[4.0, 10.0, 5.0, 11.0]));
+        // w^T a2 + bias.
+        assert_eq!(*get("gm"), floats("gm", &[2, 2], &[6.5, 7.5, 8.5, 9.5]));
+        assert_eq!(
+            *get("t"),
+            floats("t", &[3, 4], &[1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+        );
     }
 
     /// Integer arithmetic on constants is folded exactly: integer division

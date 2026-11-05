@@ -9,8 +9,9 @@ use crate::compiler::ir::{Binary, Dim, Graph, NodeId, Op, TargetDim, ValueId};
 
 /// Removes the nodes of `g` and its subgraphs whose output is their input:
 /// `Identity`, `Dropout` without its mask, a `Cast` to the type the input
-/// has, a product or quotient by ones and a sum or difference with zeros
-/// that do not broadcast, a `Pad` by zeros, a `Slice` of everything, an
+/// has, a product or quotient by ones, a sum or difference with zeros, a
+/// conjunction with trues and a disjunction with falses that do not
+/// broadcast, a `Pad` by zeros, a `Tile` by ones, a `Slice` of everything, an
 /// `Expand` to the shape the input has and a `Concat` of one input, once
 /// those of its inputs that are empty along its axis are dropped. Merges
 /// each transpose of a transpose into one, and makes a transpose that only
@@ -19,7 +20,8 @@ use crate::compiler::ir::{Binary, Dim, Graph, NodeId, Op, TargetDim, ValueId};
 /// Exporters leave such nodes: a residual branch scaled by a weight of 1
 /// (SenseVoice), casts of integers to their type (MOSS-TTS-Nano, whose
 /// rotary embeddings then differ by name in each layer), attention heads
-/// moved past the one position a decoding step takes (Moonshine).
+/// moved past the one position a decoding step takes (Moonshine), masks
+/// combined with masks of all trues (T-one), tiles by ones (Supertonic 3).
 pub(crate) fn simplify(g: &mut Graph) {
     for id in g.node_ids() {
         for sub in g.node_mut(id).op.subgraphs_mut() {
@@ -115,15 +117,17 @@ fn same_as_input(g: &Graph, id: NodeId) -> Option<ValueId> {
             (!training && !mask).then_some(x)
         }
         Op::Cast { to } => (g.value(x).dtype == *to).then_some(x),
-        Op::Binary(op @ (Binary::Add | Binary::Sub | Binary::Mul | Binary::Div)) => {
-            let neutral = if matches!(op, Binary::Add | Binary::Sub) {
+        Op::Binary(
+            op @ (Binary::Add | Binary::Sub | Binary::Mul | Binary::Div | Binary::And | Binary::Or),
+        ) => {
+            let neutral = if matches!(op, Binary::Add | Binary::Sub | Binary::Or) {
                 0.0
             } else {
                 1.0
             };
-            // Either operand of a sum or product, the second of a
-            // difference or quotient.
-            let commutes = matches!(op, Binary::Add | Binary::Mul);
+            // Either operand of a sum, product, conjunction or disjunction,
+            // the second of a difference or quotient.
+            let commutes = !matches!(op, Binary::Sub | Binary::Div);
             let (a, b) = (node.input(0)?, node.input(1)?);
             let candidates = if commutes {
                 vec![(a, b), (b, a)]
@@ -147,6 +151,7 @@ fn same_as_input(g: &Graph, id: NodeId) -> Option<ValueId> {
             })
         }
         Op::Pad { .. } => ints(1)?.iter().all(|&p| p == 0).then_some(x),
+        Op::Tile => ints(1)?.iter().all(|&r| r == 1).then_some(x),
         Op::Slice => {
             let rank = shape(x)?.len() as i64;
             let (starts, ends) = (ints(1)?, ints(2)?);
@@ -457,6 +462,49 @@ mod tests {
                 "Sub(zero, a) -> b",
                 "Add(b, half) -> c",
                 "Slice(c, start, end) -> y"
+            ]
+        );
+    }
+
+    /// A mask combined with all trues, or with all falses, and a tile by
+    /// ones go; a mask that broadcasts and a tile that repeats stay.
+    #[test]
+    fn masks_of_units_and_tiles_by_ones_go() {
+        let bools = |name: &str, dims: &[i64], v: bool| TensorProto {
+            name: name.to_string(),
+            data_type: DType::Bool.to_onnx(),
+            dims: dims.to_vec(),
+            raw_data: vec![v as u8; dims.iter().product::<i64>() as usize],
+            ..Default::default()
+        };
+        let nodes = |reps: &str, trues: &str| {
+            vec![
+                node("Tile", &["x", reps], "t"),
+                node("Greater", &["t", "zero"], "m"),
+                node("And", &[trues, "m"], "a"),
+                node("Or", &["a", "falses"], "o"),
+                node("Where", &["o", "t", "zero"], "y"),
+            ]
+        };
+        let initializer = vec![
+            floats("zero", &[], &[0.0]),
+            ints("ones", &[1, 1]),
+            ints("twice", &[1, 2]),
+            bools("trues", &[2, 4], true),
+            bools("wider", &[3, 1, 1], true),
+            bools("falses", &[1], false),
+        ];
+        assert_eq!(
+            simplified(nodes("ones", "trues"), initializer.clone(), &[2, 4]),
+            ["Greater(x, zero) -> m", "Where(m, x, zero) -> y"]
+        );
+        assert_eq!(
+            simplified(nodes("twice", "wider"), initializer, &[2, 4]),
+            [
+                "Tile(x, twice) -> t",
+                "Greater(t, zero) -> m",
+                "And(wider, m) -> a",
+                "Where(a, t, zero) -> y"
             ]
         );
     }
