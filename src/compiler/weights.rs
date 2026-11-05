@@ -159,10 +159,6 @@ impl Weights {
     /// node's constant followed by its subgraphs' weights, in attribute
     /// order. Each weight
     /// starts 16-byte aligned; identical contents are stored once.
-    pub(crate) fn collect(g: &Graph) -> Self {
-        Self::collect_shared(g, None)
-    }
-
     /// Lays out `g` on top of a blob compiled earlier: the shared bytes stay
     /// where they are and identical tensors keep their offsets, so several
     /// models can be loaded from one file.
