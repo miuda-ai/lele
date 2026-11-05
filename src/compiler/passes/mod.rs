@@ -7,6 +7,7 @@ mod fold;
 mod fuse;
 mod qdq;
 mod shapes;
+mod simplify;
 mod types;
 
 pub(crate) use branches::inline_constant_ifs;
@@ -19,4 +20,5 @@ pub(crate) use qdq::{
     fuse_weight_only_matmul,
 };
 pub(crate) use shapes::fold_shapes;
+pub(crate) use simplify::simplify;
 pub(crate) use types::{follows_input, infer_dtypes};

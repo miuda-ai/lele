@@ -5,6 +5,7 @@
 //! back. Every intermediate tensor must be read by the chain alone, so
 //! removing the chain cannot leave another reader without its input.
 
+use super::fold::{exact_ints, f16_values};
 use crate::compiler::ir::{
     Activation, Binary, DType, Dim, Graph, NodeId, Op, Reduction, Unary, ValueId,
 };
@@ -13,6 +14,9 @@ use crate::model::tensor_to_array;
 
 /// Runs every fusion on `g` and its subgraphs.
 pub(crate) fn fuse(g: &mut Graph) {
+    fuse_pad_conv(g);
+    fuse_conv_batch_norm(g);
+    fuse_conv_scale(g);
     fuse_layer_norm(g);
     fuse_scale_norm(g);
     fuse_simam(g);
@@ -60,7 +64,7 @@ fn sole_producer(g: &Graph, v: Option<ValueId>, is_match: impl Fn(&Op) -> bool) 
 }
 
 /// A compile-time constant: an initializer or a `Constant`.
-fn constant_tensor(g: &Graph, v: Option<ValueId>) -> Option<&TensorProto> {
+pub(super) fn constant_tensor(g: &Graph, v: Option<ValueId>) -> Option<&TensorProto> {
     let v = v?;
     match g.data(v) {
         Some(t) => Some(t),
@@ -73,16 +77,10 @@ fn constant_tensor(g: &Graph, v: Option<ValueId>) -> Option<&TensorProto> {
 
 /// The values of a compile-time constant, float16 ones (which
 /// `tensor_to_array` does not read) included.
-fn constant(g: &Graph, v: Option<ValueId>) -> Option<Vec<f32>> {
+pub(super) fn constant(g: &Graph, v: Option<ValueId>) -> Option<Vec<f32>> {
     let t = constant_tensor(g, v)?;
     if DType::from_onnx(t.data_type) == DType::F16 {
-        // The bits, raw or one per element of `int32_data`.
-        let bits: Vec<u16> = if t.raw_data.is_empty() {
-            t.int32_data.iter().map(|&x| x as u16).collect()
-        } else {
-            t.raw_data.as_chunks::<2>().0.iter().map(|&b| u16::from_le_bytes(b)).collect()
-        };
-        return Some(bits.into_iter().map(|b| half::f16::from_bits(b).to_f32()).collect());
+        return Some(f16_values(t));
     }
     tensor_to_array(t).ok().map(|(data, _)| data)
 }
@@ -153,6 +151,220 @@ fn kept_trailing_axes(g: &Graph, id: NodeId, x: ValueId) -> Option<usize> {
     axes.sort();
     let k = axes.len() as i64;
     (k > 0 && axes.iter().zip(-k..).all(|(&a, b)| a == b)).then_some(k as usize)
+}
+
+/// The `Conv` nodes.
+fn conv_nodes(g: &Graph) -> Vec<NodeId> {
+    g.nodes()
+        .filter(|(_, n)| matches!(n.op, Op::Conv(_)))
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// `Conv(Pad(x))`, the pad adding zeros along the spatial axes alone →
+/// the `Conv`, padding as much more, so that the padded input is not
+/// copied.
+fn fuse_pad_conv(g: &mut Graph) {
+    for conv in conv_nodes(g) {
+        let is_constant_pad = |op: &Op| matches!(op, Op::Pad { mode } if mode.as_deref().is_none_or(|m| m == "constant"));
+        let Some(pad) = sole_producer(g, g.node(conv).input(0), is_constant_pad) else {
+            continue;
+        };
+        let p = g.node(pad);
+        let zero_fill = p.input(2).is_none()
+            || constant(g, p.input(2)).is_some_and(|v| v.iter().all(|&x| x == 0.0));
+        // Pads of every axis, all begins then all ends.
+        let Some(pads) = constant_tensor(g, p.input(1)).and_then(exact_ints) else {
+            continue;
+        };
+        let Op::Conv(attrs) = &g.node(conv).op else {
+            unreachable!()
+        };
+        let rank = pads.len() / 2;
+        let spatial = rank.saturating_sub(2);
+        let conv_pads = attrs.pads.clone().unwrap_or_else(|| vec![0; 2 * spatial]);
+        let auto_pad = attrs.auto_pad.as_deref().unwrap_or("NOTSET");
+        let fits = p.input(3).is_none()
+            && zero_fill
+            && spatial > 0
+            && conv_pads.len() == 2 * spatial
+            && matches!(auto_pad, "NOTSET" | "VALID" | "")
+            && pads.iter().all(|&p| p >= 0)
+            && [0, 1, rank, rank + 1].iter().all(|&i| pads[i] == 0);
+        if !fits {
+            continue;
+        }
+        let mut merged = attrs.clone();
+        merged.auto_pad = None;
+        merged.pads = Some(
+            (0..2 * spatial)
+                .map(|i| conv_pads[i] + pads[(i / spatial) * rank + 2 + i % spatial])
+                .collect(),
+        );
+        let mut inputs = g.node(conv).inputs().to_vec();
+        inputs[0] = p.input(0);
+        let proto = g.node(conv).proto.clone();
+        g.fuse(&[pad, conv], Op::Conv(merged), proto, inputs);
+    }
+}
+
+/// The weights of a `Conv`, a float initializer, and its bias, an optional
+/// float constant.
+struct ConvParameters {
+    weights: Vec<f32>,
+    dims: Vec<i64>,
+    bias: Option<Vec<f32>>,
+}
+
+fn conv_parameters(g: &Graph, conv: NodeId) -> Option<ConvParameters> {
+    let node = g.node(conv);
+    let float = |t: DType| matches!(t, DType::F32 | DType::F16);
+    let w = g.data(node.input(1)?)?;
+    if !float(DType::from_onnx(w.data_type)) || w.dims.len() < 3 {
+        return None;
+    }
+    let bias = match node.input(2) {
+        Some(b) if !float(g.value(b).dtype) => return None,
+        Some(b) => Some(constant(g, Some(b))?),
+        None => None,
+    };
+    Some(ConvParameters {
+        weights: constant(g, node.input(1))?,
+        dims: w.dims.clone(),
+        bias,
+    })
+}
+
+/// Replaces `nodes`, a `Conv` and the nodes after it, by the `Conv` with
+/// weights and bias scaled by `scale` and then shifted by `shift`, one of
+/// each per output channel. They are computed and kept in f32, float16
+/// weights included, which rounding to float16 would change further.
+fn rescale_conv(
+    g: &mut Graph,
+    conv: NodeId,
+    nodes: &[NodeId],
+    scale: &[f32],
+    shift: Option<&[f32]>,
+) {
+    let ConvParameters {
+        weights: w,
+        dims,
+        bias,
+    } = conv_parameters(g, conv).unwrap();
+    let per_channel = w.len() / scale.len();
+    let w: Vec<f32> = w
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| x * scale[i / per_channel])
+        .collect();
+    let bias: Vec<f32> = (0..scale.len())
+        .map(|c| bias.as_ref().map_or(0.0, |b| b[c]) * scale[c] + shift.map_or(0.0, |s| s[c]))
+        .collect();
+    let tensor = |dims: Vec<i64>, data: Vec<f32>| TensorProto {
+        dims,
+        data_type: DType::F32.to_onnx(),
+        float_data: data,
+        ..Default::default()
+    };
+    let node = g.node(conv);
+    let name = g.value(node.input(1).unwrap()).name.clone();
+    let x = node.input(0);
+    let Op::Conv(attrs) = node.op.clone() else {
+        unreachable!()
+    };
+    let proto = node.proto.clone();
+    let w = g.new_initializer(&format!("{name}_rescaled"), tensor(dims, w));
+    let b = g.new_initializer(
+        &format!("{name}_rescaled_bias"),
+        tensor(vec![scale.len() as i64], bias),
+    );
+    g.fuse(nodes, Op::Conv(attrs), proto, vec![x, Some(w), Some(b)]);
+}
+
+/// `BatchNormalization(Conv(x))`, with constant weights → the `Conv`, its
+/// weights and bias scaled and shifted as the normalization would.
+fn fuse_conv_batch_norm(g: &mut Graph) {
+    let norms: Vec<(NodeId, f32)> = g
+        .nodes()
+        .filter_map(|(id, n)| match n.op {
+            Op::BatchNormalization { epsilon } => Some((id, epsilon)),
+            _ => None,
+        })
+        .collect();
+    for (norm, epsilon) in norms {
+        let node = g.node(norm);
+        // Only the normalized output: the running statistics of training
+        // mode are not read.
+        if node
+            .outputs()
+            .iter()
+            .skip(1)
+            .flatten()
+            .any(|&v| g.uses(v) > 0)
+        {
+            continue;
+        }
+        let Some(conv) = sole_producer(g, node.input(0), |op| matches!(op, Op::Conv(_))) else {
+            continue;
+        };
+        let Some(conv_params) = conv_parameters(g, conv) else {
+            continue;
+        };
+        let channels = conv_params.dims[0] as usize;
+        let Some(params) = (1..5)
+            .map(|i| constant(g, node.input(i)).filter(|p| p.len() == channels))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let [gamma, beta, mean, var] = &params[..] else {
+            unreachable!()
+        };
+        let scale: Vec<f32> = (0..channels)
+            .map(|c| gamma[c] / (var[c] + epsilon).sqrt())
+            .collect();
+        let shift: Vec<f32> = (0..channels)
+            .map(|c| beta[c] - mean[c] * scale[c])
+            .collect();
+        rescale_conv(g, conv, &[conv, norm], &scale, Some(&shift));
+    }
+}
+
+/// `Conv(x) * k`, with constant weights and `k` a constant of one value per
+/// output channel or one for all → the `Conv`, its weights and bias scaled.
+fn fuse_conv_scale(g: &mut Graph) {
+    for mul in binary_nodes(g, Binary::Mul) {
+        if !g.contains(mul) {
+            continue;
+        }
+        let fused = (0..2).find_map(|k| {
+            let conv_out = g.node(mul).input(k)?;
+            let factor = g.node(mul).input(1 - k)?;
+            let conv = sole_producer(g, Some(conv_out), |op| matches!(op, Op::Conv(_)))?;
+            let w_dims = conv_parameters(g, conv)?.dims;
+            let k_dims = &constant_tensor(g, Some(factor))?.dims;
+            let values = constant(g, Some(factor))?;
+            // One value, or one per channel along the channel axis of the
+            // `[N, C, spatial...]` output, broadcasting to no other shape.
+            let channels = w_dims[0] as usize;
+            let rank = w_dims.len();
+            let channel_axis = (k_dims.len() + 1).checked_sub(rank);
+            let per_channel = values.len() == channels
+                && channel_axis.is_some_and(|a| k_dims[a] as usize == channels);
+            let fits = k_dims.len() <= rank && (values.len() == 1 || per_channel);
+            fits.then(|| {
+                (
+                    conv,
+                    (0..channels)
+                        .map(|c| values[c % values.len()])
+                        .collect::<Vec<f32>>(),
+                )
+            })
+        });
+        if let Some((conv, scale)) = fused {
+            rescale_conv(g, conv, &[conv, mul], &scale, None);
+        }
+    }
 }
 
 /// `x - mean(x)`, normalized by `sqrt(mean((x - mean(x))^2) + eps)`, then
@@ -748,6 +960,152 @@ mod tests {
         let mut constants = gelu_constants();
         constants[2] = scalar("half", 0.25);
         assert!(!fused(nodes, constants).contains(&"Gelu".to_string()));
+    }
+
+    fn floats(name: &str, dims: &[i64], values: &[f32]) -> TensorProto {
+        TensorProto {
+            name: name.to_string(),
+            data_type: DType::F32.to_onnx(),
+            dims: dims.to_vec(),
+            float_data: values.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn ints(name: &str, values: &[i64]) -> TensorProto {
+        TensorProto {
+            name: name.to_string(),
+            data_type: DType::I64.to_onnx(),
+            dims: vec![values.len() as i64],
+            int64_data: values.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn attr(name: &str, ints: &[i64]) -> crate::model::onnx_proto::AttributeProto {
+        crate::model::onnx_proto::AttributeProto {
+            name: name.to_string(),
+            ints: ints.to_vec(),
+            r#type: 7, // INTS
+            ..Default::default()
+        }
+    }
+
+    /// `nodes` fused, with the graph output their last output.
+    fn fused_graph(nodes: Vec<NodeProto>, initializer: Vec<TensorProto>) -> Graph {
+        let last = nodes.last().unwrap().output[0].clone();
+        let mut g = Graph::from_onnx(GraphProto {
+            node: nodes,
+            initializer,
+            input: vec![ValueInfoProto {
+                name: "x".to_string(),
+                ..Default::default()
+            }],
+            output: vec![ValueInfoProto {
+                name: last,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        crate::compiler::passes::infer_dtypes(&mut g);
+        fuse(&mut g);
+        g
+    }
+
+    #[test]
+    fn folds_batch_norm_and_scales_into_conv_weights() {
+        let mut norm = node(
+            "BatchNormalization",
+            &["c", "gamma", "beta", "mean", "var"],
+            "n",
+        );
+        norm.attribute
+            .push(crate::model::onnx_proto::AttributeProto {
+                name: "epsilon".to_string(),
+                f: 1.0,
+                r#type: 1, // FLOAT
+                ..Default::default()
+            });
+        let nodes = vec![
+            node("Conv", &["x", "w", "b"], "c"),
+            norm,
+            node("Mul", &["k", "n"], "y"),
+        ];
+        let initializer = vec![
+            floats("w", &[2, 1, 1], &[1.0, 2.0]),
+            floats("b", &[2], &[0.5, -1.0]),
+            floats("gamma", &[2], &[2.0, 3.0]),
+            floats("beta", &[2], &[0.0, 1.0]),
+            floats("mean", &[2], &[1.0, 0.0]),
+            floats("var", &[2], &[3.0, 0.0]),
+            floats("k", &[2, 1], &[2.0, 0.5]),
+        ];
+        let g = fused_graph(nodes, initializer);
+        let ops: Vec<_> = g.nodes().map(|(_, n)| n.op.op_type()).collect();
+        assert_eq!(ops, ["Conv"]);
+        let (_, conv) = g.nodes().next().unwrap();
+        // Scaled by 2/sqrt(4) and 3/sqrt(1), shifted, then scaled by k.
+        assert_eq!(constant(&g, conv.input(1)), Some(vec![2.0, 3.0]));
+        assert_eq!(constant(&g, conv.input(2)), Some(vec![-1.0, -1.0]));
+    }
+
+    #[test]
+    fn keeps_scales_that_broadcast_the_conv_output() {
+        for (k_dims, k) in [
+            // Along the last axis.
+            (vec![2], vec![2.0, 0.5]),
+            // To a higher rank.
+            (vec![1, 1, 1, 1], vec![2.0]),
+        ] {
+            let nodes = vec![
+                node("Conv", &["x", "w"], "c"),
+                node("Mul", &["c", "k"], "y"),
+            ];
+            let initializer = vec![
+                floats("w", &[2, 1, 1], &[1.0, 2.0]),
+                floats("k", &k_dims, &k),
+            ];
+            let g = fused_graph(nodes, initializer);
+            assert_eq!(g.nodes().count(), 2);
+        }
+    }
+
+    #[test]
+    fn folds_spatial_zero_padding_into_conv() {
+        let mut conv = node("Conv", &["p", "w"], "y");
+        conv.attribute.push(attr("pads", &[0, 3]));
+        let nodes = vec![node("Pad", &["x", "pads"], "p"), conv];
+        let initializer = vec![
+            floats("w", &[2, 1, 1], &[1.0, 2.0]),
+            ints("pads", &[0, 0, 1, 0, 0, 2]),
+        ];
+        let g = fused_graph(nodes.clone(), initializer.clone());
+        let convs: Vec<_> = g.nodes().map(|(_, n)| (n.op.clone(), n.input(0))).collect();
+        let Op::Conv(attrs) = &convs[..][0].0 else {
+            panic!("{convs:?}")
+        };
+        assert_eq!((convs.len(), attrs.pads.as_deref()), (1, Some(&[1, 5][..])));
+        assert_eq!(convs[0].1, g.find_value("x"));
+
+        // Padding channels, or with another value or mode, stays.
+        let mut channels = initializer.clone();
+        channels[1] = ints("pads", &[0, 1, 1, 0, 0, 2]);
+        let mut value = initializer.clone();
+        value.push(scalar("one", 1.0));
+        let mut one = nodes.clone();
+        one[0].input.push("one".to_string());
+        let mut reflect = nodes.clone();
+        reflect[0]
+            .attribute
+            .push(crate::model::onnx_proto::AttributeProto {
+                name: "mode".to_string(),
+                s: b"reflect".to_vec(),
+                r#type: 3, // STRING
+                ..Default::default()
+            });
+        for (nodes, initializer) in [(nodes, channels), (one, value), (reflect, initializer)] {
+            assert_eq!(fused_graph(nodes, initializer).nodes().count(), 2);
+        }
     }
 
     #[test]

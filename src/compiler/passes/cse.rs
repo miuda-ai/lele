@@ -108,7 +108,7 @@ fn replacements(g: &Graph, first: NodeId, dup: NodeId) -> Option<Vec<(ValueId, V
 }
 
 /// Makes every node reading `old` read `new` instead.
-fn replace_uses(g: &mut Graph, old: ValueId, new: ValueId) {
+pub(super) fn replace_uses(g: &mut Graph, old: ValueId, new: ValueId) {
     let mut readers = g.value(old).consumers().to_vec();
     readers.sort();
     readers.dedup();

@@ -102,6 +102,11 @@ pub struct Optimizations {
     pub shape_folding: bool,
     /// Removes nodes whose outputs nothing reads.
     pub dead_code_elimination: bool,
+    /// Removes nodes that leave their input as it is (`Identity`, a `Cast`
+    /// to the input's type, a product by ones, a `Pad` by zeros, ...),
+    /// merges transposes of transposes, and makes reshapes of the transposes
+    /// that only move axes of size 1.
+    pub simplification: bool,
     /// Rewrites `MatMul` of a dequantized int8 weight into an integer
     /// matmul that keeps the weight in int8, and collapses
     /// `QuantizeLinear` → `DequantizeLinear` pairs into one node.
@@ -129,6 +134,7 @@ impl Optimizations {
             constant_folding: true,
             shape_folding: true,
             dead_code_elimination: true,
+            simplification: true,
             qdq_fusion: true,
             operator_fusion: true,
             common_subexpression_elimination: true,
@@ -299,6 +305,11 @@ impl Compiler {
                 passes::fold_shapes(&mut ir);
                 passes::fold_constants(&mut ir);
             }
+        }
+        if opt.simplification {
+            // A cast is removed where its input has the type it casts to.
+            passes::infer_dtypes(&mut ir);
+            passes::simplify(&mut ir);
         }
         if opt.dead_code_elimination {
             passes::eliminate_dead_code(&mut ir);

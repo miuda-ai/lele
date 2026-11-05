@@ -331,6 +331,21 @@ impl Graph {
         self.initializers.push(v);
     }
 
+    /// Adds an initializer holding `tensor`, named `name` or, if a value has
+    /// that name, `name` with a number appended.
+    pub fn new_initializer(&mut self, name: &str, mut tensor: TensorProto) -> ValueId {
+        let mut unique = name.to_string();
+        let mut n = 1;
+        while self.by_name.contains_key(&unique) {
+            unique = format!("{name}_{n}");
+            n += 1;
+        }
+        tensor.name = unique.clone();
+        let v = self.intern(&unique);
+        self.add_initializer(v, tensor);
+        v
+    }
+
     /// Turns graph input `v` into an initializer holding `tensor`, replacing
     /// the default value an initializer of its name gave it.
     pub fn fix_input(&mut self, v: ValueId, tensor: TensorProto) {

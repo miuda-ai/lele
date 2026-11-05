@@ -1,6 +1,6 @@
 //! Constant folding.
 
-use crate::compiler::ir::{Binary, DType, Graph, Op, QuantAttrs, Unary};
+use crate::compiler::ir::{Binary, DType, Graph, Op, QuantAttrs, Reduction, Unary};
 use crate::model::onnx_proto::TensorProto;
 use crate::model::tensor_to_array;
 use crate::tensor::TensorView;
@@ -22,11 +22,15 @@ struct Const {
 impl Const {
     /// The contents of `t`, if they can be read.
     fn of(t: &TensorProto) -> Option<Self> {
-        let (data, shape) = tensor_to_array(t).ok()?;
+        let dtype = DType::from_onnx(t.data_type);
+        let (data, shape) = if dtype == DType::F16 {
+            (f16_values(t), t.dims.iter().map(|&d| d as usize).collect())
+        } else {
+            tensor_to_array(t).ok()?
+        };
         if data.is_empty() {
             return None;
         }
-        let dtype = DType::from_onnx(t.data_type);
         let ints = is_integer(dtype).then(|| exact_ints(t)).flatten();
         Some(Const {
             data,
@@ -35,6 +39,24 @@ impl Const {
             dtype,
         })
     }
+}
+
+/// The values of a float16 tensor, which `tensor_to_array` does not read:
+/// its bits, raw or one per element of `int32_data`.
+pub(super) fn f16_values(t: &TensorProto) -> Vec<f32> {
+    let bits: Vec<u16> = if t.raw_data.is_empty() {
+        t.int32_data.iter().map(|&x| x as u16).collect()
+    } else {
+        t.raw_data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| u16::from_le_bytes(b))
+            .collect()
+    };
+    bits.into_iter()
+        .map(|b| half::f16::from_bits(b).to_f32())
+        .collect()
 }
 
 /// Whether lele computes tensors of `t` as integers (in i64).
@@ -152,6 +174,14 @@ fn fold_graph(g: &mut Graph, inherited: &Consts) {
 
         let name = g.value(out).name.clone();
         let dims = shape.iter().map(|&s| s as i64).collect();
+        // A float16 result is stored as such where it holds float16 values
+        // (a transpose or slice of float16 weights); computed in f32, it is
+        // stored in f32, as the generated code would have held it.
+        let half = |x: &f32| half::f16::from_f32(*x);
+        let dtype = match dtype {
+            DType::F16 if !data.iter().all(|x| half(x).to_f32() == *x) => DType::F32,
+            dtype => dtype,
+        };
         let exact = || {
             ints.clone()
                 .unwrap_or_else(|| data.iter().map(|&x| x as i64).collect())
@@ -170,6 +200,17 @@ fn fold_graph(g: &mut Graph, inherited: &Consts) {
                 dims,
                 data_type: DType::Bool.to_onnx(),
                 raw_data: exact().iter().map(|&x| (x != 0) as u8).collect(),
+                ..Default::default()
+            }
+        } else if dtype == DType::F16 {
+            TensorProto {
+                name: name.clone(),
+                dims,
+                data_type: DType::F16.to_onnx(),
+                raw_data: data
+                    .iter()
+                    .flat_map(|x| half(x).to_bits().to_le_bytes())
+                    .collect(),
                 ..Default::default()
             }
         } else {
@@ -281,13 +322,40 @@ fn view(c: &Const) -> TensorView<'_> {
 }
 
 /// Evaluates float `op` on known `inputs` with the kernel the generated code
-/// would run, so that the result is the same.
+/// would run, so that the result is the same. The generated code computes
+/// float16 tensors in f32 too.
 fn fold_float(op: &Op, inputs: &[&Const]) -> Option<(Vec<f32>, Vec<usize>)> {
-    if inputs.iter().any(|c| c.dtype != DType::F32) {
+    let float = |c: &&Const| matches!(c.dtype, DType::F32 | DType::F16);
+    // A reduction's axes are integers.
+    let operands = if matches!(op, Op::Reduce { .. }) {
+        &inputs[..1]
+    } else {
+        inputs
+    };
+    if !operands.iter().all(float) {
         return None;
     }
     let mut out = Vec::new();
     let result = match op {
+        Op::Reduce {
+            reduction,
+            axes,
+            keepdims,
+        } => {
+            let axes = match inputs.get(1) {
+                Some(c) => c.ints.clone()?,
+                None => axes.clone().unwrap_or_default(),
+            };
+            let (x, keepdims) = (view(inputs.first()?), *keepdims);
+            use crate::kernels as k;
+            match reduction {
+                Reduction::L2 => k::reduce_l2(&x, &axes, keepdims, &mut out),
+                Reduction::Max => k::reduce_max(&x, &axes, keepdims, &mut out),
+                Reduction::Mean => k::reduce_mean(&x, &axes, keepdims, &mut out),
+                Reduction::Prod => k::reduce_prod(&x, &axes, keepdims, &mut out),
+                Reduction::Sum => k::reduce_sum(&x, &axes, keepdims, &mut out),
+            }
+        }
         Op::Unary(op) => unary_kernel(*op)?(&view(inputs.first()?), &mut out),
         Op::Binary(op) => {
             let (a, b) = (inputs.first()?, inputs.get(1)?);
@@ -518,7 +586,7 @@ fn elementwise(
 /// output, or `None` if the operator or this use of it is not supported.
 fn fold_op(op: &Op, inputs: &[&Const]) -> Option<(Vec<f32>, Vec<usize>)> {
     match op {
-        Op::Unary(_) | Op::Binary(_) | Op::Range => fold_float(op, inputs),
+        Op::Unary(_) | Op::Binary(_) | Op::Range | Op::Reduce { .. } => fold_float(op, inputs),
         Op::DequantizeLinear(attrs) | Op::QuantizeLinear(attrs) => {
             let (x, scale) = (inputs.first()?, inputs.get(1)?);
             let zp = inputs.get(2);
@@ -919,6 +987,53 @@ mod tests {
             assert_eq!(y.dims, [3, 2]);
             assert_eq!(y.float_data, [0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
         }
+    }
+
+    fn halves(name: &str, dims: &[i64], v: &[f32]) -> TensorProto {
+        TensorProto {
+            name: name.to_string(),
+            data_type: DType::F16.to_onnx(),
+            dims: dims.to_vec(),
+            raw_data: v
+                .iter()
+                .flat_map(|&x| half::f16::from_f32(x).to_bits().to_le_bytes())
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Weight normalization, `w * g / ||w||`, of float16 weights is computed
+    /// in f32, as the generated code would, and kept in f32. A transpose of
+    /// them stays float16.
+    #[test]
+    fn folds_float16_weights_in_f32() {
+        let mut norm = node("ReduceL2", &["w"], "n");
+        norm.attribute = vec![AttributeProto {
+            name: "axes".to_string(),
+            ints: vec![1],
+            r#type: 7, // INTS
+            ..Default::default()
+        }];
+        let g = fold(GraphProto {
+            node: vec![
+                norm,
+                node("Div", &["g", "n"], "s"),
+                node("Mul", &["w", "s"], "y"),
+                node("Transpose", &["w"], "t"),
+            ],
+            initializer: vec![
+                halves("w", &[2, 2], &[3.0, 4.0, 6.0, 8.0]),
+                halves("g", &[2, 1], &[1.0, 2.0]),
+            ],
+            ..Default::default()
+        });
+        assert!(g.node.is_empty(), "{:?}", g.node);
+        let get = |name: &str| g.initializer.iter().find(|t| t.name == name).unwrap();
+        let (y, t) = (get("y"), get("t"));
+        assert_eq!(y.data_type, DType::F32.to_onnx());
+        let s = 1.0f32 / 5.0;
+        assert_eq!(y.float_data, [3.0 * s, 4.0 * s, 6.0 * s, 8.0 * s]);
+        assert_eq!(*t, halves("t", &[2, 2], &[3.0, 6.0, 4.0, 8.0]));
     }
 
     fn ints(name: &str, dims: &[i64], v: &[i64]) -> TensorProto {
