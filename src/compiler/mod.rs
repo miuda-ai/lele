@@ -270,8 +270,11 @@ impl Compiler {
         }
         passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);
+        // A user pattern generates a whole run of nodes at once, and may read
+        // the inputs of its first nodes after writing the outputs of later ones.
+        let lookback = if self.patterns.is_empty() { 0 } else { 8 };
         let (allocator, analysis) =
-            alloc::solve_allocation(&ir, &|name| var_types.get(&sanitize_name(name)));
+            alloc::solve_allocation(&ir, &|name| var_types.get(&sanitize_name(name)), lookback);
         // Patterns and overrides of the products would read packed weights as stored in
         // the model.
         let pack = opt.weight_packing

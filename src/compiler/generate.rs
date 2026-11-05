@@ -312,6 +312,19 @@ impl<'a> Nodes<'a> {
             protos: &self.protos[range],
         }
     }
+
+    /// How far these nodes move `current_id`: one step for each node and for
+    /// each node of its subgraphs, as the liveness analysis numbers them.
+    fn steps(&self) -> usize {
+        fn steps(g: &Graph, id: NodeId) -> usize {
+            let subgraphs = g.node(id).op.subgraphs();
+            let nested = subgraphs
+                .iter()
+                .flat_map(|s| s.node_ids().into_iter().map(|id| steps(s, id)));
+            1 + nested.sum::<usize>()
+        }
+        self.ids.iter().map(|&id| steps(self.graph, id)).sum()
+    }
 }
 
 /// The ids and lowered protos of `g`'s nodes, for [`Nodes`].
@@ -372,7 +385,7 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
         let mut chunk_inputs: Vec<String> = chunk_inputs_set.into_iter().collect();
         chunk_inputs.sort(); // Deterministic order
         // 2. Identify Outputs: Live AFTER chunk
-        let chunk_end_id = *current_id + nodes_count;
+        let chunk_end_id = *current_id + chunk.steps();
         let global_outputs: HashSet<String> =
             graph_outputs.iter().map(|o| o.name.clone()).collect();
         let _chunk_start_id = *current_id;
@@ -1307,6 +1320,65 @@ mod tests {
         let line = code.lines().find(|l| l.contains("let r = ")).unwrap_or_else(|| panic!("{code}"));
         assert!(line.contains("lele::kernels::conv1d_fused(&x, "), "{line}");
         assert!(line.contains("&[0, 1], &[1], true, "), "{line}");
+    }
+
+    /// A chunk returns what later chunks read. The nodes of `If` branches
+    /// count where the chunk ends; they used to be left out, so a chunk
+    /// holding an `If` also returned tensors its last nodes read.
+    #[test]
+    fn test_a_chunk_returns_nothing_its_own_nodes_read_last() {
+        use crate::model::onnx_proto::{AttributeProto, GraphProto, ValueInfoProto};
+        let info = |name: &str| ValueInfoProto {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let node = |op: &str, input: &[&str], output: &str| NodeProto {
+            op_type: op.to_string(),
+            input: input.iter().map(|s| s.to_string()).collect(),
+            output: vec![output.to_string()],
+            ..Default::default()
+        };
+        let branch = |op: &str| GraphProto {
+            node: vec![
+                node(op, &["x"], &format!("{op}1")),
+                node(op, &[&format!("{op}1")], &format!("{op}2")),
+                node(op, &[&format!("{op}2")], &format!("{op}3")),
+            ],
+            output: vec![info(&format!("{op}3"))],
+            ..Default::default()
+        };
+        let attr = |name: &str, g: GraphProto| AttributeProto {
+            name: name.to_string(),
+            g: Some(g),
+            ..Default::default()
+        };
+        let graph = GraphProto {
+            node: vec![
+                NodeProto {
+                    op_type: "If".to_string(),
+                    input: vec!["cond".to_string()],
+                    output: vec!["r".to_string()],
+                    attribute: vec![
+                        attr("then_branch", branch("Relu")),
+                        attr("else_branch", branch("Neg")),
+                    ],
+                    ..Default::default()
+                },
+                node("Relu", &["x"], "d"),
+                node("Relu", &["d"], "e"),
+                node("Add", &["e", "r"], "y"),
+            ],
+            input: vec![info("cond"), info("x")],
+            output: vec![info("y")],
+            ..Default::default()
+        };
+        let code = Compiler::new().compile(&graph).unwrap().code;
+        let returned = code.lines().find(|l| l.contains("let (") && l.contains("run_chunk_0("));
+        assert_eq!(
+            returned.map(str::trim),
+            Some("let (y) = self.run_chunk_0(ws, cond, x);"),
+            "{code}"
+        );
     }
 
     /// An `If` branch that returns one of its initializers reads it through
