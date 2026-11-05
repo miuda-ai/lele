@@ -7,11 +7,13 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use aligned_vec::AVec;
+
 use crate::kernels::{self, ConvWeights, QWeights};
 use crate::tensor::TensorView;
 
-type QuantizedWeightCache = HashMap<(usize, usize, usize, usize), (Vec<f32>, Arc<QWeights>)>;
-type QWeightCache = HashMap<(usize, usize, usize, usize, bool), Vec<(Vec<f32>, Vec<f32>, Arc<QWeights>)>>;
+type QWeightCache =
+    HashMap<(usize, usize, usize, usize, bool), Vec<(Vec<f32>, Vec<f32>, Arc<QWeights>)>>;
 type ConvWeightCache = HashMap<(usize, usize, usize, bool), (Vec<f32>, Arc<ConvWeights>)>;
 
 /// A model's weight blob plus the weights prepared from it for the integer
@@ -19,12 +21,14 @@ type ConvWeightCache = HashMap<(usize, usize, usize, bool), (Vec<f32>, Arc<ConvW
 /// weight, so it happens once per tensor and is cached for the life of the model.
 pub struct Weights<'a> {
     data: &'a [u8],
-    /// The f16 weights [`Self::with_f16`] converted, one after another.
-    f16: Vec<f32>,
-    /// Byte offset of each converted f16 weight and where it starts in
-    /// `f16`, by offset.
+    /// The weights [`Self::with_f16`], [`Self::with_u8`] and [`Self::with_i8`]
+    /// widened to f32, one after another, each starting on a cache line.
+    widened: AVec<f32>,
+    /// Byte offset of each widened weight and where it starts in `widened`,
+    /// by offset, for each type stored.
     f16_index: Vec<(usize, usize)>,
-    quantized_weights_cache: RefCell<QuantizedWeightCache>,
+    u8_index: Vec<(usize, usize)>,
+    i8_index: Vec<(usize, usize)>,
     qweights_cache: RefCell<QWeightCache>,
     conv_weights_cache: RefCell<ConvWeightCache>,
 }
@@ -33,9 +37,10 @@ impl<'a> Weights<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self {
             data,
-            f16: Vec::new(),
+            widened: AVec::new(0),
             f16_index: Vec::new(),
-            quantized_weights_cache: RefCell::default(),
+            u8_index: Vec::new(),
+            i8_index: Vec::new(),
             qweights_cache: RefCell::default(),
             conv_weights_cache: RefCell::default(),
         }
@@ -46,24 +51,76 @@ impl<'a> Weights<'a> {
     /// call.
     pub fn with_f16(mut self, regions: &[(usize, usize)]) -> Self {
         use half::slice::HalfFloatSliceExt;
-        let mut regions = regions.to_vec();
-        regions.sort_unstable();
-        regions.dedup();
-        self.f16 = vec![0.0; regions.iter().map(|&(_, len)| len / 2).sum()];
-        self.f16_index.reserve(regions.len());
-        let mut start = 0;
-        for (offset, len) in regions {
-            let halves: Vec<half::f16> = self.data[offset..offset + len]
+        self.f16_index = self.widen(regions, 2, |bytes, out| {
+            let halves: Vec<half::f16> = bytes
                 .as_chunks::<2>()
                 .0
                 .iter()
                 .map(|&b| half::f16::from_le_bytes(b))
                 .collect();
-            halves.convert_to_f32_slice(&mut self.f16[start..start + halves.len()]);
-            self.f16_index.push((offset, start));
-            start += halves.len();
-        }
+            halves.convert_to_f32_slice(out);
+        });
         self
+    }
+
+    /// Widens the u8 weights at `(byte offset, byte length)` to f32 once, for
+    /// [`Self::weight_u8`].
+    pub fn with_u8(mut self, regions: &[(usize, usize)]) -> Self {
+        self.u8_index = self.widen(regions, 1, |bytes, out| {
+            for (o, &b) in out.iter_mut().zip(bytes) {
+                *o = b as f32;
+            }
+        });
+        self
+    }
+
+    /// Widens the i8 weights at `(byte offset, byte length)` to f32 once, for
+    /// [`Self::weight_i8`].
+    pub fn with_i8(mut self, regions: &[(usize, usize)]) -> Self {
+        self.i8_index = self.widen(regions, 1, |bytes, out| {
+            for (o, &b) in out.iter_mut().zip(bytes) {
+                *o = b as i8 as f32;
+            }
+        });
+        self
+    }
+
+    /// Appends the weights at `regions`, of `size` bytes an element, to
+    /// `widened` through `widen`, each on a cache line; returns where each
+    /// starts, by byte offset.
+    fn widen(
+        &mut self,
+        regions: &[(usize, usize)],
+        size: usize,
+        widen: impl Fn(&[u8], &mut [f32]),
+    ) -> Vec<(usize, usize)> {
+        const LINE: usize = aligned_vec::CACHELINE_ALIGN / size_of::<f32>();
+        let mut regions = regions.to_vec();
+        regions.sort_unstable();
+        regions.dedup();
+        let mut start = self.widened.len();
+        let total = regions
+            .iter()
+            .map(|&(_, len)| (len / size).next_multiple_of(LINE))
+            .sum::<usize>();
+        self.widened.resize(start + total, 0.0);
+        let mut index = Vec::with_capacity(regions.len());
+        for (offset, len) in regions {
+            widen(
+                &self.data[offset..offset + len],
+                &mut self.widened[start..][..len / size],
+            );
+            index.push((offset, start));
+            start += (len / size).next_multiple_of(LINE);
+        }
+        index
+    }
+
+    /// The `len` widened elements of the weight at `offset` in `index`, if
+    /// widened.
+    fn widened(&self, index: &[(usize, usize)], offset: usize, len: usize) -> Option<&[f32]> {
+        let i = index.binary_search_by_key(&offset, |&(o, _)| o).ok()?;
+        Some(&self.widened[index[i].1..][..len])
     }
 
     pub fn weight_f32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, f32> {
@@ -94,26 +151,30 @@ impl<'a> Weights<'a> {
         TensorView::from_bytes_i32_as_f32(&self.data[offset..offset + len], shape.to_vec())
     }
 
-    pub fn weight_u8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
-        TensorView::from_bytes_u8(&self.data[offset..offset + len], shape.to_vec())
+    /// A u8 weight as f32: borrowed if [`Self::with_u8`] widened it, widened
+    /// now otherwise.
+    pub fn weight_u8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'_, f32> {
+        match self.widened(&self.u8_index, offset, len) {
+            Some(data) => TensorView::new(data, shape),
+            None => TensorView::from_bytes_u8(&self.data[offset..offset + len], shape.to_vec()),
+        }
     }
 
-    pub fn weight_i8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, f32> {
-        TensorView::from_bytes_i8(&self.data[offset..offset + len], shape.to_vec())
+    /// An i8 weight as f32: borrowed if [`Self::with_i8`] widened it, widened
+    /// now otherwise.
+    pub fn weight_i8(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'_, f32> {
+        match self.widened(&self.i8_index, offset, len) {
+            Some(data) => TensorView::new(data, shape),
+            None => TensorView::from_bytes_i8(&self.data[offset..offset + len], shape.to_vec()),
+        }
     }
 
     /// An f16 weight as f32: borrowed if [`Self::with_f16`] converted it,
     /// converted now otherwise.
     pub fn weight_f16(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'_, f32> {
-        match self.f16_index.binary_search_by_key(&offset, |&(o, _)| o) {
-            Ok(i) => {
-                let start = self.f16_index[i].1;
-                TensorView {
-                    data: std::borrow::Cow::Borrowed(&self.f16[start..start + len / 2]),
-                    shape: std::borrow::Cow::Borrowed(shape),
-                }
-            }
-            Err(_) => TensorView::from_bytes_f16(&self.data[offset..offset + len], shape.to_vec()),
+        match self.widened(&self.f16_index, offset, len / 2) {
+            Some(data) => TensorView::new(data, shape),
+            None => TensorView::from_bytes_f16(&self.data[offset..offset + len], shape.to_vec()),
         }
     }
 
@@ -157,27 +218,16 @@ impl<'a> Weights<'a> {
         &self.data[offset..offset + len]
     }
 
-    /// Int8 weights for QLinearMatMulI8.
+    /// Symmetric int8 weights for QLinearMatMulI8 ([`kernels::prepare_quantized_weights`]).
     fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &TensorView<f32>) -> Arc<QWeights> {
-        // Distinct initializers can share identical bytes, and one initializer
-        // can sit behind several DequantizeLinear nodes carrying different
-        // scales, so the key must include the shape and the cached entry must
-        // match the exact scale.
-        let key = (offset, len, k, n);
-        let same_bits = |s: &[f32]| s.len() == scale.data.len() && s.iter().zip(scale.data.iter()).all(|(a, b)| a.to_bits() == b.to_bits());
-        if let Some((_, qw)) = self.quantized_weights_cache.borrow().get(&key).filter(|(s, _)| same_bits(s)) {
-            return qw.clone();
-        }
-        let raw = &self.data[offset..offset + len];
-        let qw = Arc::new(kernels::prepare_quantized_weights(raw, k, n, &scale.data));
-        self.quantized_weights_cache
-            .borrow_mut()
-            .insert(key, (scale.data.to_vec(), qw.clone()));
-        qw
+        self.get_qweights(offset, len, k, n, true, &[0.0], &scale.data)
     }
 
     /// 8-bit weights packed for the integer GEMM, with their zero points
-    /// subtracted, so the cached entry must match those and the scales.
+    /// subtracted. Distinct initializers can share identical bytes, and one
+    /// initializer can sit behind several DequantizeLinear nodes carrying
+    /// different scales, so the key includes the shape and the cached entry
+    /// must match the zero points and scales bit for bit.
     #[allow(clippy::too_many_arguments)]
     fn get_qweights(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool, zero_point: &[f32], scale: &[f32]) -> Arc<QWeights> {
         let key = (offset, len, k, n, signed);
@@ -185,9 +235,12 @@ impl<'a> Weights<'a> {
         // MatMulInteger and the fused dynamic-quantize linear patterns, which
         // pass different scales. One entry per key would make those two evict
         // each other and re-pack the weight on every call.
+        let same_bits = |a: &[f32], b: &[f32]| {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+        };
         if let Some(entries) = self.qweights_cache.borrow().get(&key) {
             for (z, s, w) in entries {
-                if z.as_slice() == zero_point && s.as_slice() == scale {
+                if same_bits(z, zero_point) && same_bits(s, scale) {
                     return w.clone();
                 }
             }

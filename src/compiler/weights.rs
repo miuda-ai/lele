@@ -90,13 +90,13 @@ impl Weights {
         self.int64.get(name).map(|(ints, _)| ints.as_slice())
     }
 
-    /// Byte offset and length of every f16 weight, in file order, for the
-    /// runtime to convert once at load.
-    pub(crate) fn f16_regions(&self) -> Vec<(usize, usize)> {
+    /// Byte offset and length of every weight of `dtype` stored as it is (not
+    /// packed), in file order, for the runtime to widen once at load.
+    pub(crate) fn regions(&self, dtype: DType) -> Vec<(usize, usize)> {
         let mut regions: Vec<_> = self
             .lookup
             .values()
-            .filter(|w| w.dtype == DType::F16 && !w.packed)
+            .filter(|w| w.dtype == dtype && !w.packed)
             .map(|w| (w.offset, w.len))
             .collect();
         regions.sort_unstable();

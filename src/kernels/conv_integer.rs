@@ -19,6 +19,7 @@
 use crate::kernels::qgemm::{Epilogue, Layout, QWeights, run_at};
 use crate::kernels::utils;
 use crate::tensor::TensorView;
+use aligned_vec::AVec;
 use fearless_simd::Level;
 
 /// The deepest group whose sums are exact in `f32`: `258 * 255 * 255 < 2^24`.
@@ -221,10 +222,10 @@ fn transpose(src: &[f32], rows: usize, cols: usize, dst: &mut [f32]) {
 }
 
 thread_local! {
-    static CENTERED: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
-    static CHANNELS_LAST: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
-    static PATCHES: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
-    static SUMS: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static CENTERED: std::cell::RefCell<AVec<f32>> = std::cell::RefCell::new(AVec::new(0));
+    static CHANNELS_LAST: std::cell::RefCell<AVec<f32>> = std::cell::RefCell::new(AVec::new(0));
+    static PATCHES: std::cell::RefCell<AVec<f32>> = std::cell::RefCell::new(AVec::new(0));
+    static SUMS: std::cell::RefCell<AVec<f32>> = std::cell::RefCell::new(AVec::new(0));
 }
 
 /// Elements of patches gathered at a time: as many rows as fit, at least enough for
@@ -292,7 +293,7 @@ pub(crate) fn conv_integer_at<'a>(
         Kind::Float(centered) => {
             return CENTERED.with_borrow_mut(|x| {
                 // SAFETY: every element is written below before any is read.
-                unsafe { utils::ensure_capacity(x, input.data.len()) };
+                unsafe { utils::ensure_scratch(x, input.data.len()) };
                 for (x, &v) in x.iter_mut().zip(input.data.iter()) {
                     *x = v - pad;
                 }
@@ -365,8 +366,8 @@ pub(crate) fn conv_integer_at<'a>(
                 // SAFETY: the transposed input and the sums of each block are
                 // written before they are read.
                 unsafe {
-                    utils::ensure_capacity(nhwc, spatial * in_channels);
-                    utils::ensure_capacity(sums, positions * per_group);
+                    utils::ensure_scratch(nhwc, spatial * in_channels);
+                    utils::ensure_scratch(sums, positions * per_group);
                 }
                 for b in 0..batch {
                     let x = &input.data[b * in_channels * spatial..][..in_channels * spatial];
@@ -379,7 +380,7 @@ pub(crate) fn conv_integer_at<'a>(
                             } else {
                                 // SAFETY: every patch row is written below
                                 // before any is read.
-                                unsafe { utils::ensure_capacity(patches, m * depth) };
+                                unsafe { utils::ensure_scratch(patches, m * depth) };
                                 for (i, row) in
                                     patches[..m * depth].chunks_exact_mut(depth).enumerate()
                                 {

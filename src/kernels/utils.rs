@@ -1,3 +1,5 @@
+use aligned_vec::AVec;
+
 pub fn compute_strides(shape: &[usize]) -> Vec<usize> {
     let mut strides = vec![0; shape.len()];
     let mut s = 1;
@@ -16,6 +18,21 @@ pub fn compute_strides(shape: &[usize]) -> Vec<usize> {
 /// The caller must write every element of `v[..len]` before reading any (and
 /// before returning `v`), and `T` must be a plain value with no drop logic.
 pub(crate) unsafe fn ensure_capacity<T: Copy>(v: &mut Vec<T>, len: usize) {
+    if v.capacity() < len {
+        let extra = len - v.len();
+        v.reserve(extra);
+    }
+    // SAFETY: the capacity holds `len` elements; the caller writes them all
+    // before reading any.
+    unsafe {
+        v.set_len(len);
+    }
+}
+/// [`ensure_capacity`] for a kernel's aligned scratch.
+///
+/// # Safety
+/// As for [`ensure_capacity`].
+pub(crate) unsafe fn ensure_scratch<T: Copy>(v: &mut AVec<T>, len: usize) {
     if v.capacity() < len {
         let extra = len - v.len();
         v.reserve(extra);

@@ -7,6 +7,7 @@ use crate::kernels::timing;
 use crate::kernels::utils;
 use crate::kernels::window2d::{self, Window};
 use crate::tensor::TensorView;
+use aligned_vec::AVec;
 use fearless_simd::{Level, Simd, f32x16};
 use fearless_simd_macros::simd;
 
@@ -373,7 +374,7 @@ pub(crate) fn conv2d_activation<'b, 'a>(
 
     // Reuse thread-local im2col buffer to avoid repeated allocation
     thread_local! {
-        static COL_BUF: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+        static COL_BUF: std::cell::RefCell<AVec<f32>> = std::cell::RefCell::new(AVec::new(0));
     }
     COL_BUF.with(|buf_cell| {
         let mut col_buf_ref = buf_cell.borrow_mut();
@@ -1293,7 +1294,7 @@ fn conv_transpose_depthwise_1d(
     let (stride, len, out_len, kernel) = (s.stride_w, s.in_w, s.out_w, s.kernel_w);
     let phase_len = out_len.div_ceil(stride);
     thread_local! {
-        static PHASES: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+        static PHASES: std::cell::RefCell<AVec<f32>> = std::cell::RefCell::new(AVec::new(0));
     }
     PHASES.with_borrow_mut(|phases| {
         phases.resize(stride * phase_len, 0.0);
@@ -1413,7 +1414,7 @@ fn conv_transpose_gemm(
     }
 
     thread_local! {
-        static CT_COL_BUF: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+        static CT_COL_BUF: std::cell::RefCell<AVec<f32>> = std::cell::RefCell::new(AVec::new(0));
     }
     CT_COL_BUF.with_borrow_mut(|col| {
         col.resize(col_rows * hw, 0.0);

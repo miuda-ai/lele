@@ -27,6 +27,7 @@
 use crate::kernels::qgemm_dot::{self, Dot, QuadWeights};
 use crate::kernels::simd::simd_call;
 use crate::tensor::TensorView;
+use aligned_vec::AVec;
 use fearless_simd::{Level, Simd, f32x8, i16x16, i32x8};
 use fearless_simd_macros::simd;
 
@@ -428,7 +429,7 @@ pub(crate) fn qgemm_at(
 
 thread_local! {
     /// The sums of C between depth blocks.
-    static SUMS: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SUMS: std::cell::RefCell<AVec<i32>> = std::cell::RefCell::new(AVec::new(0));
 }
 
 #[simd]
@@ -834,11 +835,11 @@ pub(crate) fn quantize_rows_at(
     scale: f32,
     zero_point: i32,
     center: i32,
-    dst: &mut Vec<i32>,
+    dst: &mut AVec<i32>,
 ) {
     assert!(src.len() >= m * k);
     // SAFETY: every pair is written, so the buffer is not filled first.
-    unsafe { crate::kernels::utils::ensure_capacity(dst, m * k.div_ceil(2)) };
+    unsafe { crate::kernels::utils::ensure_scratch(dst, m * k.div_ceil(2)) };
     simd_call!(
         level,
         quantize_rows_simd(src, m, k, scale, zero_point, center, dst)
@@ -1151,10 +1152,10 @@ pub fn qmatmul_acts<'a>(
 
 thread_local! {
     /// Rows of A, quantized, and (for the quads) their sums.
-    static A_ROWS: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
-    static ROW_SUMS: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static A_ROWS: std::cell::RefCell<AVec<i32>> = std::cell::RefCell::new(AVec::new(0));
+    static ROW_SUMS: std::cell::RefCell<AVec<i32>> = std::cell::RefCell::new(AVec::new(0));
     /// Rows of A, quantized and centered, in `f32`.
-    static A_FLOAT: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static A_FLOAT: std::cell::RefCell<AVec<f32>> = std::cell::RefCell::new(AVec::new(0));
 }
 
 /// `C = epilogue(A * w)` for the `m x k` activations `src`, quantized with `scale` and
@@ -1188,7 +1189,7 @@ pub(crate) fn run_at(
         Packed::Float(b) => A_FLOAT.with_borrow_mut(|a| {
             let (k, n) = (w.k, w.n);
             // SAFETY: every element is written below before any is read.
-            unsafe { crate::kernels::utils::ensure_capacity(a, m * k) };
+            unsafe { crate::kernels::utils::ensure_scratch(a, m * k) };
             simd_call!(
                 level,
                 quantize_rows_f32_simd(src, m * k, scale, zero_point, center, a)
@@ -1499,7 +1500,7 @@ mod tests {
                     for (i, v) in x.iter_mut().enumerate().step_by(3) {
                         *v = scale * ((i % 300) as f32 - 20.0 - zp as f32);
                     }
-                    let mut got = Vec::new();
+                    let mut got = AVec::new(0);
                     quantize_rows_at(level, &x, m, k, scale, zp, center, &mut got);
                     let got = unpack_rows(&got, m, k);
                     for (i, (&g, &v)) in got.iter().zip(&x).enumerate() {

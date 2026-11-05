@@ -190,40 +190,12 @@ impl<'a> TensorView<'a, f32> {
 
     /// Create a TensorView<f32> from u8 byte slice (cast each byte to f32)
     pub fn from_bytes_u8(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, f32> {
-        use std::cell::RefCell;
-        use std::collections::HashMap;
-        thread_local! {
-            static CACHE: RefCell<HashMap<usize, Vec<f32>>> = RefCell::new(HashMap::new());
-        }
-        CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let key = bytes.as_ptr() as usize;
-            let vec = cache
-                .entry(key)
-                .or_insert_with(|| bytes.iter().map(|&x| x as f32).collect());
-            let data: &'static [f32] =
-                unsafe { std::slice::from_raw_parts(vec.as_ptr(), vec.len()) };
-            TensorView::from_slice(data, shape)
-        })
+        TensorView::from_owned(bytes.iter().map(|&x| x as f32).collect(), shape)
     }
 
     /// Create a TensorView<f32> from i8 byte slice (cast each byte to i8 then f32)
     pub fn from_bytes_i8(bytes: &[u8], shape: Vec<usize>) -> TensorView<'static, f32> {
-        use std::cell::RefCell;
-        use std::collections::HashMap;
-        thread_local! {
-            static CACHE: RefCell<HashMap<usize, Vec<f32>>> = RefCell::new(HashMap::new());
-        }
-        CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let key = bytes.as_ptr() as usize;
-            let vec = cache
-                .entry(key)
-                .or_insert_with(|| bytes.iter().map(|&x| x as i8 as f32).collect());
-            let data: &'static [f32] =
-                unsafe { std::slice::from_raw_parts(vec.as_ptr(), vec.len()) };
-            TensorView::from_slice(data, shape)
-        })
+        TensorView::from_owned(bytes.iter().map(|&x| x as i8 as f32).collect(), shape)
     }
 
     /// Create a TensorView<f32> from f16 byte slice

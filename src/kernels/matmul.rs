@@ -14,6 +14,7 @@
 
 use crate::kernels::matmul_dot::{DotDims, gemm_dot};
 use crate::kernels::matmul_nn::{BSrc, Dims, SMALL_M, gemm_nn, gemm_small_m};
+use aligned_vec::AVec;
 use fearless_simd::Level;
 
 /// Accumulation mode for matmul output.
@@ -300,7 +301,7 @@ pub fn matmul_f16_a(
 ) {
     use half::slice::HalfFloatSliceExt;
     thread_local! {
-        static WIDE_A: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+        static WIDE_A: std::cell::RefCell<AVec<f32>> = std::cell::RefCell::new(AVec::new(0));
     }
     let (m, k) = (dst.nrows, b.nrows);
     if m == 0 || k == 0 {
@@ -463,8 +464,8 @@ fn matmul_b(level: Level, mut dst: MatMut<f32>, accum: Accum, a: MatRef<f32>, b:
     // Row-major copies of what is not row-major, kept for the thread (as large as the
     // largest seen).
     thread_local! {
-        static SCRATCH: std::cell::RefCell<[Vec<f32>; 3]> =
-            const { std::cell::RefCell::new([Vec::new(), Vec::new(), Vec::new()]) };
+        static SCRATCH: std::cell::RefCell<[AVec<f32>; 3]> =
+            std::cell::RefCell::new([AVec::new(0), AVec::new(0), AVec::new(0)]);
     }
     SCRATCH.with_borrow_mut(|[a_rm, b_rm, c_rm]| {
         let a_data = a.data();
@@ -510,7 +511,7 @@ fn run_b(
     operand: BOperand,
     c: &mut [f32],
     (rsc, csc): (isize, isize),
-    c_rm: &mut Vec<f32>,
+    c_rm: &mut AVec<f32>,
 ) {
     let run = |c: &mut [f32], ldc: usize| match operand {
         BOperand::Rows(b, ldb) => {
@@ -600,7 +601,7 @@ enum BOperand<'a> {
 
 /// A row-major copy of a strided `rows x cols` matrix, in `out`.
 fn gather<'a>(
-    out: &'a mut Vec<f32>,
+    out: &'a mut AVec<f32>,
     data: &[f32],
     rows: usize,
     cols: usize,
@@ -685,7 +686,7 @@ mod tests {
                 (cols + 1, 2),
             ];
             for (rs, cs) in strides {
-                let mut out = Vec::new();
+                let mut out = AVec::new(0);
                 let got = gather(&mut out, &data, rows, cols, rs, cs).to_vec();
                 let want: Vec<f32> = (0..rows)
                     .flat_map(|i| (0..cols).map(move |j| (i * rs + j * cs) as f32))

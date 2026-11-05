@@ -483,28 +483,25 @@ impl Compiler {
         writeln!(&mut code, "}}")?;
         writeln!(&mut code, "\nimpl<'a> {}<'a> {{", struct_name)?;
         writeln!(&mut code, "    pub fn new(data: &'a [u8]) -> Self {{")?;
-        // f16 weights read as f32 are converted once, here, not on every read;
-        // those the matmul kernels take as f16 are left as they are.
-        let f16: Vec<_> = weights
-            .f16_regions()
-            .into_iter()
-            .filter(|(offset, len)| {
-                let read = format!("self.weight_f16({offset}, {len},");
-                all_code.contains(&read) || self.custom_methods.iter().any(|m| m.contains(&read))
-            })
-            .collect();
-        if f16.is_empty() {
-            writeln!(
-                &mut code,
-                "        Self {{ weights: lele::runtime::Weights::new(data) }}"
-            )?;
-        } else {
-            writeln!(
-                &mut code,
-                "        Self {{ weights: lele::runtime::Weights::new(data).with_f16(&{:?}) }}",
-                f16
-            )?;
+        // f16, u8 and i8 weights read as f32 are widened once, here, not on
+        // every read; those the kernels take as they are stored are left so.
+        let mut weights_expr = "lele::runtime::Weights::new(data)".to_string();
+        use ir::DType;
+        for (dtype, ty) in [(DType::F16, "f16"), (DType::U8, "u8"), (DType::I8, "i8")] {
+            let read: Vec<_> = weights
+                .regions(dtype)
+                .into_iter()
+                .filter(|(offset, len)| {
+                    let read = format!("self.weight_{ty}({offset}, {len},");
+                    all_code.contains(&read)
+                        || self.custom_methods.iter().any(|m| m.contains(&read))
+                })
+                .collect();
+            if !read.is_empty() {
+                weights_expr += &format!(".with_{ty}(&{read:?})");
+            }
         }
+        writeln!(&mut code, "        Self {{ weights: {weights_expr} }}")?;
         writeln!(&mut code, "    }}")?;
         for method in &self.custom_methods {
             writeln!(&mut code, "{}", method)?;

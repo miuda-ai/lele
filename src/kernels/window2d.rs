@@ -4,6 +4,7 @@
 use crate::kernels::conv2d::Activation;
 use crate::kernels::simd::simd_call;
 use crate::kernels::simd_math as vm;
+use aligned_vec::AVec;
 use fearless_simd::{Level, Simd, f32x16};
 use fearless_simd_macros::simd;
 
@@ -30,7 +31,7 @@ pub(crate) struct Window {
 const VECTOR: usize = 16;
 
 thread_local! {
-    static PADDED: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PADDED: std::cell::RefCell<AVec<f32>> = std::cell::RefCell::new(AVec::new(0));
 }
 
 /// Where one channel is copied before the window slides over it: a plane with

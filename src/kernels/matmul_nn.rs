@@ -24,6 +24,7 @@
 //! high: 20 accumulators, 5 of A and 4 of B, of the 32 registers.
 
 use crate::kernels::simd::simd_call;
+use aligned_vec::AVec;
 use fearless_simd::{Level, Simd, f32x4, f32x8};
 use fearless_simd_macros::simd;
 
@@ -195,7 +196,7 @@ pub(crate) fn gemm_nn(level: Level, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32])
 }
 
 thread_local! {
-    static PACKED: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PACKED: std::cell::RefCell<AVec<f32>> = std::cell::RefCell::new(AVec::new(0));
 }
 
 /// How a tile gets its panel of B.
@@ -740,7 +741,7 @@ fn gemm_small_m_wide_simd<S: Simd>(
 const WIDEN_ROWS: usize = 48;
 
 thread_local! {
-    static WIDENED: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static WIDENED: std::cell::RefCell<AVec<f32>> = std::cell::RefCell::new(AVec::new(0));
 }
 
 #[simd]

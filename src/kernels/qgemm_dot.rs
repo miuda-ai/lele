@@ -30,6 +30,7 @@
 //! block, read from L2.
 
 use crate::kernels::qgemm::{AlignedI32, Epilogue, Requant, requant};
+use aligned_vec::AVec;
 use fearless_simd::{Level, Simd, f32x16, i32x16};
 use fearless_simd_macros::simd;
 
@@ -134,14 +135,14 @@ pub(crate) fn quantize_rows(
     k: usize,
     scale: f32,
     zero_point: i32,
-    dst: &mut Vec<i32>,
-    row_sums: &mut Vec<i32>,
+    dst: &mut AVec<i32>,
+    row_sums: &mut AVec<i32>,
 ) {
     assert!(src.len() >= m * k);
     // SAFETY: every quad and sum is written, so the buffers are not filled first.
     unsafe {
-        crate::kernels::utils::ensure_capacity(dst, m * k.div_ceil(4));
-        crate::kernels::utils::ensure_capacity(row_sums, m);
+        crate::kernels::utils::ensure_scratch(dst, m * k.div_ceil(4));
+        crate::kernels::utils::ensure_scratch(row_sums, m);
     }
     let flip = if dot == Dot::Sdot {
         0x8080_8080u32 as i32
@@ -540,11 +541,11 @@ mod tests {
                     }
                 }
                 for level in levels() {
-                    let (mut got, mut sums) = (Vec::new(), Vec::new());
+                    let (mut got, mut sums) = (AVec::new(0), AVec::new(0));
                     quantize_rows(level, dot, &src, m, k, scale, zero_point, &mut got, &mut sums);
                     let what = format!("k {k} {dot:?} {level:?}");
-                    assert_eq!(got, want, "{what}");
-                    assert_eq!(sums, want_sums, "{what}");
+                    assert_eq!(*got, *want, "{what}");
+                    assert_eq!(*sums, *want_sums, "{what}");
                 }
             }
         }

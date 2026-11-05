@@ -60,6 +60,7 @@ compiler = ["dep:prost", "dep:thiserror"]
 prost = { version = "0.14.3", optional = true }
 thiserror = { version = "2", optional = true }
 half = "2.7.1"
+aligned-vec = "0.6"
 fearless_simd = "1.1"
 fearless_simd_macros = "0.1"
 

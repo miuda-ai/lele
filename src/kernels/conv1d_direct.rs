@@ -2,6 +2,7 @@
 //! im2col copy and no matrix multiply.
 
 use crate::kernels::simd::simd_call;
+use aligned_vec::AVec;
 use fearless_simd::{Level, Simd, f32x8, f32x16};
 use fearless_simd_macros::simd;
 
@@ -55,7 +56,7 @@ fn padded_row_len(shape: &Depthwise) -> usize {
 const VECTOR: usize = 16;
 
 thread_local! {
-    static DEPTHWISE_PADDED: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static DEPTHWISE_PADDED: std::cell::RefCell<AVec<f32>> = std::cell::RefCell::new(AVec::new(0));
 }
 
 #[simd]
@@ -234,7 +235,7 @@ pub(crate) fn kernel3(
 const DOT_MAX_LEN: usize = 4;
 
 thread_local! {
-    static PADDED: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PADDED: std::cell::RefCell<AVec<f32>> = std::cell::RefCell::new(AVec::new(0));
 }
 
 /// Computes `OC` output channels from `oc` over positions `t..t + $n`, with
@@ -461,12 +462,12 @@ const LANES_MIN_OUT_LEN: usize = 32;
 const LANES_MAX_KERNEL: usize = 32;
 
 thread_local! {
-    static PACKED: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PACKED: std::cell::RefCell<AVec<f32>> = std::cell::RefCell::new(AVec::new(0));
 }
 
 /// `packed[(block * kernel + k) * LANES + lane] = weights[block * LANES + lane, k]`,
 /// zero for channels past `out_channels`.
-fn pack_weights(weights: &[f32], out_channels: usize, kernel: usize, packed: &mut Vec<f32>) {
+fn pack_weights(weights: &[f32], out_channels: usize, kernel: usize, packed: &mut AVec<f32>) {
     packed.clear();
     packed.resize(out_channels.div_ceil(LANES) * kernel * LANES, 0.0);
     for (oc, row) in weights.chunks_exact(kernel).take(out_channels).enumerate() {
