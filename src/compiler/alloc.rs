@@ -34,6 +34,11 @@ struct Schedule {
     /// Tensors that are views of others: `If` outputs of their branches'
     /// outputs, reshapes and casts of their input.
     aliases: HashMap<String, Vec<String>>,
+    /// Tensors that may be views of others or copies in a buffer of their
+    /// own, as the kernel finds at run time: slices, gathers, transposes and
+    /// splits (see `kernels::manipulation::borrow_run`). They get a buffer,
+    /// and keep what they read alive as views do.
+    borrows: HashMap<String, String>,
 }
 
 impl Schedule {
@@ -81,6 +86,13 @@ impl Schedule {
                     self.aliases
                         .insert(outputs[0].clone(), vec![inputs[0].clone()]);
                 }
+                Op::Slice | Op::Gather { .. } | Op::Transpose { .. } | Op::Split { .. }
+                    if !inputs.is_empty() =>
+                {
+                    for out in outputs.iter().filter(|o| !o.is_empty()) {
+                        self.borrows.insert(out.clone(), inputs[0].clone());
+                    }
+                }
                 _ => {}
             }
             self.steps.push(Step { inputs, outputs });
@@ -117,17 +129,20 @@ pub(crate) fn solve_allocation(
         }
     }
     // A viewed tensor must live as long as its views.
+    let views = schedule
+        .aliases
+        .iter()
+        .flat_map(|(view, sources)| sources.iter().map(move |s| (view, s)));
+    let views: Vec<(&String, &String)> = views.chain(schedule.borrows.iter()).collect();
     let mut changed = true;
     while changed {
         changed = false;
-        for (alias, sources) in &schedule.aliases {
-            let alias_death = *death_time.get(alias).unwrap_or(&0);
-            for source in sources {
-                let source_death = *death_time.get(source).unwrap_or(&0);
-                if alias_death > source_death {
-                    death_time.insert(source.clone(), alias_death);
-                    changed = true;
-                }
+        for &(view, source) in &views {
+            let view_death = *death_time.get(view).unwrap_or(&0);
+            let source_death = *death_time.get(source).unwrap_or(&0);
+            if view_death > source_death {
+                death_time.insert(source.clone(), view_death);
+                changed = true;
             }
         }
     }
@@ -203,4 +218,58 @@ pub(crate) fn solve_allocation(
             uses: schedule.uses,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::onnx_proto::{GraphProto, NodeProto, ValueInfoProto};
+
+    fn node(op: &str, inputs: &[&str], output: &str) -> NodeProto {
+        NodeProto {
+            op_type: op.to_string(),
+            input: inputs.iter().map(|s| s.to_string()).collect(),
+            output: vec![output.to_string()],
+            ..Default::default()
+        }
+    }
+
+    /// What a slice, gather, transpose or split reads stays in its buffer while the
+    /// result is in use, since the result may be a view of it.
+    #[test]
+    fn test_what_may_be_viewed_lives_as_long_as_the_view() {
+        for (op, inputs) in [
+            ("Slice", &["a", "starts", "ends"][..]),
+            ("Gather", &["a", "index"]),
+            ("Transpose", &["a"]),
+            ("Split", &["a"]),
+            // A copy: `a` is free once read.
+            ("Relu", &["a"]),
+        ] {
+            // A chain long enough to pass the nodes whose inputs are never overwritten.
+            let chain: Vec<String> = (0..8).map(|i| format!("b{i}")).collect();
+            let mut nodes = vec![node("Relu", &["x"], "a"), node(op, inputs, "v")];
+            nodes.push(node("Relu", &["x"], &chain[0]));
+            for w in chain.windows(2) {
+                nodes.push(node("Relu", &[&w[0]], &w[1]));
+            }
+            nodes.push(node("Add", &["v", &chain[7]], "y"));
+            let g = crate::compiler::ir::Graph::from_onnx(GraphProto {
+                node: nodes,
+                input: vec![ValueInfoProto {
+                    name: "x".to_string(),
+                    ..Default::default()
+                }],
+                output: vec![ValueInfoProto {
+                    name: "y".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            let (alloc, _) = solve_allocation(&g, &|_| ElemType::F32);
+            let buffer = |t: &str| alloc.tensor_to_buffer[t];
+            let reused = chain.iter().any(|t| buffer(t) == buffer("a"));
+            assert_eq!(reused, op == "Relu", "{op}");
+        }
+    }
 }

@@ -644,7 +644,33 @@ fn concat_impl<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     }
     TensorView::from_slice(out, out_shape)
 }
-pub fn slice<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
+/// The elements of `input` from `offset` on, as a tensor of `shape`, without copying them,
+/// if `input` borrows its data (a workspace buffer, the weights or the caller's): a view
+/// of data `input` owns could not outlive it.
+///
+/// Slice, Gather, Transpose and Split return such a view whenever what they would copy is
+/// one run of their input, as when a model splits its state into parts or takes one
+/// layer's cache out of a stack of them. The compiler keeps what they read alive as long
+/// as what they return.
+fn borrow_run<'b: 'a, 'a, T: Clone + std::fmt::Debug>(
+    input: &TensorView<'b, T>,
+    offset: usize,
+    shape: Vec<usize>,
+) -> Option<TensorView<'a, T>> {
+    match input.data {
+        std::borrow::Cow::Borrowed(data) => {
+            let len = shape.iter().product::<usize>();
+            Some(TensorView {
+                data: std::borrow::Cow::Borrowed(&data[offset..offset + len]),
+                shape: std::borrow::Cow::Owned(shape),
+            })
+        }
+        std::borrow::Cow::Owned(_) => None,
+    }
+}
+
+/// See [`borrow_run`] for when the result borrows from `input` rather than `out`.
+pub fn slice<'b: 'a, 'a, T: Clone + Copy + std::fmt::Debug>(
     input: &TensorView<'b, T>,
     starts: &[i64],
     ends: &[i64],
@@ -680,13 +706,15 @@ pub fn slice<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
                 let stride: usize = input.shape[1..].iter().product();
                 let start_offset = start * stride;
                 let end_offset = end * stride;
+                let mut out_shape = input.shape.to_vec();
+                out_shape[0] = end - start;
+                if let Some(view) = borrow_run(input, start_offset, out_shape.clone()) {
+                    return view;
+                }
 
                 // SAFETY: the run is copied in whole below.
                 unsafe { utils::ensure_capacity(out, end_offset - start_offset) };
                 out.copy_from_slice(&input.data[start_offset..end_offset]);
-
-                let mut out_shape = input.shape.to_vec();
-                out_shape[0] = end - start;
                 return TensorView::from_slice(out, out_shape);
             }
         }
@@ -798,10 +826,9 @@ pub fn slice<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         out_shape[i] = count as usize;
     }
     let out_numel = out_shape.iter().product::<usize>();
-    // SAFETY: every element is written below before any is read.
-    unsafe { utils::ensure_capacity(out, out_numel) };
-
     if out_numel == 0 {
+        // SAFETY: there is nothing to write.
+        unsafe { utils::ensure_capacity(out, 0) };
         return TensorView::from_slice(out, out_shape);
     }
     let in_strides = utils::compute_strides(&input.shape);
@@ -819,6 +846,17 @@ pub fn slice<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     let run_start: isize = (inner..ndim)
         .map(|d| actual_starts[d] * in_strides[d] as isize)
         .sum();
+    // One run (the outer dimensions take one element each): the slice is a view.
+    if run == out_numel {
+        let offset: isize = (0..inner)
+            .map(|d| actual_starts[d] * in_strides[d] as isize)
+            .sum();
+        if let Some(view) = borrow_run(input, (run_start + offset) as usize, out_shape.clone()) {
+            return view;
+        }
+    }
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, out_numel) };
     let mut coords = vec![0usize; inner];
     for chunk in out[..out_numel].chunks_exact_mut(run) {
         let mut in_off = run_start;
@@ -990,9 +1028,10 @@ enum PadMode {
     Reflect,
 }
 
-pub fn gather<'b, 'a, T, I>(
+/// See [`borrow_run`] for when the result borrows from `data` rather than `out`.
+pub fn gather<'b: 'a, 'a, T, I>(
     data: &TensorView<'b, T>,
-    indices: &TensorView<'b, I>,
+    indices: &TensorView<'_, I>,
     axis: i64,
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T>
@@ -1014,12 +1053,24 @@ where
         out_shape.push(data.shape[i]);
     }
     let out_numel = out_shape.iter().product::<usize>();
-    // SAFETY: every element is written below before any is read.
-    unsafe { utils::ensure_capacity(out, out_numel) };
     let outer_dim: usize = data.shape[..axis].iter().product();
     let axis_dim = data.shape[axis];
     let inner_dim: usize = data.shape[axis + 1..].iter().product();
     let indices_len = indices.data.len();
+    let index = |i: usize| {
+        let v = indices.data[i].as_i64();
+        (if v < 0 { v + axis_dim as i64 } else { v }) as usize
+    };
+    // Consecutive indices into an outermost axis (as one taken out of a stack): a view.
+    if outer_dim == 1
+        && indices_len > 0
+        && (1..indices_len).all(|i| index(i) == index(0) + i)
+        && let Some(view) = borrow_run(data, index(0) * inner_dim, out_shape.clone())
+    {
+        return view;
+    }
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, out_numel) };
     let mut out_idx = 0;
 
     for o in 0..outer_dim {
@@ -1040,7 +1091,8 @@ where
 pub fn cast<'a>(input: &TensorView<'a>, _to: i64) -> TensorView<'a> {
     input.clone()
 }
-pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
+/// See [`borrow_run`] for when the result borrows from `input` rather than `out`.
+pub fn transpose<'b: 'a, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
     input: &TensorView<'b, T>,
     perm: &[i64],
     out: &'a mut Vec<T>,
@@ -1059,6 +1111,16 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
         "transpose: perm {perm:?} is not a permutation of the {ndim} axes of shape {input_shape:?}"
     );
     let out_shape: Vec<usize> = (0..ndim).map(|i| input_shape[perm_at(i)]).collect();
+    // Only axes of length 1 move (as a batch of one swapped with another axis): the
+    // elements stay in order, and the transpose is a view.
+    let mut long_axes = (0..ndim).map(perm_at).filter(|&p| input_shape[p] != 1);
+    let in_order = long_axes
+        .clone()
+        .zip(long_axes.by_ref().skip(1))
+        .all(|(a, b)| a < b);
+    if in_order && let Some(view) = borrow_run(input, 0, out_shape.clone()) {
+        return view;
+    }
     let out_numel = input.data.len();
     // SAFETY: every element is written below before any is read.
     unsafe { utils::ensure_capacity(out, out_numel) };
@@ -1248,8 +1310,10 @@ pub fn split<'a, T: Clone + Copy + std::fmt::Debug>(
 
 /// Output `index` of [`split`], into `out`. Generated code takes each output on its
 /// own, so that each borrows only its own buffer.
-pub fn split_one<'a, T: Copy + std::fmt::Debug>(
-    input: &TensorView<'_, T>,
+///
+/// See [`borrow_run`] for when the result borrows from `input` rather than `out`.
+pub fn split_one<'b: 'a, 'a, T: Copy + std::fmt::Debug>(
+    input: &TensorView<'b, T>,
     axis: i64,
     splits: &[i64],
     index: usize,
@@ -1283,6 +1347,12 @@ pub fn split_one<'a, T: Copy + std::fmt::Debug>(
     let mut out_shape = input.shape.to_vec();
     out_shape[axis] = split_size;
     let copy_len = split_size * inner_dim;
+    // A split of an outermost axis (as of a convolution's channels, batch one): a view.
+    if outer_dim == 1
+        && let Some(view) = borrow_run(input, axis_offset * inner_dim, out_shape.clone())
+    {
+        return view;
+    }
     out.clear();
     out.reserve(outer_dim * copy_len);
     for outer_idx in 0..outer_dim {
@@ -1585,6 +1655,50 @@ where
 mod tests {
     use super::*;
     use crate::tensor::TensorView;
+
+    /// Slice, Gather, Transpose and Split return a view of a borrowed input exactly when
+    /// what they take is one run of it, with the elements and shape a copy has; an owned
+    /// input is always copied.
+    #[test]
+    fn test_views_are_of_contiguous_runs_of_borrowed_inputs() {
+        type Op = dyn Fn(&TensorView<'_>, &mut Vec<f32>) -> (Vec<usize>, Vec<f32>, bool);
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        // The result, and whether it lies in `base`.
+        fn run(t: &TensorView<'_>, r: TensorView<'_>) -> (Vec<usize>, Vec<f32>, bool) {
+            let inside = t.data.as_ptr_range().contains(&r.data.as_ptr());
+            (r.shape.to_vec(), r.data.to_vec(), inside)
+        }
+        let idx = |v: &[i64]| v.to_vec();
+        // One case to a line.
+        #[rustfmt::skip]
+        let cases: Vec<(&str, Vec<usize>, Box<Op>, bool)> = vec![
+            ("slice of the first axis", vec![2, 3, 4], Box::new(|t, o| run(t, slice(t, &[1], &[2], &[0], &[1], o))), true),
+            ("slice of a middle axis, batch one", vec![1, 3, 4], Box::new(|t, o| run(t, slice(t, &[1], &[3], &[1], &[1], o))), true),
+            ("slice of one row's columns", vec![1, 3, 4], Box::new(|t, o| run(t, slice(t, &[2, 1], &[3, 3], &[1, 2], &[1, 1], o))), true),
+            ("slice of every row's columns", vec![1, 3, 4], Box::new(|t, o| run(t, slice(t, &[1], &[3], &[2], &[1], o))), false),
+            ("slice with a step", vec![1, 3, 4], Box::new(|t, o| run(t, slice(t, &[0], &[3], &[1], &[2], o))), false),
+            ("gather of one index of the first axis", vec![2, 3, 4], Box::new(move |t, o| run(t, gather(t, &TensorView::from_owned(idx(&[1]), vec![]), 0, o))), true),
+            ("gather of consecutive indices", vec![2, 3, 4], Box::new(move |t, o| run(t, gather(t, &TensorView::from_owned(idx(&[-2, -1]), vec![2]), 0, o))), true),
+            ("gather of indices out of order", vec![2, 3, 4], Box::new(move |t, o| run(t, gather(t, &TensorView::from_owned(idx(&[1, 0]), vec![2]), 0, o))), false),
+            ("gather of a middle axis, batch one", vec![1, 3, 4], Box::new(move |t, o| run(t, gather(t, &TensorView::from_owned(idx(&[2]), vec![]), 1, o))), true),
+            ("gather of a middle axis", vec![2, 3, 4], Box::new(move |t, o| run(t, gather(t, &TensorView::from_owned(idx(&[2]), vec![]), 1, o))), false),
+            ("transpose moving an axis of one", vec![1, 3, 4], Box::new(|t, o| run(t, transpose(t, &[1, 0, 2], o))), true),
+            ("transpose swapping two axes", vec![1, 3, 4], Box::new(|t, o| run(t, transpose(t, &[0, 2, 1], o))), false),
+            ("split of a middle axis, batch one", vec![1, 3, 4], Box::new(|t, o| run(t, split_one(t, 1, &[1, 2], 1, o))), true),
+            ("split of a middle axis", vec![2, 3, 4], Box::new(|t, o| run(t, split_one(t, 1, &[1, 2], 1, o))), false),
+        ];
+        for (what, shape, op, view) in cases {
+            let data = &data[..shape.iter().product::<usize>()];
+            let borrowed = TensorView::from_slice(data, shape.clone());
+            let owned = TensorView::from_owned(data.to_vec(), shape);
+            let (mut b_out, mut o_out) = (Vec::new(), Vec::new());
+            let (b_shape, b_data, b_view) = op(&borrowed, &mut b_out);
+            let (o_shape, o_data, o_view) = op(&owned, &mut o_out);
+            assert_eq!(b_view, view, "{what}: view");
+            assert!(!o_view, "{what}: a view of an owned input");
+            assert_eq!((b_shape, b_data), (o_shape, o_data), "{what}");
+        }
+    }
 
     /// `where_op` against indexing each operand by its broadcast coordinates, for
     /// conditions that repeat over the output (trailing dimensions) and ones that

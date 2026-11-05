@@ -482,7 +482,8 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
 /// is freed when the chunk returns.
 ///
 /// A variable written into `ws.buf_*` qualifies, as does a weight or a chunk argument; a
-/// view (`reshape`, `unsqueeze`, `squeeze`, `.clone()`) qualifies if what it views does.
+/// view (`reshape`, `unsqueeze`, `squeeze`, `.clone()`) qualifies if what it views does,
+/// and a slice, gather, transpose or split (which may be a view) if both do.
 /// Every definition counts (there is one per target under `cfg`). Anything else is
 /// returned as a copy.
 fn outlives_chunk(body: &str, var: &str, depth: usize) -> bool {
@@ -508,8 +509,21 @@ fn outlives_chunk(body: &str, var: &str, depth: usize) -> bool {
     if defs.is_empty() {
         return true;
     }
+    // The first operand of `rhs` if it is a call to `f`.
+    let operand = |rhs: &str, f: &str| {
+        rhs.strip_prefix(&format!("lele::kernels::{f}(&"))
+            .map(|s| s.split([',', ')']).next().unwrap_or("").trim().to_string())
+    };
     defs.iter().all(|rhs| {
         let rhs = rhs.split(';').next().unwrap_or("");
+        // These may return a view of their first operand rather than their buffer
+        // (`kernels::manipulation::borrow_run`): both have to outlive the chunk.
+        let borrowed = ["slice", "gather", "transpose", "split_one"]
+            .iter()
+            .find_map(|f| operand(rhs, f));
+        if let Some(source) = borrowed {
+            return rhs.contains("&mut ws.buf_") && outlives_chunk(body, &source, depth + 1);
+        }
         if rhs.contains("&mut ws.buf_") || rhs.starts_with("self.weight_") {
             return true;
         }
@@ -727,6 +741,11 @@ mod tests {
         let z = lele::kernels::add(&a, &b, &mut buf_z);
         let (values, indices) = lele::kernels::topk(&x, 5, 1, true, true, &mut buf_v, &mut buf_i);
         let picked = lele::kernels::squeeze(&indices, None);
+        let part = lele::kernels::slice(&x, &[0], &[1], &[0], &[1], &mut ws.buf_5);
+        let part_of_y = lele::kernels::slice(&y, &[0], &[1], &[0], &[1], &mut ws.buf_6);
+        let layer = lele::kernels::gather(&arg, &self.weight_i64(0, 8, &[]), 0, &mut ws.buf_7);
+        let swapped = lele::kernels::transpose(&x, &[1, 0], &mut buf_t);
+        let half = lele::kernels::split_one(&m3, 1, &[0, 0], 0, &mut ws.buf_8);
 ";
         for (var, safe) in [
             ("values", false),
@@ -741,6 +760,12 @@ mod tests {
             ("y", false),
             ("z", false),
             ("chunk_argument", true),
+            // May be views of their first operand.
+            ("part", true),
+            ("part_of_y", false),
+            ("layer", true),
+            ("swapped", false),
+            ("half", false),
         ] {
             assert_eq!(outlives_chunk(body, var, 0), safe, "{var}");
         }

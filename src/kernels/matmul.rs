@@ -525,11 +525,26 @@ fn gather<'a>(
     cs: usize,
 ) -> &'a [f32] {
     out.clear();
-    out.extend(
-        (0..rows)
-            .flat_map(|i| (0..cols).map(move |j| (i, j)))
-            .map(|(i, j)| data[i * rs + j * cs]),
-    );
+    out.resize(rows * cols, 0.0);
+    if rows == 0 || cols == 0 {
+        return out;
+    }
+    if cs == 1 {
+        // Rows of a matrix stored with a gap between them.
+        for (i, row) in out.chunks_exact_mut(cols).enumerate() {
+            row.copy_from_slice(&data[i * rs..][..cols]);
+        }
+    } else if rs == 1 {
+        // The transpose of a row-major `cols x rows` matrix `cs` apart: the common case,
+        // which a model reaches by transposing an activation before a product.
+        crate::kernels::manipulation::transpose_matrix(data, cs, out, cols, cols, rows);
+    } else {
+        for (i, row) in out.chunks_exact_mut(cols).enumerate() {
+            for (j, x) in row.iter_mut().enumerate() {
+                *x = data[i * rs + j * cs];
+            }
+        }
+    }
     out
 }
 
@@ -569,6 +584,34 @@ mod tests {
     /// An f16 B gives the product of B widened to f32, bit for bit: through the packed
     /// panels (narrow ones, every row group), the small-M stream (several widened blocks,
     /// a remainder of rows) and the dot products.
+    /// `gather` against indexing, for rows of a matrix with and without a gap, the
+    /// transpose of one, and any other strides, at sizes around the tiles of a transpose.
+    #[test]
+    fn test_gather_matches_indexing() {
+        let data: Vec<f32> = (0..8000).map(|i| i as f32).collect();
+        #[rustfmt::skip]
+        let sizes = [(0, 3), (3, 0), (1, 1), (5, 3), (3, 5), (10, 384), (384, 10), (8, 8), (17, 33), (4, 4)];
+        for (rows, cols) in sizes {
+            // (row stride, column stride): contiguous, a gap, transposed (two spacings),
+            // and neither.
+            let strides = [
+                (cols, 1),
+                (cols + 3, 1),
+                (1, rows),
+                (1, rows + 5),
+                (cols + 1, 2),
+            ];
+            for (rs, cs) in strides {
+                let mut out = Vec::new();
+                let got = gather(&mut out, &data, rows, cols, rs, cs).to_vec();
+                let want: Vec<f32> = (0..rows)
+                    .flat_map(|i| (0..cols).map(move |j| (i * rs + j * cs) as f32))
+                    .collect();
+                assert_eq!(got, want, "{rows}x{cols} strides {rs}, {cs}");
+            }
+        }
+    }
+
     #[test]
     fn test_matmul_f16_is_matmul_of_widened_b() {
         let mut rng = Rng::new(5);

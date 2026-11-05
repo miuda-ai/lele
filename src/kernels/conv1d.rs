@@ -269,6 +269,31 @@ fn conv1d_fused_at<'b, 'a>(
         return TensorView::from_slice(out, vec![batch_size, out_channels, output_len]);
     }
 
+    // A channel multiplier (every channel convolved with several kernels, as in a
+    // depthwise convolution that widens, or a strided one that reduces a sequence while
+    // widening it): one depthwise convolution for each multiple. Per group, the product
+    // is a few rows against a few columns, and its fixed costs are the whole time.
+    // (Of one channel, or with many multiples, each of its own pass over the input, the
+    // product is the better way.)
+    if g == in_channels
+        && in_channels > 1
+        && in_channels_per_group == 1
+        && (2..=MAX_MULTIPLIER).contains(&out_channels_per_group)
+        && (dilation == 1 || stride == 1)
+    {
+        depthwise_multiplied(
+            level,
+            (input, batch_size, in_channels, input_len),
+            weights,
+            bias,
+            (kernel_size, stride, dilation, pad_left),
+            relu,
+            (out_channels_per_group, output_len),
+            &mut out[..total_output_size],
+        );
+        return TensorView::from_slice(out, vec![batch_size, out_channels, output_len]);
+    }
+
     if group == 1
         && kernel_size == 3
         && dilation == 1
@@ -449,6 +474,71 @@ fn conv1d_fused_at<'b, 'a>(
 
         TensorView::from_slice(out, vec![batch_size, out_channels, output_len])
     })
+}
+
+/// The most kernels per channel that [`depthwise_multiplied`] takes.
+const MAX_MULTIPLIER: usize = 8;
+
+/// A depthwise convolution with `multiplier` kernels for each channel: output channel
+/// `c * multiplier + j` is channel `c` convolved with kernel `c * multiplier + j`. Each
+/// `j` is a depthwise convolution of its own, whose rows go to their place in `out`.
+#[allow(clippy::too_many_arguments)]
+fn depthwise_multiplied(
+    level: Level,
+    (input, batch, channels, len): (&TensorView, usize, usize, usize),
+    weights: &TensorView,
+    bias: Option<&TensorView>,
+    (kernel, stride, dilation, pad_left): (usize, usize, usize, usize),
+    relu: bool,
+    (multiplier, out_len): (usize, usize),
+    out: &mut [f32],
+) {
+    thread_local! {
+        /// The taps and bias of one multiple, and its output.
+        static MULTIPLES: std::cell::RefCell<[Vec<f32>; 3]> =
+            const { std::cell::RefCell::new([Vec::new(), Vec::new(), Vec::new()]) };
+    }
+    MULTIPLES.with_borrow_mut(|[taps, biases, part]| {
+        part.clear();
+        part.resize(batch * channels * out_len, 0.0);
+        for j in 0..multiplier {
+            taps.clear();
+            biases.clear();
+            for c in 0..channels {
+                let oc = c * multiplier + j;
+                taps.extend_from_slice(&weights.data[oc * kernel..][..kernel]);
+                if let Some(bias) = bias {
+                    biases.push(bias.data[oc]);
+                }
+            }
+            let shape = Depthwise {
+                batch,
+                channels,
+                len,
+                kernel,
+                stride,
+                dilation,
+                pad_left,
+                out_len,
+                bias: bias.map(|_| &biases[..]),
+                relu,
+            };
+            depthwise(
+                level,
+                &shape,
+                &input.data[..batch * channels * len],
+                taps,
+                part,
+            );
+            for b in 0..batch {
+                for c in 0..channels {
+                    let dst = (b * channels * multiplier + c * multiplier + j) * out_len;
+                    out[dst..][..out_len]
+                        .copy_from_slice(&part[(b * channels + c) * out_len..][..out_len]);
+                }
+            }
+        }
+    });
 }
 
 /// [`conv1d_fused_at`] as the convolution of a `[batch, channels, 1, len]` input.
@@ -768,6 +858,37 @@ mod tests {
                 batch: 2,
                 group: 6,
                 ..case(6, 6, 33, 3, 2, [1, 1])
+            },
+            // A channel multiplier: T-one's strided one (384 channels, four kernels
+            // each, over 40 samples), and ones with padding, a batch, dilation, a bias
+            // and ReLU, a multiplier past the limit, one channel, and dilation with a
+            // stride (the general path).
+            Case {
+                group: 6,
+                ..case(6, 24, 40, 3, 2, [0, 0])
+            },
+            Case {
+                batch: 2,
+                group: 5,
+                ..case(5, 15, 33, 5, 1, [2, 2])
+            },
+            Case {
+                group: 4,
+                dilation: 3,
+                ..case(4, 8, 50, 3, 1, [3, 3])
+            },
+            Case {
+                group: 3,
+                ..case(3, 30, 20, 3, 1, [1, 1])
+            },
+            Case {
+                group: 1,
+                ..case(1, 4, 20, 3, 1, [1, 1])
+            },
+            Case {
+                group: 4,
+                dilation: 2,
+                ..case(4, 8, 40, 3, 2, [2, 2])
             },
         ]);
         cases
