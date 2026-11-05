@@ -43,7 +43,7 @@ fn is_integer(t: DType) -> bool {
 }
 
 /// The values of an int64, int32 or bool tensor.
-fn exact_ints(t: &TensorProto) -> Option<Vec<i64>> {
+pub(super) fn exact_ints(t: &TensorProto) -> Option<Vec<i64>> {
     if !t.int64_data.is_empty() {
         return Some(t.int64_data.clone());
     }

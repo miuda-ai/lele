@@ -11,6 +11,9 @@ pub struct Allocator {
     pub num_buffers: usize,
     /// Element type of each buffer, that of every tensor it holds.
     pub(crate) buffer_types: Vec<ElemType>,
+    /// Number of elements of the largest tensor each buffer holds, where all
+    /// their shapes are fixed.
+    pub(crate) buffer_lens: Vec<Option<usize>>,
 }
 
 pub(crate) struct AnalysisData {
@@ -90,7 +93,11 @@ impl Schedule {
         for (_, node) in g.nodes() {
             let id = self.steps.len();
             let inputs: Vec<String> = node.inputs().iter().map(|&v| name(v)).collect();
-            let outputs: Vec<String> = node.outputs().iter().map(|&v| name(v)).collect();
+            // A constant is read from the weights.
+            let outputs: Vec<String> = match node.op {
+                Op::Constant { .. } => Vec::new(),
+                _ => node.outputs().iter().map(|&v| name(v)).collect(),
+            };
             for input in &inputs {
                 self.uses.entry(input.clone()).or_default().push(id);
             }
@@ -272,6 +279,13 @@ pub(crate) fn solve_allocation(
             tensor_to_buffer: all,
             num_buffers: buffer_types.len(),
             buffer_types,
+            buffer_lens: capacities
+                .into_iter()
+                .map(|c| {
+                    c.filter(|c| c.symbols.is_empty())
+                        .and_then(|c| usize::try_from(c.count).ok())
+                })
+                .collect(),
         },
         AnalysisData {
             death_time,

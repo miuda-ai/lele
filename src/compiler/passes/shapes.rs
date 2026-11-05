@@ -771,6 +771,34 @@ fn output_shapes(g: &Graph, node: &Node, elems: &Elems) -> Vec<Option<Shape>> {
                 ])
             }))
         }
+        // lele's kernels take one sequence (batch 1) in one direction, with
+        // the time axis first (`layout` 0): `Y` is `[seq, 1, 1, hidden]`,
+        // `Y_h` and `Y_c` `[1, 1, hidden]`.
+        Op::Lstm | Op::Gru { .. } => {
+            let gates = if matches!(node.op, Op::Lstm) { 4 } else { 3 };
+            let layout = node.proto.attribute.iter().find(|a| a.name == "layout");
+            let out = shape(0).zip(shape(1)).and_then(|(x, w)| {
+                let ([seq, Dim::Fixed(1), _], [Dim::Fixed(1), Dim::Fixed(g), _]) =
+                    (x.as_slice(), w.as_slice())
+                else {
+                    return None;
+                };
+                let hidden = Dim::Fixed(g / gates);
+                (layout.is_none_or(|a| a.i == 0) && g % gates == 0).then(|| {
+                    let one = Dim::Fixed(1);
+                    (
+                        vec![seq.clone(), one.clone(), one.clone(), hidden.clone()],
+                        vec![one.clone(), one, hidden],
+                    )
+                })
+            });
+            (0..n_out)
+                .map(|i| {
+                    out.as_ref()
+                        .map(|(y, h)| if i == 0 { y } else { h }.clone())
+                })
+                .collect()
+        }
         Op::EmbeddingConcat { .. } => first(shape(1).zip(dims(0)).and_then(|(w, fill)| {
             let rows = match (fixed(w.first()?), fixed(fill.first()?)) {
                 (Some(a), Some(b)) => Dim::Fixed(a + b),
@@ -1165,6 +1193,85 @@ mod tests {
         infer_dtypes(&mut g);
         fold_shapes(&mut g);
         g
+    }
+
+    /// LSTM and GRU outputs have the shapes lele's kernels give them, for
+    /// one sequence in one direction.
+    #[test]
+    fn recurrent_outputs_have_the_shapes_of_the_kernels() {
+        let weight = |name: &str, dims: &[i64]| TensorProto {
+            name: name.to_string(),
+            data_type: DType::F32.to_onnx(),
+            dims: dims.to_vec(),
+            ..Default::default()
+        };
+        let shape = |g: &Graph, name: &str| g.value(g.find_value(name).unwrap()).shape.clone();
+        let fixed = |dims: &[i64]| Some(dims.iter().map(|&d| Dim::Fixed(d)).collect::<Vec<_>>());
+        for (op, gates, outputs) in [("LSTM", 4, &["y", "h", "c"][..]), ("GRU", 3, &["y", "h"])] {
+            for (directions, batch) in [(1, "1"), (2, "1"), (1, "2")] {
+                let g = run(GraphProto {
+                    node: vec![node(op, &["x", "w", "r"], outputs)],
+                    input: vec![input("x", &["seq", batch, "13"])],
+                    initializer: vec![
+                        weight("w", &[directions, gates * 37, 13]),
+                        weight("r", &[directions, gates * 37, 37]),
+                    ],
+                    output: outputs.iter().map(|o| output(o)).collect(),
+                    ..Default::default()
+                });
+                let known = directions == 1 && batch == "1";
+                let seq = Dim::Sym("seq".to_string());
+                let y = known.then(|| vec![seq, Dim::Fixed(1), Dim::Fixed(1), Dim::Fixed(37)]);
+                assert_eq!(shape(&g, "y"), y, "{op} {directions} {batch}");
+                for state in &outputs[1..] {
+                    let want = if known { fixed(&[1, 1, 37]) } else { None };
+                    assert_eq!(shape(&g, state), want, "{op} {directions} {batch}");
+                }
+            }
+        }
+    }
+
+    /// T-one's `Expand` targets: the dimensions of `x`, with each -1 (none)
+    /// replaced by 1 through `Where`. Inference leaves the target open, and
+    /// folding resolves it, so a second round of inference is needed for the
+    /// shape of the result.
+    #[test]
+    fn a_second_round_infers_what_folding_resolved() {
+        let fold = super::super::fold_constants;
+        let mut g = Graph::from_onnx(GraphProto {
+            node: vec![
+                node("Shape", &["x"], &["s"]),
+                node("Shape", &["s"], &["rank"]),
+                NodeProto {
+                    attribute: vec![AttributeProto {
+                        name: "value".to_string(),
+                        t: Some(ints("one", &[1])),
+                        ..Default::default()
+                    }],
+                    ..node("ConstantOfShape", &["rank"], &["ones"])
+                },
+                node("Mul", &["ones", "minus_one"], &["minus_ones"]),
+                node("Equal", &["s", "minus_ones"], &["unset"]),
+                node("Where", &["unset", "ones", "s"], &["target"]),
+                node("Expand", &["k", "target"], &["y"]),
+            ],
+            input: vec![input("x", &["2", "3"]), input("k", &["1"])],
+            initializer: vec![TensorProto {
+                dims: vec![],
+                ..ints("minus_one", &[-1])
+            }],
+            output: vec![output("y")],
+            ..Default::default()
+        });
+        let shape = |g: &Graph| g.value(g.find_value("y").unwrap()).shape.clone();
+        fold(&mut g);
+        infer_dtypes(&mut g);
+        fold_shapes(&mut g);
+        fold(&mut g);
+        assert_eq!(shape(&g).map(|s| s.contains(&Dim::Unknown)), Some(true));
+        infer_dtypes(&mut g);
+        fold_shapes(&mut g);
+        assert_eq!(shape(&g), Some(vec![Dim::Fixed(2), Dim::Fixed(3)]));
     }
 
     /// The attention reshape `x[batch, seq, 768] -> [batch, seq, 12, 64]`,

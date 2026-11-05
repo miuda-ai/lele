@@ -62,7 +62,10 @@ pub mod generate;
 pub mod ir;
 pub mod ops;
 mod passes;
+mod specialize;
 mod weights;
+
+pub use specialize::InputValue;
 
 pub(crate) use generate::*;
 
@@ -88,7 +91,8 @@ fn to_pascal_case(s: &str) -> String {
 pub struct Optimizations {
     /// Replaces nodes whose inputs are all known at compile time by
     /// initializers holding their result, computed with the kernels the
-    /// generated code would run.
+    /// generated code would run, and `If` nodes whose condition is known by
+    /// the branch they take.
     pub constant_folding: bool,
     /// Infers tensor shapes and replaces shape computations (`Shape`,
     /// `Gather` of dimensions, ...) by constants where the dimensions are
@@ -138,6 +142,7 @@ pub struct Compiler {
     pub(crate) model_name: String,
     pub(crate) patterns: Vec<Pattern>,
     pub(crate) custom_methods: Vec<String>,
+    pub(crate) specialization: specialize::Specialization,
     pub optimizations: Optimizations,
     /// Optional weights blob (and content index) reused from an earlier
     /// compilation, so identical tensors are not stored twice.
@@ -157,6 +162,7 @@ impl Compiler {
             model_name: "Model".to_string(),
             patterns: Vec::new(),
             custom_methods: Vec::new(),
+            specialization: Default::default(),
             optimizations: Optimizations::default(),
             shared_weights: std::cell::RefCell::new(None),
         }
@@ -221,12 +227,45 @@ impl Compiler {
         self
     }
 
+    /// Compiles the model for input `name` of shape `shape` alone. The passes
+    /// know its dimensions, shape folding resolves what depends on them, and
+    /// buffers whose sizes become known are reserved by the workspace up
+    /// front. The generated `forward` panics on another shape.
+    pub fn with_input_shape(mut self, name: &str, shape: &[usize]) -> Self {
+        self.specialization
+            .shapes
+            .insert(name.to_string(), shape.to_vec());
+        self
+    }
+
+    /// Compiles the model for the symbolic dimension `name` (an input's
+    /// `dim_param`, such as `batch_size`) being `value`, in every input and
+    /// tensor that has it. The generated `forward` panics on inputs where it
+    /// is not.
+    pub fn with_dim(mut self, name: &str, value: usize) -> Self {
+        self.specialization.dims.insert(name.to_string(), value);
+        self
+    }
+
+    /// Compiles input `name` in as a constant holding `value`, its elements
+    /// in order, of the input's type: what depends on it alone is folded.
+    /// Its shape must be fixed, by the model or by
+    /// [`with_input_shape`](Self::with_input_shape). The generated `forward`
+    /// still takes the input, and panics on another value.
+    pub fn with_input_value(mut self, name: &str, value: impl Into<InputValue>) -> Self {
+        self.specialization
+            .values
+            .insert(name.to_string(), value.into());
+        self
+    }
+
     pub fn compile(
         &self,
         graph: &GraphProto,
     ) -> Result<CompilationResult, Box<dyn std::error::Error>> {
         let opt = self.optimizations;
         let mut ir = ir::Graph::from_onnx(graph.clone());
+        let inputs = self.specialization.apply(&mut ir)?;
         if opt.qdq_fusion {
             // Must precede folding, which would otherwise consume the int8
             // weights.
@@ -242,6 +281,22 @@ impl Compiler {
             passes::infer_dtypes(&mut ir);
             passes::fold_shapes(&mut ir);
             if opt.constant_folding {
+                passes::fold_constants(&mut ir);
+                // Folding resolves shape computations inference left open
+                // (an `Expand` target selected by `Where`), whose results a
+                // second round of inference then knows the shapes of.
+                passes::infer_dtypes(&mut ir);
+                passes::fold_shapes(&mut ir);
+                passes::fold_constants(&mut ir);
+            }
+        }
+        // Each round takes out at least one `If`, whose branch may fold into
+        // the condition of another.
+        while opt.constant_folding && passes::inline_constant_ifs(&mut ir) {
+            passes::fold_constants(&mut ir);
+            if opt.shape_folding {
+                passes::infer_dtypes(&mut ir);
+                passes::fold_shapes(&mut ir);
                 passes::fold_constants(&mut ir);
             }
         }
@@ -365,9 +420,39 @@ impl Compiler {
             }
         }
         writeln!(&mut code, "}}")?;
+        // Buffers whose tensors all have fixed shapes are allocated once, at
+        // their largest size, when the workspace is made.
+        let mut used: Vec<usize> = used_buffers.iter().copied().collect();
+        used.sort();
+        let sized: Vec<(usize, usize)> = used
+            .iter()
+            .filter_map(|&b| Some((b, allocator.buffer_lens[b]?)))
+            .collect();
         writeln!(&mut code, "impl {}Workspace {{", struct_name)?;
+        if sized.len() == used.len() {
+            let bytes: usize = sized
+                .iter()
+                .map(|&(b, len)| len * allocator.buffer_types[b].size())
+                .sum();
+            writeln!(
+                &mut code,
+                "    /// Bytes of the buffers `new` allocates. Every tensor's shape is fixed, so the buffers never grow."
+            )?;
+            writeln!(&mut code, "    pub const BYTES: usize = {bytes};")?;
+        }
         writeln!(&mut code, "    pub fn new() -> Self {{")?;
-        writeln!(&mut code, "        Self::default()")?;
+        if sized.is_empty() {
+            writeln!(&mut code, "        Self::default()")?;
+        } else {
+            writeln!(&mut code, "        Self {{")?;
+            for (b, len) in &sized {
+                writeln!(&mut code, "            buf_{b}: Vec::with_capacity({len}),")?;
+            }
+            if sized.len() < used.len() {
+                writeln!(&mut code, "            ..Default::default()")?;
+            }
+            writeln!(&mut code, "        }}")?;
+        }
         writeln!(&mut code, "    }}")?;
         writeln!(&mut code, "}}")?;
         // Main struct: wraps the weights and derefs to them, so the weight
@@ -420,11 +505,16 @@ impl Compiler {
 
         // Inference Function
         writeln!(&mut code, "\n    // Inference Entry Point")?;
-        let args: Vec<String> = graph_inputs
+        // `forward` takes every input, those compiled in included.
+        let input_type = |i: &specialize::Input| {
+            i.fixed_type
+                .unwrap_or_else(|| var_types.get(&sanitize_name(&i.name)))
+        };
+        let args: Vec<String> = inputs
             .iter()
             .map(|i| {
                 let name = sanitize_name(&i.name);
-                match var_types.get(&name) {
+                match input_type(i) {
                     ElemType::F32 => format!("{}: TensorView<'a>", name),
                     ty => format!("{}: TensorView<'a, {}>", name, ty),
                 }
@@ -455,7 +545,7 @@ impl Compiler {
             "        let mut ws = {}Workspace::new();",
             struct_name
         )?;
-        let arg_names_str = graph_inputs
+        let arg_names_str = inputs
             .iter()
             .map(|i| sanitize_name(&i.name))
             .collect::<Vec<_>>()
@@ -489,6 +579,12 @@ impl Compiler {
             args.join(", ").replace("'a", "'w"),
             ret_sig.replace("'a", "'w")
         )?;
+        for input in &inputs {
+            let var = sanitize_name(&input.name);
+            for check in input.checks(struct_name, &var, input_type(input)) {
+                writeln!(&mut code, "        {check}")?;
+            }
+        }
         // Generate Body
         code.extend_from_slice(body_str.as_bytes());
         // Return outputs

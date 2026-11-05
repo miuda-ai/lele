@@ -13,3 +13,7 @@ dest = "model.onnx"
 class_name = "TOne"
 model_file = "model.onnx"
 custom_methods = []
+
+# One stream at a time.
+[codegen.dims]
+batch_size = 1

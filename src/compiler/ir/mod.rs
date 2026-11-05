@@ -331,6 +331,67 @@ impl Graph {
         self.initializers.push(v);
     }
 
+    /// Turns graph input `v` into an initializer holding `tensor`, replacing
+    /// the default value an initializer of its name gave it.
+    pub fn fix_input(&mut self, v: ValueId, tensor: TensorProto) {
+        self.inputs.retain(|&i| i != v);
+        let value = &mut self.values[v.0 as usize];
+        value.dtype = DType::from_onnx(tensor.data_type);
+        value.shape = Some(tensor.dims.iter().map(|&d| Dim::Fixed(d)).collect());
+        if value.data.replace(tensor).is_none() {
+            self.initializers.push(v);
+        }
+    }
+
+    /// Replaces `node` by the nodes of `branch`, one of its subgraphs, run
+    /// where it ran: `branch` reads the values it captures from this graph,
+    /// and its outputs become the node's, through `Identity` nodes. Returns
+    /// false, leaving the graph as it was, if a value `branch` defines has the
+    /// name of a value of this graph.
+    pub fn inline_subgraph(&mut self, node: NodeId, branch: &Graph) -> bool {
+        let defined: Vec<ValueId> = branch
+            .value_ids()
+            .filter(|&v| branch.value(v).producer.is_some() || branch.value(v).data.is_some())
+            .collect();
+        if defined
+            .iter()
+            .any(|&v| self.by_name.contains_key(&branch.value(v).name))
+        {
+            return false;
+        }
+        let outputs = self.node(node).outputs.clone();
+        let pos = self.order.iter().position(|&n| n == node).unwrap();
+        self.remove_node(node);
+        let first = self.order.len();
+        for &v in branch.initializers() {
+            let value = branch.value(v);
+            let new = self.intern(&value.name);
+            self.add_initializer(new, value.data.clone().unwrap());
+        }
+        for (id, _) in branch.nodes() {
+            self.push_node(branch.node_proto(id));
+        }
+        for (&out, &src) in outputs.iter().zip(&branch.outputs) {
+            if let Some(out) = out {
+                self.push_node(NodeProto {
+                    op_type: "Identity".to_string(),
+                    input: vec![branch.value(src).name.clone()],
+                    output: vec![self.value(out).name.clone()],
+                    ..Default::default()
+                });
+            }
+        }
+        for &v in &defined {
+            let (value, new) = (branch.value(v), self.by_name[&branch.value(v).name]);
+            let new = &mut self.values[new.0 as usize];
+            new.dtype = value.dtype;
+            new.shape = value.shape.clone();
+        }
+        let inlined: Vec<NodeId> = self.order.drain(first..).collect();
+        self.order.splice(pos..pos, inlined);
+        true
+    }
+
     /// Number of reads of `v`, counting each graph output it is as one.
     pub fn uses(&self, v: ValueId) -> usize {
         self.value(v).consumers.len() + self.outputs.iter().filter(|&&o| o == v).count()

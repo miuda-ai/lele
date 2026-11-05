@@ -471,10 +471,66 @@ fn embedding_concat<'d, T: Clone + std::fmt::Debug>(shape: &TensorView<'_, i64>,
     }
 }
 
+/// Panics unless `shape`, that of input `input` of `model`, has the
+/// dimensions `expected` gives, a `None` matching any. The model was compiled
+/// for those.
+pub fn check_input_shape(model: &str, input: &str, shape: &[usize], expected: &[Option<usize>]) {
+    let matches = shape.len() == expected.len()
+        && shape
+            .iter()
+            .zip(expected)
+            .all(|(&d, e)| e.is_none_or(|e| e == d));
+    if !matches {
+        let dims: Vec<String> = expected
+            .iter()
+            .map(|e| e.map_or("_".to_string(), |d| d.to_string()))
+            .collect();
+        panic!(
+            "{model} was compiled for input {input} of shape [{}], not {shape:?}",
+            dims.join(", ")
+        );
+    }
+}
+
+/// Panics unless `data`, that of input `input` of `model`, is `expected`,
+/// which the model was compiled with.
+pub fn check_input_value<T: PartialEq + std::fmt::Debug>(
+    model: &str,
+    input: &str,
+    data: &[T],
+    expected: &[T],
+) {
+    if data != expected {
+        panic!("{model} was compiled for input {input} = {expected:?}, not {data:?}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use half::f16;
+
+    #[test]
+    fn input_checks_pass_what_the_model_was_compiled_for() {
+        check_input_shape("M", "x", &[1, 512], &[Some(1), Some(512)]);
+        check_input_shape("M", "x", &[1, 7, 80], &[Some(1), None, Some(80)]);
+        check_input_shape("M", "sr", &[], &[]);
+        check_input_value("M", "sr", &[16000i64], &[16000]);
+        let shape =
+            std::panic::catch_unwind(|| check_input_shape("M", "x", &[1, 7], &[None, Some(8)]));
+        let msg = *shape.unwrap_err().downcast::<String>().unwrap();
+        assert_eq!(
+            msg,
+            "M was compiled for input x of shape [_, 8], not [1, 7]"
+        );
+        assert!(
+            std::panic::catch_unwind(|| check_input_shape("M", "x", &[1], &[Some(1), None]))
+                .is_err()
+        );
+        let value = std::panic::catch_unwind(|| check_input_value("M", "sr", &[8000i64], &[16000]));
+        let msg = *value.unwrap_err().downcast::<String>().unwrap();
+        assert_eq!(msg, "M was compiled for input sr = [16000], not [8000]");
+    }
 
     /// f16 weights converted at load read the same as converted per call,
     /// and those not listed are still converted per call.

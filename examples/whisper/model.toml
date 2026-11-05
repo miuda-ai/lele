@@ -43,3 +43,13 @@ dest = "config.json"
 class_name = "WhisperEncoder"
 model_file = "encoder_model.onnx"
 custom_methods = []
+
+# One transcript at a time, of 30 seconds of 80 mel bins, which the encoder
+# turns into 1500 frames.
+[codegen.shapes]
+input_features = [1, 80, 3000]
+
+[codegen.dims]
+batch_size = 1
+"encoder_sequence_length / 2" = 1500
+encoder_sequence_length_out = 1500

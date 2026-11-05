@@ -103,6 +103,14 @@ impl ElemType {
         }
     }
 
+    /// Size of an element in bytes.
+    pub fn size(self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::I64 => 8,
+        }
+    }
+
     /// The Rust element type.
     pub fn rust(self) -> &'static str {
         match self {

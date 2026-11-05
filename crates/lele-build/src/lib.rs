@@ -41,7 +41,10 @@ impl<T, E: fmt::Display> Context<T> for std::result::Result<T, E> {
 }
 
 pub mod config {
+    use lele::compiler::Compiler;
+    use lele::model::onnx_proto::{GraphProto, ValueInfoProto, tensor_shape_proto, type_proto};
     use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
     use std::path::Path;
 
     #[derive(Debug, Deserialize, Serialize)]
@@ -96,6 +99,140 @@ pub mod config {
         pub model_file: Option<String>,
         #[serde(default)]
         pub custom_methods: Vec<String>,
+        /// The inputs the model is compiled for.
+        #[serde(flatten)]
+        pub inputs: InputConfig,
+    }
+
+    /// The inputs a model is compiled for, in `[codegen]`; see
+    /// `lele::compiler::Compiler::with_input_shape`, `with_dim` and
+    /// `with_input_value`. With several models in one config, each setting
+    /// applies to the models that have the input or dimension it names.
+    ///
+    /// ```toml
+    /// [codegen.shapes]
+    /// input = [1, 512]
+    /// [codegen.dims]
+    /// batch_size = 1
+    /// [codegen.values]
+    /// sr = 16000
+    /// ```
+    #[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq)]
+    pub struct InputConfig {
+        /// Input shapes, by input name.
+        #[serde(default)]
+        pub shapes: BTreeMap<String, Vec<usize>>,
+        /// Values of named symbolic dimensions (`dim_param`s).
+        #[serde(default)]
+        pub dims: BTreeMap<String, usize>,
+        /// Input values compiled in, by input name: a number or a list of
+        /// the input's elements.
+        #[serde(default)]
+        pub values: BTreeMap<String, InputValue>,
+    }
+
+    /// The value of an input compiled in.
+    #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+    #[serde(untagged)]
+    pub enum InputValue {
+        Int(i64),
+        Float(f64),
+        Ints(Vec<i64>),
+        Floats(Vec<f64>),
+    }
+
+    impl From<&InputValue> for lele::compiler::InputValue {
+        fn from(v: &InputValue) -> Self {
+            match v {
+                InputValue::Int(x) => Self::Ints(vec![*x]),
+                InputValue::Float(x) => Self::Floats(vec![*x]),
+                InputValue::Ints(v) => Self::Ints(v.clone()),
+                InputValue::Floats(v) => Self::Floats(v.clone()),
+            }
+        }
+    }
+
+    impl InputConfig {
+        /// `compiler`, compiled for these inputs.
+        pub fn apply(&self, mut compiler: Compiler) -> Compiler {
+            for (name, shape) in &self.shapes {
+                compiler = compiler.with_input_shape(name, shape);
+            }
+            for (name, &value) in &self.dims {
+                compiler = compiler.with_dim(name, value);
+            }
+            for (name, value) in &self.values {
+                compiler = compiler.with_input_value(name, value);
+            }
+            compiler
+        }
+
+        /// The settings that apply to `graph`: those naming one of its
+        /// inputs, or a dimension one of its inputs has.
+        pub fn for_graph(&self, graph: &GraphProto) -> Self {
+            let weights: Vec<&str> = graph.initializer.iter().map(|t| t.name.as_str()).collect();
+            let inputs: Vec<&ValueInfoProto> = graph
+                .input
+                .iter()
+                .filter(|i| !weights.contains(&i.name.as_str()))
+                .collect();
+            let has_input = |name: &String| inputs.iter().any(|i| &i.name == name);
+            let has_dim = |name: &String| {
+                inputs.iter().any(|i| {
+                    let Some(type_proto::Value::TensorType(t)) =
+                        i.r#type.as_ref().and_then(|t| t.value.as_ref())
+                    else {
+                        return false;
+                    };
+                    t.shape.iter().flat_map(|s| &s.dim).any(|d| {
+                        matches!(&d.value, Some(tensor_shape_proto::dimension::Value::DimParam(p)) if p == name)
+                    })
+                })
+            };
+            Self {
+                shapes: self
+                    .shapes
+                    .clone()
+                    .into_iter()
+                    .filter(|(n, _)| has_input(n))
+                    .collect(),
+                dims: self
+                    .dims
+                    .clone()
+                    .into_iter()
+                    .filter(|(n, _)| has_dim(n))
+                    .collect(),
+                values: self
+                    .values
+                    .clone()
+                    .into_iter()
+                    .filter(|(n, _)| has_input(n))
+                    .collect(),
+            }
+        }
+
+        /// The settings of `self` that are not in any of `applied`, as they
+        /// would be written in the config.
+        pub fn unused(&self, applied: &[Self]) -> Vec<String> {
+            let used = |f: &dyn Fn(&Self) -> bool| applied.iter().any(f);
+            let shapes = self
+                .shapes
+                .keys()
+                .filter(|n| !used(&|a| a.shapes.contains_key(*n)));
+            let dims = self
+                .dims
+                .keys()
+                .filter(|n| !used(&|a| a.dims.contains_key(*n)));
+            let values = self
+                .values
+                .keys()
+                .filter(|n| !used(&|a| a.values.contains_key(*n)));
+            shapes
+                .map(|n| format!("shapes.{n}"))
+                .chain(dims.map(|n| format!("dims.{n}")))
+                .chain(values.map(|n| format!("values.{n}")))
+                .collect()
+        }
     }
 
     impl ModelConfig {
@@ -358,20 +495,72 @@ pub fn generate_model_code(
     output_dir: impl AsRef<Path>,
     _custom_methods: &[String],
 ) -> Result {
+    generate_model_code_for(model_path, class_name, output_dir, &Default::default())
+}
+
+/// [`generate_model_code`] compiling the model for `inputs`, which must all
+/// apply to it.
+pub fn generate_model_code_for(
+    model_path: impl AsRef<Path>,
+    class_name: &str,
+    output_dir: impl AsRef<Path>,
+    inputs: &config::InputConfig,
+) -> Result {
     let model_path = model_path.as_ref();
     println!("cargo:warning=Generating code for {}...", class_name);
-    let result = compile_model(model_path, class_name, None).context(|| {
+    compile_model_for(model_path, class_name, output_dir.as_ref(), |_| {
+        inputs.clone()
+    })
+    .map(|_| ())
+    .context(|| {
         format!(
             "generating code for {} from {}",
             class_name,
             model_path.display()
         )
-    })?;
-    write_model_weights(output_dir.as_ref(), class_name, &result.weights)
-        .context(|| format!("writing the weights of {class_name}"))?;
-    write_model_code(output_dir.as_ref(), class_name, &result.code)
-        .context(|| format!("writing the code of {class_name}"))?;
-    Ok(())
+    })
+}
+
+/// Compiles the model at `model_path` for the inputs `inputs` gives for its
+/// graph, which it returns.
+fn compile_model_for(
+    model_path: &Path,
+    class_name: &str,
+    output_dir: &Path,
+    inputs: impl FnOnce(&lele::model::onnx_proto::GraphProto) -> config::InputConfig,
+) -> std::result::Result<config::InputConfig, Box<dyn std::error::Error>> {
+    use lele::compiler::Compiler;
+    use lele::model::OnnxModel;
+
+    let model = OnnxModel::load(model_path)?;
+    let graph = model.graph().ok_or("Missing graph in ONNX model")?;
+
+    let inputs = inputs(graph);
+    let compiler = inputs.apply(
+        Compiler::new()
+            .with_name(class_name)
+            .with_default_optimizations(),
+    );
+
+    let result = compiler.compile(graph)?;
+
+    fs::create_dir_all(output_dir)?;
+
+    // Write weights binary
+    let weights_filename = format!("{}_weights.bin", class_name.to_lowercase());
+    let bin_path = output_dir.join(&weights_filename);
+    let mut bin_file = std::io::BufWriter::new(File::create(&bin_path)?);
+    bin_file.write_all(&result.weights)?;
+    bin_file.flush()?;
+
+    // Write generated Rust code
+    let rs_filename = format!("{}.rs", class_name.to_lowercase());
+    let rs_path = output_dir.join(&rs_filename);
+    let mut rs_file = std::io::BufWriter::new(File::create(&rs_path)?);
+    rs_file.write_all(result.code.as_bytes())?;
+    rs_file.flush()?;
+
+    Ok(inputs)
 }
 
 /// Builds the model `model_toml` describes: fetches its files into the
@@ -399,18 +588,15 @@ pub fn build_model(model_toml: &str, output_dir: impl AsRef<Path>) -> Result {
     }
 
     fetch_model_files(&config.model, config_dir(model_toml))?;
-    generate_model_code(
-        model_file,
-        &codegen.class_name,
-        output_dir,
-        &codegen.custom_methods,
-    )
+    generate_model_code_for(model_file, &codegen.class_name, output_dir, &codegen.inputs)
 }
 
 /// Builds several models from the files `model_toml` lists: fetches them into
 /// the current crate and generates `<output_dir>/<class>.rs` and its weights
 /// for each `(onnx file, class name)` of `models` whose generated files are
-/// older than the config or the model.
+/// older than the config or the model. Each model is compiled for the
+/// settings of `[codegen]` that apply to it; one that applies to none of the
+/// models generated is an error.
 pub fn build_models(
     model_toml: &str,
     output_dir: impl AsRef<Path>,
@@ -436,8 +622,21 @@ pub fn build_models(
 
     let config = config::ModelConfig::load(model_toml)?;
     fetch_model_files(&config.model, config_dir(model_toml))?;
+    let inputs = &config.codegen.inputs;
+    let mut applied = Vec::new();
     for (onnx, class_name) in stale {
-        generate_model_code(onnx, class_name, output_dir, &[])?;
+        println!("cargo:warning=Generating code for {}...", class_name);
+        let model = Path::new(onnx);
+        let used = compile_model_for(model, class_name, output_dir, |g| inputs.for_graph(g))
+            .context(|| format!("generating code for {class_name} from {onnx}"))?;
+        applied.push(used);
+    }
+    let unused = inputs.unused(&applied);
+    if !unused.is_empty() {
+        return Err(Error(format!(
+            "{model_toml}: no model has what {} name",
+            unused.join(", ")
+        )));
     }
     Ok(())
 }
@@ -538,4 +737,101 @@ pub fn need_regenerate_with_model(
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::config::{InputConfig, InputValue, ModelConfig};
+    use lele::model::onnx_proto::{
+        GraphProto, TensorProto, TensorShapeProto, TypeProto, ValueInfoProto, tensor_shape_proto,
+        type_proto,
+    };
+
+    #[test]
+    fn codegen_states_the_inputs_a_model_is_compiled_for() {
+        let config: ModelConfig = toml::from_str(
+            r#"
+            [model]
+            source = "local"
+            [codegen]
+            class_name = "M"
+            [codegen.shapes]
+            input = [1, 512]
+            [codegen.dims]
+            batch_size = 1
+            [codegen.values]
+            sr = 16000
+            scale = 0.5
+            ids = [1, 2]
+            gains = [0.5, 2.0]
+            "#,
+        )
+        .unwrap();
+        let inputs = &config.codegen.inputs;
+        assert_eq!(inputs.shapes["input"], [1, 512]);
+        assert_eq!(inputs.dims["batch_size"], 1);
+        assert_eq!(inputs.values["sr"], InputValue::Int(16000));
+        assert_eq!(inputs.values["scale"], InputValue::Float(0.5));
+        assert_eq!(inputs.values["ids"], InputValue::Ints(vec![1, 2]));
+        assert_eq!(inputs.values["gains"], InputValue::Floats(vec![0.5, 2.0]));
+        let bare: ModelConfig =
+            toml::from_str("[model]\nsource = \"local\"\n[codegen]\nclass_name = \"M\"").unwrap();
+        assert_eq!(bare.codegen.inputs, InputConfig::default());
+    }
+
+    /// Each model of a config takes the settings naming its inputs and their
+    /// dimensions; a setting no model takes is reported.
+    #[test]
+    fn settings_apply_to_the_models_that_have_what_they_name() {
+        let input = |name: &str, dims: &[&str]| ValueInfoProto {
+            name: name.to_string(),
+            r#type: Some(TypeProto {
+                value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                    elem_type: 1,
+                    shape: Some(TensorShapeProto {
+                        dim: dims
+                            .iter()
+                            .map(|d| tensor_shape_proto::Dimension {
+                                value: Some(tensor_shape_proto::dimension::Value::DimParam(
+                                    d.to_string(),
+                                )),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    }),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let encoder = GraphProto {
+            input: vec![input("audio", &["batch", "time"]), input("w", &["n"])],
+            initializer: vec![TensorProto {
+                name: "w".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let decoder = GraphProto {
+            input: vec![input("tokens", &["batch", "len"]), input("sr", &[])],
+            ..Default::default()
+        };
+        let all = InputConfig {
+            shapes: [
+                ("audio".to_string(), vec![1, 16000]),
+                ("x".to_string(), vec![1]),
+            ]
+            .into(),
+            dims: [("batch".to_string(), 1), ("n".to_string(), 3)].into(),
+            values: [("sr".to_string(), InputValue::Int(16000))].into(),
+        };
+        let (enc, dec) = (all.for_graph(&encoder), all.for_graph(&decoder));
+        assert_eq!(enc.shapes.keys().collect::<Vec<_>>(), ["audio"]);
+        assert_eq!(enc.dims.keys().collect::<Vec<_>>(), ["batch"]);
+        assert!(enc.values.is_empty());
+        assert!(dec.shapes.is_empty());
+        assert_eq!(dec.dims.keys().collect::<Vec<_>>(), ["batch"]);
+        assert_eq!(dec.values.keys().collect::<Vec<_>>(), ["sr"]);
+        assert_eq!(all.unused(&[enc, dec]), ["shapes.x", "dims.n"]);
+    }
 }
