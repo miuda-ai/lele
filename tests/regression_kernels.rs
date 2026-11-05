@@ -693,9 +693,11 @@ fn ref_gru_step(
     } else {
         let z_g: Vec<f32> = (0..hs).map(|k| lele::kernels::activations::sigmoid(wc[k] + rc[k] + bias_w[k] + bias_r[k])).collect();
         let r_g: Vec<f32> = (0..hs).map(|k| lele::kernels::activations::sigmoid(wc[hs+k] + rc[hs+k] + bias_w[hs+k] + bias_r[hs+k])).collect();
+        // Without linear_before_reset the reset gate scales h before R_h does.
+        let rh: Vec<f32> = (0..hs).map(|k| r_g[k] * h[k]).collect();
         for k in 0..hs {
             let wh_x = wc[2*hs+k] + bias_w[2*hs+k];
-            let r_rh = r_g[k] * (rc[2*hs+k] + bias_r[2*hs+k]);
+            let r_rh: f32 = (0..hs).map(|j| r[(2*hs+k) * hs + j] * rh[j]).sum::<f32>() + bias_r[2*hs+k];
             let h_gate = lele::kernels::activations::tanh(wh_x + r_rh);
             h[k] = (1.0 - z_g[k]) * h_gate + z_g[k] * h[k];
         }
