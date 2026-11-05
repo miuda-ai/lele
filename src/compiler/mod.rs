@@ -795,7 +795,9 @@ mod codegen_smoke_tests {
     }
 }
 
+#[cfg(test)]
 mod sanitize_tests {
+    use super::sanitize_name;
 
     #[test]
     fn names_are_identifiers() {
