@@ -64,17 +64,22 @@ lele is not an interpreter. It **compiles ONNX graphs into Rust source code** at
 The `Compiler` builder lets you customize code generation for any model:
 
 ```rust
-use lele::compiler::Compiler;
+use lele::compiler::{Compiler, Optimizations};
 
 let compiler = Compiler::new()
     .with_name("MyModel")           // Set generated struct name
-    .with_default_optimizations()   // Load fusion patterns + helper methods
-    .with_constant_folding(true)    // Enable compile-time folding
+    .with_default_optimizations()   // Enable every optimization
     .with_override("MyCustomOp", |node, inputs, outputs, buf, w, indent| {
         // Generate custom Rust code for any operator
         Ok(())
     })
     .with_pattern("MyFusion", my_matcher, my_generator);  // Custom fusion
+
+// Or pick optimizations one by one:
+let compiler = Compiler::new().with_optimizations(Optimizations {
+    operator_fusion: false,
+    ..Optimizations::all()
+});
 ```
 
 ### Runtime / Compiler Split

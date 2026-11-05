@@ -292,8 +292,7 @@ pub fn compile_model(
 
     let mut compiler = Compiler::new()
         .with_name(class_name)
-        .with_default_optimizations()
-        .with_constant_folding(true);
+        .with_default_optimizations();
     if let Some(shared) = shared {
         compiler = compiler.with_shared_weights(shared);
     }

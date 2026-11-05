@@ -51,6 +51,7 @@ pub fn conv2d_silu<'b, 'a>(
         pads,
         strides,
         Activation::SiLU,
+        IM2COL_BYTES,
         out,
     );
 }
@@ -90,10 +91,16 @@ pub fn conv2d_fused<'b, 'a>(
         pads,
         strides,
         act,
+        IM2COL_BYTES,
         out,
     );
 }
 
+/// Most bytes of unfolded input per band of output rows: about half of L2, so the
+/// columns are written and read back from cache.
+const IM2COL_BYTES: usize = 512 * 1024;
+
+/// `band_bytes` bounds the unfolded input per band ([`IM2COL_BYTES`]; smaller in tests).
 fn conv2d_activation<'b, 'a>(
     level: Level,
     input: &TensorView<'b>,
@@ -104,6 +111,7 @@ fn conv2d_activation<'b, 'a>(
     pads: &[i64],
     strides: &[i64],
     act: Activation,
+    band_bytes: usize,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     let _relu = act == Activation::Relu;
@@ -317,6 +325,9 @@ fn conv2d_activation<'b, 'a>(
 
     let col_rows = in_channels_per_group * kernel_h * kernel_w;
     let col_cols = out_h * out_w;
+    // The output is computed in bands of whole rows whose columns fit in L2, so the
+    // unfolded input is written and read back from cache, not memory.
+    let band_rows = (band_bytes / (col_rows * out_w * 4)).clamp(1, out_h);
 
     // Reuse thread-local im2col buffer to avoid repeated allocation
     thread_local! {
@@ -324,86 +335,76 @@ fn conv2d_activation<'b, 'a>(
     }
     COL_BUF.with(|buf_cell| {
         let mut col_buf_ref = buf_cell.borrow_mut();
-        let needed = col_rows * col_cols;
+        let needed = col_rows * band_rows * out_w;
         if col_buf_ref.len() < needed {
             col_buf_ref.resize(needed, 0.0);
         }
-        let col_buf = &mut col_buf_ref[..needed];
 
         for n in 0..batch_size {
             for g in 0..groups {
                 let in_ch_start = g * in_channels_per_group;
                 let out_ch_start = g * out_channels_per_group;
-
-                // im2col: unfold input patch into column matrix
-                im2col(
-                    input_data,
-                    n,
-                    in_ch_start,
-                    in_channels_per_group,
-                    in_h,
-                    in_w,
-                    in_channels,
-                    kernel_h,
-                    kernel_w,
-                    stride_h,
-                    stride_w,
-                    pad_top,
-                    pad_left,
-                    dilation_h,
-                    dilation_w,
-                    out_h,
-                    out_w,
-                    col_buf,
-                );
-
-                // GEMM: weight_matrix [out_channels_per_group, col_rows] x col_matrix [col_rows, col_cols]
-                // = output [out_channels_per_group, out_h * out_w]
-                let w_offset = out_ch_start * (in_channels_per_group * kernel_h * kernel_w);
-                let o_offset = (n * out_channels + out_ch_start) * out_h * out_w;
-
-                // GEMM over the im2col columns
-                unsafe {
-                    let w_ptr = weight_data.as_ptr().add(w_offset);
-                    let col_ptr = col_buf.as_ptr();
-                    let out_ptr = out.as_mut_ptr().add(o_offset);
-                    // Weight: [out_channels_per_group, col_rows] row-major
-                    let w_mat = MatRef::<f32>::from_raw_parts(
-                        w_ptr,
-                        out_channels_per_group,
-                        col_rows,
-                        col_rows as isize,
-                        1,
+                let w_offset = out_ch_start * col_rows;
+                let o_offset = (n * out_channels + out_ch_start) * col_cols;
+                for oh_start in (0..out_h).step_by(band_rows) {
+                    let oh_end = (oh_start + band_rows).min(out_h);
+                    let band_cols = (oh_end - oh_start) * out_w;
+                    let col_buf = &mut col_buf_ref[..col_rows * band_cols];
+                    im2col(
+                        level,
+                        input_data,
+                        n,
+                        in_ch_start,
+                        in_channels_per_group,
+                        in_h,
+                        in_w,
+                        in_channels,
+                        kernel_h,
+                        kernel_w,
+                        stride_h,
+                        stride_w,
+                        pad_top,
+                        pad_left,
+                        dilation_h,
+                        dilation_w,
+                        oh_start..oh_end,
+                        out_w,
+                        col_buf,
                     );
-                    // Col: [col_rows, col_cols] row-major
-                    let col_mat = MatRef::<f32>::from_raw_parts(
-                        col_ptr,
-                        col_rows,
-                        col_cols,
-                        col_cols as isize,
-                        1,
-                    );
-                    // Out: [out_channels_per_group, col_cols] row-major
-                    let out_mat = MatMut::<f32>::from_raw_parts_mut(
-                        out_ptr,
-                        out_channels_per_group,
-                        col_cols,
-                        col_cols as isize,
-                        1,
-                    );
-                    strided_matmul(out_mat, Accum::Replace, w_mat, col_mat, 1.0, Par::Seq);
-                }
-
-                // Apply bias and optional activation
-                for oc in 0..out_channels_per_group {
-                    let bias_val = if let Some(b) = bias {
-                        b.data[out_ch_start + oc]
-                    } else {
-                        0.0
-                    };
-                    if bias_val != 0.0 || act != Activation::None {
-                        let row_start = o_offset + oc * col_cols;
-                        bias_act_inplace(&mut out[row_start..row_start + col_cols], bias_val, act);
+                    let band_offset = o_offset + oh_start * out_w;
+                    // weights [out_channels_per_group, col_rows] x columns [col_rows, band_cols]
+                    // = the band of the output, rows `col_cols` apart.
+                    unsafe {
+                        let w_mat = MatRef::<f32>::from_raw_parts(
+                            weight_data.as_ptr().add(w_offset),
+                            out_channels_per_group,
+                            col_rows,
+                            col_rows as isize,
+                            1,
+                        );
+                        let col_mat = MatRef::<f32>::from_raw_parts(
+                            col_buf.as_ptr(),
+                            col_rows,
+                            band_cols,
+                            band_cols as isize,
+                            1,
+                        );
+                        let out_mat = MatMut::<f32>::from_raw_parts_mut(
+                            out.as_mut_ptr().add(band_offset),
+                            out_channels_per_group,
+                            band_cols,
+                            col_cols as isize,
+                            1,
+                        );
+                        strided_matmul(out_mat, Accum::Replace, w_mat, col_mat, 1.0, Par::Seq);
+                    }
+                    // Bias and activation while the band is in cache.
+                    for oc in 0..out_channels_per_group {
+                        let bias_val = bias.map_or(0.0, |b| b.data[out_ch_start + oc]);
+                        if bias_val != 0.0 || act != Activation::None {
+                            let start = band_offset + oc * col_cols;
+                            bias_act_inplace(&mut out[start..start + band_cols], bias_val, act);
+                        }
                     }
                 }
             }
@@ -426,6 +427,7 @@ fn conv2d_activation<'b, 'a>(
 /// im2col: unfold input patches into column matrix for GEMM-based convolution.
 #[inline]
 fn im2col(
+    level: Level,
     input: &[f32],
     batch_idx: usize,
     ch_start: usize,
@@ -441,11 +443,11 @@ fn im2col(
     pad_left: usize,
     dilation_h: usize,
     dilation_w: usize,
-    out_h: usize,
+    out_rows: std::ops::Range<usize>,
     out_w: usize,
     col: &mut [f32],
 ) {
-    let spatial_cols = out_h * out_w;
+    let spatial_cols = out_rows.len() * out_w;
     let batch_offset = batch_idx * total_channels * in_h * in_w;
 
     // Row-contiguous path: any row stride, unit column stride and dilation. One
@@ -465,9 +467,9 @@ fn im2col(
                     let iw_start = (ow_start + kw).saturating_sub(pad_left);
                     let count = ow_end.saturating_sub(ow_start);
 
-                    for oh in 0..out_h {
+                    for oh in out_rows.clone() {
                         let ih = (oh * stride_h + kh * dilation_h) as isize - pad_top as isize;
-                        let col_base = col_row_offset + oh * out_w;
+                        let col_base = col_row_offset + (oh - out_rows.start) * out_w;
                         unsafe {
                             let col_ptr = col.as_mut_ptr().add(col_base);
                             if ih < 0 || ih >= in_h as isize {
@@ -496,7 +498,8 @@ fn im2col(
         return;
     }
 
-    // General path for non-unit column stride/dilation
+    // General path, for a column stride or dilation: per kernel column, the output
+    // columns whose source is in range are copied with a fixed stride, the rest zeroed.
     for c in 0..channels {
         let in_ch = ch_start + c;
         let ch_offset = batch_offset + in_ch * in_h * in_w;
@@ -504,32 +507,65 @@ fn im2col(
             for kw in 0..kernel_w {
                 let col_row = (c * kernel_h + kh) * kernel_w + kw;
                 let col_row_offset = col_row * spatial_cols;
-                for oh in 0..out_h {
+                // Output column `ow` reads input column `ow * stride_w + shift - pad_left`.
+                let shift = kw * dilation_w;
+                let ow_start = pad_left.saturating_sub(shift).div_ceil(stride_w).min(out_w);
+                let ow_end = (in_w + pad_left)
+                    .saturating_sub(shift)
+                    .div_ceil(stride_w)
+                    .clamp(ow_start, out_w);
+                for oh in out_rows.clone() {
                     let ih = (oh * stride_h + kh * dilation_h) as isize - pad_top as isize;
-                    let col_oh_offset = col_row_offset + oh * out_w;
-                    if ih >= 0 && ih < in_h as isize {
-                        let in_row = ch_offset + ih as usize * in_w;
-                        for ow in 0..out_w {
-                            let iw = (ow * stride_w + kw * dilation_w) as isize - pad_left as isize;
-                            unsafe {
-                                *col.get_unchecked_mut(col_oh_offset + ow) =
-                                    if iw >= 0 && iw < in_w as isize {
-                                        *input.get_unchecked(in_row + iw as usize)
-                                    } else {
-                                        0.0
-                                    };
+                    let col_oh_offset = col_row_offset + (oh - out_rows.start) * out_w;
+                    let dst = &mut col[col_oh_offset..][..out_w];
+                    if ih < 0 || ih >= in_h as isize {
+                        dst.fill(0.0);
+                        continue;
+                    }
+                    dst[..ow_start].fill(0.0);
+                    dst[ow_end..].fill(0.0);
+                    if ow_end > ow_start {
+                        let first = ow_start * stride_w + shift - pad_left;
+                        let src = &input[ch_offset + ih as usize * in_w + first..];
+                        let dst = &mut dst[ow_start..ow_end];
+                        match stride_w {
+                            1 => copy_strided::<1>(src, dst),
+                            2 => simd_call!(level, copy_stride2_simd(src, dst)),
+                            s => {
+                                for (i, d) in dst.iter_mut().enumerate() {
+                                    *d = src[i * s];
+                                }
                             }
-                        }
-                    } else {
-                        // Entire row is padding — zero it
-                        unsafe {
-                            let col_ptr = col.as_mut_ptr().add(col_oh_offset);
-                            std::ptr::write_bytes(col_ptr, 0, out_w);
                         }
                     }
                 }
             }
         }
+    }
+}
+
+/// `dst[i] = src[2 * i]`, eight at a time from the even lanes of two vectors.
+#[simd]
+fn copy_stride2_simd<S: Simd>(simd: S, src: &[f32], dst: &mut [f32]) {
+    use fearless_simd::{f32x8, prelude::*};
+    // Each step reads 16 elements of `src`, one past the last it takes.
+    let steps = (dst.len() / 8).min(src.len() / 16);
+    for i in 0..steps {
+        let a = f32x8::from_slice(simd, &src[16 * i..][..8]);
+        let b = f32x8::from_slice(simd, &src[16 * i + 8..][..8]);
+        simd.unzip_low_f32x8(a, b).store_slice(&mut dst[8 * i..][..8]);
+    }
+    for i in 8 * steps..dst.len() {
+        dst[i] = src[2 * i];
+    }
+}
+
+/// `dst[i] = src[i * S]`.
+#[inline(always)]
+fn copy_strided<const S: usize>(src: &[f32], dst: &mut [f32]) {
+    let src = &src[..(dst.len() - 1) * S + 1];
+    for (i, d) in dst.iter_mut().enumerate() {
+        *d = src[i * S];
     }
 }
 
@@ -786,15 +822,29 @@ fn resize_nearest_inner<'b, 'a>(
         })
         .collect();
 
+    // Each input column twice, as an upsampling by 2 gives.
+    let doubled = out_w == 2 * in_w && col_map.iter().enumerate().all(|(ow, &iw)| iw == ow / 2);
     for n in 0..batch {
         for c in 0..channels {
             let in_offset = (n * channels + c) * in_h * in_w;
             let out_offset = (n * channels + c) * out_h * out_w;
+            let plane = &mut out[out_offset..][..out_h * out_w];
             for (oh, &ih) in row_map.iter().enumerate() {
+                // A row from the same input row as the one above is a copy of it.
+                if oh > 0 && row_map[oh - 1] == ih {
+                    plane.copy_within((oh - 1) * out_w..oh * out_w, oh * out_w);
+                    continue;
+                }
                 let in_row = &data[in_offset + ih * in_w..][..in_w];
-                let out_row = &mut out[out_offset + oh * out_w..][..out_w];
-                for (o, &iw) in out_row.iter_mut().zip(&col_map) {
-                    *o = in_row[iw];
+                let out_row = &mut plane[oh * out_w..][..out_w];
+                if doubled {
+                    for (pair, &v) in out_row.as_chunks_mut::<2>().0.iter_mut().zip(in_row) {
+                        *pair = [v, v];
+                    }
+                } else {
+                    for (o, &iw) in out_row.iter_mut().zip(&col_map) {
+                        *o = in_row[iw];
+                    }
                 }
             }
         }
@@ -1491,12 +1541,76 @@ mod tests {
                             &to_i64(&pads),
                             &to_i64(&strides),
                             act,
+                            IM2COL_BYTES,
                             &mut out,
                         );
                         assert_eq!(got.shape.as_ref(), &[batch, c, oh_n, ow_n]);
                         let what = format!("{level:?} {case:?} {act:?} bias {}", bias.is_some());
                         assert_close(&got.data, &want, 1e-5, &what);
                     }
+                }
+            }
+        }
+    }
+
+    /// Dense and grouped convolution over the window cases (im2col on every path:
+    /// row-contiguous, strided and dilated columns, and 1x1), in one band and in
+    /// bands of one or a few output rows.
+    #[test]
+    fn test_conv2d_matches_reference() {
+        let mut rng = Rng::new(12);
+        for case in WINDOW_CASES {
+            let ([c, h, w], [kh, kw], strides, dilations, pads) = *case;
+            let (oh_n, ow_n) = out_dims(case);
+            let batch = 2;
+            for groups in [1, 2].into_iter().filter(|g| c % g == 0) {
+                let (cg, oc) = (c / groups, 4 * groups);
+                let ocg = oc / groups;
+                let x = rng.vec(batch * c * h * w, -1.0, 1.0);
+                let wt = rng.vec(oc * cg * kh * kw, -1.0, 1.0);
+                let b = rng.vec(oc, -1.0, 1.0);
+                let mut want = Vec::new();
+                for n in 0..batch {
+                    for o in 0..oc {
+                        let g = o / ocg;
+                        for oh in 0..oh_n {
+                            for ow in 0..ow_n {
+                                let mut s = b[o] as f64;
+                                for ci in 0..cg {
+                                    let plane = &x[(n * c + g * cg + ci) * h * w..][..h * w];
+                                    let wk = &wt[(o * cg + ci) * kh * kw..][..kh * kw];
+                                    for (i, k) in window_taps(case, oh, ow) {
+                                        s += plane[i] as f64 * wk[k] as f64;
+                                    }
+                                }
+                                want.push(s / (1.0 + (-s).exp()));
+                            }
+                        }
+                    }
+                }
+                let to_i64 = |v: &[usize]| v.iter().map(|&v| v as i64).collect::<Vec<_>>();
+                let input = TensorView::from_slice(&x, vec![batch, c, h, w]);
+                let weights = TensorView::from_slice(&wt, vec![oc, cg, kh, kw]);
+                let bias = TensorView::from_slice(&b, vec![oc]);
+                let row_bytes = cg * kh * kw * ow_n * 4;
+                for band_bytes in [IM2COL_BYTES, row_bytes, 3 * row_bytes] {
+                    let mut out = Vec::new();
+                    let got = conv2d_activation(
+                        Level::new(),
+                        &input,
+                        &weights,
+                        Some(&bias),
+                        &to_i64(&dilations),
+                        groups as i64,
+                        &to_i64(&pads),
+                        &to_i64(&strides),
+                        Activation::SiLU,
+                        band_bytes,
+                        &mut out,
+                    );
+                    assert_eq!(got.shape.as_ref(), &[batch, oc, oh_n, ow_n]);
+                    let what = format!("{case:?} groups {groups} band {band_bytes}");
+                    assert_close(&got.data, &want, 1e-5, &what);
                 }
             }
         }
@@ -1806,6 +1920,40 @@ mod tests {
     }
 
     // ==================== resize_nearest tests ====================
+
+    #[test]
+    fn test_resize_nearest_matches_gather() {
+        // Upsampling by 2 (rows copied, columns doubled), by 3 and 1.5 (rows copied),
+        // and downsampling, in both coordinate modes.
+        let (c, h, w) = (3usize, 5usize, 7usize);
+        let data: Vec<f32> = (0..c * h * w).map(|v| v as f32).collect();
+        let input = TensorView::from_slice(&data, vec![1, c, h, w]);
+        for scale in [2.0f32, 3.0, 1.5, 0.5] {
+            for mode in ["asymmetric", "half_pixel"] {
+                let mut out = Vec::new();
+                let got = resize_nearest_inner(&input, Some(&[1.0, 1.0, scale, scale]), None, mode, &mut out);
+                let (oh_n, ow_n) = (got.shape[2], got.shape[3]);
+                let src = |o: usize, n_in: usize, n_out: usize| -> usize {
+                    let s = n_in as f32 / n_out as f32;
+                    let v = if mode == "asymmetric" {
+                        (o as f32 * s).floor()
+                    } else {
+                        ((o as f32 + 0.5) * s - 0.5).round().max(0.0)
+                    };
+                    v.min((n_in - 1) as f32) as usize
+                };
+                let mut want = Vec::new();
+                for ch in 0..c {
+                    for oh in 0..oh_n {
+                        for ow in 0..ow_n {
+                            want.push(data[(ch * h + src(oh, h, oh_n)) * w + src(ow, w, ow_n)]);
+                        }
+                    }
+                }
+                assert_eq!(got.data.as_ref(), &want[..], "scale {scale} {mode}");
+            }
+        }
+    }
 
     #[test]
     fn test_resize_nearest_identity() {

@@ -1481,6 +1481,39 @@ where
         out.resize(out_numel, T::constant_min());
     }
     out.fill(T::constant_min());
+    // Fast path: the reduced axes are consecutive, so the input is `[outer, reduced,
+    // inner]` and each output the maximum of `reduced` elements `inner` apart; taken
+    // row by row of `inner` elements, or along a run when `inner` is 1.
+    if let (Some(&first), Some(&last)) = (resolved_axes.first(), resolved_axes.last())
+        && last - first + 1 == resolved_axes.len()
+    {
+        let reduced: usize = input.shape[first..=last].iter().product();
+        let inner: usize = input.shape[last + 1..].iter().product();
+        let data = &input.data[..];
+        for (o, out_block) in out[..out_numel].chunks_mut(inner.max(1)).enumerate() {
+            let block = &data[o * reduced * inner..][..reduced * inner];
+            if inner == 1 {
+                let m = &mut out_block[0];
+                for &v in block {
+                    if v > *m {
+                        *m = v;
+                    }
+                }
+            } else {
+                for row in block.chunks_exact(inner) {
+                    for (m, &v) in out_block.iter_mut().zip(row) {
+                        if v > *m {
+                            *m = v;
+                        }
+                    }
+                }
+            }
+        }
+        return TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(out_shape),
+        };
+    }
     let real_out_strides = utils::compute_strides(&out_shape);
     let mut input_to_out_strides = vec![0; dims];
     let mut out_dim_idx = 0;
@@ -2306,6 +2339,42 @@ pub fn stft_power_spectrum<'b, 'a>(
 mod tests {
     use super::*;
     use crate::tensor::TensorView;
+
+    /// Every set of axes of a `[2, 3, 4, 5]` tensor (consecutive ones take the fast
+    /// path), with and without kept dimensions, against a reference.
+    #[test]
+    fn test_reduce_max_matches_reference_on_every_axis_set() {
+        let shape = [2usize, 3, 4, 5];
+        let n: usize = shape.iter().product();
+        // Distinct values in a scrambled order, some negative.
+        let data: Vec<f32> = (0..n).map(|i| ((i * 37) % n) as f32 - 50.0).collect();
+        let t = TensorView::from_slice(&data, shape.to_vec());
+        for mask in 1u32..16 {
+            let axes: Vec<i64> = (0..4).filter(|d| mask & (1 << d) != 0).collect();
+            for keepdims in [false, true] {
+                let mut out = Vec::new();
+                let got = reduce_max(&t, &axes, keepdims, &mut out);
+                // Reference: the max over all input indices that agree on the kept axes.
+                let kept: Vec<usize> = (0..4).filter(|&d| mask & (1 << d) == 0).collect();
+                let out_n: usize = kept.iter().map(|&d| shape[d]).product();
+                let mut want = vec![f32::NEG_INFINITY; out_n];
+                for (i, &v) in data.iter().enumerate() {
+                    let idx = [i / 60, i / 20 % 3, i / 5 % 4, i % 5];
+                    let o = kept.iter().fold(0, |o, &d| o * shape[d] + idx[d]);
+                    want[o] = want[o].max(v);
+                }
+                assert_eq!(got.data.as_ref(), &want[..], "axes {axes:?} keepdims {keepdims}");
+                let want_shape: Vec<usize> = (0..4)
+                    .filter_map(|d| match (mask & (1 << d) != 0, keepdims) {
+                        (false, _) => Some(shape[d]),
+                        (true, true) => Some(1),
+                        (true, false) => None,
+                    })
+                    .collect();
+                assert_eq!(got.shape.as_ref(), &want_shape[..], "axes {axes:?}");
+            }
+        }
+    }
 
     #[test]
     fn test_tile_repeats_every_axis() {

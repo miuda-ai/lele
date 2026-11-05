@@ -744,7 +744,9 @@ pub fn slice<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         } else if end_i64 > dim_size as i64 {
             dim_size
         } else if end_i64 < -(dim_size as i64) {
-            -dim_size
+            // Before the first element: -1 once normalized, so a reversed slice
+            // includes the first element.
+            -dim_size - 1
         } else {
             end_i64 as isize
         };
@@ -796,17 +798,32 @@ pub fn slice<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     let out_numel = out_shape.iter().product::<usize>();
     utils::ensure_capacity(out, out_numel);
 
+    if out_numel == 0 {
+        return TensorView::from_slice(out, out_shape);
+    }
     let in_strides = utils::compute_strides(&input.shape);
-    let mut coords = vec![0; ndim];
-    let out_slice = out.as_mut_slice();
-    for o in &mut out_slice[..out_numel] {
-        let mut in_off = 0isize;
-        for d in 0..ndim {
-            let in_idx = actual_starts[d] + (coords[d] as isize) * actual_steps[d];
-            in_off += in_idx * (in_strides[d] as isize);
+    // Copied in contiguous runs: the innermost dimensions with step 1, each taken
+    // whole except the outermost of them.
+    let mut inner = ndim;
+    let mut run = 1;
+    while inner > 0 && actual_steps[inner - 1] == 1 {
+        inner -= 1;
+        run *= out_shape[inner];
+        if out_shape[inner] != input.shape[inner] {
+            break;
         }
-        *o = input.data[in_off as usize];
-        for d in (0..ndim).rev() {
+    }
+    let run_start: isize = (inner..ndim)
+        .map(|d| actual_starts[d] * in_strides[d] as isize)
+        .sum();
+    let mut coords = vec![0usize; inner];
+    for chunk in out[..out_numel].chunks_exact_mut(run) {
+        let mut in_off = run_start;
+        for d in 0..inner {
+            in_off += (actual_starts[d] + coords[d] as isize * actual_steps[d]) * in_strides[d] as isize;
+        }
+        chunk.copy_from_slice(&input.data[in_off as usize..][..run]);
+        for d in (0..inner).rev() {
             coords[d] += 1;
             if coords[d] < out_shape[d] {
                 break;
@@ -1557,6 +1574,69 @@ mod tests {
         let res = slice(&t, &[1], &[4], &[1], &[2], &mut out);
         assert_eq!(res.shape.as_ref(), &[2, 2]);
         assert_eq!(res.data.as_ref(), &[1.0, 3.0, 5.0, 7.0]);
+    }
+
+    /// Slices of a `[3, 4, 5, 6]` tensor, every combination of a few ranges per
+    /// axis (whole, part, stepped, reversed), against indexing element by element.
+    #[test]
+    fn test_slice_matches_elementwise() {
+        let shape = [3usize, 4, 5, 6];
+        let data: Vec<f32> = (0..shape.iter().product::<usize>()).map(|v| v as f32).collect();
+        let t = TensorView::from_owned(data.clone(), shape.to_vec());
+        // (start, end, step) per axis; ends are exclusive, as the indices taken show.
+        let ranges = |n: i64| {
+            [
+                (0, n, 1),
+                (1, n - 1, 1),
+                (0, n, 2),
+                (n - 1, -n - 1, -1),
+                (0, i64::MAX, 1),
+            ]
+        };
+        let taken = |(s, e, step): (i64, i64, i64), n: i64| -> Vec<usize> {
+            // A negative end counts from the end; reversed, one before the first is -1.
+            let e = if e < 0 { (e + n).max(-1) } else { e.min(n) };
+            let mut idx = Vec::new();
+            let mut i = s;
+            while (step > 0 && i < e) || (step < 0 && i > e) {
+                idx.push(i as usize);
+                i += step;
+            }
+            idx
+        };
+        let mut out = Vec::new();
+        for r0 in ranges(3) {
+            for r1 in ranges(4) {
+                for r2 in ranges(5) {
+                    for r3 in ranges(6) {
+                        let rs = [r0, r1, r2, r3];
+                        let res = slice(
+                            &t,
+                            &rs.map(|r| r.0),
+                            &rs.map(|r| r.1),
+                            &[0, 1, 2, 3],
+                            &rs.map(|r| r.2),
+                            &mut out,
+                        );
+                        let idx: Vec<Vec<usize>> =
+                            (0..4).map(|d| taken(rs[d], shape[d] as i64)).collect();
+                        let mut want = Vec::new();
+                        for &a in &idx[0] {
+                            for &b in &idx[1] {
+                                for &c in &idx[2] {
+                                    for &d in &idx[3] {
+                                        want.push(data[((a * 4 + b) * 5 + c) * 6 + d]);
+                                    }
+                                }
+                            }
+                        }
+                        let want_shape: Vec<usize> = idx.iter().map(|i| i.len()).collect();
+                        assert_eq!(res.shape.as_ref(), &want_shape[..], "{rs:?}");
+                        assert_eq!(res.data.as_ref(), &want[..], "{rs:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

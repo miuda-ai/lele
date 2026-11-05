@@ -1,10 +1,11 @@
 //! Layout of the weights file.
 
-use super::ir::{DType, Graph, Op};
+use super::ir::{DType, Graph, Op, ValueId};
 use super::{SharedWeights, WeightTable, sanitize_name};
+use crate::kernels::matmul::PACK_COLS;
 use crate::model::onnx_proto::TensorProto;
 use crate::model::{tensor_to_array, tensor_to_vec_u8};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 /// Where a weight lives in the weights file.
@@ -16,6 +17,9 @@ pub(crate) struct WeightRef {
     pub len: usize,
     pub shape: Vec<usize>,
     pub dtype: DType,
+    /// An f16 matrix stored as [`pack_f16`](crate::kernels::matmul::pack_f16)
+    /// lays it out.
+    pub packed: bool,
 }
 
 /// The weights file, with where each weight landed in it.
@@ -39,15 +43,17 @@ impl Weights {
     /// subgraphs: per graph, its initializers in model order, then each
     /// node's constant followed by its subgraphs' weights, in attribute
     /// order. Each weight
-    /// starts 16-byte aligned; identical contents are stored once.
-    pub(crate) fn collect(g: &Graph) -> Self {
-        Self::collect_shared(g, None)
+    /// starts 16-byte aligned; identical contents are stored once. With
+    /// `pack`, f16 initializers only read as the right operand of `MatMul`
+    /// and `Linear` are packed ([`packable`]).
+    pub(crate) fn collect(g: &Graph, pack: bool) -> Self {
+        Self::collect_shared(g, pack, None)
     }
 
     /// Lays out `g` on top of a blob compiled earlier: the shared bytes stay
     /// where they are and identical tensors keep their offsets, so several
     /// models can be loaded from one file.
-    pub(crate) fn collect_shared(g: &Graph, shared: Option<SharedWeights>) -> Self {
+    pub(crate) fn collect_shared(g: &Graph, pack: bool, shared: Option<SharedWeights>) -> Self {
         let mut weights = match shared {
             Some(shared) => Weights {
                 data: shared.blob,
@@ -56,7 +62,7 @@ impl Weights {
             },
             None => Weights::default(),
         };
-        weights.add_graph(g);
+        weights.add_graph(g, pack);
         weights
     }
 
@@ -89,7 +95,7 @@ impl Weights {
         let mut regions: Vec<_> = self
             .lookup
             .values()
-            .filter(|w| w.dtype == DType::F16)
+            .filter(|w| w.dtype == DType::F16 && !w.packed)
             .map(|w| (w.offset, w.len))
             .collect();
         regions.sort_unstable();
@@ -103,30 +109,40 @@ impl Weights {
         self.get(name).is_some() || self.int64.contains_key(name)
     }
 
-    fn add_graph(&mut self, g: &Graph) {
+    fn add_graph(&mut self, g: &Graph, pack: bool) {
+        let mut sub_reads = HashSet::new();
+        if pack {
+            for (_, node) in g.nodes() {
+                for sub in node.op.subgraphs() {
+                    names_read(sub, &mut sub_reads);
+                }
+            }
+        }
         for &v in g.initializers() {
             // Those that folding left without readers are not written.
             if let Some(t) = g.data(v).filter(|_| g.uses(v) > 0) {
-                self.add(&g.value(v).name, t);
+                let name = &g.value(v).name;
+                let packed = pack && !sub_reads.contains(name) && packable(g, v);
+                self.add(name, t, packed);
             }
         }
         for (_, node) in g.nodes() {
             if let Op::Constant { value } = &node.op
                 && let Some(out) = node.output(0)
             {
-                self.add(&g.value(out).name, value);
+                self.add(&g.value(out).name, value, false);
             }
             // In the order the node lists them.
             let mut subgraphs = node.op.named_subgraphs();
             subgraphs
                 .sort_by_key(|(name, _)| node.proto.attribute.iter().position(|a| a.name == *name));
             for (_, sub) in subgraphs {
-                self.add_graph(sub);
+                self.add_graph(sub, pack);
             }
         }
     }
 
-    fn add(&mut self, name: &str, t: &TensorProto) {
+    fn add(&mut self, name: &str, t: &TensorProto, packed: bool) {
         let dtype = DType::from_onnx(t.data_type);
         if matches!(dtype, DType::I64 | DType::I32)
             && let Ok((data, dims)) = tensor_to_array(t)
@@ -134,11 +150,21 @@ impl Weights {
             let ints = data.iter().map(|&x| x as i64).collect();
             self.int64.insert(name.to_string(), (ints, dims));
         }
-        let Ok((bytes, shape, _)) = tensor_to_vec_u8(t) else {
+        let Ok((mut bytes, shape, _)) = tensor_to_vec_u8(t) else {
             return;
         };
         if bytes.is_empty() {
             return;
+        }
+        if packed {
+            let halves: Vec<half::f16> = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&b| half::f16::from_le_bytes(b))
+                .collect();
+            let packed = crate::kernels::matmul::pack_f16(&halves, shape[0], shape[1]);
+            bytes = packed.iter().flat_map(|h| h.to_le_bytes()).collect();
         }
         let hash = {
             use std::hash::{Hash, Hasher};
@@ -158,6 +184,38 @@ impl Weights {
             len,
             shape,
             dtype,
+            packed,
         });
     }
+}
+
+/// Whether initializer `v` of `g` can be stored packed: an f16 matrix with a
+/// multiple of [`PACK_COLS`] columns, every read of which (in `g`) is as the
+/// right operand of a `MatMul` or `Linear`.
+fn packable(g: &Graph, v: ValueId) -> bool {
+    let value = g.value(v);
+    let shape = g.data(v).map(|t| t.dims.as_slice()).unwrap_or_default();
+    value.dtype == DType::F16
+        && matches!(shape, [k, n] if *k > 0 && *n > 0 && *n as usize % PACK_COLS == 0)
+        && value.consumers().len() == g.uses(v)
+        && value.consumers().iter().all(|&id| {
+            let node = g.node(id);
+            matches!(node.op, Op::MatMul | Op::Linear)
+                && node.input(1) == Some(v)
+                && node.inputs().iter().filter(|&&i| i == Some(v)).count() == 1
+        })
+}
+
+/// Adds the names of the values read by the nodes of `g` and its subgraphs,
+/// and of its outputs, to `names`.
+fn names_read(g: &Graph, names: &mut HashSet<String>) {
+    for (_, node) in g.nodes() {
+        for v in node.inputs().iter().flatten() {
+            names.insert(g.value(*v).name.clone());
+        }
+        for sub in node.op.subgraphs() {
+            names_read(sub, names);
+        }
+    }
+    names.extend(g.output_infos().into_iter().map(|o| o.name));
 }

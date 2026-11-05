@@ -2,6 +2,7 @@ use crate::kernels::bias_act::bias_act_inplace;
 use crate::kernels::conv2d::Activation;
 use crate::kernels::matmul::{
     Accum, MatMut, MatRef, Par, matmul as strided_matmul, matmul_f16, matmul_f16_a,
+    matmul_f16_packed,
 };
 use crate::kernels::utils;
 use crate::tensor::TensorView;
@@ -93,6 +94,40 @@ impl WeightElem for half::f16 {
         // SAFETY: the caller promised `m * k` readable elements.
         let a = unsafe { std::slice::from_raw_parts(a, m * k) };
         matmul_f16_a(out, accum, a, k, b, 1.0);
+    }
+}
+
+/// An element of an f16 weight stored as [`pack_f16`](crate::kernels::matmul::pack_f16)
+/// lays it out. A `TensorView<PackedF16>` of shape `[k, n]` is a matrix packed that way,
+/// taken as the right operand of [`matmul`] and [`matmul_fused_add`] only.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(transparent)]
+pub struct PackedF16(pub half::f16);
+
+impl WeightElem for PackedF16 {
+    unsafe fn matmul_into(
+        out: MatMut<f32>,
+        accum: Accum,
+        a: MatRef<f32>,
+        b: *const PackedF16,
+        k: usize,
+        n: usize,
+    ) {
+        // SAFETY: the caller promised `k * n` readable elements, and `PackedF16` is a
+        // transparent `f16`.
+        let b = unsafe { std::slice::from_raw_parts(b as *const half::f16, k * n) };
+        matmul_f16_packed(out, accum, a, b, 1.0);
+    }
+
+    unsafe fn matmul_left_into(
+        _: MatMut<f32>,
+        _: Accum,
+        _: *const PackedF16,
+        _: usize,
+        _: usize,
+        _: MatRef<f32>,
+    ) {
+        unimplemented!("packed f16 weights are only right operands")
     }
 }
 

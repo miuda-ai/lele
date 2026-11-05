@@ -54,10 +54,14 @@ impl<'a> OpContext<'a> {
     }
 
     /// Input `i` as a weight operand of the matrix products (`matmul`,
-    /// `linear`, `conv1d_pointwise`): an f16 weight is passed as stored, for
-    /// the kernel to widen as it reads it.
+    /// `linear`, `conv1d_pointwise`): an f16 weight is passed as stored
+    /// (packed or not), for the kernel to widen as it reads it.
     pub fn matmul_weight(&self, i: usize) -> String {
         match self.weight(i) {
+            Some(w) if w.packed => format!(
+                "self.weight_f16_packed({}, {}, &{:?})",
+                w.offset, w.len, w.shape
+            ),
             Some(w) if w.dtype == DType::F16 => format!(
                 "self.weight_f16_raw({}, {}, &{:?})",
                 w.offset, w.len, w.shape
@@ -822,7 +826,7 @@ mod tests {
         let mut ir = crate::compiler::ir::Graph::from_onnx(graph);
         crate::compiler::passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);
-        let weights = Weights::collect(&ir);
+        let weights = Weights::collect(&ir, false);
         assert_eq!(var_types.get("indices"), ElemType::F32);
         assert_eq!(var_types.get("anchor"), ElemType::F32);
 
@@ -848,6 +852,74 @@ mod tests {
         let result = generate_one(&node, &Weights::default(), &compiler, &VarTypes::default());
         assert!(result.contains("let mut buf_c = Vec::<f32>::new();"));
         assert!(result.contains("let c = lele::kernels::add(&a, &b, &mut buf_c);"));
+    }
+
+    /// f16 weights read only as the right operand of a product, with a
+    /// multiple of 16 columns, are stored packed and read as such; others
+    /// are stored as they are.
+    #[test]
+    fn test_packs_f16_matmul_weights() {
+        use crate::compiler::Optimizations;
+        use crate::model::onnx_proto::{GraphProto, TensorProto, ValueInfoProto};
+        let info = |name: &str| ValueInfoProto {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let halves = |k: usize, n: usize, first: usize| -> Vec<half::f16> {
+            (0..k * n).map(|i| half::f16::from_f32((first + i) as f32)).collect()
+        };
+        let f16 = |name: &str, k: usize, n: usize, first: usize| TensorProto {
+            name: name.to_string(),
+            data_type: DType::F16.to_onnx(),
+            dims: vec![k as i64, n as i64],
+            raw_data: halves(k, n, first).iter().flat_map(|h| h.to_le_bytes()).collect(),
+            ..Default::default()
+        };
+        let node = |op: &str, input: &[&str], output: &str| NodeProto {
+            op_type: op.to_string(),
+            input: input.iter().map(|s| s.to_string()).collect(),
+            output: vec![output.to_string()],
+            ..Default::default()
+        };
+        let graph = GraphProto {
+            node: vec![
+                node("MatMul", &["x", "packed"], "y1"),
+                node("MatMul", &["x", "narrow"], "y2"),
+                node("MatMul", &["x", "shared"], "y3"),
+                node("Neg", &["shared"], "y4"),
+            ],
+            initializer: vec![
+                f16("packed", 8, 32, 0),
+                f16("narrow", 8, 24, 300),
+                f16("shared", 8, 16, 600),
+            ],
+            input: vec![info("x")],
+            output: vec![info("y1"), info("y2"), info("y3"), info("y4")],
+            ..Default::default()
+        };
+        let compile = |weight_packing| {
+            Compiler::new()
+                .with_optimizations(Optimizations {
+                    weight_packing,
+                    ..Default::default()
+                })
+                .compile(&graph)
+                .unwrap()
+        };
+        let result = compile(true);
+        let code = &result.code;
+        assert_eq!(code.matches("self.weight_f16_packed(").count(), 1, "{code}");
+        assert_eq!(code.matches("self.weight_f16_raw(").count(), 2, "{code}");
+        let bytes = |h: &[half::f16]| -> Vec<u8> { h.iter().flat_map(|h| h.to_le_bytes()).collect() };
+        let packed = bytes(&crate::kernels::matmul::pack_f16(&halves(8, 32, 0), 8, 32));
+        let raw = bytes(&halves(8, 32, 0));
+        let contains = |w: &[u8], s: &[u8]| w.windows(s.len()).any(|x| x == s);
+        assert!(contains(&result.weights, &packed));
+        assert!(!contains(&result.weights, &raw));
+
+        let unpacked = compile(false);
+        assert!(!unpacked.code.contains("weight_f16_packed"));
+        assert!(contains(&unpacked.weights, &raw));
     }
 
     /// An `If` branch that returns one of its initializers reads it through

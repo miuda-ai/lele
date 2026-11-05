@@ -135,6 +135,23 @@ impl<'a> Weights<'a> {
         }
     }
 
+    /// An f16 weight stored as [`kernels::matmul::pack_f16`] lays it out, borrowed
+    /// where aligned (else copied).
+    pub fn weight_f16_packed(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, kernels::PackedF16> {
+        let halves = self.weight_f16_raw(offset, len, shape).data;
+        let data = match halves {
+            // SAFETY: `PackedF16` is a transparent `f16`.
+            std::borrow::Cow::Borrowed(h) => std::borrow::Cow::Borrowed(unsafe {
+                std::slice::from_raw_parts(h.as_ptr() as *const kernels::PackedF16, h.len())
+            }),
+            std::borrow::Cow::Owned(h) => std::borrow::Cow::Owned(h.into_iter().map(kernels::PackedF16).collect()),
+        };
+        TensorView {
+            data,
+            shape: std::borrow::Cow::Borrowed(shape),
+        }
+    }
+
     /// Raw bytes of a weight, for prepared weights that skip the f32 conversion.
     pub fn weight_u8_raw(&self, offset: usize, len: usize) -> &'a [u8] {
         &self.data[offset..offset + len]

@@ -33,7 +33,11 @@ const MR: usize = 6;
 const LANE_MR: usize = 5;
 /// Vectors of 8 columns of C per register tile.
 const NV: usize = 2;
-const NR: usize = 8 * NV;
+/// Columns of C per register tile.
+///
+/// `NR` and `KC` fix the layout of `pack_f16`, in which generated weights files store
+/// f16 matmul weights: changing either changes the format.
+pub(crate) const NR: usize = 8 * NV;
 /// Most depth per block; the depth is split into equal blocks no deeper than this.
 const KC: usize = 512;
 /// Panels of B per column block: the packed block stays in L2 while the rows of A pass.
@@ -46,13 +50,15 @@ const PANELS: usize = 8;
 pub(crate) enum BSrc<'a> {
     F32(&'a [f32]),
     F16(&'a [half::f16]),
+    /// f16 in panel order ([`pack_f16`]), `n` a multiple of `NR`.
+    F16Packed(&'a [half::f16]),
 }
 
 impl<'a> BSrc<'a> {
     fn f32(self) -> Option<&'a [f32]> {
         match self {
             BSrc::F32(b) => Some(b),
-            BSrc::F16(_) => None,
+            _ => None,
         }
     }
 
@@ -62,8 +68,29 @@ impl<'a> BSrc<'a> {
         match self {
             BSrc::F32(b) => dst.copy_from_slice(&b[start..][..dst.len()]),
             BSrc::F16(b) => widen_f16(simd, &b[start..][..dst.len()], dst),
+            BSrc::F16Packed(_) => unreachable!("packed B is widened by the panel"),
         }
     }
+}
+
+/// A row-major `k x n` B, `n` a multiple of `NR`, in the order `gemm_nn` packs it: its
+/// depth blocks in turn, each its panels of `NR` columns in turn, each `kc` rows of `NR`.
+pub(crate) fn pack_f16(b: &[half::f16], k: usize, n: usize) -> Vec<half::f16> {
+    assert!(n % NR == 0, "pack_f16: {n} columns");
+    assert_eq!(b.len(), k * n, "pack_f16: B is not k x n");
+    let depth = block_depth(k);
+    let mut out = Vec::with_capacity(k * n);
+    let mut pc = 0;
+    while pc < k {
+        let kc = depth.min(k - pc);
+        for j in (0..n).step_by(NR) {
+            for p in pc..pc + kc {
+                out.extend_from_slice(&b[p * n + j..][..NR]);
+            }
+        }
+        pc += kc;
+    }
+    out
 }
 
 /// `src` widened into `dst`, eight at a time with F16C's `vcvtph2ps` where the level has
@@ -137,6 +164,9 @@ const IN_PLACE: u8 = 0;
 const PACKED_PANEL: u8 = 1;
 /// In place, writing the packed panel as it goes.
 const PACK_NOW: u8 = 2;
+/// Widening the packed f16 panel `Tile::src16` (two vectors wide) as it goes, and
+/// writing the widened panel if given somewhere to.
+const WIDEN_NOW: u8 = 3;
 
 #[simd]
 fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32], bpack: &mut [f32]) {
@@ -169,18 +199,31 @@ fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32], b
             } else {
                 nc / NR
             };
-            pack_b(
-                simd,
-                b,
-                d.ldb,
-                d.b_cols,
-                pc,
-                kc,
-                jc,
-                nc,
-                if b32.is_some() { first_prepacked } else { 0 },
-                bpack,
-            );
+            // Packed f16 (whole panels only): its panels for this block lie in order from
+            // `start`. The tiles of the first group of rows widen them as they read them,
+            // into the packed panels for the next groups; tiles multiplying by lanes read
+            // the block widened first.
+            let mut block16: &[half::f16] = &[];
+            if let BSrc::F16Packed(b) = b {
+                let len = panels * kc * NR;
+                block16 = &b[pc * d.n + jc * kc..][..len];
+                if lanes {
+                    widen_f16(simd, block16, &mut bpack[..len]);
+                }
+            } else {
+                pack_b(
+                    simd,
+                    b,
+                    d.ldb,
+                    d.b_cols,
+                    pc,
+                    kc,
+                    jc,
+                    nc,
+                    if b32.is_some() { first_prepacked } else { 0 },
+                    bpack,
+                );
+            }
             let mut ir = 0;
             while ir < d.m {
                 let rows = mr.min(d.m - ir);
@@ -192,6 +235,11 @@ fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32], b
                     let slot = &mut bpack[jp * kc * NR..][..kc * NR];
                     // (Only for a row-major f32 B, in the branches below that read it.)
                     let in_place = || &b32.expect("f16 B is packed")[pc * d.ldb + j..];
+                    let panel16 = if block16.is_empty() {
+                        block16
+                    } else {
+                        &block16[jp * kc * NR..][..kc * NR]
+                    };
                     macro_rules! tile {
                         ($mode:expr, $src:expr, $lds:expr, $dst:expr) => {{
                             let t = Tile {
@@ -200,6 +248,7 @@ fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32], b
                                 lds: $lds,
                                 width,
                                 accumulate,
+                                src16: panel16,
                             };
                             // A panel no wider than a vector takes the one-vector tiles.
                             match (rows, width > 8) {
@@ -230,7 +279,11 @@ fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32], b
                             }
                         }};
                     }
-                    if jp >= first_prepacked || (pack && ir > 0) {
+                    if !panel16.is_empty() && !lanes && ir == 0 {
+                        // Reads the same values in the same order as the in-place tiles.
+                        let dst: &mut [f32] = if pack { slot } else { &mut [] };
+                        tile!(WIDEN_NOW, &[], NR, dst)
+                    } else if jp >= first_prepacked || (pack && ir > 0) {
                         tile!(PACKED_PANEL, slot, NR, &mut [])
                     } else if b32.is_none() {
                         tile!(IN_PLACE, slot, NR, &mut [])
@@ -314,11 +367,13 @@ fn pack_b<S: Simd>(
 }
 
 /// What a tile does, besides its operands.
-struct Tile {
+struct Tile<'a> {
     /// Depth.
     kc: usize,
-    /// `IN_PLACE`, `PACKED_PANEL` or `PACK_NOW`.
+    /// `IN_PLACE`, `PACKED_PANEL`, `PACK_NOW` or `WIDEN_NOW`.
     mode: u8,
+    /// The packed f16 panel, for `WIDEN_NOW`.
+    src16: &'a [half::f16],
     /// Elements between the rows of the panel of B as given.
     lds: usize,
     /// Columns of C written (the panel may be zero-padded past them).
@@ -398,6 +453,17 @@ macro_rules! tile_fn {
                 // In place, only the `V` vectors used are read (and copied).
                 IN_PLACE => {
                     for (p, row) in src.chunks(t.lds).take(kc).enumerate() {
+                        step!(p, row.first_chunk().unwrap());
+                    }
+                }
+                WIDEN_NOW => {
+                    let mut out = dst.as_chunks_mut::<NR>().0.iter_mut();
+                    for (p, row16) in t.src16.as_chunks::<NR>().0[..kc].iter().enumerate() {
+                        let mut row = [0.0f32; NR];
+                        widen_f16(simd, row16, &mut row);
+                        if let Some(out) = out.next() {
+                            *out = row;
+                        }
                         step!(p, row.first_chunk().unwrap());
                     }
                 }
@@ -590,6 +656,7 @@ pub(crate) fn gemm_small_m(level: Level, d: &Dims, a: &[f32], b: BSrc, c: &mut [
     let b16 = match b {
         BSrc::F32(b) => return simd_call!(level, gemm_small_m_simd(d, a, b, c)),
         BSrc::F16(b) => b,
+        BSrc::F16Packed(_) => unreachable!("packed B goes to gemm_nn"),
     };
     // f16: blocks of `WIDEN_ROWS` rows of B, widened, each a product of that depth adding
     // into C. The blocks are a whole number of passes of every height, so the passes are

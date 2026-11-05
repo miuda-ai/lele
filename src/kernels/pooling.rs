@@ -6,25 +6,9 @@ pub fn global_average_pool<'b, 'a>(
     input: &TensorView<'b>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let shape = &input.shape;
-    assert!(shape.len() == 4, "GlobalAveragePool: expected rank-4 input");
-    let batch = shape[0];
-    let channels = shape[1];
-    let in_h = shape[2];
-    let in_w = shape[3];
-    let spatial = in_h * in_w;
-    let numel = batch * channels;
-    crate::kernels::utils::ensure_capacity(out, numel);
-    let data = &input.data;
-    let o_slice = out.as_mut_slice();
-    for (nc, o) in o_slice[..numel].iter_mut().enumerate() {
-        let sum: f32 = data[nc * spatial..][..spatial].iter().sum();
-        *o = sum / spatial as f32;
-    }
-    TensorView {
-        data: Cow::Borrowed(out),
-        shape: Cow::Owned(vec![batch, channels, 1, 1]),
-    }
+    assert!(input.shape.len() == 4, "GlobalAveragePool: expected rank-4 input");
+    // The mean of each channel plane, a contiguous run.
+    crate::kernels::reduce_mean(input, &[2, 3], true, out)
 }
 
 /// AveragePool2d for NCHW rank-4 input with optional count_include_pad.

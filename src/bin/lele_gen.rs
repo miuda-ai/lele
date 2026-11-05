@@ -28,8 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let compiler = lele::compiler::Compiler::new()
         .with_name(class_name)
-        .with_default_optimizations()
-        .with_constant_folding(true);
+        .with_default_optimizations();
     let result = compiler.compile(graph)?;
     let weights_filename = format!("{}_weights.bin", class_name.to_lowercase());
     let bin_path = output_dir.join(&weights_filename);

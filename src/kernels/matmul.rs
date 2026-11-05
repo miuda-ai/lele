@@ -230,6 +230,33 @@ pub fn matmul_f16(
     )
 }
 
+/// Columns of B per panel of [`pack_f16`]; packed B has a multiple of this many columns.
+pub const PACK_COLS: usize = crate::kernels::matmul_nn::NR;
+
+/// A row-major `k x n` f16 B laid out in the order [`matmul_f16_packed`] reads it: in
+/// blocks of rows of equal depth (the fewest no deeper than 512), each block in panels of
+/// [`PACK_COLS`] columns, each panel row-major. Weights are stored this way when code is
+/// generated, so the product streams B from start to end.
+///
+/// # Panics
+/// If `n` is not a multiple of [`PACK_COLS`] or `b` does not hold `k * n` elements.
+pub fn pack_f16(b: &[half::f16], k: usize, n: usize) -> Vec<half::f16> {
+    crate::kernels::matmul_nn::pack_f16(b, k, n)
+}
+
+/// [`matmul_f16`] with B as [`pack_f16`] lays it out, `a.ncols` rows of `dst.ncols`
+/// columns. With more than 4 rows of C the product is [`matmul_f16`]'s, bit for bit;
+/// with fewer, it is computed in panels too, so it may round differently.
+pub fn matmul_f16_packed(
+    dst: MatMut<f32>,
+    accum: Accum,
+    a: MatRef<f32>,
+    b: &[half::f16],
+    alpha: f32,
+) {
+    matmul_b(Level::new(), dst, accum, a, BMat::F16Packed(b), alpha)
+}
+
 /// [`matmul`] with A an f16 matrix, row-major with `lda` elements between its `dst.nrows`
 /// rows of `b.nrows` columns. A is widened whole into a buffer kept for the thread (as
 /// large as the largest A seen), then the product is [`matmul`]'s, so it is that of A
@@ -273,6 +300,8 @@ enum BMat<'a> {
         data: &'a [half::f16],
         ldb: usize,
     },
+    /// As [`pack_f16`] lays it out.
+    F16Packed(&'a [half::f16]),
 }
 
 fn matmul_b(level: Level, mut dst: MatMut<f32>, accum: Accum, a: MatRef<f32>, b: BMat, alpha: f32) {
@@ -310,7 +339,12 @@ fn matmul_b(level: Level, mut dst: MatMut<f32>, accum: Accum, a: MatRef<f32>, b:
     let b = match b {
         BMat::F16 { data, ldb } => {
             assert!(data.len() >= (k - 1) * ldb + n, "matmul: B is too short");
-            Err((data, ldb))
+            Err((BSrc::F16(data), ldb))
+        }
+        BMat::F16Packed(data) => {
+            assert!(n % PACK_COLS == 0, "matmul: packed B has {n} columns");
+            assert_eq!(data.len(), k * n, "matmul: packed B is not k x n");
+            Err((BSrc::F16Packed(data), n))
         }
         BMat::F32(b) => Ok(b),
     };
@@ -328,7 +362,7 @@ fn matmul_b(level: Level, mut dst: MatMut<f32>, accum: Accum, a: MatRef<f32>, b:
     // from panels of its rows.
     let b_rm;
     let operand = match &b {
-        Err((b16, ldb)) => BOperand::Rows(BSrc::F16(b16), *ldb),
+        Err((b, ldb)) => BOperand::Rows(*b, *ldb),
         Ok(b) => {
             let b_data = b.data();
             if n <= DOT_MAX_N {
@@ -362,7 +396,8 @@ fn matmul_b(level: Level, mut dst: MatMut<f32>, accum: Accum, a: MatRef<f32>, b:
                 add,
                 b_cols: false,
             };
-            if m <= SMALL_M {
+            // Packed B is read in panels whatever the rows of C.
+            if m <= SMALL_M && !matches!(b, BSrc::F16Packed(_)) {
                 gemm_small_m(level, &dims, a_data, b, c)
             } else {
                 gemm_nn(level, &dims, a_data, b, c)
@@ -537,6 +572,69 @@ mod tests {
                     }
                     let what = format!("{level:?} m={m} n={n} k={k} alpha={alpha} add={add}");
                     assert_same_bits(&got, &want, &what);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_matmul_f16_packed_is_matmul_f16() {
+        let mut rng = Rng::new(6);
+        // Several column blocks, several depth blocks (with a shallower last one), one
+        // and several groups of rows, and fewer rows than `SMALL_M`.
+        let sizes = [
+            (1, 16, 1),
+            (1, 1536, 384),
+            (3, 48, 70),
+            (4, 32, 1100),
+            (5, 384, 1536),
+            (6, 16, 513),
+            (7, 144, 40),
+            (10, 1536, 384),
+            (13, 160, 1030),
+            (40, 272, 700),
+        ];
+        for level in levels() {
+            for &(m, n, k) in &sizes {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b16: Vec<half::f16> = rng
+                    .vec(k * n, -2.0, 2.0)
+                    .iter()
+                    .map(|&x| half::f16::from_f32(x))
+                    .collect();
+                let packed = pack_f16(&b16, k, n);
+                for (alpha, add) in [(1.0, false), (-1.5, true)] {
+                    let c0 = rng.vec(m * n, -1.0, 1.0);
+                    let accum = || if add { Accum::Add } else { Accum::Replace };
+                    let (mut want, mut got) = (c0.clone(), c0.clone());
+                    // SAFETY: each pointer addresses the row-major elements given.
+                    unsafe {
+                        let a = || MatRef::from_raw_parts(a.as_ptr(), m, k, k as isize, 1);
+                        matmul_b(
+                            level,
+                            MatMut::from_raw_parts_mut(want.as_mut_ptr(), m, n, n as isize, 1),
+                            accum(),
+                            a(),
+                            BMat::F16 { data: &b16, ldb: n },
+                            alpha,
+                        );
+                        matmul_b(
+                            level,
+                            MatMut::from_raw_parts_mut(got.as_mut_ptr(), m, n, n as isize, 1),
+                            accum(),
+                            a(),
+                            BMat::F16Packed(&packed),
+                            alpha,
+                        );
+                    }
+                    let what = format!("{level:?} m={m} n={n} k={k} alpha={alpha} add={add}");
+                    if m > SMALL_M {
+                        assert_same_bits(&got, &want, &what);
+                    } else {
+                        for (g, w) in got.iter().zip(&want) {
+                            assert!((g - w).abs() <= 1e-4 * (1.0 + w.abs()), "{what}: {g} vs {w}");
+                        }
+                    }
                 }
             }
         }

@@ -82,16 +82,61 @@ fn to_pascal_case(s: &str) -> String {
     result
 }
 
+/// Graph optimizations the compiler runs before code generation. All are off
+/// in [`Optimizations::default`]; [`Optimizations::all`] turns every one on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Optimizations {
+    /// Replaces nodes whose inputs are all known at compile time by
+    /// initializers holding their result, computed with the kernels the
+    /// generated code would run.
+    pub constant_folding: bool,
+    /// Infers tensor shapes and replaces shape computations (`Shape`,
+    /// `Gather` of dimensions, ...) by constants where the dimensions are
+    /// known, and `Reshape`/`Expand`/`ConstantOfShape` targets by
+    /// dimensions of their inputs where they are not. With constant folding
+    /// on, the results are folded further.
+    pub shape_folding: bool,
+    /// Removes nodes whose outputs nothing reads.
+    pub dead_code_elimination: bool,
+    /// Rewrites `MatMul` of a dequantized int8 weight into an integer
+    /// matmul that keeps the weight in int8, and collapses
+    /// `QuantizeLinear` → `DequantizeLinear` pairs into one node.
+    pub qdq_fusion: bool,
+    /// Fuses operator chains (LayerNorm, GELU, SiLU, Conv + bias/activation,
+    /// MatMul + Add, dynamically quantized linear layers, ...) into single
+    /// operators with fused kernels.
+    pub operator_fusion: bool,
+    /// Stores f16 weights read only as the right operand of matrix products
+    /// in the order the matmul kernel reads them
+    /// ([`pack_f16`](crate::kernels::matmul::pack_f16)), so that each product
+    /// streams its weight from start to end. Not done when patterns are
+    /// registered, whose generators read weights as stored in the model.
+    pub weight_packing: bool,
+}
+
+impl Optimizations {
+    /// Every optimization.
+    pub fn all() -> Self {
+        Self {
+            constant_folding: true,
+            shape_folding: true,
+            dead_code_elimination: true,
+            qdq_fusion: true,
+            operator_fusion: true,
+            weight_packing: true,
+        }
+    }
+}
+
 pub struct Compiler {
     pub(crate) overrides: HashMap<String, OpHandler>,
     pub(crate) model_name: String,
     pub(crate) patterns: Vec<Pattern>,
     pub(crate) custom_methods: Vec<String>,
-    pub constant_folding: bool,
+    pub optimizations: Optimizations,
     /// Optional weights blob (and content index) reused from an earlier
     /// compilation, so identical tensors are not stored twice.
     pub(crate) shared_weights: std::cell::RefCell<Option<SharedWeights>>,
-    pub(crate) fusion: bool,
 }
 
 impl Default for Compiler {
@@ -107,9 +152,8 @@ impl Compiler {
             model_name: "Model".to_string(),
             patterns: Vec::new(),
             custom_methods: Vec::new(),
-            constant_folding: false,
+            optimizations: Optimizations::default(),
             shared_weights: std::cell::RefCell::new(None),
-            fusion: false,
         }
     }
     /// Reuse the tensors of an already compiled model. New (or different)
@@ -156,11 +200,14 @@ impl Compiler {
         self
     }
 
-    /// Fuses operator chains (LayerNorm, GELU, SiLU, Conv + bias/activation,
-    /// MatMul + Add, dynamically quantized linear layers, ...) into single
-    /// operators with fused kernels.
-    pub fn with_default_optimizations(mut self) -> Self {
-        self.fusion = true;
+    /// Enables every optimization ([`Optimizations::all`]).
+    pub fn with_default_optimizations(self) -> Self {
+        self.with_optimizations(Optimizations::all())
+    }
+
+    /// Sets the optimizations to run.
+    pub fn with_optimizations(mut self, optimizations: Optimizations) -> Self {
+        self.optimizations = optimizations;
         self
     }
 
@@ -169,40 +216,55 @@ impl Compiler {
         self
     }
 
-    pub fn with_constant_folding(mut self, enabled: bool) -> Self {
-        self.constant_folding = enabled;
-        self
-    }
-
     pub fn compile(
         &self,
         graph: &GraphProto,
     ) -> Result<CompilationResult, Box<dyn std::error::Error>> {
+        let opt = self.optimizations;
         let mut ir = ir::Graph::from_onnx(graph.clone());
-        // Must precede folding, which would otherwise consume the int8 weights.
-        passes::fuse_qdq_matmul(&mut ir);
-        if self.constant_folding {
+        if opt.qdq_fusion {
+            // Must precede folding, which would otherwise consume the int8
+            // weights.
+            passes::fuse_qdq_matmul(&mut ir);
+        }
+        if opt.constant_folding {
             passes::fold_constants(&mut ir);
+        }
+        if opt.shape_folding {
             // Shape inference resolves the shape computations folding
             // could not, which may leave more to fold.
             passes::infer_dtypes(&mut ir);
             passes::fold_shapes(&mut ir);
-            passes::fold_constants(&mut ir);
+            if opt.constant_folding {
+                passes::fold_constants(&mut ir);
+            }
+        }
+        if opt.dead_code_elimination {
             passes::eliminate_dead_code(&mut ir);
         }
-        // Runs after folding so that only the activation pairs are left.
-        passes::fuse_qdq(&mut ir);
-        if self.fusion {
+        if opt.qdq_fusion {
+            // Runs after folding so that only the activation pairs are left.
+            passes::fuse_qdq(&mut ir);
+        }
+        if opt.operator_fusion {
             passes::fuse(&mut ir);
         }
         passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);
         let (allocator, analysis) = alloc::solve_allocation(&ir);
+        // Patterns and overrides of the products would read packed weights as stored in
+        // the model.
+        let pack = opt.weight_packing
+            && self.patterns.is_empty()
+            && !["MatMul", "Linear"].iter().any(|op| self.overrides.contains_key(*op));
         // Start from a previously compiled blob when weights are shared. The
         // shared bytes stay where they are; anything new is appended after them,
         // so the resulting file is a superset of the first model's weights.
-        let weights =
-            weights::Weights::collect_shared(&ir, self.shared_weights.borrow_mut().take());
+        let weights = weights::Weights::collect_shared(
+            &ir,
+            pack,
+            self.shared_weights.borrow_mut().take(),
+        );
         let (graph_inputs, graph_outputs) = (ir.input_infos(), ir.output_infos());
         let (ids, protos) = lower_nodes(&ir);
         let protos: Vec<&NodeProto> = protos.iter().collect();
