@@ -7,3 +7,4 @@ pub mod model;
 pub mod runtime;
 pub mod tensor;
 pub use kernels::*;
+pub use tensor::scalar;

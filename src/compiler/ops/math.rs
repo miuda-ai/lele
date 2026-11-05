@@ -38,33 +38,31 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
         )?,
         Op::MatMulInteger => {
             // MatMulInteger expects u8 inputs.
-            let a_zp = if inputs.len() > 2 {
-                format!("Some(&{})", inputs[2])
-            } else {
-                "None".to_string()
+            // Zero points are optional, and may be given as empty names.
+            let zero_point = |i: usize| match ctx.node.input.get(i) {
+                Some(name) if !name.is_empty() => format!("Some(&{})", inputs[i]),
+                _ => "None".to_string(),
             };
-            let b_zp = if inputs.len() > 3 {
-                format!("Some(&{})", inputs[3])
-            } else {
-                "None".to_string()
-            };
-            // A static B is packed once for the integer GEMM.
-            match ctx.weight(1) {
-                Some(b) if matches!(b.dtype, DType::U8 | DType::I8) && b.shape.len() == 2 => {
-                    writeln!(
-                        w,
-                        "{}let {} = self.mat_mul_integer_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {});",
-                        tab,
-                        outputs[0],
-                        inputs[0],
+            let (a_zp, b_zp) = (zero_point(2), zero_point(3));
+            // A static B with static zero points is packed for the integer
+            // GEMM when the model is created.
+            let zero_point = ctx.weight_at_load(3, "lele::scalar(0.0f32)");
+            match (ctx.weight(1), zero_point) {
+                (Some(b), Some(zero_point))
+                    if matches!(b.dtype, DType::U8 | DType::I8) && b.shape.len() == 2 =>
+                {
+                    let n = ctx.weights.qweights(format!(
+                        "weights.pack_qweights({}, {}, {}, {}, {}, &{zero_point}, &lele::scalar(1.0f32))",
                         b.offset,
                         b.len,
                         b.shape[0],
                         b.shape[1],
                         b.dtype == DType::I8,
-                        a_zp,
-                        b_zp,
-                        buf_expr
+                    ));
+                    writeln!(
+                        w,
+                        "{tab}let {} = self.mat_mul_integer_packed(&{}, self.qweights({n}), {a_zp}, {buf_expr});",
+                        outputs[0], inputs[0],
                     )?;
                 }
                 _ => writeln!(

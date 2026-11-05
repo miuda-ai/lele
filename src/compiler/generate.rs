@@ -1,5 +1,5 @@
 use super::ir::{Binary, DType, Graph, Node, NodeId, Op};
-use super::weights::{WeightRef, Weights};
+use super::weights::{Scalar, WeightRef, Weights};
 use super::{Allocator, AnalysisData, Compiler, sanitize_name};
 use crate::model::onnx_proto::{NodeProto, ValueInfoProto};
 use std::collections::{HashMap, HashSet};
@@ -38,6 +38,19 @@ impl<'a> OpContext<'a> {
     /// The weight input `i` reads, if it reads one.
     pub fn weight(&self, i: usize) -> Option<&'a WeightRef> {
         self.weights.get(self.node.input.get(i)?)
+    }
+
+    /// The expression reading weight input `i` as f32 from `weights` when the
+    /// model is created, if input `i` is a weight; `default` if it is absent.
+    pub fn weight_at_load(&self, i: usize, default: &str) -> Option<String> {
+        if self.node.input.get(i).is_none_or(|name| name.is_empty()) {
+            return Some(default.to_string());
+        }
+        let expr = weight_expr(self.weight(i)?, ElemType::F32);
+        Some(match expr.strip_prefix("self.") {
+            Some(read) => format!("weights.{read}"),
+            None => expr,
+        })
     }
 
     /// The element type input `i` is held in, whether it is a variable or a
@@ -153,6 +166,22 @@ impl VarTypes {
 
 /// Expression reading weight `w` from the weights file as `target`.
 pub(crate) fn weight_expr(w: &WeightRef, target: ElemType) -> String {
+    let float = |v: f32| match v {
+        _ if v.is_finite() => format!("{v:?}f32"),
+        _ if v.is_nan() => "f32::NAN".to_string(),
+        _ if v > 0.0 => "f32::INFINITY".to_string(),
+        _ => "f32::NEG_INFINITY".to_string(),
+    };
+    match (w.scalar, target) {
+        (Some(Scalar::Int(v)), ElemType::I64) => return format!("lele::scalar({v}i64)"),
+        (Some(Scalar::Int(v)), ElemType::F32) => {
+            return format!("lele::scalar({})", float(v as f32));
+        }
+        (Some(Scalar::Float(v)), ElemType::F32) => {
+            return format!("lele::scalar({})", float(v));
+        }
+        _ => {}
+    }
     let accessor = match target {
         ElemType::I64 => match w.dtype {
             DType::I32 => "weight_i32_i64",
@@ -591,11 +620,12 @@ fn outlives_chunk(body: &str, var: &str, depth: usize) -> bool {
         // A tensor owning its data moves out of the chunk.
         if rhs.contains("&mut ws.buf_")
             || rhs.starts_with("self.weight_")
+            || rhs.starts_with("lele::scalar(")
             || rhs.starts_with("lele::kernels::scatter_nd_owned(")
         {
             return true;
         }
-        let viewed = ["reshape", "unsqueeze", "squeeze"]
+        let viewed = ["reshape", "unsqueeze", "squeeze", "select"]
             .iter()
             .find_map(|f| rhs.strip_prefix(&format!("lele::kernels::{f}(&")))
             .or_else(|| rhs.strip_suffix(".clone()"))
@@ -814,6 +844,8 @@ mod tests {
         let layer = lele::kernels::gather(&arg, &self.weight_i64(0, 8, &[]), 0, &mut ws.buf_7);
         let swapped = lele::kernels::transpose(&x, &[1, 0], &mut buf_t);
         let half = lele::kernels::split_one(&m3, 1, &[0, 0], 0, &mut ws.buf_8);
+        let row = lele::kernels::select(&x2, 3);
+        let row_of_y = lele::kernels::select(&y, 0);
 ";
         for (var, safe) in [
             ("values", false),
@@ -834,6 +866,9 @@ mod tests {
             ("layer", true),
             ("swapped", false),
             ("half", false),
+            // Views of their operand.
+            ("row", true),
+            ("row_of_y", false),
         ] {
             assert_eq!(outlives_chunk(body, var, 0), safe, "{var}");
         }
@@ -932,9 +967,67 @@ mod tests {
         let result = generate_one(&div, &weights, &Compiler::new(), &var_types);
         assert!(
             result.contains(
-                "let anchor = lele::kernels::div_trunc(&indices, &self.weight_i64_f32(16, 8, &[]), &mut buf_anchor);"
+                "let anchor = lele::kernels::div_trunc(&indices, &lele::scalar(80.0f32), &mut buf_anchor);"
             ),
             "{result}"
+        );
+    }
+
+    /// Integer products of one static weight with the same zero point read
+    /// the same weights, packed once when the model is created; another zero
+    /// point packs them again.
+    #[test]
+    fn test_integer_weights_packed_at_load_by_number() {
+        let node = |input: &[&str], output: &str| NodeProto {
+            input: input.iter().map(|s| s.to_string()).collect(),
+            output: vec![output.to_string()],
+            op_type: "MatMulInteger".to_string(),
+            ..Default::default()
+        };
+        let products = [
+            node(&["a", "b", "", "zb"], "y0"),
+            node(&["a2", "b", "", "zb"], "y1"),
+            node(&["a", "b", "", "zb2"], "y2"),
+        ];
+        let tensor = |name: &str, dims: Vec<i64>, raw_data: Vec<u8>| {
+            crate::model::onnx_proto::TensorProto {
+                name: name.to_string(),
+                data_type: DType::U8.to_onnx(),
+                dims,
+                raw_data,
+                ..Default::default()
+            }
+        };
+        let graph = crate::model::onnx_proto::GraphProto {
+            node: products.to_vec(),
+            initializer: vec![
+                tensor("b", vec![2, 2], vec![1, 2, 3, 4]),
+                tensor("zb", vec![], vec![1]),
+                tensor("zb2", vec![], vec![2]),
+            ],
+            ..Default::default()
+        };
+        let mut ir = crate::compiler::ir::Graph::from_onnx(graph);
+        crate::compiler::passes::infer_dtypes(&mut ir);
+        let var_types = variable_types(&ir);
+        let weights = Weights::collect(&ir, false);
+        let compiler = Compiler::new();
+        let code: Vec<String> = products
+            .iter()
+            .map(|n| generate_one(n, &weights, &compiler, &var_types))
+            .collect();
+        for (code, n) in code.iter().zip([0, 0, 1]) {
+            assert!(code.contains("self.mat_mul_integer_packed(&"), "{code}");
+            assert!(code.contains(&format!(", self.qweights({n}), None, ")), "{code}");
+        }
+        let prepared = weights.prepared.borrow();
+        assert_eq!(prepared.qweights.len(), 2);
+        assert_eq!(
+            prepared.qweights,
+            [
+                "weights.pack_qweights(0, 4, 2, 2, false, &lele::scalar(1.0f32), &lele::scalar(1.0f32))",
+                "weights.pack_qweights(0, 4, 2, 2, false, &lele::scalar(2.0f32), &lele::scalar(1.0f32))",
+            ]
         );
     }
 

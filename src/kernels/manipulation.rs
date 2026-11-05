@@ -1028,6 +1028,32 @@ enum PadMode {
     Reflect,
 }
 
+/// Slab `index` of `data` along its outermost axis, as `Gather` of a scalar
+/// index along axis 0 takes it: a view of `data`, copied only where `data`
+/// owns its elements, as [`reshape`](crate::kernels::reshape) copies them.
+pub fn select<'a, T>(data: &TensorView<'a, T>, index: i64) -> TensorView<'a, T>
+where
+    T: Clone + std::fmt::Debug,
+{
+    let rows = data.shape[0];
+    let row = if index < 0 { index + rows as i64 } else { index };
+    assert!(
+        (0..rows as i64).contains(&row),
+        "select index {index} out of range for {rows} rows"
+    );
+    let shape = data.shape[1..].to_vec();
+    let len: usize = shape.iter().product();
+    let range = row as usize * len..(row as usize + 1) * len;
+    let data = match &data.data {
+        std::borrow::Cow::Borrowed(d) => std::borrow::Cow::Borrowed(&d[range]),
+        std::borrow::Cow::Owned(d) => std::borrow::Cow::Owned(d[range].to_vec()),
+    };
+    TensorView {
+        data,
+        shape: std::borrow::Cow::Owned(shape),
+    }
+}
+
 /// See [`borrow_run`] for when the result borrows from `data` rather than `out`.
 pub fn gather<'b: 'a, 'a, T, I>(
     data: &TensorView<'b, T>,
@@ -1088,6 +1114,42 @@ where
     }
     TensorView::from_slice(out, out_shape)
 }
+/// [`gather`] of 8-bit `data`, as stored, widening only what it takes to f32:
+/// rows of a quantized embedding table rather than the whole table.
+pub fn gather_widened<'a, S, I>(
+    data: &TensorView<'_, S>,
+    indices: &TensorView<'_, I>,
+    axis: i64,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a, f32>
+where
+    S: Copy + Into<f32> + std::fmt::Debug,
+    I: crate::kernels::utils::AsI64 + Copy + std::fmt::Debug,
+{
+    let axis = if axis < 0 {
+        (data.dim() as i64 + axis) as usize
+    } else {
+        axis as usize
+    };
+    let mut out_shape = data.shape[..axis].to_vec();
+    out_shape.extend_from_slice(&indices.shape);
+    out_shape.extend_from_slice(&data.shape[axis + 1..]);
+    let outer_dim: usize = data.shape[..axis].iter().product();
+    let axis_dim = data.shape[axis];
+    let inner_dim: usize = data.shape[axis + 1..].iter().product();
+    out.clear();
+    out.reserve(out_shape.iter().product());
+    for o in 0..outer_dim {
+        for index in indices.data.iter() {
+            let i = index.as_i64();
+            let i = if i < 0 { i + axis_dim as i64 } else { i } as usize;
+            let src = (o * axis_dim + i) * inner_dim;
+            out.extend(data.data[src..src + inner_dim].iter().map(|&x| x.into()));
+        }
+    }
+    TensorView::from_slice(out, out_shape)
+}
+
 pub fn cast<'a>(input: &TensorView<'a>, _to: i64) -> TensorView<'a> {
     input.clone()
 }
@@ -1823,6 +1885,48 @@ pub fn scatter_elements<'a, T: Copy + std::fmt::Debug, I: utils::AsI64 + Copy + 
 mod tests {
     use super::*;
     use crate::tensor::TensorView;
+
+    /// `select` takes what `gather` of the scalar index along axis 0 takes,
+    /// borrowing it from a borrowed input and copying it from an owned one.
+    #[test]
+    fn test_select_is_gather_of_a_scalar_index() {
+        let values: Vec<f32> = (0..24).map(|x| x as f32).collect();
+        let borrowed = TensorView::new(&values, &[4, 2, 3]);
+        let owned = TensorView::from_owned(values.clone(), vec![4, 2, 3]);
+        for index in [0i64, 2, 3, -1, -4] {
+            let mut out = Vec::new();
+            let want = gather(&borrowed, &TensorView::from_owned(vec![index], vec![]), 0, &mut out);
+            for (input, is_borrowed) in [(&borrowed, true), (&owned, false)] {
+                let got = select(input, index);
+                assert_eq!(got.shape.as_ref(), &[2, 3]);
+                assert_eq!(got.data.as_ref(), want.data.as_ref(), "{index}");
+                assert_eq!(matches!(got.data, std::borrow::Cow::Borrowed(_)), is_borrowed);
+            }
+        }
+        assert!(std::panic::catch_unwind(|| select(&borrowed, 4)).is_err());
+    }
+
+    /// `gather_widened` of 8-bit data takes what `gather` takes of the data
+    /// widened, along either axis and with negative indices.
+    #[test]
+    fn test_gather_widened_is_gather_of_the_widened_data() {
+        let bytes: Vec<u8> = (0..24).map(|x| (x * 11) as u8).collect();
+        let signed: Vec<i8> = bytes.iter().map(|&b| b as i8).collect();
+        let indices = TensorView::from_owned(vec![2i64, -1, 0, 2], vec![2, 2]);
+        for axis in [0, 1, -2] {
+            let mut want_buf = Vec::new();
+            let mut got_buf = Vec::new();
+            let widened: Vec<f32> = bytes.iter().map(|&b| b as f32).collect();
+            let want = gather(&TensorView::new(&widened, &[4, 3, 2]), &indices, axis, &mut want_buf);
+            let got = gather_widened(&TensorView::new(&bytes, &[4, 3, 2]), &indices, axis, &mut got_buf);
+            assert_eq!(got.shape, want.shape, "{axis}");
+            assert_eq!(got.data, want.data, "{axis}");
+            let widened: Vec<f32> = signed.iter().map(|&b| b as f32).collect();
+            let want = gather(&TensorView::new(&widened, &[4, 3, 2]), &indices, axis, &mut want_buf);
+            let got = gather_widened(&TensorView::new(&signed, &[4, 3, 2]), &indices, axis, &mut got_buf);
+            assert_eq!(got.data, want.data, "{axis}");
+        }
+    }
 
     /// The examples of the ONNX ScatterElements spec, and a negative index.
     #[test]

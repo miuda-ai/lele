@@ -336,6 +336,10 @@ impl Compiler {
         }
         passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);
+        // Casts between types held alike are left to the element types to
+        // tell apart.
+        passes::bypass_view_casts(&mut ir, &|name| var_types.get(&sanitize_name(name)));
+        let var_types = variable_types(&ir);
         // A user pattern generates a whole run of nodes at once, and may read
         // the inputs of its first nodes after writing the outputs of later ones.
         let lookback = if self.patterns.is_empty() { 0 } else { 8 };
@@ -483,11 +487,18 @@ impl Compiler {
         writeln!(&mut code, "}}")?;
         writeln!(&mut code, "\nimpl<'a> {}<'a> {{", struct_name)?;
         writeln!(&mut code, "    pub fn new(data: &'a [u8]) -> Self {{")?;
-        // f16, u8 and i8 weights read as f32 are widened once, here, not on
-        // every read; those the kernels take as they are stored are left so.
+        // f16, u8 and i8 weights read as f32, and i32 and bool ones read as
+        // i64, are widened once, here, not on every read; those the kernels
+        // take as they are stored are left so.
         let mut weights_expr = "lele::runtime::Weights::new(data)".to_string();
         use ir::DType;
-        for (dtype, ty) in [(DType::F16, "f16"), (DType::U8, "u8"), (DType::I8, "i8")] {
+        for (dtype, ty) in [
+            (DType::F16, "f16"),
+            (DType::U8, "u8"),
+            (DType::I8, "i8"),
+            (DType::I32, "i32_i64"),
+            (DType::Bool, "bool_i64"),
+        ] {
             let read: Vec<_> = weights
                 .regions(dtype)
                 .into_iter()
@@ -501,7 +512,30 @@ impl Compiler {
                 weights_expr += &format!(".with_{ty}(&{read:?})");
             }
         }
-        writeln!(&mut code, "        Self {{ weights: {weights_expr} }}")?;
+        // The weights of the integer products are packed here, numbered as the
+        // code reads them.
+        let prepared = weights.prepared.borrow();
+        if prepared.qweights.is_empty() && prepared.conv_weights.is_empty() {
+            writeln!(&mut code, "        Self {{ weights: {weights_expr} }}")?;
+        } else {
+            writeln!(&mut code, "        let weights = {weights_expr};")?;
+            let mut with = String::new();
+            for (name, packed) in [
+                ("qweights", &prepared.qweights),
+                ("conv_weights", &prepared.conv_weights),
+            ] {
+                if packed.is_empty() {
+                    continue;
+                }
+                writeln!(&mut code, "        let {name} = vec![")?;
+                for expr in packed {
+                    writeln!(&mut code, "            {expr},")?;
+                }
+                writeln!(&mut code, "        ];")?;
+                with += &format!(".with_{name}({name})");
+            }
+            writeln!(&mut code, "        Self {{ weights: weights{with} }}")?;
+        }
         writeln!(&mut code, "    }}")?;
         for method in &self.custom_methods {
             writeln!(&mut code, "{}", method)?;

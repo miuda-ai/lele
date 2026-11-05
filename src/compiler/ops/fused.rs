@@ -142,20 +142,28 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
         }
         Op::QLinearDynamic { relu } => {
             let (x, scale, zero_point, bias) = (&inputs[0], &inputs[2], &inputs[3], &inputs[4]);
-            // A static weight is packed once for the integer GEMM.
-            match ctx.weight(1) {
-                Some(weight)
+            // A static weight with static scales and zero points is packed for
+            // the integer GEMM when the model is created.
+            let at_load = (
+                ctx.weight_at_load(2, "lele::scalar(1.0f32)"),
+                ctx.weight_at_load(3, "lele::scalar(0.0f32)"),
+            );
+            match (ctx.weight(1), at_load) {
+                (Some(weight), (Some(scale), Some(zero_point)))
                     if matches!(weight.dtype, DType::U8 | DType::I8) && weight.shape.len() == 2 =>
                 {
-                    writeln!(
-                        w,
-                        "{tab}let {} = self.linear_quantized_packed(&{x}, {}, {}, {}, {}, {}, {scale}, {zero_point}, {bias}, {relu}, {buf});",
-                        outputs[0],
+                    let n = ctx.weights.qweights(format!(
+                        "weights.pack_qweights({}, {}, {}, {}, {}, &{zero_point}, &{scale})",
                         weight.offset,
                         weight.len,
                         weight.shape[0],
                         weight.shape[1],
                         weight.dtype == DType::I8,
+                    ));
+                    writeln!(
+                        w,
+                        "{tab}let {} = self.linear_quantized_packed(&{x}, self.qweights({n}), {bias}, {relu}, {buf});",
+                        outputs[0],
                     )?
                 }
                 _ => {

@@ -4,6 +4,7 @@
 use super::cse::replace_uses;
 use super::fold::exact_ints;
 use super::fuse::{constant, constant_tensor};
+use crate::compiler::generate::ElemType;
 use crate::compiler::ir::{Binary, Dim, Graph, NodeId, Op, TargetDim, ValueId};
 
 /// Removes the nodes of `g` and its subgraphs whose output is their input:
@@ -34,6 +35,32 @@ pub(crate) fn simplify(g: &mut Graph) {
             bypass(g, id, src);
         } else if matches!(g.node(id).op, Op::Transpose { .. }) {
             simplify_transpose(g, id);
+        }
+    }
+}
+
+/// Removes the `Cast`s of `g` and its subgraphs that lele computes as a view
+/// of their input ([`ElemType::cast_is_view`]), as a cast between f32 and f16,
+/// both held in f32: their readers read the input instead. `ty` gives the
+/// element type of a value by name.
+///
+/// Models converted to f16 but for their normalizations (T-one) cast to f32
+/// and back around each one.
+pub(crate) fn bypass_view_casts(g: &mut Graph, ty: &dyn Fn(&str) -> ElemType) {
+    for id in g.node_ids() {
+        for sub in g.node_mut(id).op.subgraphs_mut() {
+            bypass_view_casts(sub, ty);
+        }
+    }
+    for id in g.node_ids() {
+        if !g.contains(id) {
+            continue;
+        }
+        let node = g.node(id);
+        if let (Op::Cast { to }, Some(x)) = (&node.op, node.input(0))
+            && ty(&g.value(x).name).cast_is_view(*to)
+        {
+            bypass(g, id, x);
         }
     }
 }
@@ -475,5 +502,49 @@ mod tests {
             simplified(nodes, vec![], &[0, 2, 8, 4]),
             ["Transpose(x) -> y"]
         );
+    }
+
+    /// Casts to f16 and back are views when f16 is held in f32; a cast to
+    /// int64 converts, and one the graph outputs keeps its name.
+    #[test]
+    fn casts_lele_computes_as_views_go() {
+        let cast = |input: &str, to: DType, output: &str| {
+            let mut n = node("Cast", &[input], output);
+            n.attribute.push(AttributeProto {
+                name: "to".to_string(),
+                i: to.to_onnx() as i64,
+                r#type: 2, // INT
+                ..Default::default()
+            });
+            n
+        };
+        let mut g = Graph::from_onnx(GraphProto {
+            node: vec![
+                cast("x", DType::F16, "a"),
+                node("Relu", &["a"], "b"),
+                cast("b", DType::F32, "c"),
+                cast("c", DType::I64, "d"),
+                node("Relu", &["c"], "e"),
+                cast("e", DType::F16, "y"),
+            ],
+            input: vec![info("x", &[4])],
+            output: ["d", "y"]
+                .map(|name| ValueInfoProto {
+                    name: name.to_string(),
+                    ..Default::default()
+                })
+                .to_vec(),
+            ..Default::default()
+        });
+        crate::compiler::passes::infer_dtypes(&mut g);
+        let ty = |name: &str| if name == "d" { ElemType::I64 } else { ElemType::F32 };
+        bypass_view_casts(&mut g, &ty);
+        let nodes: Vec<String> = g
+            .into_onnx()
+            .node
+            .iter()
+            .map(|n| format!("{}({}) -> {}", n.op_type, n.input.join(", "), n.output[0]))
+            .collect();
+        assert_eq!(nodes, ["Relu(x) -> b", "Cast(b) -> d", "Relu(b) -> y"]);
     }
 }

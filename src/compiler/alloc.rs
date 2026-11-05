@@ -2,6 +2,7 @@
 
 use super::generate::ElemType;
 use super::ir::{Dim, Graph, Op};
+use super::passes;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -132,6 +133,12 @@ impl Schedule {
                     if !inputs.is_empty()
                         && !outputs.is_empty()
                         && ty(&inputs[0]).cast_is_view(*to) =>
+                {
+                    self.aliases
+                        .insert(outputs[0].clone(), vec![inputs[0].clone()]);
+                }
+                Op::Gather { .. }
+                    if !outputs.is_empty() && passes::selected_index(g, node).is_some() =>
                 {
                     self.aliases
                         .insert(outputs[0].clone(), vec![inputs[0].clone()]);

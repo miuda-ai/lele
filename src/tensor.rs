@@ -19,6 +19,16 @@ pub type TensorViewI64<'a> = TensorView<'a, i64>;
 pub type TensorViewF16<'a> = TensorView<'a, f16>;
 pub type TensorViewBF16<'a> = TensorView<'a, bf16>;
 
+/// A rank-0 tensor holding `value`: how generated code reads integer scalar
+/// weights.
+pub fn scalar<T>(value: T) -> TensorView<'static, T>
+where
+    T: Clone + std::fmt::Debug,
+    [T]: ToOwned<Owned = Vec<T>>,
+{
+    TensorView::from_owned(vec![value], Vec::new())
+}
+
 impl<'a, T> TensorView<'a, T>
 where
     T: Clone + std::fmt::Debug,

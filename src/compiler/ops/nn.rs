@@ -324,10 +324,11 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             } else {
                 "None".to_string()
             };
-            // A static weight is prepared once, on first use. A 1-D one is a
-            // 2-D one over a single row.
-            match ctx.weight(1) {
-                Some(weight)
+            // A static weight with static zero points is prepared when the
+            // model is created. A 1-D one is a 2-D one over a single row.
+            let zero_point = ctx.weight_at_load(3, "lele::scalar(0.0f32)");
+            match (ctx.weight(1), zero_point) {
+                (Some(weight), Some(zero_point))
                     if matches!(weight.dtype, DType::U8 | DType::I8)
                         && matches!(weight.shape.len(), 3 | 4) =>
                 {
@@ -335,19 +336,21 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                         [o, c, k] => vec![o, c, 1, k],
                         _ => weight.shape.to_vec(),
                     };
-                    writeln!(
-                        w,
-                        "{}let {} = self.conv_integer_packed(&{}, {}, {}, {:?}, {}, {}, {}, {}, &{:?}, &{:?}, &{:?}, {});",
-                        tab,
-                        outputs[0],
-                        inputs[0],
+                    let n = ctx.weights.conv_weights(format!(
+                        "weights.pack_conv_weights({}, {}, {:?}, {}, {}, &{zero_point})",
                         weight.offset,
                         weight.len,
                         shape,
-                        weight.dtype == DType::I8,
                         group,
+                        weight.dtype == DType::I8,
+                    ));
+                    writeln!(
+                        w,
+                        "{}let {} = self.conv_integer_packed(&{}, self.conv_weights({n}), {}, &{:?}, &{:?}, &{:?}, {});",
+                        tab,
+                        outputs[0],
+                        inputs[0],
                         x_zero_point,
-                        w_zero_point,
                         dilations,
                         pads,
                         strides,

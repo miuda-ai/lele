@@ -2,10 +2,10 @@
 //! quantization.
 
 use super::super::{
-    generate::{ElemType, OpContext},
+    generate::{ElemType, OpContext, weight_expr},
     ir::{DType, Op, TargetDim},
 };
-use crate::compiler::passes::{ACT_REQUANT, I8_BIAS, I8_REQUANT};
+use crate::compiler::passes::{self, ACT_REQUANT, I8_BIAS, I8_REQUANT};
 use crate::model::onnx_proto::TensorProto;
 use std::io::Write;
 
@@ -164,6 +164,29 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 w,
                 "{}let {} = lele::kernels::where_op(&{}, &{}, &{}, {});",
                 tab, outputs[0], inputs[0], inputs[1], inputs[2], buf_expr
+            )?;
+        }
+        Op::Gather { .. } if let Some(index) = passes::selected_index(ctx.graph, ctx.ir()) => {
+            writeln!(
+                w,
+                "{tab}let {} = lele::kernels::select(&{}, {index});",
+                outputs[0], inputs[0]
+            )?;
+        }
+        // An 8-bit table, as a quantized embedding, is read as stored and only
+        // the rows taken widened.
+        Op::Gather { axis }
+            if let Some(table) = ctx.weight(0)
+                && let Some(ty) = match table.dtype {
+                    DType::U8 => Some("u8"),
+                    DType::I8 => Some("i8"),
+                    _ => None,
+                } =>
+        {
+            writeln!(
+                w,
+                "{tab}let {} = lele::kernels::gather_widened(&self.weight_{ty}_stored({}, {}, &{:?}), &{}, {axis}, {buf_expr});",
+                outputs[0], table.offset, table.len, table.shape, inputs[1],
             )?;
         }
         Op::Gather { axis } => {
@@ -378,16 +401,18 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
         }
         Op::QLinearMatMulI8 => {
             // Produced by `Compiler::fuse_qdq_matmul`, so the weight is always
-            // an int8 initializer with a known blob offset. It is passed by
-            // offset rather than as a `TensorView` because the runtime packs it
-            // into an architecture-specific layout once and caches that.
-            let Some(weight) = ctx.weight(3) else {
+            // an int8 initializer, and its scale one too. The runtime packs it
+            // into an architecture-specific layout when the model is created.
+            let (Some(weight), Some(scale)) = (ctx.weight(3), ctx.weight_at_load(4, "")) else {
                 panic!(
-                    "QLinearMatMulI8 weight {} is not a known initializer",
+                    "QLinearMatMulI8 weight {} or its scale is not a known initializer",
                     ctx.node.input[3]
                 );
             };
-            let (offset, len, shape) = (weight.offset, weight.len, &weight.shape);
+            let n = ctx.weights.qweights(format!(
+                "weights.pack_qweights({}, {}, {}, {}, true, &lele::scalar(0.0f32), &{scale})",
+                weight.offset, weight.len, weight.shape[0], weight.shape[1],
+            ));
             // `fold_qdq_into_matmuls` may have given it the pair after the
             // product, the bias added after that, or both.
             let requant = requant_expr(ctx, inputs, I8_REQUANT);
@@ -397,8 +422,8 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             };
             writeln!(
                 w,
-                "{tab}let {} = self.qmatmul_i8(&{}, &{}, &{}, {offset}, {len}, {}, {}, &{}, {requant}, {bias}, {buf_expr});",
-                outputs[0], inputs[0], inputs[1], inputs[2], shape[0], shape[1], inputs[4],
+                "{tab}let {} = self.qmatmul_i8(&{}, &{}, &{}, self.qweights({n}), {requant}, {bias}, {buf_expr});",
+                outputs[0], inputs[0], inputs[1], inputs[2],
             )?;
         }
         Op::QLinearMatMulAct => {
@@ -480,7 +505,13 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             )?;
         }
         op @ (Op::Identity | Op::Constant { .. }) => {
-            if let Some(weight) = ctx.weights.get(&ctx.node.output[0]) {
+            if let Some(weight) = ctx.weights.get(&ctx.node.output[0])
+                && matches!(weight.dtype, DType::I64 | DType::F32 | DType::F16)
+                && weight.scalar.is_some()
+            {
+                let weight = weight_expr(weight, ElemType::of(weight.dtype));
+                writeln!(w, "{}let {} = {};", tab, outputs[0], weight)?;
+            } else if let Some(weight) = ctx.weights.get(&ctx.node.output[0]) {
                 let weight_fn = match weight.dtype {
                     DType::U8 => "weight_u8",
                     DType::I8 => "weight_i8",

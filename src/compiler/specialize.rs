@@ -398,14 +398,15 @@ mod tests {
     /// takes none.
     #[test]
     fn fixed_shapes_size_the_workspace() {
-        // Only the buffer of the scalars `n` and `is_16k` has a fixed size.
+        // Only the buffer of the shape `s` of `x` (of which `n` is a view)
+        // and the scalar `is_16k` has a fixed size.
         let general = code(Compiler::new());
         assert_eq!(
             general.matches("Vec::with_capacity(").count(),
             1,
             "{general}"
         );
-        assert!(general.contains("Vec::with_capacity(1),"), "{general}");
+        assert!(general.contains("Vec::with_capacity(2),"), "{general}");
         assert!(general.contains("..Default::default()"), "{general}");
         assert!(!general.contains("BYTES"), "{general}");
         let fixed = code(
