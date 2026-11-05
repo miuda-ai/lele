@@ -570,6 +570,26 @@ pub enum Op {
     /// (x · w[:, n:] + b[n:])`. Inputs: `[x, w, b]`, `w` `[k, 2n]` holding the
     /// gate's weights then the value's, `b` `[2n]` their biases likewise.
     SwiGlu,
+    /// Rotary position embedding of the first `rot` values along the last
+    /// axis, the others passed through: `r * cos + rotate_half(r) * sin`,
+    /// `rotate_half(r) = concat(-r[rot/2..], r[..rot/2])`. Inputs:
+    /// `[x, cos, sin]`, the tables `rot` wide (unlike ONNX
+    /// `RotaryEmbedding`'s half-width caches) and broadcast over `x`.
+    Rope {
+        rot: usize,
+    },
+    /// ONNX `RotaryEmbedding`, and `com.microsoft`'s, whose inputs are
+    /// reordered to match. Inputs: `[x, cos_cache, sin_cache, position_ids]`,
+    /// the last optional, the caches half as wide as the values each head
+    /// rotates. `x` is `[batch, heads, seq, head]` or `[batch, seq, hidden]`,
+    /// `num_heads` heads (0: as wide as the rotation); a single position is
+    /// that of the first in the sequence (`com.microsoft`'s offset).
+    /// `rot` is `rotary_embedding_dim` as given, 0 if not.
+    RotaryEmbedding {
+        interleaved: bool,
+        num_heads: usize,
+        rot: usize,
+    },
     /// Dynamically quantized linear layer: `DynamicQuantizeLinear` of the
     /// activation, `MatMulInteger` against a quantized weight, rescale and
     /// bias, optionally an activation. Inputs:
@@ -623,6 +643,9 @@ impl Op {
             domain: node.domain.clone(),
             graphs: Vec::new(),
         };
+        if node.domain == "com.microsoft" && node.op_type == "RotaryEmbedding" {
+            return parse_rotary_embedding(node, true).unwrap_or_else(|| fallback(node));
+        }
         if !(node.domain.is_empty() || node.domain == "ai.onnx") {
             return fallback(node);
         }
@@ -738,6 +761,9 @@ impl Op {
             "Trilu" => Op::Trilu {
                 upper: attr_i(node, "upper").unwrap_or(1) != 0,
             },
+            "RotaryEmbedding" => {
+                parse_rotary_embedding(node, false).unwrap_or_else(|| fallback(node))
+            }
             "LayerNormalization" => Op::LayerNormalization {
                 axis: attr_i(node, "axis").unwrap_or(-1),
                 epsilon: attr_f(node, "epsilon").unwrap_or(1e-5),
@@ -880,6 +906,8 @@ impl Op {
             Op::SimAm { .. } => "SimAm",
             Op::Linear { .. } => "Linear",
             Op::SwiGlu => "SwiGlu",
+            Op::Rope { .. } => "Rope",
+            Op::RotaryEmbedding { .. } => "RotaryEmbedding",
             Op::QLinearDynamic { .. } => "QLinearDynamic",
             Op::EmbeddingConcat { .. } => "EmbeddingConcat",
             Op::ReshapeTo { .. } => "ReshapeTo",
@@ -1050,6 +1078,16 @@ impl Op {
                 set_attr_f(attrs, "next_epsilon", next_epsilon, 0.0);
             }
             Op::RmsNorm { epsilon } => set_attr_f(attrs, "epsilon", epsilon, 0.0),
+            Op::Rope { rot } => set_attr_i(attrs, "rot", rot as i64, 0),
+            Op::RotaryEmbedding {
+                interleaved,
+                num_heads,
+                rot,
+            } => {
+                set_attr_i(attrs, "interleaved", interleaved as i64, 0);
+                set_attr_i(attrs, "num_heads", num_heads as i64, 0);
+                set_attr_i(attrs, "rotary_embedding_dim", rot as i64, 0);
+            }
             Op::SimAm {
                 axes,
                 lambda,
@@ -1110,6 +1148,33 @@ impl Op {
             | Op::SwiGlu => {}
         }
     }
+}
+
+/// `RotaryEmbedding`, ONNX's or (`contrib`) `com.microsoft`'s, whose inputs
+/// `[x, position_ids, cos_cache, sin_cache]` are reordered to ONNX's. `None`
+/// for what the kernel does not run: packed batches, a custom scale.
+fn parse_rotary_embedding(node: &mut NodeProto, contrib: bool) -> Option<Op> {
+    let int = |name: &str| attr_i(node, name).unwrap_or(0);
+    let (interleaved, num_heads, rot) = (
+        int("interleaved") != 0,
+        int("num_heads"),
+        int("rotary_embedding_dim"),
+    );
+    if num_heads < 0 || rot < 0 {
+        return None;
+    }
+    if contrib {
+        let packed = int("is_packed_batching") != 0;
+        if packed || attr_f(node, "scale").is_some_and(|s| s != 1.0) || node.input.len() != 4 {
+            return None;
+        }
+        node.input[1..].rotate_left(1);
+    }
+    Some(Op::RotaryEmbedding {
+        interleaved,
+        num_heads: num_heads as usize,
+        rot: rot as usize,
+    })
 }
 
 fn attr_i(node: &NodeProto, name: &str) -> Option<i64> {
@@ -1366,6 +1431,14 @@ mod tests {
                 vec![int("axis", 1), int("largest", 0), int("sorted", 1)],
             ),
             ("Transpose", vec![ints("perm", &[0, 2, 1])]),
+            (
+                "RotaryEmbedding",
+                vec![
+                    int("interleaved", 1),
+                    int("num_heads", 4),
+                    int("rotary_embedding_dim", 32),
+                ],
+            ),
         ];
         let mut nodes = Vec::new();
         for (op_type, attribute) in cases {
@@ -1398,5 +1471,47 @@ mod tests {
             );
         }
         assert_eq!(g.into_onnx().node, nodes);
+    }
+
+    /// `com.microsoft`'s `RotaryEmbedding` takes the positions second; parsed,
+    /// they come last, as ONNX's. A custom scale or packed batches leave it
+    /// untyped, its inputs as they were.
+    #[test]
+    fn contrib_rotary_embedding_takes_the_positions_last() {
+        let node = |attribute: Vec<AttributeProto>| NodeProto {
+            op_type: "RotaryEmbedding".to_string(),
+            domain: "com.microsoft".to_string(),
+            input: ["x", "pos", "cos", "sin"].map(String::from).to_vec(),
+            output: vec!["y".to_string()],
+            attribute,
+            ..Default::default()
+        };
+        let parsed = |attribute| {
+            let g = Graph::from_onnx(GraphProto {
+                node: vec![node(attribute)],
+                ..Default::default()
+            });
+            let (_, n) = g.nodes().next().unwrap();
+            let names = n.inputs().iter().map(|v| g.value(v.unwrap()).name.clone());
+            (n.op.clone(), names.collect::<Vec<_>>())
+        };
+        let (op, inputs) = parsed(vec![int("num_heads", 4), int("interleaved", 1)]);
+        assert!(matches!(
+            op,
+            Op::RotaryEmbedding {
+                interleaved: true,
+                num_heads: 4,
+                rot: 0
+            }
+        ));
+        assert_eq!(inputs, ["x", "cos", "sin", "pos"]);
+        for attribute in [
+            vec![float("scale", 0.5)],
+            vec![int("is_packed_batching", 1)],
+        ] {
+            let (op, inputs) = parsed(attribute);
+            assert!(matches!(op, Op::Onnx { .. }));
+            assert_eq!(inputs, ["x", "pos", "cos", "sin"]);
+        }
     }
 }

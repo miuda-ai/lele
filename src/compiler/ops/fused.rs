@@ -81,6 +81,26 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             "{tab}let {} = lele::kernels::rms_norm(&{}, &{}, -1, {epsilon:?}, {buf});",
             outputs[0], inputs[0], inputs[1]
         )?,
+        Op::Rope { rot } => writeln!(
+            w,
+            "{tab}let {} = lele::kernels::rope(&{}, &{}, &{}, {rot}, {buf});",
+            outputs[0], inputs[0], inputs[1], inputs[2]
+        )?,
+        Op::RotaryEmbedding {
+            interleaved,
+            num_heads,
+            rot,
+        } => {
+            let positions = match ctx.ir().input(3) {
+                Some(_) => format!("Some(&{})", inputs[3]),
+                None => "None".to_string(),
+            };
+            writeln!(
+                w,
+                "{tab}let {} = lele::kernels::rotary_embedding(&{}, &{}, &{}, {positions}, {interleaved}, {num_heads}, {rot}, {buf});",
+                outputs[0], inputs[0], inputs[1], inputs[2]
+            )?
+        }
         Op::Snake => writeln!(
             w,
             "{tab}let {} = lele::kernels::snake(&{}, &{}, &{}, {buf});",

@@ -23,6 +23,7 @@ pub(crate) fn fuse(g: &mut Graph) {
     fuse_layer_norm(g);
     fuse_scale_norm(g);
     fuse_rms_norm(g);
+    fuse_rope(g);
     fuse_simam(g);
     fuse_snake(g);
     fuse_gelu(g);
@@ -1261,6 +1262,200 @@ fn fuse_embedding_concat(g: &mut Graph) {
     }
 }
 
+/// The shape of `v` and the size of its last axis, if each dimension is
+/// fixed or named, and the last fixed: shapes equal so are equal at run time.
+fn shape_and_width(g: &Graph, v: ValueId) -> Option<(&[Dim], i64)> {
+    let shape = g.value(v).shape.as_deref()?;
+    let Some(Dim::Fixed(width)) = shape.last() else {
+        return None;
+    };
+    (!shape.contains(&Dim::Unknown)).then_some((shape, *width))
+}
+
+/// The values `[start, end)` that `Slice` node `id` keeps of the last axis of
+/// its input, `n` long, if it slices that axis alone, with step 1.
+fn last_axis_range(g: &Graph, id: NodeId, n: i64) -> Option<(i64, i64)> {
+    let node = g.node(id);
+    if !matches!(node.op, Op::Slice) {
+        return None;
+    }
+    let rank = g.value(node.input(0)?).shape.as_ref()?.len() as i64;
+    let ints = |i: usize| constant_tensor(g, node.input(i)).and_then(exact_ints);
+    let (starts, ends) = (ints(1)?, ints(2)?);
+    let axes = match node.input(3) {
+        Some(_) => ints(3)?,
+        None => (0..starts.len() as i64).collect(),
+    };
+    let steps = match node.input(4) {
+        Some(_) => ints(4)?,
+        None => vec![1; starts.len()],
+    };
+    let fits = starts.len() == 1
+        && ends.len() == 1
+        && steps == [1]
+        && matches!(axes[..], [a] if a == -1 || a == rank - 1);
+    let clamp = |i: i64| if i < 0 { (i + n).max(0) } else { i.min(n) };
+    fits.then(|| (clamp(starts[0]), clamp(ends[0])))
+}
+
+/// Whether `axis` is the last of `rank`.
+fn is_last_axis(axis: i64, rank: usize) -> bool {
+    axis == -1 || axis == rank as i64 - 1
+}
+
+/// The rotation of a `Rope` chain: its nodes but the `Add`, the values `r`
+/// it rotates, `rot` along the last axis, and the tables.
+struct RopeChain {
+    nodes: Vec<NodeId>,
+    r: ValueId,
+    rot: i64,
+    cos: ValueId,
+    sin: ValueId,
+}
+
+/// The rotation summed by an `Add` of `plain` and `rotated`:
+/// `plain = Mul(r, cos)` and `rotated = Mul(Concat(Neg(Slice(r, h, rot)),
+/// Slice(r, 0, h)), sin)` along the last axis, the products in either order.
+/// The tables must be `rot` wide and leave `r`'s shape as it is.
+fn rope_chain(g: &Graph, plain: ValueId, rotated: ValueId) -> Option<RopeChain> {
+    let is_slice = |op: &Op| matches!(op, Op::Slice);
+    let mul_cos = sole_producer(g, Some(plain), binary(Binary::Mul))?;
+    let mul_sin = sole_producer(g, Some(rotated), binary(Binary::Mul))?;
+    let (concat, sin) = (0..2).find_map(|i| {
+        let node = g.node(mul_sin);
+        let concat = sole_producer(g, node.input(i), |op| matches!(op, Op::Concat { .. }))?;
+        Some((concat, node.input(1 - i)?))
+    })?;
+    let c = g.node(concat);
+    let Op::Concat { axis } = c.op else {
+        unreachable!()
+    };
+    let &[Some(negated), Some(first)] = c.inputs() else {
+        return None;
+    };
+    let neg = sole_producer(g, Some(negated), unary(Unary::Neg))?;
+    let second = sole_producer(g, g.node(neg).input(0), is_slice)?;
+    let first = sole_producer(g, Some(first), is_slice)?;
+    let r = g.node(second).input(0)?;
+    if g.node(first).input(0) != Some(r) {
+        return None;
+    }
+    let cos = other_operand(g, mul_cos, r)??;
+    let (shape, rot) = shape_and_width(g, r)?;
+    let h = rot / 2;
+    let keeps_shape = |m: NodeId| {
+        g.node(m)
+            .output(0)
+            .and_then(|v| shape_and_width(g, v))
+            .is_some_and(|(s, _)| s == shape)
+    };
+    let fits_table = |t: ValueId| {
+        shape_and_width(g, t).is_some_and(|(s, width)| s.len() <= shape.len() && width == rot)
+    };
+    let fits = rot > 0
+        && rot % 2 == 0
+        && is_last_axis(axis, shape.len())
+        && last_axis_range(g, first, rot) == Some((0, h))
+        && last_axis_range(g, second, rot) == Some((h, rot))
+        && keeps_shape(mul_cos)
+        && keeps_shape(mul_sin)
+        && fits_table(cos)
+        && fits_table(sin);
+    fits.then(|| RopeChain {
+        nodes: vec![first, second, neg, concat, mul_cos, mul_sin],
+        r,
+        rot,
+        cos,
+        sin,
+    })
+}
+
+/// The values passed through around a rotation of `r`, the first `rot`
+/// values along the last axis of an `x`, its result `y`: the `Slice` taking
+/// `r`, and the `Concat` of `y` and a `Slice` of the rest of `x`; with `x`.
+fn rope_pass_through(
+    g: &Graph,
+    y: ValueId,
+    r: ValueId,
+    rot: i64,
+) -> Option<([NodeId; 3], ValueId)> {
+    let take = g
+        .value(r)
+        .producer()
+        .filter(|&p| matches!(g.node(p).op, Op::Slice))?;
+    let x = g.node(take).input(0)?;
+    let (shape, d) = shape_and_width(g, x)?;
+    let &[concat] = g.value(y).consumers() else {
+        return None;
+    };
+    let c = g.node(concat);
+    let Op::Concat { axis } = c.op else {
+        return None;
+    };
+    let &[Some(first), Some(rest)] = c.inputs() else {
+        return None;
+    };
+    let keep = sole_producer(g, Some(rest), |op| matches!(op, Op::Slice))?;
+    // The chain reads `r` three times.
+    let fits = g.uses(r) == 3
+        && g.uses(y) == 1
+        && first == y
+        && is_last_axis(axis, shape.len())
+        && g.node(keep).input(0) == Some(x)
+        && last_axis_range(g, take, d) == Some((0, rot))
+        && last_axis_range(g, keep, d) == Some((rot, d));
+    fits.then_some(([take, keep, concat], x))
+}
+
+/// Rotary position embedding as exporters write `rotate_half`, of the first
+/// `rot` values along the last axis of `x` or all of them → `Rope`:
+///
+/// ```text
+/// r = Slice(x, 0, rot)                     (or r = x)
+/// y = Mul(r, cos) + Mul(Concat(Neg(Slice(r, rot/2, rot)), Slice(r, 0, rot/2)), sin)
+/// Concat(y, Slice(x, rot, end))            (or y)
+/// ```
+///
+/// The kernel computes each value with the chain's arithmetic, so the result
+/// is the chain's bit for bit. T-one rotates 32 of the 48 values of each head
+/// of its queries and keys this way.
+fn fuse_rope(g: &mut Graph) {
+    for add in binary_nodes(g, Binary::Add) {
+        if !g.contains(add) {
+            continue;
+        }
+        let node = g.node(add);
+        let (Some(a), Some(b), Some(y)) = (node.input(0), node.input(1), node.output(0)) else {
+            continue;
+        };
+        let Some(RopeChain {
+            mut nodes,
+            r,
+            rot,
+            cos,
+            sin,
+        }) = rope_chain(g, a, b).or_else(|| rope_chain(g, b, a))
+        else {
+            continue;
+        };
+        nodes.push(add);
+        let x = match rope_pass_through(g, y, r, rot) {
+            Some((pass, x)) => {
+                nodes.extend(pass);
+                x
+            }
+            None => r,
+        };
+        // f16 is held as f32 and goes through the same kernels.
+        if !matches!(g.value(x).dtype, DType::F32 | DType::F16 | DType::Undefined) {
+            continue;
+        }
+        let proto = named_after(g, add);
+        let op = Op::Rope { rot: rot as usize };
+        g.fuse(&nodes, op, proto, vec![Some(x), Some(cos), Some(sin)]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1988,6 +2183,130 @@ mod tests {
         let mut nodes = nodes(false);
         nodes[1].attribute[0].ints = vec![1];
         assert_eq!(fused(nodes, constants).len(), 6);
+    }
+
+    /// Rotary embeddings as T-one writes them, rotating 32 of the 48 values of
+    /// each head (its batch fixed or not), and of whole rows, with the
+    /// operands of each `Mul` and the `Add` in either order. A rotation whose
+    /// halves are concatenated the other way round, or whose tables broadcast
+    /// the values to more rows, stays as it is.
+    #[test]
+    fn fuses_rope() {
+        use crate::model::onnx_proto::{
+            TensorShapeProto, TypeProto, tensor_shape_proto, type_proto,
+        };
+        use tensor_shape_proto::dimension::Value;
+        // A negative dimension is named.
+        let input = |dims: &[i64]| ValueInfoProto {
+            name: "x".to_string(),
+            r#type: Some(TypeProto {
+                value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                    elem_type: DType::F32.to_onnx(),
+                    shape: Some(TensorShapeProto {
+                        dim: dims
+                            .iter()
+                            .map(|&d| tensor_shape_proto::Dimension {
+                                value: Some(if d < 0 {
+                                    Value::DimParam("batch".to_string())
+                                } else {
+                                    Value::DimValue(d)
+                                }),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    }),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let slice =
+            |x: &str, start: &str, end: &str, y: &str| node("Slice", &[x, start, end, "axes"], y);
+        let concat = |inputs: &[&str], y: &str| {
+            let mut n = node("Concat", inputs, y);
+            n.attribute.push(crate::model::onnx_proto::AttributeProto {
+                name: "axis".to_string(),
+                i: -1,
+                ..Default::default()
+            });
+            n
+        };
+        // `swap` puts the operands of the products and the sum the other way
+        // round; `rotate_back` concatenates the halves first to last.
+        let fused = |x_dims: &[i64], table_dims: &[i64], swap: bool, rotate_back: bool| {
+            let (d, rot) = (*x_dims.last().unwrap(), *table_dims.last().unwrap());
+            let partial = rot < d;
+            let r = if partial { "r" } else { "x" };
+            let mut nodes = vec![];
+            if partial {
+                nodes.push(slice("x", "zero", "rot", "r"));
+            }
+            let order = |a: &'static str, b: &'static str| if swap { [b, a] } else { [a, b] };
+            let halves = if rotate_back {
+                ["lo", "n"]
+            } else {
+                ["n", "lo"]
+            };
+            nodes.extend([
+                slice(r, "zero", "h", "lo"),
+                slice(r, "h", "end", "hi"),
+                node("Neg", &["hi"], "n"),
+                concat(&halves, "rotated"),
+                node("Mul", &order(r, "cos"), "a"),
+                node("Mul", &order("rotated", "sin"), "b"),
+                node("Add", &order("a", "b"), "y"),
+            ]);
+            if partial {
+                nodes.push(slice("x", "rot", "end", "kept"));
+                nodes.push(concat(&["y", "kept"], "out"));
+            }
+            let len = table_dims.iter().product::<i64>() as usize;
+            let g = GraphProto {
+                output: vec![ValueInfoProto {
+                    name: nodes.last().unwrap().output[0].clone(),
+                    ..Default::default()
+                }],
+                node: nodes,
+                input: vec![input(x_dims)],
+                initializer: vec![
+                    floats("cos", table_dims, &vec![0.5; len]),
+                    floats("sin", table_dims, &vec![0.25; len]),
+                    ints("axes", &[-1]),
+                    ints("zero", &[0]),
+                    ints("h", &[rot / 2]),
+                    ints("rot", &[rot]),
+                    ints("end", &[i64::MAX]),
+                ],
+                ..Default::default()
+            };
+            let mut ir = Graph::from_onnx(g);
+            crate::compiler::passes::infer_dtypes(&mut ir);
+            crate::compiler::passes::fold_shapes(&mut ir);
+            fuse(&mut ir);
+            ir.into_onnx()
+                .node
+                .into_iter()
+                .map(|n| n.op_type)
+                .collect::<Vec<_>>()
+        };
+        for swap in [false, true] {
+            assert_eq!(
+                fused(&[10, 1, 8, 48], &[10, 1, 1, 32], swap, false),
+                ["Rope"]
+            );
+            assert_eq!(
+                fused(&[10, -1, 8, 48], &[10, 1, 1, 32], swap, false),
+                ["Rope"]
+            );
+            assert_eq!(fused(&[2, 4, 8], &[4, 8], swap, false), ["Rope"]);
+        }
+        let rotated_back = fused(&[2, 4, 8], &[4, 8], false, true);
+        assert!(
+            !rotated_back.contains(&"Rope".to_string()),
+            "{rotated_back:?}"
+        );
+        let broadcast = fused(&[4, 8], &[2, 4, 8], false, false);
+        assert!(!broadcast.contains(&"Rope".to_string()), "{broadcast:?}");
     }
 
     /// T-one's layer boundary: `norm_out` of a layer, read by the next one's

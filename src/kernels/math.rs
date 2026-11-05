@@ -2664,11 +2664,379 @@ pub fn stft_power_spectrum<'b, 'a>(
     TensorView::from_slice(out, stft_shape)
 }
 
+/// Rotary position embedding of the first `rot` values along the last axis of
+/// `x`, the others passed through: `r * cos + rotate_half(r) * sin` for those
+/// values `r`, `rotate_half(r) = concat(-r[h..], r[..h])` with `h = rot / 2`.
+/// `cos` and `sin` hold `rot` values along their last axis, as many as they
+/// are multiplied with, and broadcast over the other axes of `x`.
+///
+/// Each value is its product with `cos` plus its partner's, negated in the
+/// first half, with `sin`, which is how exporters write the rotation (two
+/// `Slice`s, `Neg`, `Concat`, two `Mul`s and `Add`), so the result is theirs bit
+/// for bit.
+pub fn rope<'a>(
+    x: &TensorView<'_>,
+    cos: &TensorView<'_>,
+    sin: &TensorView<'_>,
+    rot: usize,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let rank = x.shape.len();
+    let d = *x.shape.last().expect("rope: x is a scalar");
+    assert!(
+        rot % 2 == 0 && rot <= d,
+        "rope: cannot rotate {rot} of {d} values"
+    );
+    assert_eq!(cos.shape, sin.shape, "rope: cos and sin differ in shape");
+    let table = &cos.shape[..];
+    assert!(
+        table.last() == Some(&rot) && table.len() <= rank,
+        "rope: tables of shape {table:?} for {rot} values of x {:?}",
+        &x.shape[..]
+    );
+    // The table row each row of `x` reads: the row axes of the tables
+    // right-aligned to those of `x`, those of size 1 broadcast.
+    let rows_shape = &x.shape[..rank - 1];
+    let table_rows = &table[..table.len() - 1];
+    let skipped = rows_shape.len() - table_rows.len();
+    let mut strides = vec![0; rows_shape.len()];
+    let mut stride = 1;
+    for (k, &n) in table_rows.iter().enumerate().rev() {
+        let axis = skipped + k;
+        assert!(
+            n == 1 || n == rows_shape[axis],
+            "rope: tables of shape {table:?} do not broadcast to x {:?}",
+            &x.shape[..]
+        );
+        if n != 1 {
+            strides[axis] = stride;
+        }
+        stride *= n;
+    }
+    let numel = x.data.len();
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
+    let h = rot / 2;
+    if d > 0 {
+        let rows = x.data.chunks_exact(d).zip(out[..numel].chunks_exact_mut(d));
+        for (r, (x, o)) in rows.enumerate() {
+            let (mut rest, mut t) = (r, 0);
+            for (&n, &s) in rows_shape.iter().zip(&strides).rev() {
+                t += rest % n * s;
+                rest /= n;
+            }
+            let (c, s) = (&cos.data[t * rot..][..rot], &sin.data[t * rot..][..rot]);
+            rotate_halves(x, o, c.split_at(h), s.split_at(h));
+            o[rot..].copy_from_slice(&x[rot..]);
+        }
+    }
+    TensorView::from_slice(&out[..numel], x.shape.to_vec())
+}
+
+/// Rotates the first `2h` values of `x` into `o`, `h` being as long as the
+/// tables of each half: `x[i] * cos + -x[i + h] * sin` in the first half,
+/// `x[i] * cos + x[i - h] * sin` in the second.
+#[inline]
+fn rotate_halves(x: &[f32], o: &mut [f32], (c0, c1): (&[f32], &[f32]), (s0, s1): (&[f32], &[f32])) {
+    let h = c0.len();
+    let (x0, x1) = (&x[..h], &x[h..2 * h]);
+    let (o0, o1) = o[..2 * h].split_at_mut(h);
+    for i in 0..h {
+        o0[i] = x0[i] * c0[i] + -x1[i] * s0[i];
+        o1[i] = x1[i] * c1[i] + x0[i] * s1[i];
+    }
+}
+
+/// ONNX `RotaryEmbedding`: each head of `x`, `[batch, heads, seq, head]` or
+/// `[batch, seq, hidden]` with `num_heads` heads (0: heads as wide as the
+/// rotation), has its first `2h` values rotated by the row of `cos` and
+/// `sin`, `h` wide, for its position, and the rest passed through. Without
+/// `positions` the tables are `[batch, seq, h]`, or `[seq, h]`; with them
+/// `[positions, h]`, read at `positions[batch, seq]`, or at the first
+/// position plus the sequence index if there is one (`com.microsoft`'s
+/// offset).
+///
+/// The halves rotate as [`rope`] does; `interleaved` pairs each even value
+/// with the odd one after it instead. `rot`, the model's
+/// `rotary_embedding_dim`, must be 0 or `2h`.
+#[allow(clippy::too_many_arguments)]
+pub fn rotary_embedding<'a>(
+    x: &TensorView<'_>,
+    cos: &TensorView<'_>,
+    sin: &TensorView<'_>,
+    positions: Option<&TensorView<'_, i64>>,
+    interleaved: bool,
+    num_heads: usize,
+    rot: usize,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    assert_eq!(
+        cos.shape, sin.shape,
+        "rotary_embedding: cos and sin differ in shape"
+    );
+    let h = *cos.shape.last().expect("rotary_embedding: cos is a scalar");
+    assert!(
+        rot == 0 || rot == 2 * h,
+        "rotary_embedding: rotary_embedding_dim {rot} with caches {h} wide"
+    );
+    // Batch, heads, sequence and head size, and the strides of the heads and
+    // the positions in `x`.
+    let (batch, heads, seq, head, head_stride, seq_stride) = match x.shape[..] {
+        [b, n, s, d] => (b, n, s, d, s * d, d),
+        [b, s, hidden] => {
+            let n = if num_heads > 0 {
+                num_heads
+            } else {
+                hidden / (2 * h).max(1)
+            };
+            assert!(
+                n > 0 && hidden % n == 0,
+                "rotary_embedding: {hidden} values in {n} heads"
+            );
+            (b, n, s, hidden / n, hidden / n, hidden)
+        }
+        _ => panic!("rotary_embedding: x of shape {:?}", &x.shape[..]),
+    };
+    assert!(
+        2 * h <= head,
+        "rotary_embedding: caches {h} wide for heads of {head}"
+    );
+    // The table row of position `s` of batch `b`.
+    let rows = cos.data.len() / h.max(1);
+    let row = |b: usize, s: usize| -> usize {
+        let r = match positions {
+            Some(p) if p.data.len() == 1 => p.data[0] + s as i64,
+            Some(p) => p.data[b * seq + s],
+            None if cos.shape.len() == 3 => (b * seq + s) as i64,
+            None => s as i64,
+        };
+        assert!(
+            (0..rows as i64).contains(&r),
+            "rotary_embedding: position {r} of {rows}"
+        );
+        r as usize
+    };
+    let numel = x.data.len();
+    assert_eq!(numel, batch * heads * seq * head);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
+    let o_all = &mut out[..numel];
+    for b in 0..batch {
+        for s in 0..seq {
+            let r = row(b, s);
+            let (c, sn) = (&cos.data[r * h..][..h], &sin.data[r * h..][..h]);
+            for n in 0..heads {
+                let at = b * heads * seq * head + n * head_stride + s * seq_stride;
+                let (x, o) = (&x.data[at..at + head], &mut o_all[at..at + head]);
+                if interleaved {
+                    for i in 0..h {
+                        let (re, im) = (x[2 * i], x[2 * i + 1]);
+                        o[2 * i] = re * c[i] + -im * sn[i];
+                        o[2 * i + 1] = im * c[i] + re * sn[i];
+                    }
+                } else {
+                    rotate_halves(x, o, (c, c), (sn, sn));
+                }
+                o[2 * h..].copy_from_slice(&x[2 * h..]);
+            }
+        }
+    }
+    TensorView::from_slice(o_all, x.shape.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::kernels::test_util::assert_close;
     use crate::tensor::TensorView;
+
+    /// Values in `[-8, 8)` from a fixed seed.
+    fn lcg_values(seed: &mut u32, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (*seed >> 8) as f32 / (1 << 20) as f32 - 8.0
+            })
+            .collect()
+    }
+
+    /// `rotary_embedding` against `rope` given the tables it reads, full
+    /// width, a row per batch and position: of heads first and of heads in
+    /// the hidden values, rotating 4 of 8 values per head, at given positions
+    /// and from an offset; and interleaved, against `rope` of the even values
+    /// followed by the odd ones.
+    #[test]
+    fn test_rotary_embedding_matches_rope() {
+        let mut seed = 0x9e37_79b9u32;
+        let (b, n, s, d, h) = (2, 3, 5, 8, 2);
+        let x = lcg_values(&mut seed, b * n * s * d);
+        let (cos, sin) = (lcg_values(&mut seed, 16 * h), lcg_values(&mut seed, 16 * h));
+        let cache = |t: &[f32]| TensorView::from_slice(t, vec![16, h]).into_owned();
+        let (cos_cache, sin_cache) = (cache(&cos), cache(&sin));
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        // The full-width table rows of `positions`, `[b, s, 2h]`.
+        let full = |t: &[f32], positions: &[usize]| -> Vec<f32> {
+            positions
+                .iter()
+                .flat_map(|&p| t[p * h..][..h].iter().chain(&t[p * h..][..h]).copied())
+                .collect()
+        };
+        let given: Vec<i64> = (0..(b * s) as i64).map(|i| (i * 7) % 16).collect();
+        let offset = [3i64];
+        for positions in [&given[..], &offset[..]] {
+            let at: Vec<usize> = (0..b * s)
+                .map(|i| match positions {
+                    [o] => (o + (i % s) as i64) as usize,
+                    p => p[i] as usize,
+                })
+                .collect();
+            let pos = TensorView::from_slice(positions, vec![positions.len()]);
+            let (cf, sf) = (full(&cos, &at), full(&sin, &at));
+            for heads_first in [true, false] {
+                // `[b, n, s, d]` with tables `[b, 1, s, 2h]`, or `[b, s, n * d]`
+                // seen as `[b, s, n, d]` with tables `[b, s, 1, 2h]`.
+                let (x_shape, rope_shape, table_shape) = if heads_first {
+                    (vec![b, n, s, d], vec![b, n, s, d], vec![b, 1, s, 2 * h])
+                } else {
+                    (vec![b, s, n * d], vec![b, s, n, d], vec![b, s, 1, 2 * h])
+                };
+                let mut out = Vec::new();
+                let got = rotary_embedding(
+                    &TensorView::from_slice(&x, x_shape.clone()),
+                    &cos_cache,
+                    &sin_cache,
+                    Some(&pos),
+                    false,
+                    if heads_first { 0 } else { n },
+                    2 * h,
+                    &mut out,
+                );
+                assert_eq!(got.shape.to_vec(), x_shape);
+                let mut want = Vec::new();
+                let want = rope(
+                    &TensorView::from_slice(&x, rope_shape),
+                    &TensorView::from_slice(&cf, table_shape.clone()),
+                    &TensorView::from_slice(&sf, table_shape),
+                    2 * h,
+                    &mut want,
+                );
+                assert_eq!(
+                    bits(&got.data),
+                    bits(&want.data),
+                    "heads first {heads_first}"
+                );
+            }
+        }
+
+        // Interleaved: each head's first 2h values are pairs.
+        let deinterleave = |v: &[f32]| -> Vec<f32> {
+            v.chunks_exact(d)
+                .flat_map(|head| {
+                    let pairs = &head[..2 * h];
+                    let even = pairs.iter().step_by(2);
+                    let odd = pairs.iter().skip(1).step_by(2);
+                    even.chain(odd)
+                        .chain(&head[2 * h..])
+                        .copied()
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let pos = TensorView::from_slice(&given, vec![b, s]);
+        let at: Vec<usize> = given.iter().map(|&p| p as usize).collect();
+        let (cf, sf) = (full(&cos, &at), full(&sin, &at));
+        let mut out = Vec::new();
+        let x_view = TensorView::from_slice(&x, vec![b, n, s, d]);
+        let got = rotary_embedding(
+            &x_view,
+            &cos_cache,
+            &sin_cache,
+            Some(&pos),
+            true,
+            0,
+            0,
+            &mut out,
+        );
+        let xd = deinterleave(&x);
+        let mut want = Vec::new();
+        let tables = |t: &[f32]| TensorView::from_slice(t, vec![b, 1, s, 2 * h]).into_owned();
+        let want = rope(
+            &TensorView::from_slice(&xd, vec![b, n, s, d]),
+            &tables(&cf),
+            &tables(&sf),
+            2 * h,
+            &mut want,
+        );
+        assert_eq!(
+            bits(&deinterleave(&got.data)),
+            bits(&want.data),
+            "interleaved"
+        );
+    }
+
+    /// `rope` against the chain exporters write, for T-one's shapes (32 of 48
+    /// values rotated, a table row per position broadcast over the heads),
+    /// and for a whole row rotated by tables of lower rank.
+    #[test]
+    fn test_rope_matches_the_rotation_chain_bit_for_bit() {
+        use crate::kernels::manipulation::{concat, slice};
+        let mut seed = 0x2545_f491u32;
+        let mut values = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (seed >> 8) as f32 / (1 << 20) as f32 - 8.0
+                })
+                .collect()
+        };
+        for (x_shape, table_shape) in [
+            (vec![10, 1, 8, 48], vec![10, 1, 1, 32]),
+            (vec![2, 3, 8], vec![3, 8]),
+            (vec![2, 3, 8], vec![8]),
+        ] {
+            let (d, rot) = (
+                x_shape[x_shape.len() - 1],
+                table_shape[table_shape.len() - 1],
+            );
+            let (h, end) = (rot as i64 / 2, i64::MAX);
+            let x_data = values(x_shape.iter().product());
+            let table_len = table_shape.iter().product();
+            let (cos_data, sin_data) = (values(table_len), values(table_len));
+            let x = TensorView::from_slice(&x_data, x_shape.clone());
+            let cos = TensorView::from_slice(&cos_data, table_shape.clone());
+            let sin = TensorView::from_slice(&sin_data, table_shape.clone());
+
+            let mut b = vec![Vec::new(); 9];
+            let [r, lo, hi, n, rotated, a, c, sum, want] = &mut b[..] else {
+                unreachable!()
+            };
+            let r = slice(&x, &[0], &[rot as i64], &[-1], &[1], r);
+            let lo = slice(&r, &[0], &[h], &[-1], &[1], lo);
+            let hi = slice(&r, &[h], &[end], &[-1], &[1], hi);
+            let n = neg(&hi, n);
+            let rotated = concat(&[&n, &lo], -1, rotated);
+            let a = mul(&r, &cos, a);
+            let c = mul(&rotated, &sin, c);
+            let sum = add(&a, &c, sum);
+            let want = if rot < d {
+                let mut kept = Vec::new();
+                let kept = slice(&x, &[rot as i64], &[end], &[-1], &[1], &mut kept);
+                concat(&[&sum, &kept], -1, want).data.to_vec()
+            } else {
+                sum.data.to_vec()
+            };
+
+            let mut out = Vec::new();
+            let got = rope(&x, &cos, &sin, rot, &mut out);
+            assert_eq!(got.shape.to_vec(), x_shape);
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&got.data),
+                bits(&want),
+                "x {x_shape:?}, tables {table_shape:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_mod_i64_takes_the_sign_of_the_divisor() {
