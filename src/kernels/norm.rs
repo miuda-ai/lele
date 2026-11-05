@@ -560,6 +560,60 @@ pub fn scale_norm<'a>(
     }
 }
 
+/// [`scale_norm`] of `input` into `out`, then of that into `next`, as two
+/// calls would compute them, bit for bit: each row is normalized twice in
+/// turn, the second time while the first result is still in cache.
+#[allow(clippy::too_many_arguments)]
+pub fn scale_norm_pair<'a, 'b>(
+    input: &TensorView<'_>,
+    gamma: &TensorView<'_>,
+    scale: f32,
+    epsilon: f32,
+    next_gamma: &TensorView<'_>,
+    next_scale: f32,
+    next_epsilon: f32,
+    out: &'a mut Vec<f32>,
+    next: &'b mut Vec<f32>,
+) -> (TensorView<'a>, TensorView<'b>) {
+    let n = *input.shape.last().expect("scale_norm_pair: a scalar input");
+    let len = input.data.len();
+    for gamma in [gamma, next_gamma] {
+        assert!(
+            gamma.data.len() == n || gamma.data.len() == 1,
+            "scale_norm_pair: {} scales for rows of {n}",
+            gamma.data.len()
+        );
+    }
+    // SAFETY: every row of both is written below before any is read.
+    unsafe {
+        utils::ensure_capacity(out, len);
+        utils::ensure_capacity(next, len);
+    }
+    if let Some(rows) = len.checked_div(n) {
+        let norms = [
+            (&gamma.data[..], (scale, epsilon)),
+            (&next_gamma.data[..], (next_scale, next_epsilon)),
+        ];
+        let (out, next) = (&mut out[..len], &mut next[..len]);
+        simd_call!(
+            Level::new(),
+            max = Avx2,
+            scale_norm_pair_rows_simd(n, rows, &input.data, norms, out, next)
+        );
+    }
+    let shape = || Cow::Owned(input.shape.to_vec());
+    (
+        TensorView {
+            data: Cow::Borrowed(&out[..len]),
+            shape: shape(),
+        },
+        TensorView {
+            data: Cow::Borrowed(&next[..len]),
+            shape: shape(),
+        },
+    )
+}
+
 #[simd]
 fn scale_norm_rows_simd<S: Simd>(
     simd: S,
@@ -568,7 +622,7 @@ fn scale_norm_rows_simd<S: Simd>(
     src: &[f32],
     gamma: &[f32],
     out: &mut [f32],
-    (scale, epsilon): (f32, f32),
+    params: (f32, f32),
 ) {
     let (mut src, mut out) = (&src[..rows * n], &mut out[..rows * n]);
     for _ in 0..rows {
@@ -576,28 +630,64 @@ fn scale_norm_rows_simd<S: Simd>(
         (row, src) = src.split_at(n);
         let out_row;
         (out_row, out) = std::mem::take(&mut out).split_at_mut(n);
-        // The sum `reduce_l2` takes, so the norm is its.
-        let denom = crate::kernels::math::sum_squares(row).sqrt() * scale + epsilon;
-        let denom_v = f32x16::splat(simd, denom);
-        let (x, x_tail) = row.as_chunks::<LANES>();
-        let (o, o_tail) = out_row.as_chunks_mut::<LANES>();
-        if let [g] = gamma[..] {
-            let g_v = f32x16::splat(simd, g);
-            for (x, o) in x.iter().zip(o) {
-                (g_v * (f32x16::load_array_ref(simd, x) / denom_v)).store_array(o);
-            }
-            for (&x, o) in x_tail.iter().zip(o_tail) {
-                *o = g * (x / denom);
-            }
-        } else {
-            let (g, g_tail) = gamma[..n].as_chunks::<LANES>();
-            for ((x, g), o) in x.iter().zip(g).zip(o) {
-                let q = f32x16::load_array_ref(simd, x) / denom_v;
-                (f32x16::load_array_ref(simd, g) * q).store_array(o);
-            }
-            for ((&x, &g), o) in x_tail.iter().zip(g_tail).zip(o_tail) {
-                *o = g * (x / denom);
-            }
+        scale_norm_row(simd, row, gamma, out_row, params);
+    }
+}
+
+#[simd]
+fn scale_norm_pair_rows_simd<S: Simd>(
+    simd: S,
+    n: usize,
+    rows: usize,
+    src: &[f32],
+    [(gamma, params), (next_gamma, next_params)]: [(&[f32], (f32, f32)); 2],
+    out: &mut [f32],
+    next: &mut [f32],
+) {
+    let mut src = &src[..rows * n];
+    let (mut out, mut next) = (&mut out[..rows * n], &mut next[..rows * n]);
+    for _ in 0..rows {
+        let row;
+        (row, src) = src.split_at(n);
+        let (out_row, next_row);
+        (out_row, out) = std::mem::take(&mut out).split_at_mut(n);
+        (next_row, next) = std::mem::take(&mut next).split_at_mut(n);
+        scale_norm_row(simd, row, gamma, out_row, params);
+        scale_norm_row(simd, out_row, next_gamma, next_row, next_params);
+    }
+}
+
+/// [`scale_norm`] of one row.
+#[inline(always)]
+fn scale_norm_row<S: Simd>(
+    simd: S,
+    row: &[f32],
+    gamma: &[f32],
+    out_row: &mut [f32],
+    (scale, epsilon): (f32, f32),
+) {
+    let n = row.len();
+    // The sum `reduce_l2` takes, so the norm is its.
+    let denom = crate::kernels::math::sum_squares(row).sqrt() * scale + epsilon;
+    let denom_v = f32x16::splat(simd, denom);
+    let (x, x_tail) = row.as_chunks::<LANES>();
+    let (o, o_tail) = out_row.as_chunks_mut::<LANES>();
+    if let [g] = gamma[..] {
+        let g_v = f32x16::splat(simd, g);
+        for (x, o) in x.iter().zip(o) {
+            (g_v * (f32x16::load_array_ref(simd, x) / denom_v)).store_array(o);
+        }
+        for (&x, o) in x_tail.iter().zip(o_tail) {
+            *o = g * (x / denom);
+        }
+    } else {
+        let (g, g_tail) = gamma[..n].as_chunks::<LANES>();
+        for ((x, g), o) in x.iter().zip(g).zip(o) {
+            let q = f32x16::load_array_ref(simd, x) / denom_v;
+            (f32x16::load_array_ref(simd, g) * q).store_array(o);
+        }
+        for ((&x, &g), o) in x_tail.iter().zip(g_tail).zip(o_tail) {
+            *o = g * (x / denom);
         }
     }
 }
@@ -1298,6 +1388,34 @@ mod tests {
                 assert_eq!(got.shape, want.shape);
                 let what = format!("n {n} gammas {}", gamma.len());
                 crate::kernels::test_util::assert_same_bits(&got.data, &want.data, &what);
+            }
+        }
+    }
+
+    /// `scale_norm_pair` is `scale_norm` of the input, then of that, bit for bit,
+    /// with one gamma per column or one in either norm.
+    #[test]
+    fn test_scale_norm_pair_is_two_scale_norms() {
+        use crate::kernels::test_util::assert_same_bits;
+        let mut rng = Rng::new(9);
+        for &n in AWKWARD_LENS.iter().chain(&[384]) {
+            let data = rng.vec(2 * ROWS * n, -3.0, 3.0);
+            let x = TensorView::from_slice(&data, vec![2, ROWS, n]);
+            let gammas = [rng.vec(n, -2.0, 2.0), vec![0.75], rng.vec(n, -1.0, 1.0)];
+            for (first, second) in [(0, 2), (1, 2), (0, 1)] {
+                let g1 = TensorView::from_slice(&gammas[first], vec![gammas[first].len()]);
+                let g2 = TensorView::from_slice(&gammas[second], vec![gammas[second].len()]);
+                let (s1, e1) = (1.0 / (n as f32).sqrt(), 1e-8);
+                let (s2, e2) = (0.5, 1e-5);
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                let y1 = scale_norm(&x, &g1, s1, e1, &mut a);
+                let y2 = scale_norm(&y1, &g2, s2, e2, &mut b);
+                let (mut c, mut d) = (Vec::new(), Vec::new());
+                let (p1, p2) = scale_norm_pair(&x, &g1, s1, e1, &g2, s2, e2, &mut c, &mut d);
+                assert_eq!((&p1.shape, &p2.shape), (&y1.shape, &y2.shape));
+                let what = format!("n {n} gammas {first} {second}");
+                assert_same_bits(&p1.data, &y1.data, &what);
+                assert_same_bits(&p2.data, &y2.data, &what);
             }
         }
     }

@@ -335,6 +335,56 @@ pub fn matmul_fused_add<'a, B: WeightElem>(
     }
 }
 
+/// The gated product of a SwiGLU feed-forward, `b` `[k, 2n]` holding the gate's
+/// weights then the value's, and `bias` `[2n]` their biases likewise:
+/// `silu(a · b[:, :n] + bias[:n]) * (a · b[:, n:] + bias[n:])`, `[.., n]`.
+///
+/// Both halves are one [`matmul_fused_add`], and the gate goes through
+/// [`silu`](crate::kernels::silu)'s arithmetic. With `n` a multiple of
+/// [`PACK_COLS`](crate::kernels::matmul::PACK_COLS), each column of the product
+/// comes out as it would from a product with that half alone, so the result is
+/// that of the two products, `silu` and `mul`, bit for bit; with another `n`,
+/// the columns of the last, narrower panel of a half may round differently.
+pub fn linear_swiglu<'a, B: WeightElem>(
+    a: &TensorView<'_>,
+    b: &TensorView<'_, B>,
+    bias: &TensorView<'_>,
+    out_buf: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    thread_local! {
+        static BOTH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let two_n = *b.shape.last().expect("linear_swiglu: b has no columns");
+    assert!(
+        two_n % 2 == 0,
+        "linear_swiglu: b has {two_n} columns, an odd number"
+    );
+    let n = two_n / 2;
+    let (out_shape, len) = BOTH.with_borrow_mut(|both| {
+        let both = matmul_fused_add(a, b, bias, both);
+        let mut out_shape = both.shape.to_vec();
+        *out_shape.last_mut().unwrap() = n;
+        let len = both.data.len() / 2;
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out_buf, len) };
+        if n > 0 {
+            let rows = both.data.chunks_exact(two_n);
+            for (row, out) in rows.zip(out_buf[..len].chunks_exact_mut(n)) {
+                let (gate, value) = row.split_at(n);
+                crate::kernels::math::silu_slice(gate, out);
+                for (o, &v) in out.iter_mut().zip(value) {
+                    *o *= v;
+                }
+            }
+        }
+        (out_shape, len)
+    });
+    TensorView {
+        data: Cow::Borrowed(&out_buf[..len]),
+        shape: Cow::Owned(out_shape),
+    }
+}
+
 pub fn gemm<'a>(
     a: &TensorView<'_>,
     b: &TensorView<'_>,
@@ -424,6 +474,113 @@ pub fn gemm<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `linear_swiglu` is the two products, `silu` and `mul` it replaces, bit for
+    /// bit, with f32, f16 and packed f16 weights, and rows of C below and above
+    /// the small-M kernel's, for gates a multiple of `PACK_COLS` wide.
+    #[test]
+    fn test_linear_swiglu_is_the_chain_it_replaces() {
+        use crate::kernels::matmul::{PACK_COLS, pack_f16};
+        let k = 40;
+        let value = |i: usize, scale: f32| ((i * 7919) % 23) as f32 * scale - 1.0;
+        for m in [1, 3, 5, 10] {
+            for n in [PACK_COLS, 3 * PACK_COLS] {
+                let a: Vec<f32> = (0..m * k).map(|i| value(i, 0.11)).collect();
+                // The gate's and the value's weights side by side, and biases.
+                let both: Vec<f32> = (0..k * 2 * n).map(|i| value(i, 0.07)).collect();
+                let bias: Vec<f32> = (0..2 * n).map(|i| value(i, 0.05)).collect();
+                let half_of = |h: usize| -> Vec<f32> {
+                    (0..k * n)
+                        .map(|i| both[i / n * 2 * n + h * n + i % n])
+                        .collect()
+                };
+                let at = TensorView::from_slice(&a, vec![m, k]);
+                let reference = |gate: TensorView<'_>, value: TensorView<'_>| {
+                    let (mut s, mut y) = (Vec::new(), Vec::new());
+                    let s = crate::kernels::silu(&gate, &mut s);
+                    crate::kernels::mul(&s, &value, &mut y).data.to_vec()
+                };
+                let bias_of = |h: usize| TensorView::from_slice(&bias[h * n..][..n], vec![n]);
+                let bias_both = TensorView::from_slice(&bias, vec![2 * n]);
+                // f32 weights.
+                let (mut g, mut v, mut out) = (Vec::new(), Vec::new(), Vec::new());
+                let (wg, wv) = (half_of(0), half_of(1));
+                let want = reference(
+                    matmul_fused_add(
+                        &at,
+                        &TensorView::from_slice(&wg, vec![k, n]),
+                        &bias_of(0),
+                        &mut g,
+                    ),
+                    matmul_fused_add(
+                        &at,
+                        &TensorView::from_slice(&wv, vec![k, n]),
+                        &bias_of(1),
+                        &mut v,
+                    ),
+                );
+                let got = linear_swiglu(
+                    &at,
+                    &TensorView::from_slice(&both, vec![k, 2 * n]),
+                    &bias_both,
+                    &mut out,
+                );
+                assert_eq!(got.shape.as_ref(), &[m, n]);
+                assert_eq!(got.data.as_ref(), want, "f32, m {m}, n {n}");
+                // f16 weights, as stored and packed.
+                let f16 = |x: &[f32]| -> Vec<half::f16> {
+                    x.iter().map(|&x| half::f16::from_f32(x)).collect()
+                };
+                let (hg, hv, hb) = (f16(&wg), f16(&wv), f16(&both));
+                let want = reference(
+                    matmul_fused_add(
+                        &at,
+                        &TensorView::from_slice(&hg, vec![k, n]),
+                        &bias_of(0),
+                        &mut g,
+                    ),
+                    matmul_fused_add(
+                        &at,
+                        &TensorView::from_slice(&hv, vec![k, n]),
+                        &bias_of(1),
+                        &mut v,
+                    ),
+                );
+                let got = linear_swiglu(
+                    &at,
+                    &TensorView::from_slice(&hb, vec![k, 2 * n]),
+                    &bias_both,
+                    &mut out,
+                );
+                assert_eq!(got.data.as_ref(), want, "f16, m {m}, n {n}");
+                let packed = |h: &[half::f16], cols: usize| -> Vec<PackedF16> {
+                    pack_f16(h, k, cols).into_iter().map(PackedF16).collect()
+                };
+                let (pg, pv, pb) = (packed(&hg, n), packed(&hv, n), packed(&hb, 2 * n));
+                let want = reference(
+                    matmul_fused_add(
+                        &at,
+                        &TensorView::from_slice(&pg, vec![k, n]),
+                        &bias_of(0),
+                        &mut g,
+                    ),
+                    matmul_fused_add(
+                        &at,
+                        &TensorView::from_slice(&pv, vec![k, n]),
+                        &bias_of(1),
+                        &mut v,
+                    ),
+                );
+                let got = linear_swiglu(
+                    &at,
+                    &TensorView::from_slice(&pb, vec![k, 2 * n]),
+                    &bias_both,
+                    &mut out,
+                );
+                assert_eq!(got.data.as_ref(), want, "packed f16, m {m}, n {n}");
+            }
+        }
+    }
 
     #[test]
     fn test_matmul_wrapper() {

@@ -359,6 +359,10 @@ impl Compiler {
         // Casts between types held alike are left to the element types to
         // tell apart.
         passes::bypass_view_casts(&mut ir, &|name| var_types.get(&sanitize_name(name)));
+        if opt.operator_fusion {
+            // Norms the casts kept apart are now adjacent.
+            passes::fuse_scale_norm_pairs(&mut ir);
+        }
         let var_types = variable_types(&ir);
         let (allocator, analysis) =
             alloc::solve_allocation(&ir, &|name| var_types.get(&sanitize_name(name)));

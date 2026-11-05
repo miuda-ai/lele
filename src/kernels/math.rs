@@ -1058,6 +1058,20 @@ fn silu_inner<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorVi
     unary(input, out, silu_into)
 }
 
+/// [`silu`] of `src` into `out`, of the same length, element for element as
+/// `silu` computes it.
+pub(crate) fn silu_slice(src: &[f32], out: &mut [f32]) {
+    const LANES: usize = 16;
+    if src.len() >= LANES {
+        silu_into(Level::new(), src, out);
+    } else {
+        let (mut padded, mut padded_out) = ([0.0f32; LANES], [0.0f32; LANES]);
+        padded[..src.len()].copy_from_slice(src);
+        silu_into(Level::new(), &padded, &mut padded_out);
+        out.copy_from_slice(&padded_out[..src.len()]);
+    }
+}
+
 pub fn relu<'a, 'b>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     unary(input, out, relu_into)
 }

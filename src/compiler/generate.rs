@@ -761,7 +761,7 @@ pub(crate) fn generate_nodes(
             // Some ops like Split/LSTM manage their own buffers.
             if !matches!(
                 ir_op,
-                Op::DynamicQuantizeLinear | Op::Lstm | Op::Split { .. }
+                Op::DynamicQuantizeLinear | Op::Lstm | Op::Split { .. } | Op::ScaleNormPair { .. }
             ) {
                 writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[0])?;
             }

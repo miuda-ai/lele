@@ -71,12 +71,14 @@ pub mod utils;
 pub(crate) mod window2d;
 pub use conv_integer::{ConvWeights, conv_integer, conv_integer_packed};
 pub use conv1d::{conv1d, conv1d_pointwise};
-pub use conv1d::conv1d_fused;
+pub use conv1d::{conv1d_fused, conv1d_silu};
 pub use conv2d::{
     conv_transpose, conv2d, conv2d_fused, conv2d_silu, gather_elements, max_pool2d, resize_nearest,
     topk,
 };
-pub use gemm::{PackedF16, WeightElem, gemm, matmul, matmul_fused_add, weight_only_matmul};
+pub use gemm::{
+    PackedF16, WeightElem, gemm, linear_swiglu, matmul, matmul_fused_add, weight_only_matmul,
+};
 pub use matmul::Codes;
 pub use manipulation::*;
 pub use manipulation::{split, where_op};

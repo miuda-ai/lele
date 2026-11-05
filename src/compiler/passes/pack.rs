@@ -7,8 +7,8 @@ use crate::model::tensor_to_vec_u8;
 use std::collections::HashSet;
 
 /// Lays out the f16 initializers of `g` and its subgraphs read only as the
-/// right operand of `MatMul` and `Linear`, or as the weights of pointwise
-/// `Conv`s, as the matmul kernel reads them
+/// right operand of `MatMul`, `Linear` and `SwiGlu`, or as the weights of
+/// pointwise `Conv`s, as the matmul kernel reads them
 /// ([`pack_f16`](crate::kernels::matmul::pack_f16)), so that each product
 /// streams its weight from start to end ([`Layout::PackedF16`]). Reads by
 /// nodes `skip` holds, which code generation leaves to someone else, keep an
@@ -75,10 +75,10 @@ fn pack(t: &TensorProto, packing: Packing) -> Option<TensorProto> {
 
 /// How initializer `v` of `g` can be stored packed, if it can: an f16 matrix
 /// with a multiple of [`PACK_COLS`] columns, every read of which (in `g`) is
-/// as the right operand of a `MatMul` or `Linear`; or f16 weights `[m, k, 1]`,
-/// `m` a multiple of [`PACK_COLS`], every read of which is by a `Conv` code
-/// generation computes with `conv1d_pointwise`. Neither if `skip` holds one
-/// of the nodes reading it.
+/// as the right operand of a `MatMul`, `Linear` or `SwiGlu`; or f16 weights
+/// `[m, k, 1]`, `m` a multiple of [`PACK_COLS`], every read of which is by a
+/// `Conv` code generation computes with `conv1d_pointwise`. Neither if `skip`
+/// holds one of the nodes reading it.
 fn packable(g: &Graph, v: ValueId, skip: &dyn Fn(&Node) -> bool) -> Option<Packing> {
     let value = g.value(v);
     let shape = g.data(v).map(|t| t.dims.as_slice()).unwrap_or_default();
@@ -91,7 +91,7 @@ fn packable(g: &Graph, v: ValueId, skip: &dyn Fn(&Node) -> bool) -> Option<Packi
     let read_by = |id| {
         let node = g.node(id);
         let op_reads = match (&node.op, packing) {
-            (Op::MatMul | Op::Linear, Packing::Matrix) => true,
+            (Op::MatMul | Op::Linear | Op::SwiGlu, Packing::Matrix) => true,
             (Op::Conv(conv), Packing::Transposed) => is_pointwise(conv),
             _ => false,
         };

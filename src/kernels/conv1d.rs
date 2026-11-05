@@ -160,6 +160,29 @@ pub fn conv1d_fused<'b, 'a>(
     )
 }
 
+/// [`conv1d`] followed by SiLU, applied in place: [`conv1d`] then
+/// [`silu`](crate::kernels::silu), bit for bit, without a second buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_silu<'b, 'a>(
+    input: &TensorView<'b>,
+    weights: &TensorView<'b>,
+    bias: Option<&TensorView<'b>>,
+    dilations: &[i64],
+    group: i64,
+    pads: &[i64],
+    strides: &[i64],
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let shape = conv1d_fused(
+        input, weights, bias, dilations, group, pads, strides, false, out,
+    )
+    .shape
+    .into_owned();
+    let len = shape.iter().product();
+    crate::kernels::bias_act::silu_inplace(&mut out[..len]);
+    TensorView::from_slice(&out[..len], shape)
+}
+
 /// `unfold_bytes` bounds the input unfolded whole ([`IM2COL_BYTES`]; others in tests).
 fn conv1d_fused_at<'b, 'a>(
     level: Level,
@@ -593,6 +616,40 @@ mod tests {
     use crate::kernels::matmul::{PACK_COLS, pack_f16};
     use crate::kernels::test_util::{Rng, assert_close, assert_same_bits};
     use crate::tensor::TensorView;
+
+    /// `conv1d_silu` is `conv1d` then `silu`, bit for bit: T-one's depthwise
+    /// convolution and a dense one, outputs shorter and longer than a vector,
+    /// with and without bias.
+    #[test]
+    fn test_conv1d_silu_is_conv1d_then_silu() {
+        let mut rng = Rng::new(11);
+        // (channels in, channels out, groups, kernel, padding, length)
+        for (cin, cout, group, k, pad, len) in [
+            (384, 384, 384, 31, 0, 40),
+            (8, 8, 8, 31, 15, 5),
+            (6, 10, 1, 5, 2, 23),
+        ] {
+            let x = rng.vec(2 * cin * len, -3.0, 3.0);
+            let w = rng.vec(cout * (cin / group) * k, -0.5, 0.5);
+            let b = rng.vec(cout, -1.0, 1.0);
+            let x = TensorView::from_slice(&x, vec![2, cin, len]);
+            let w = TensorView::from_slice(&w, vec![cout, cin / group, k]);
+            let b = TensorView::from_slice(&b, vec![cout]);
+            for bias in [None, Some(&b)] {
+                let (mut c, mut s, mut got) = (Vec::new(), Vec::new(), Vec::new());
+                let (pads, groups) = ([pad as i64; 2], group as i64);
+                let conv = conv1d(&x, &w, bias, &[1], groups, &pads, &[1], &mut c);
+                let want = crate::kernels::silu(&conv, &mut s);
+                let fused = conv1d_silu(&x, &w, bias, &[1], groups, &pads, &[1], &mut got);
+                assert_eq!(fused.shape, want.shape);
+                let what = format!(
+                    "{cin}->{cout}/{group} k{k} len {len} bias {}",
+                    bias.is_some()
+                );
+                assert_same_bits(&fused.data, &want.data, &what);
+            }
+        }
+    }
 
     /// `conv1d_pointwise` is `conv1d` for f32 weights, and for f16 weights `conv1d` of
     /// the widened ones, bit for bit (packed f16 weights sum in another order, so only

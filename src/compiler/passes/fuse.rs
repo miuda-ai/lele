@@ -10,7 +10,9 @@ use crate::compiler::ir::matching::{constant, constant_tensor, other_operand, so
 use crate::compiler::ir::{
     Activation, Binary, DType, Dim, Graph, NodeId, Op, Reduction, Unary, ValueId,
 };
+use crate::kernels::matmul::PACK_COLS;
 use crate::model::onnx_proto::{NodeProto, TensorProto};
+use crate::model::tensor_to_vec_u8;
 
 /// Runs every fusion on `g` and its subgraphs.
 pub(crate) fn fuse(g: &mut Graph) {
@@ -28,6 +30,7 @@ pub(crate) fn fuse(g: &mut Graph) {
     fuse_conv_act(g);
     fuse_dynamic_quant_linear(g);
     fuse_linear(g);
+    fuse_swiglu(g);
     fuse_embedding_concat(g);
     for id in g.node_ids() {
         for sub in g.node_mut(id).op.subgraphs_mut() {
@@ -479,6 +482,57 @@ fn fuse_scale_norm(g: &mut Graph) {
     }
 }
 
+/// A `ScaleNorm` of the result of another → `ScaleNormPair`, run where the
+/// first ran, whose result other nodes may read too (T-one's `norm_out`
+/// feeds the next layer's residual and its `norm_feed_forward1`). The second
+/// norm's gamma must be an initializer, to be there at that point.
+///
+/// Runs after [`bypass_view_casts`](super::bypass_view_casts): T-one casts
+/// each norm's result to f16 and back to f32 before the next, which lele
+/// holds alike.
+pub(crate) fn fuse_scale_norm_pairs(g: &mut Graph) {
+    for id in g.node_ids() {
+        for sub in g.node_mut(id).op.subgraphs_mut() {
+            fuse_scale_norm_pairs(sub);
+        }
+    }
+    for second in g.node_ids() {
+        if !g.contains(second) {
+            continue;
+        }
+        let node = g.node(second);
+        let Op::ScaleNorm {
+            scale: next_scale,
+            epsilon: next_epsilon,
+        } = node.op
+        else {
+            continue;
+        };
+        let (y, next_gamma) = (node.input(0), node.input(1));
+        let Some(first) = y.and_then(|y| g.value(y).producer()) else {
+            continue;
+        };
+        let Op::ScaleNorm { scale, epsilon } = g.node(first).op else {
+            continue;
+        };
+        if next_gamma.is_none_or(|v| g.data(v).is_none()) {
+            continue;
+        }
+        let op = Op::ScaleNormPair {
+            scale,
+            epsilon,
+            next_scale,
+            next_epsilon,
+        };
+        let inputs = vec![g.node(first).input(0), g.node(first).input(1), next_gamma];
+        let outputs = vec![y, g.node(second).output(0)];
+        let proto = named_after(g, first);
+        g.remove_node(first);
+        g.remove_node(second);
+        g.insert_node(first, op, proto, inputs, outputs);
+    }
+}
+
 /// An unscaled RMSNorm, `x * (1 / sqrt(ReduceMean(x^2) + eps))` over the
 /// last axis of an `x` of known width, ending in `Mul` node `mul`: its nodes,
 /// `x`, `eps` and the width.
@@ -803,7 +857,8 @@ fn fuse_conv_bias(g: &mut Graph) {
     }
 }
 
-/// `Conv` followed by `Relu`, or a 2D `Conv` followed by `Silu` → `ConvAct`.
+/// `Conv` followed by `Relu`, or a 2D or non-pointwise 1D `Conv` followed by
+/// `Silu` → `ConvAct`.
 fn fuse_conv_act(g: &mut Graph) {
     let acts: Vec<(NodeId, Activation)> = g
         .nodes()
@@ -824,8 +879,16 @@ fn fuse_conv_act(g: &mut Graph) {
         let Op::Conv(attrs) = g.node(conv).op.clone() else {
             unreachable!()
         };
-        // Only the 2D kernel fuses SiLU.
-        if act == Activation::Silu && attrs.kernel_shape.as_ref().is_none_or(|k| k.len() < 2) {
+        // SiLU fuses into a 2D kernel, or into a 1D one whose constant weights
+        // say it is 1D; not into a pointwise one, whose weights are read by
+        // the matrix product kernels, packed.
+        let weight_dims = constant_tensor(g, g.node(conv).input(1)).map(|w| w.dims.as_slice());
+        let silu_fuses = match (attrs.kernel_shape.as_deref(), weight_dims) {
+            (_, Some(&[_, _, k])) => k > 1,
+            (Some(k), _) => k.len() >= 2,
+            (None, _) => false,
+        };
+        if act == Activation::Silu && !silu_fuses {
             continue;
         }
         let inputs = g.node(conv).inputs().to_vec();
@@ -859,6 +922,92 @@ fn fuse_linear(g: &mut Graph) {
             g.fuse(&[mm, add], Op::Linear, proto, inputs);
         }
     }
+}
+
+/// The gated product of a SwiGLU feed-forward → `SwiGlu`:
+///
+/// ```text
+/// y = Silu(Linear(x, w_gate, b_gate)) * Linear(x, w_value, b_value)
+/// ```
+///
+/// The weights must be constant f32 or f16 matrices `[k, n]` of one type,
+/// `n` a multiple of [`PACK_COLS`], and the biases constant vectors `[n]` of
+/// one type. `SwiGlu` reads them side by side, `[k, 2n]` and `[2n]`, as one
+/// product whose columns each come out as from its half alone
+/// ([`linear_swiglu`](crate::kernels::linear_swiglu)).
+fn fuse_swiglu(g: &mut Graph) {
+    for mul in binary_nodes(g, Binary::Mul) {
+        if !g.contains(mul) {
+            continue;
+        }
+        let fused = (0..2).find_map(|k| {
+            let node = g.node(mul);
+            let silu = sole_producer(g, node.input(k), |op| matches!(op, Op::Silu))?;
+            let linear = |op: &Op| matches!(op, Op::Linear);
+            let gate = sole_producer(g, g.node(silu).input(0), linear)?;
+            let value = sole_producer(g, node.input(1 - k), linear)?;
+            let (gn, vn) = (g.node(gate), g.node(value));
+            if gn.input(0).is_none() || gn.input(0) != vn.input(0) {
+                return None;
+            }
+            let operand = |i: usize| {
+                let (a, b) = (
+                    constant_tensor(g, gn.input(i))?,
+                    constant_tensor(g, vn.input(i))?,
+                );
+                (matches!(DType::from_onnx(a.data_type), DType::F32 | DType::F16)
+                    && a.data_type == b.data_type
+                    && a.dims == b.dims)
+                    .then_some((a, b))
+            };
+            let ((wg, wv), (bg, bv)) = (operand(1)?, operand(2)?);
+            let n = match wg.dims[..] {
+                [k, n] if k > 0 && n > 0 && n as usize % PACK_COLS == 0 => n,
+                _ => return None,
+            };
+            if bg.dims != [n] {
+                return None;
+            }
+            let name = g.value(gn.input(1)?).name.clone();
+            let weights = side_by_side(wg, wv)?;
+            let biases = side_by_side(bg, bv)?;
+            Some(([gate, value, silu, mul], gn.input(0), name, weights, biases))
+        });
+        if let Some((nodes, x, name, weights, biases)) = fused {
+            let proto = named_after(g, mul);
+            let w = g.new_initializer(&format!("{name}_swiglu"), weights);
+            let b = g.new_initializer(&format!("{name}_swiglu_bias"), biases);
+            g.fuse(&nodes, Op::SwiGlu, proto, vec![x, Some(w), Some(b)]);
+        }
+    }
+}
+
+/// Matrices `[k, n]`, or vectors `[n]`, `a` and `b` of one type side by side:
+/// each row of `a` followed by that of `b`, `[k, 2n]` (or `[2n]`).
+fn side_by_side(a: &TensorProto, b: &TensorProto) -> Option<TensorProto> {
+    let rows = match a.dims[..] {
+        [k, _] => k as usize,
+        [_] => 1,
+        _ => return None,
+    };
+    let (a_bytes, b_bytes) = (tensor_to_vec_u8(a).ok()?.0, tensor_to_vec_u8(b).ok()?.0);
+    if rows == 0 || a_bytes.len() != b_bytes.len() || a_bytes.len() % rows != 0 {
+        return None;
+    }
+    let row = a_bytes.len() / rows;
+    let raw_data = a_bytes
+        .chunks_exact(row)
+        .zip(b_bytes.chunks_exact(row))
+        .flat_map(|(a, b)| a.iter().chain(b).copied())
+        .collect();
+    let mut dims = a.dims.clone();
+    *dims.last_mut()? *= 2;
+    Some(TensorProto {
+        data_type: a.data_type,
+        dims,
+        raw_data,
+        ..Default::default()
+    })
 }
 
 /// The dynamically quantized linear layer ONNX Runtime's
@@ -1216,6 +1365,26 @@ mod tests {
             node("Mul", &["c", "s"], "y"),
         ];
         assert_eq!(fused(nodes, vec![]), ["ConvAct"]);
+
+        // A 1D one, as T-one's depthwise convolution, fuses; a pointwise one,
+        // and one whose rank is not known, do not.
+        let weights = |dims: &[i64]| TensorProto {
+            name: "w".to_string(),
+            data_type: DType::F32.to_onnx(),
+            dims: dims.to_vec(),
+            float_data: vec![0.5; dims.iter().product::<i64>() as usize],
+            ..Default::default()
+        };
+        let nodes = || {
+            vec![
+                node("Conv", &["x", "w"], "c"),
+                node("Sigmoid", &["c"], "s"),
+                node("Mul", &["c", "s"], "y"),
+            ]
+        };
+        assert_eq!(fused(nodes(), vec![weights(&[4, 1, 31])]), ["ConvAct"]);
+        assert_eq!(fused(nodes(), vec![weights(&[4, 4, 1])]), ["Conv", "Silu"]);
+        assert_eq!(fused(nodes(), vec![]), ["Conv", "Silu"]);
     }
 
     #[test]
@@ -1273,6 +1442,76 @@ mod tests {
         assert_eq!(fused(&[2, 4]), ["Linear"]);
         assert_eq!(fused(&[5, 1, 4]), ["MatMul", "Add"]);
         assert_eq!(fused(&[1, 2, 4]), ["MatMul", "Add"]);
+    }
+
+    /// T-one's feed-forward: `Silu(Linear(x)) * Linear(x)`, either way round,
+    /// reads both weights side by side. Gates not a multiple of `PACK_COLS`
+    /// wide, and products of two inputs, stay as they are.
+    #[test]
+    fn fuses_swiglu() {
+        let floats = |name: &str, dims: &[i64], first: f32| TensorProto {
+            name: name.to_string(),
+            data_type: DType::F32.to_onnx(),
+            dims: dims.to_vec(),
+            float_data: (0..dims.iter().product::<i64>())
+                .map(|i| first + i as f32)
+                .collect(),
+            ..Default::default()
+        };
+        let graph = |n: i64, value_input: &str, swap: bool| {
+            let mut nodes = vec![
+                node("MatMul", &["x", "wg"], "mg"),
+                node("Add", &["mg", "bg"], "g"),
+                node("Sigmoid", &["g"], "s"),
+                node("Mul", &["g", "s"], "sg"),
+                node("MatMul", &[value_input, "wv"], "mv"),
+                node("Add", &["mv", "bv"], "v"),
+            ];
+            let (a, b) = if swap { ("v", "sg") } else { ("sg", "v") };
+            nodes.push(node("Mul", &[a, b], "y"));
+            let init = vec![
+                floats("wg", &[2, n], 0.0),
+                floats("bg", &[n], 100.0),
+                floats("wv", &[2, n], 200.0),
+                floats("bv", &[n], 300.0),
+            ];
+            (nodes, init)
+        };
+        let n = PACK_COLS as i64;
+        for swap in [false, true] {
+            let (nodes, init) = graph(n, "x", swap);
+            assert_eq!(fused(nodes, init), ["SwiGlu"], "swap {swap}");
+        }
+        let unfused = ["Linear", "Silu", "Linear", "Mul"];
+        let (nodes, init) = graph(n + 1, "x", false);
+        assert_eq!(fused(nodes, init), unfused);
+        let (nodes, init) = graph(n, "z", false);
+        assert_eq!(fused(nodes, init), unfused);
+
+        // The weights row by row, the gate's then the value's.
+        let (nodes, init) = graph(n, "x", false);
+        let mut ir = Graph::from_onnx(GraphProto {
+            node: nodes,
+            initializer: init,
+            output: vec![ValueInfoProto {
+                name: "y".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        fuse(&mut ir);
+        let (_, swiglu) = ir.nodes().next().unwrap();
+        let values = |i: usize| constant(&ir, swiglu.input(i)).unwrap();
+        let n = n as usize;
+        let row = |first: f32, i: usize| (0..n).map(move |j| first + (i * n + j) as f32);
+        let weights: Vec<f32> = (0..2)
+            .flat_map(|i| row(0.0, i).chain(row(200.0, i)))
+            .collect();
+        assert_eq!(values(1), weights);
+        assert_eq!(
+            values(2),
+            row(100.0, 0).chain(row(300.0, 0)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1424,6 +1663,90 @@ mod tests {
         let mut nodes = nodes(false);
         nodes[1].attribute[0].ints = vec![1];
         assert_eq!(fused(nodes, constants).len(), 6);
+    }
+
+    /// T-one's layer boundary: `norm_out` of a layer, read by the next one's
+    /// residual and by its `norm_feed_forward1`, becomes one `ScaleNormPair`
+    /// where `norm_out` ran, before the residual. A second gamma that is not an
+    /// initializer (here a `Constant` node) leaves both norms.
+    #[test]
+    fn fuses_scale_norm_pairs() {
+        let norm = |x: &str, gamma: &str, y: &str| {
+            let name = |s: &str| format!("{y}_{s}");
+            let mut l2 = node("ReduceL2", &[x], &name("norm"));
+            l2.attribute.push(crate::model::onnx_proto::AttributeProto {
+                name: "axes".to_string(),
+                ints: vec![-1],
+                ..Default::default()
+            });
+            vec![
+                l2,
+                node("Mul", &[&name("norm"), "scale"], &name("scaled")),
+                node("Add", &[&name("scaled"), "eps"], &name("denom")),
+                node("Div", &[x, &name("denom")], &name("normed")),
+                node("Mul", &[gamma, &name("normed")], y),
+            ]
+        };
+        let graph = |constant_gamma: bool| {
+            let mut cast = node("Cast", &["input"], "x");
+            cast.attribute
+                .push(crate::model::onnx_proto::AttributeProto {
+                    name: "to".to_string(),
+                    i: 1,
+                    ..Default::default()
+                });
+            let mut nodes = vec![cast];
+            if constant_gamma {
+                let mut constant = node("Constant", &[], "gamma2");
+                constant
+                    .attribute
+                    .push(crate::model::onnx_proto::AttributeProto {
+                        name: "value".to_string(),
+                        t: Some(scalar("", 2.0)),
+                        ..Default::default()
+                    });
+                nodes.push(constant);
+            }
+            nodes.extend(norm("x", "gamma1", "y1"));
+            nodes.push(node("Add", &["y1", "x"], "residual"));
+            nodes.extend(norm("y1", "gamma2", "y2"));
+            nodes.push(node("Add", &["residual", "y2"], "out"));
+            let mut init = vec![
+                scalar("scale", 0.5),
+                scalar("eps", 1e-8),
+                scalar("gamma1", 1.5),
+            ];
+            if !constant_gamma {
+                init.push(scalar("gamma2", 2.0));
+            }
+            (nodes, init)
+        };
+        let paired = |(nodes, init): (Vec<NodeProto>, Vec<TensorProto>)| {
+            let mut ir = Graph::from_onnx(GraphProto {
+                node: nodes,
+                initializer: init,
+                output: vec![ValueInfoProto {
+                    name: "out".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            crate::compiler::passes::infer_dtypes(&mut ir);
+            fuse(&mut ir);
+            fuse_scale_norm_pairs(&mut ir);
+            ir.nodes()
+                .map(|(_, n)| n.op.op_type().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            paired(graph(false)),
+            ["Cast", "ScaleNormPair", "Add", "Add"]
+        );
+        let ops = paired(graph(true));
+        assert_eq!(
+            ops,
+            ["Cast", "Constant", "ScaleNorm", "Add", "ScaleNorm", "Add"]
+        );
     }
 
     /// RMSNorm as SmolLM2 writes it, and as Hojo-TTS does, scaling in f16

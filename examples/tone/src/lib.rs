@@ -1,5 +1,6 @@
 pub mod tone;
 
+use half::slice::HalfFloatSliceExt;
 use lele::tensor::{TensorView, f16};
 
 pub const SAMPLE_RATE: u32 = 8000;
@@ -63,17 +64,13 @@ impl<'a> Recognizer<'a> {
     pub fn feed(&mut self, chunk: &[i32]) -> [usize; FRAMES_PER_CHUNK] {
         assert_eq!(chunk.len(), CHUNK);
         let x: Vec<i64> = chunk.iter().map(|&s| s as i64).collect();
-        for (d, s) in self.state_f32.iter_mut().zip(&self.state) {
-            *d = s.to_f32();
-        }
+        self.state.convert_to_f32_slice(&mut self.state_f32);
         let (logprobs, next) = self.model.forward_with_workspace(
             &mut self.ws,
             TensorView::from_owned(x, vec![1, CHUNK, 1]),
             TensorView::from_slice(&self.state_f32, vec![1, STATE_SIZE]),
         );
-        for (d, &s) in self.state.iter_mut().zip(next.data.iter()) {
-            *d = f16::from_f32(s);
-        }
+        self.state.convert_from_f32_slice(&next.data);
         let mut best = [BLANK; FRAMES_PER_CHUNK];
         for (b, frame) in best.iter_mut().zip(logprobs.data.chunks_exact(VOCAB)) {
             *b = frame

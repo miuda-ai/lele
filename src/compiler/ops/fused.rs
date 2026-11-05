@@ -34,6 +34,31 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             "{tab}let {} = lele::kernels::scale_norm(&{}, &{}, {scale:?}, {epsilon:?}, {buf});",
             outputs[0], inputs[0], inputs[1]
         )?,
+        Op::ScaleNormPair {
+            scale,
+            epsilon,
+            next_scale,
+            next_epsilon,
+        } => {
+            // Each result into its workspace buffer, or one local to the chunk.
+            let mut bufs = Vec::new();
+            for (raw, out) in ctx.node.output.iter().zip(outputs) {
+                bufs.push(
+                    match ctx.allocator.and_then(|a| a.tensor_to_buffer.get(raw)) {
+                        Some(idx) => format!("&mut ws.buf_{idx}"),
+                        None => {
+                            writeln!(w, "{tab}let mut buf_{out} = Vec::<f32>::new();")?;
+                            format!("&mut buf_{out}")
+                        }
+                    },
+                );
+            }
+            writeln!(
+                w,
+                "{tab}let ({}, {}) = lele::kernels::scale_norm_pair(&{}, &{}, {scale:?}, {epsilon:?}, &{}, {next_scale:?}, {next_epsilon:?}, {}, {});",
+                outputs[0], outputs[1], inputs[0], inputs[1], inputs[2], bufs[0], bufs[1]
+            )?;
+        }
         Op::RmsNorm { epsilon } => writeln!(
             w,
             "{tab}let {} = lele::kernels::rms_norm(&{}, &{}, -1, {epsilon:?}, {buf});",
@@ -74,6 +99,14 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             ctx.matmul_weight(1),
             inputs[2]
         )?,
+        Op::SwiGlu => writeln!(
+            w,
+            "{tab}let {} = lele::kernels::linear_swiglu(&{}, &{}, &{}, {buf});",
+            outputs[0],
+            inputs[0],
+            ctx.matmul_weight(1),
+            inputs[2]
+        )?,
         Op::ConvAct { conv, act } => {
             let weight_shape = ctx
                 .weight(1)
@@ -83,7 +116,8 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 Some(_) => format!("Some(&{})", inputs[2]),
                 None => "None".to_string(),
             };
-            if *act == Activation::Silu {
+            // 1-D SiLU goes with the 1-D kernels below.
+            if *act == Activation::Silu && weight_shape.len() != 3 {
                 // Attributes as written, with ONNX defaults.
                 let ints = |v: &Option<Vec<i64>>, default: &[i64]| {
                     v.clone().unwrap_or_else(|| default.to_vec())
@@ -131,10 +165,14 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                     outputs[0], inputs[0], inputs[1], dilations, pads, strides,
                 )?;
             } else {
+                let (kernel, relu) = match act {
+                    Activation::Silu => ("conv1d_silu", ""),
+                    _ => ("conv1d_fused", " true,"),
+                };
                 // Pads are [begin, end], or [begin, _, end, _] as computed above.
                 writeln!(
                     w,
-                    "{tab}let {} = lele::kernels::conv1d_fused(&{}, &{}, {bias}, &[{}], {groups}, &[{}, {}], &[{}], true, {buf});",
+                    "{tab}let {} = lele::kernels::{kernel}(&{}, &{}, {bias}, &[{}], {groups}, &[{}, {}], &[{}],{relu} {buf});",
                     outputs[0],
                     inputs[0],
                     inputs[1],
