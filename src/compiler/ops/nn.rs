@@ -95,6 +95,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             };
             // An f16 pointwise conv1d (the case `conv1d` computes as a matrix
             // product) takes its weights as stored, widening them as it reads them.
+            // `weights::packable` packs only weights of Convs taking this path.
             let ones = |v: &[i64]| v.iter().all(|&x| x == 1);
             if let Some(weight) = ctx.weight(1)
                 && weight.dtype == DType::F16
@@ -115,6 +116,10 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                     buf_expr
                 );
             }
+            assert!(
+                !ctx.weight(1).is_some_and(|weight| weight.packed),
+                "Conv weights packed for conv1d_pointwise read by another kernel"
+            );
             // Determine conv1d vs conv2d based on weight tensor rank
             let weight_rank = ctx.weight(1).map(|weight| weight.shape.len()).unwrap_or(3);
             let kernel_fn = if weight_rank >= 4 { "conv2d" } else { "conv1d" };

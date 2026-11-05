@@ -1,6 +1,6 @@
 //! Layout of the weights file.
 
-use super::ir::{DType, Graph, Op, ValueId};
+use super::ir::{ConvAttrs, DType, Graph, Op, ValueId};
 use super::{SharedWeights, WeightTable, sanitize_name};
 use crate::kernels::matmul::PACK_COLS;
 use crate::model::onnx_proto::TensorProto;
@@ -18,7 +18,7 @@ pub(crate) struct WeightRef {
     pub shape: Vec<usize>,
     pub dtype: DType,
     /// An f16 matrix stored as [`pack_f16`](crate::kernels::matmul::pack_f16)
-    /// lays it out.
+    /// lays it out (or lays out its transpose: see [`Packing`]).
     pub packed: bool,
 }
 
@@ -45,7 +45,8 @@ impl Weights {
     /// order. Each weight
     /// starts 16-byte aligned; identical contents are stored once. With
     /// `pack`, f16 initializers only read as the right operand of `MatMul`
-    /// and `Linear` are packed ([`packable`]).
+    /// and `Linear`, or as the weights of pointwise `Conv`s, are packed
+    /// ([`packable`]).
     pub(crate) fn collect(g: &Graph, pack: bool) -> Self {
         Self::collect_shared(g, pack, None)
     }
@@ -122,15 +123,17 @@ impl Weights {
             // Those that folding left without readers are not written.
             if let Some(t) = g.data(v).filter(|_| g.uses(v) > 0) {
                 let name = &g.value(v).name;
-                let packed = pack && !sub_reads.contains(name) && packable(g, v);
-                self.add(name, t, packed);
+                let packing = (pack && !sub_reads.contains(name))
+                    .then(|| packable(g, v))
+                    .flatten();
+                self.add(name, t, packing);
             }
         }
         for (_, node) in g.nodes() {
             if let Op::Constant { value } = &node.op
                 && let Some(out) = node.output(0)
             {
-                self.add(&g.value(out).name, value, false);
+                self.add(&g.value(out).name, value, None);
             }
             // In the order the node lists them.
             let mut subgraphs = node.op.named_subgraphs();
@@ -142,7 +145,7 @@ impl Weights {
         }
     }
 
-    fn add(&mut self, name: &str, t: &TensorProto, packed: bool) {
+    fn add(&mut self, name: &str, t: &TensorProto, packing: Option<Packing>) {
         let dtype = DType::from_onnx(t.data_type);
         if matches!(dtype, DType::I64 | DType::I32)
             && let Ok((data, dims)) = tensor_to_array(t)
@@ -156,14 +159,22 @@ impl Weights {
         if bytes.is_empty() {
             return;
         }
-        if packed {
-            let halves: Vec<half::f16> = bytes
+        if let Some(packing) = packing {
+            let mut halves: Vec<half::f16> = bytes
                 .as_chunks::<2>()
                 .0
                 .iter()
                 .map(|&b| half::f16::from_le_bytes(b))
                 .collect();
-            let packed = crate::kernels::matmul::pack_f16(&halves, shape[0], shape[1]);
+            let (k, n) = match packing {
+                Packing::Matrix => (shape[0], shape[1]),
+                Packing::Transposed => {
+                    let (m, k) = (shape[0], shape[1]);
+                    halves = (0..k * m).map(|i| halves[i % m * k + i / m]).collect();
+                    (k, m)
+                }
+            };
+            let packed = crate::kernels::matmul::pack_f16(&halves, k, n);
             bytes = packed.iter().flat_map(|h| h.to_le_bytes()).collect();
         }
         let hash = {
@@ -184,26 +195,62 @@ impl Weights {
             len,
             shape,
             dtype,
-            packed,
+            packed: packing.is_some(),
         });
     }
 }
 
-/// Whether initializer `v` of `g` can be stored packed: an f16 matrix with a
-/// multiple of [`PACK_COLS`] columns, every read of which (in `g`) is as the
-/// right operand of a `MatMul` or `Linear`.
-fn packable(g: &Graph, v: ValueId) -> bool {
+/// How an f16 weight is packed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Packing {
+    /// A `[k, n]` right operand, packed as it is.
+    Matrix,
+    /// The `[m, k, 1]` weights of a pointwise `Conv` (a left operand), packed
+    /// as their transpose `[k, m]`.
+    Transposed,
+}
+
+/// How initializer `v` of `g` can be stored packed, if it can: an f16 matrix
+/// with a multiple of [`PACK_COLS`] columns, every read of which (in `g`) is
+/// as the right operand of a `MatMul` or `Linear`; or f16 weights `[m, k, 1]`,
+/// `m` a multiple of [`PACK_COLS`], every read of which is by a `Conv` code
+/// generation computes with `conv1d_pointwise`.
+fn packable(g: &Graph, v: ValueId) -> Option<Packing> {
     let value = g.value(v);
     let shape = g.data(v).map(|t| t.dims.as_slice()).unwrap_or_default();
-    value.dtype == DType::F16
-        && matches!(shape, [k, n] if *k > 0 && *n > 0 && *n as usize % PACK_COLS == 0)
+    let cols = |n: i64| n > 0 && n as usize % PACK_COLS == 0;
+    let packing = match *shape {
+        [k, n] if k > 0 && cols(n) => Packing::Matrix,
+        [m, k, 1] if k > 1 && cols(m) => Packing::Transposed,
+        _ => return None,
+    };
+    let read_by = |id| {
+        let node = g.node(id);
+        let op_reads = match (&node.op, packing) {
+            (Op::MatMul | Op::Linear, Packing::Matrix) => true,
+            (Op::Conv(conv), Packing::Transposed) => is_pointwise(conv),
+            _ => false,
+        };
+        op_reads
+            && node.input(1) == Some(v)
+            && node.inputs().iter().filter(|&&i| i == Some(v)).count() == 1
+    };
+    (value.dtype == DType::F16
         && value.consumers().len() == g.uses(v)
-        && value.consumers().iter().all(|&id| {
-            let node = g.node(id);
-            matches!(node.op, Op::MatMul | Op::Linear)
-                && node.input(1) == Some(v)
-                && node.inputs().iter().filter(|&&i| i == Some(v)).count() == 1
-        })
+        && value.consumers().iter().all(|&id| read_by(id)))
+    .then_some(packing)
+}
+
+/// Whether a `Conv` with weights `[m, k, 1]`, `k > 1`, is one code generation
+/// computes with `conv1d_pointwise`: one group, stride and dilation 1, no
+/// padding.
+fn is_pointwise(conv: &ConvAttrs) -> bool {
+    let ones = |v: &Option<Vec<i64>>| v.iter().flatten().all(|&x| x == 1);
+    matches!(conv.auto_pad.as_deref(), None | Some("NOTSET" | ""))
+        && conv.group.unwrap_or(1) == 1
+        && ones(&conv.strides)
+        && ones(&conv.dilations)
+        && conv.pads.iter().flatten().all(|&p| p == 0)
 }
 
 /// Adds the names of the values read by the nodes of `g` and its subgraphs,

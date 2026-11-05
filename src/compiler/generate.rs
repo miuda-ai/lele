@@ -855,8 +855,9 @@ mod tests {
     }
 
     /// f16 weights read only as the right operand of a product, with a
-    /// multiple of 16 columns, are stored packed and read as such; others
-    /// are stored as they are.
+    /// multiple of 16 columns, or as the weights of a pointwise conv with a
+    /// multiple of 16 output channels (transposed), are stored packed and read
+    /// as such; others are stored as they are.
     #[test]
     fn test_packs_f16_matmul_weights() {
         use crate::compiler::Optimizations;
@@ -868,13 +869,17 @@ mod tests {
         let halves = |k: usize, n: usize, first: usize| -> Vec<half::f16> {
             (0..k * n).map(|i| half::f16::from_f32((first + i) as f32)).collect()
         };
-        let f16 = |name: &str, k: usize, n: usize, first: usize| TensorProto {
+        let f16_dims = |name: &str, dims: &[usize], first: usize| TensorProto {
             name: name.to_string(),
             data_type: DType::F16.to_onnx(),
-            dims: vec![k as i64, n as i64],
-            raw_data: halves(k, n, first).iter().flat_map(|h| h.to_le_bytes()).collect(),
+            dims: dims.iter().map(|&d| d as i64).collect(),
+            raw_data: halves(dims.iter().product(), 1, first)
+                .iter()
+                .flat_map(|h| h.to_le_bytes())
+                .collect(),
             ..Default::default()
         };
+        let f16 = |name: &str, k: usize, n: usize, first: usize| f16_dims(name, &[k, n], first);
         let node = |op: &str, input: &[&str], output: &str| NodeProto {
             op_type: op.to_string(),
             input: input.iter().map(|s| s.to_string()).collect(),
@@ -887,14 +892,18 @@ mod tests {
                 node("MatMul", &["x", "narrow"], "y2"),
                 node("MatMul", &["x", "shared"], "y3"),
                 node("Neg", &["shared"], "y4"),
+                node("Conv", &["z", "conv"], "y5"),
+                node("Conv", &["z", "conv_narrow"], "y6"),
             ],
             initializer: vec![
                 f16("packed", 8, 32, 0),
                 f16("narrow", 8, 24, 300),
                 f16("shared", 8, 16, 600),
+                f16_dims("conv", &[32, 8, 1], 900),
+                f16_dims("conv_narrow", &[24, 8, 1], 1200),
             ],
-            input: vec![info("x")],
-            output: vec![info("y1"), info("y2"), info("y3"), info("y4")],
+            input: vec![info("x"), info("z")],
+            output: ["y1", "y2", "y3", "y4", "y5", "y6"].map(info).to_vec(),
             ..Default::default()
         };
         let compile = |weight_packing| {
@@ -908,18 +917,26 @@ mod tests {
         };
         let result = compile(true);
         let code = &result.code;
-        assert_eq!(code.matches("self.weight_f16_packed(").count(), 1, "{code}");
-        assert_eq!(code.matches("self.weight_f16_raw(").count(), 2, "{code}");
+        assert_eq!(code.matches("self.weight_f16_packed(").count(), 2, "{code}");
+        assert_eq!(code.matches("self.weight_f16_raw(").count(), 3, "{code}");
         let bytes = |h: &[half::f16]| -> Vec<u8> { h.iter().flat_map(|h| h.to_le_bytes()).collect() };
-        let packed = bytes(&crate::kernels::matmul::pack_f16(&halves(8, 32, 0), 8, 32));
+        let pack_f16 = crate::kernels::matmul::pack_f16;
+        let packed = bytes(&pack_f16(&halves(8, 32, 0), 8, 32));
         let raw = bytes(&halves(8, 32, 0));
+        // The conv weights [32, 8, 1] are packed as their transpose [8, 32].
+        let conv = halves(32, 8, 900);
+        let transposed: Vec<_> = (0..8 * 32).map(|i| conv[i % 32 * 8 + i / 32]).collect();
+        let conv_packed = bytes(&pack_f16(&transposed, 8, 32));
         let contains = |w: &[u8], s: &[u8]| w.windows(s.len()).any(|x| x == s);
         assert!(contains(&result.weights, &packed));
         assert!(!contains(&result.weights, &raw));
+        assert!(contains(&result.weights, &conv_packed));
+        assert!(!contains(&result.weights, &bytes(&conv)));
 
         let unpacked = compile(false);
         assert!(!unpacked.code.contains("weight_f16_packed"));
         assert!(contains(&unpacked.weights, &raw));
+        assert!(contains(&unpacked.weights, &bytes(&conv)));
     }
 
     /// An `If` branch that returns one of its initializers reads it through

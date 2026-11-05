@@ -38,7 +38,8 @@ fn bias_relu_rows(
 /// `[batch, in_channels, len]` with more than one channel (the case [`conv1d`] computes
 /// as a matrix product), whose weights `[out_channels, in_channels, 1]` may be f16: they
 /// are widened as they are read, and the result is that of [`conv1d`] on the widened
-/// weights, bit for bit.
+/// weights, bit for bit. Weights stored packed ([`PackedF16`](crate::kernels::PackedF16))
+/// are read in panels from start to end and sum in another order.
 pub fn conv1d_pointwise<'a, W: WeightElem>(
     input: &TensorView<'_>,
     weights: &TensorView<'_, W>,
@@ -420,12 +421,15 @@ fn conv1d_fused_at<'b, 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::test_util::{Rng, assert_same_bits};
+    use crate::kernels::PackedF16;
+    use crate::kernels::matmul::{PACK_COLS, pack_f16};
+    use crate::kernels::test_util::{Rng, assert_close, assert_same_bits};
     use crate::tensor::TensorView;
 
     /// `conv1d_pointwise` is `conv1d` for f32 weights, and for f16 weights `conv1d` of
-    /// the widened ones, bit for bit: lengths through the dot products and the packed
-    /// kernels, with and without bias and ReLU.
+    /// the widened ones, bit for bit (packed f16 weights sum in another order, so only
+    /// to rounding): lengths through the dot products and the packed kernels, with and
+    /// without bias and ReLU.
     #[test]
     fn test_conv1d_pointwise_matches_conv1d() {
         let mut rng = Rng::new(9);
@@ -434,6 +438,9 @@ mod tests {
             (2, 3, 5, 1),
             (1, 16, 7, 40),
             (2, 33, 20, 13),
+            (2, 40, 48, 3),
+            (1, 600, 32, 7),
+            (1, 32, 32, 300),
         ] {
             let input = rng.vec(batch * cin * len, -1.0, 1.0);
             let w16: Vec<half::f16> = rng
@@ -449,6 +456,16 @@ mod tests {
                 TensorView::from_slice(&w32, vec![cout, cin, 1]),
             );
             let tb = TensorView::from_slice(&bias, vec![cout]);
+            let transposed: Vec<half::f16> = (0..cin * cout)
+                .map(|i| w16[i % cout * cin + i / cout])
+                .collect();
+            let p16: Option<Vec<PackedF16>> = (cout % PACK_COLS == 0).then(|| {
+                let packed = pack_f16(&transposed, cin, cout);
+                packed.into_iter().map(PackedF16).collect()
+            });
+            let packed = p16
+                .as_ref()
+                .map(|p| TensorView::from_slice(p, vec![cout, cin, 1]));
             for (b, relu) in [(None, false), (Some(&tb), true)] {
                 let mut want = Vec::new();
                 let want = conv1d_fused(&x, &t32, b, &[1], 1, &[0, 0], &[1], relu, &mut want);
@@ -460,6 +477,12 @@ mod tests {
                 let mut got = Vec::new();
                 let got = conv1d_pointwise(&x, &t16, b, relu, &mut got);
                 assert_same_bits(&got.data, &want.data, &format!("f16 {what}"));
+                if let Some(packed) = &packed {
+                    let mut got = Vec::new();
+                    let got = conv1d_pointwise(&x, packed, b, relu, &mut got);
+                    let want: Vec<f64> = want.data.iter().map(|&x| x as f64).collect();
+                    assert_close(&got.data, &want, 1e-5, &format!("packed {what}"));
+                }
             }
         }
     }

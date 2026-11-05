@@ -257,6 +257,34 @@ pub fn matmul_f16_packed(
     matmul_b(Level::new(), dst, accum, a, BMat::F16Packed(b), alpha)
 }
 
+/// [`matmul`] with A an f16 matrix of `dst.nrows` rows of `b.nrows` columns stored as
+/// [`pack_f16`] lays out its transpose (so `dst.nrows` is a multiple of [`PACK_COLS`]).
+/// It is computed as `bᵀ aᵀ` into `dstᵀ`, which [`matmul_f16_packed`] reads in panels
+/// from start to end; `b` and `dst` are copied to and from row-major when transposed.
+pub fn matmul_f16_packed_a(
+    dst: MatMut<f32>,
+    accum: Accum,
+    a: &[half::f16],
+    b: MatRef<f32>,
+    alpha: f32,
+) {
+    let dst_t = MatMut {
+        ptr: dst.ptr,
+        nrows: dst.ncols,
+        ncols: dst.nrows,
+        rs: dst.cs,
+        cs: dst.rs,
+    };
+    let b_t = MatRef {
+        ptr: b.ptr,
+        nrows: b.ncols,
+        ncols: b.nrows,
+        rs: b.cs,
+        cs: b.rs,
+    };
+    matmul_b(Level::new(), dst_t, accum, b_t, BMat::F16Packed(a), alpha)
+}
+
 /// [`matmul`] with A an f16 matrix, row-major with `lda` elements between its `dst.nrows`
 /// rows of `b.nrows` columns. A is widened whole into a buffer kept for the thread (as
 /// large as the largest A seen), then the product is [`matmul`]'s, so it is that of A
