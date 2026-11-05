@@ -1819,7 +1819,9 @@ mod tests {
                     );
                     assert_eq!(got.shape.as_ref(), &[batch, oc, oh_n, ow_n]);
                     let what = format!("{case:?} groups {groups} of {ocg} band {band_bytes}");
-                    assert_close(&got.data, &want, 1e-5, &what);
+                    // The deepest cases dot 576 terms in f32 against an f64
+                    // reference; their rounding is just above 1e-5.
+                    assert_close(&got.data, &want, 2e-5, &what);
                 }
             }
         }

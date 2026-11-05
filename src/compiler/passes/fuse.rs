@@ -573,6 +573,9 @@ fn fuse_dynamic_quant_linear(g: &mut Graph) {
         let fused = (0..2).find_map(|k| {
             let node = g.node(add);
             let (dequant, bias) = (node.input(k), node.input(1 - k));
+            // The kernel adds a bias per output column: an operand computed at run
+            // time is a residual of the layer's shape, which it does not take.
+            g.data(bias?)?;
             let mul = sole_producer(g, dequant, binary(Binary::Mul))?;
             let (cast, scale) = (0..2).find_map(|j| {
                 let input = g.node(mul).input(j);
@@ -970,6 +973,39 @@ mod tests {
         let mut nodes = nodes(false);
         nodes[1].attribute[0].ints = vec![1];
         assert_eq!(fused(nodes, constants).len(), 6);
+    }
+
+    /// `DynamicQuantizeLinear → MatMulInteger → Cast → Mul → Add(bias)`.
+    #[test]
+    fn fuses_dynamic_quant_linear_with_a_constant_bias_only() {
+        let nodes = |bias: &str| {
+            let mut quantize = node("DynamicQuantizeLinear", &["x"], "q");
+            quantize.output = vec!["q".into(), "s".into(), "z".into()];
+            let mut cast = node("Cast", &["acc"], "acc_f");
+            cast.attribute
+                .push(crate::model::onnx_proto::AttributeProto {
+                    name: "to".to_string(),
+                    i: 1,
+                    ..Default::default()
+                });
+            vec![
+                quantize,
+                node("Mul", &["s", "w_scale"], "scale"),
+                node("MatMulInteger", &["q", "w", "z", "w_zp"], "acc"),
+                cast,
+                node("Mul", &["acc_f", "scale"], "scaled"),
+                node("Add", &["scaled", bias], "y"),
+            ]
+        };
+        let constants = vec![
+            scalar("w_scale", 0.1),
+            scalar("w_zp", 0.0),
+            scalar("bias", 1.0),
+        ];
+        assert_eq!(fused(nodes("bias"), constants.clone()), ["QLinearDynamic"]);
+        // The kernel adds a bias per column: a residual computed at run time, as the
+        // sum that closes a transformer block is, is not one.
+        assert_eq!(fused(nodes("residual"), constants).len(), 6);
     }
 
     #[test]

@@ -246,14 +246,15 @@ mod tests {
             // A copy: `a` is free once read.
             ("Relu", &["a"]),
         ] {
-            // A chain long enough to pass the nodes whose inputs are never overwritten.
-            let chain: Vec<String> = (0..8).map(|i| format!("b{i}")).collect();
+            // A chain long enough to pass the nodes whose inputs are never
+            // overwritten, and the allocator's 8-node look-back window.
+            let chain: Vec<String> = (0..12).map(|i| format!("b{i}")).collect();
             let mut nodes = vec![node("Relu", &["x"], "a"), node(op, inputs, "v")];
             nodes.push(node("Relu", &["x"], &chain[0]));
             for w in chain.windows(2) {
                 nodes.push(node("Relu", &[&w[0]], &w[1]));
             }
-            nodes.push(node("Add", &["v", &chain[7]], "y"));
+            nodes.push(node("Add", &["v", &chain[11]], "y"));
             let g = crate::compiler::ir::Graph::from_onnx(GraphProto {
                 node: nodes,
                 input: vec![ValueInfoProto {

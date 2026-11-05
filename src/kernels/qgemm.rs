@@ -1171,6 +1171,11 @@ pub(crate) fn run_at(
     e: &Epilogue,
     c: &mut [f32],
 ) {
+    // A sequence of length 0, as the first step of a model fed its prompt in two parts
+    // is, has no rows to multiply.
+    if m == 0 {
+        return;
+    }
     A_ROWS.with_borrow_mut(|a| match &w.packed {
         Packed::Pairs { pairs, .. } => {
             quantize_rows_at(level, src, m, w.k, scale, zero_point, center, a);
@@ -1508,6 +1513,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// An input of no rows gives an output of no rows.
+    #[test]
+    fn test_quantized_matmul_of_no_rows_is_empty() {
+        let mut rng = Rng::new(3);
+        let (k, n) = (37, 21);
+        let raw = codes(&mut rng, k * n);
+        let w = QWeights::new(&raw, k, n, false, &[131], &[1.0]);
+        let mut out = Vec::new();
+        let x = TensorView::from_slice(&[], vec![1, 0, k]);
+        let got = mat_mul_integer_qweights(&x, 179, &w, &mut out);
+        assert_eq!(got.shape.as_ref(), &[1, 0, n]);
+        assert!(got.data.is_empty());
+        let ws = vec![0.01f32; n];
+        let w = QWeights::new(&raw, k, n, true, &[0], &ws);
+        let got = qlinear_static(&x, 0.03, 100, &w, None, None, &mut out);
+        assert_eq!(got.shape.as_ref(), &[1, 0, n]);
     }
 
     /// The ONNX-level entry points, against the ONNX definitions in f64: what each one

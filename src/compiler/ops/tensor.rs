@@ -73,23 +73,8 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             )?;
         }
         Op::Reshape => {
-            let shape_raw = resolve_i64_with_temp(1, ctx, w, &tab)?;
-            // Replace 0 with -1 in reshape targets (ONNX 0 means "copy from source",
-            // but in static compilation -1/infer is more robust)
-            let shape = if shape_raw.starts_with('&') && shape_raw.contains(" 0,")
-                || shape_raw.contains("[0,")
-                || shape_raw.contains("[0]")
-                || shape_raw.contains(", 0]")
-                || shape_raw.contains(", 0,")
-            {
-                // Replace standalone 0 values (not 10, 100, etc.) with -1
-                let s = shape_raw;
-                // Use regex-free approach: split on known patterns
-                let s = s.replace("[0,", "[-1,").replace("[0]", "[-1]");
-                s.replace(", 0,", ", -1,").replace(", 0]", ", -1]")
-            } else {
-                shape_raw
-            };
+            // A 0 in the target copies the input's dimension, which the kernel reads.
+            let shape = resolve_i64_with_temp(1, ctx, w, &tab)?;
             writeln!(
                 w,
                 "{}let {} = lele::kernels::reshape(&{}, {});",
@@ -615,6 +600,32 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 w,
                 "{}let {} = lele::kernels::gather_elements(&{}, &{}, {}, {});",
                 tab, outputs[0], inputs[0], inputs[1], axis, buf_expr
+            )?;
+        }
+        Op::ScatterElements { axis } => {
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::scatter_elements(&{}, &{}, &{}, {}, {});",
+                tab, outputs[0], inputs[0], inputs[1], inputs[2], axis, buf_expr
+            )?;
+        }
+        Op::ScatterND => {
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::scatter_nd(&{}, &{}, &{}, {});",
+                tab, outputs[0], inputs[0], inputs[1], inputs[2], buf_expr
+            )?;
+        }
+        Op::Trilu { upper } => {
+            // `k` is optional and defaults to the main diagonal.
+            let k = match ctx.ir().input(1) {
+                Some(_) => format!("{}.data[0] as i64", inputs[1]),
+                None => "0".to_string(),
+            };
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::trilu(&{}, {}, {}, {});",
+                tab, outputs[0], inputs[0], k, upper, buf_expr
             )?;
         }
         op => unreachable!("{} is not a tensor operator", op.op_type()),

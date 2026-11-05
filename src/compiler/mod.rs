@@ -510,8 +510,18 @@ pub fn sanitize_name(name: &str) -> String {
         .replace("/", "_")
         .replace("-", "_")
         .replace(":", "_");
+    // Tensors are named by what produced them: `where`, `type` and `match` do occur.
+    const KEYWORDS: &[&str] = &[
+        "Self", "abstract", "as", "async", "await", "become", "box", "break", "const", "continue",
+        "crate", "do", "dyn", "else", "enum", "extern", "false", "final", "fn", "for", "gen", "if",
+        "impl", "in", "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv",
+        "pub", "ref", "return", "self", "static", "struct", "super", "trait", "true", "try",
+        "type", "typeof", "unsafe", "unsized", "use", "virtual", "where", "while", "yield",
+    ];
     if s.chars().next().is_some_and(|c| c.is_numeric()) {
         format!("_{}", s)
+    } else if KEYWORDS.contains(&s.as_str()) {
+        format!("{}_", s)
     } else {
         s
     }
@@ -615,6 +625,19 @@ mod codegen_smoke_tests {
                 "identical content must keep its offset"
             );
         }
+    }
+}
+
+mod sanitize_tests {
+    use super::sanitize_name;
+
+    #[test]
+    fn names_are_identifiers() {
+        assert_eq!(sanitize_name("/a/b.c-d:e"), "_a_b_c_d_e");
+        assert_eq!(sanitize_name("1x"), "_1x");
+        assert_eq!(sanitize_name("where"), "where_");
+        assert_eq!(sanitize_name("type"), "type_");
+        assert_eq!(sanitize_name("wherever"), "wherever");
     }
 }
 

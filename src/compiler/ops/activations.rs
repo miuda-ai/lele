@@ -12,6 +12,11 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
     let buf_expr = &ctx.buf_expr;
 
     match ctx.ir().op {
+        Op::Elu { alpha } => writeln!(
+            w,
+            "{}let {} = lele::kernels::elu(&{}, {:?}, {});",
+            tab, outputs[0], inputs[0], alpha, buf_expr
+        )?,
         Op::LeakyRelu { alpha } => writeln!(
             w,
             "{}let {} = lele::kernels::leaky_relu(&{}, {}, {});",

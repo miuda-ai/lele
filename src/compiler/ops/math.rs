@@ -22,6 +22,11 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             buf_expr
         )?,
         Op::Binary(binary) => generate_binary(ctx, *binary, w)?,
+        Op::IsNaN => writeln!(
+            w,
+            "{}let {} = lele::kernels::is_nan(&{}, {});",
+            tab, outputs[0], inputs[0], buf_expr
+        )?,
         Op::MatMul => writeln!(
             w,
             "{}let {} = lele::kernels::matmul(&{}, &{}, {});",
@@ -245,6 +250,7 @@ fn generate_binary(ctx: &OpContext, op: Binary, w: &mut dyn Write) -> std::io::R
     let kernel = match op {
         Binary::Add => "add",
         Binary::And => "logical_and",
+        Binary::Mod if types.is_i64(out) => "mod_i64",
         Binary::Mod => "mod_f32",
         Binary::Mul => "mul",
         Binary::Or => "logical_or",

@@ -229,13 +229,21 @@ pub(crate) fn variable_types(g: &Graph) -> VarTypes {
             }
             for (i, v) in node.outputs().iter().enumerate() {
                 let Some(v) = *v else { continue };
-                let f32_kernel = matches!(
-                    node.op,
-                    Op::Binary(Binary::Mod)
-                        | Op::ConvInteger(_)
-                        | Op::MatMulInteger
-                        | Op::TopK { .. }
-                );
+                // `Mod` of two i64 tensors stays i64: its result goes on to meet i64
+                // initializers, which the kernels of f32 and i64 tensors cannot mix.
+                let integer_mod = matches!(node.op, Op::Binary(Binary::Mod))
+                    && (0..2).all(|k| {
+                        node.input(k)
+                            .is_some_and(|input| repr.get(&input) == Some(&ElemType::I64))
+                    });
+                let f32_kernel = !integer_mod
+                    && matches!(
+                        node.op,
+                        Op::Binary(Binary::Mod)
+                            | Op::ConvInteger(_)
+                            | Op::MatMulInteger
+                            | Op::TopK { .. }
+                    );
                 // If and Loop take the representation of their subgraphs'
                 // outputs.
                 let from_subgraph = |sub: &Graph, j: usize, reprs: &HashMap<String, ElemType>| {
@@ -1033,6 +1041,139 @@ mod tests {
         assert_ne!(
             buffer("split_one(&x, 0, &[0, 0], 0,"),
             buffer("split_one(&x, 0, &[0, 0], 1,")
+        );
+    }
+
+    /// Trilu, ScatterND and InstanceNormalization have code, a Trilu without its
+    /// `k` takes the main diagonal, and a Reshape target keeps its 0s, which copy
+    /// the input's dimension, beside a -1.
+    #[test]
+    fn test_trilu_scatter_nd_instance_norm_and_reshape_zero() {
+        use crate::model::onnx_proto::{AttributeProto, GraphProto, TensorProto, ValueInfoProto};
+        let info = |name: &str| ValueInfoProto {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let node =
+            |op: &str, input: &[&str], output: &[&str], attribute: Vec<AttributeProto>| NodeProto {
+                op_type: op.to_string(),
+                input: input.iter().map(|s| s.to_string()).collect(),
+                output: output.iter().map(|s| s.to_string()).collect(),
+                attribute,
+                ..Default::default()
+            };
+        let constant = |name: &str, dims: Vec<i64>, values: &[f32]| TensorProto {
+            name: name.to_string(),
+            data_type: DType::F32.to_onnx(),
+            dims,
+            raw_data: values.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            ..Default::default()
+        };
+        let ints = |name: &str, values: &[i64]| TensorProto {
+            name: name.to_string(),
+            data_type: DType::I64.to_onnx(),
+            dims: vec![values.len() as i64],
+            raw_data: values.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            ..Default::default()
+        };
+        let attribute = |name: &str, f: f32| AttributeProto {
+            name: name.to_string(),
+            f,
+            ..Default::default()
+        };
+        let graph = GraphProto {
+            node: vec![
+                node("Trilu", &["x"], &["t"], vec![]),
+                node("ScatterND", &["x", "idx", "upd"], &["s"], vec![]),
+                node(
+                    "InstanceNormalization",
+                    &["x", "g", "b"],
+                    &["n"],
+                    vec![attribute("epsilon", 1e-3)],
+                ),
+                node("Reshape", &["x", "target"], &["r"], vec![]),
+            ],
+            initializer: vec![
+                ints("idx", &[1]),
+                constant("upd", vec![1], &[0.0]),
+                constant("g", vec![1], &[1.0]),
+                constant("b", vec![1], &[0.0]),
+                ints("target", &[0, 1, -1]),
+            ],
+            input: vec![info("x")],
+            output: ["t", "s", "n", "r"].map(info).to_vec(),
+            ..Default::default()
+        };
+        let code = Compiler::new().compile(&graph).unwrap().code;
+        assert!(code.contains("kernels::trilu(&x, 0, true,"), "{code}");
+        assert!(code.contains("kernels::scatter_nd(&x,"), "{code}");
+        assert!(
+            code.contains("kernels::instance_norm(&x,") && code.contains("0.001"),
+            "{code}"
+        );
+        assert!(code.contains("kernels::reshape(&x, &[0, 1, -1])"), "{code}");
+    }
+
+    /// Elu, IsNaN and ScatterElements have code, with the attributes they were given.
+    #[test]
+    fn test_elu_is_nan_and_scatter_elements() {
+        use crate::model::onnx_proto::{AttributeProto, GraphProto, TensorProto, ValueInfoProto};
+        let info = |name: &str| ValueInfoProto {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let node =
+            |op: &str, input: &[&str], output: &[&str], attribute: Vec<AttributeProto>| NodeProto {
+                op_type: op.to_string(),
+                input: input.iter().map(|s| s.to_string()).collect(),
+                output: output.iter().map(|s| s.to_string()).collect(),
+                attribute,
+                ..Default::default()
+            };
+        let graph = GraphProto {
+            node: vec![
+                node("Elu", &["x"], &["e"], vec![]),
+                node(
+                    "Elu",
+                    &["x"],
+                    &["e2"],
+                    vec![AttributeProto {
+                        name: "alpha".to_string(),
+                        f: 0.5,
+                        ..Default::default()
+                    }],
+                ),
+                node("IsNaN", &["x"], &["n"], vec![]),
+                node(
+                    "ScatterElements",
+                    &["x", "idx", "x"],
+                    &["s"],
+                    vec![AttributeProto {
+                        name: "axis".to_string(),
+                        i: 1,
+                        ..Default::default()
+                    }],
+                ),
+            ],
+            initializer: vec![TensorProto {
+                name: "idx".to_string(),
+                data_type: DType::I64.to_onnx(),
+                dims: vec![1],
+                raw_data: 0i64.to_le_bytes().to_vec(),
+                ..Default::default()
+            }],
+            input: vec![info("x")],
+            output: ["e", "e2", "n", "s"].map(info).to_vec(),
+            ..Default::default()
+        };
+        let code = Compiler::new().compile(&graph).unwrap().code;
+        // A whole alpha is written as a float.
+        assert!(code.contains("kernels::elu(&x, 1.0,"), "{code}");
+        assert!(code.contains("kernels::elu(&x, 0.5,"), "{code}");
+        assert!(code.contains("kernels::is_nan(&x,"), "{code}");
+        assert!(
+            code.contains("kernels::scatter_elements(&x,") && code.contains(", 1, "),
+            "{code}"
         );
     }
 

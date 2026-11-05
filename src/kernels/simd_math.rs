@@ -242,6 +242,14 @@ pub(crate) fn leaky_relu<S: Simd>(x: f32x16<S>, alpha: f32x16<S>) -> f32x16<S> {
     x.simd_ge(f32x16::splat(x.simd, 0.0)).select(x, x * alpha)
 }
 
+/// `x` for `x >= 0`, else `alpha · (eˣ - 1)`.
+#[inline(always)]
+pub(crate) fn elu<S: Simd>(x: f32x16<S>, alpha: f32x16<S>) -> f32x16<S> {
+    let simd = x.simd;
+    x.simd_ge(f32x16::splat(simd, 0.0))
+        .select(x, alpha * (exp_saturating(x) - f32x16::splat(simd, 1.0)))
+}
+
 #[inline(always)]
 pub(crate) fn sqrt<S: Simd>(x: f32x16<S>) -> f32x16<S> {
     x.sqrt()

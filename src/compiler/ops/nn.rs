@@ -259,6 +259,13 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 )?;
             }
         }
+        Op::InstanceNormalization { epsilon } => {
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::instance_norm(&{}, &{}, &{}, {}, {});",
+                tab, outputs[0], inputs[0], inputs[1], inputs[2], epsilon, buf_expr
+            )?;
+        }
         Op::LayerNormalization { axis, epsilon } => {
             let scale = if ctx.node.input.len() > 1
                 && !ctx.node.input[1].is_empty()

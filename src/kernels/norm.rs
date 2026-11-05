@@ -310,6 +310,52 @@ pub fn layer_norm<'b, 'a>(
         shape: std::borrow::Cow::Owned(input.shape.to_vec()),
     }
 }
+/// InstanceNormalization: each channel of each sample, over its spatial axes, is
+/// normalised and then scaled and shifted by its channel's `scale` and `bias`.
+/// The input is `[n, c, ...]`.
+pub fn instance_norm<'b, 'a>(
+    input: &TensorView<'b>,
+    scale: &TensorView<'b>,
+    bias: &TensorView<'b>,
+    epsilon: f32,
+    out_buf: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    assert!(
+        input.shape.len() >= 2,
+        "InstanceNormalization needs [n, c, ...]"
+    );
+    let channels = input.shape[1];
+    let n = input.shape[2..].iter().product::<usize>();
+    let rows = input.shape[0] * channels;
+    assert_eq!(scale.data.len(), channels);
+    assert_eq!(bias.data.len(), channels);
+    let len = input.data.len();
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out_buf, len) };
+    let out = &mut out_buf[..len];
+    // Normalised as rows of a LayerNorm with no scale or shift, which the loop
+    // below then applies per row.
+    layer_norm_rows(
+        Level::new(),
+        rows,
+        &input.data,
+        &vec![1.0; n],
+        &vec![0.0; n],
+        out,
+        epsilon,
+    );
+    for (r, row) in out.chunks_mut(n).enumerate() {
+        let (g, b) = (scale.data[r % channels], bias.data[r % channels]);
+        for x in row {
+            *x = *x * g + b;
+        }
+    }
+    TensorView {
+        data: Cow::Borrowed(out),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
+}
+
 pub fn batch_norm<'b, 'a>(
     input: &TensorView<'b>,
     scale: &TensorView<'b>,
@@ -853,6 +899,46 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_instance_norm_normalises_each_channel_of_each_sample() {
+        let mut rng = Rng::new(7);
+        // Samples and channels of different levels; one spatial axis, two, and a long one.
+        for shape in [vec![2, 3, 37], vec![2, 3, 5, 7], vec![1, 1, 1000]] {
+            let (n, c) = (shape[0], shape[1]);
+            let spatial: usize = shape[2..].iter().product();
+            let mut x = rng.vec(n * c * spatial, -1.0, 1.0);
+            for (i, v) in x.iter_mut().enumerate() {
+                *v += (i / spatial) as f32;
+            }
+            let scale = rng.vec(c, 0.5, 1.5);
+            let bias = rng.vec(c, -0.5, 0.5);
+            let want: Vec<f64> = x
+                .chunks(spatial)
+                .enumerate()
+                .flat_map(|(r, row)| {
+                    let mean = row.iter().map(|&v| v as f64).sum::<f64>() / spatial as f64;
+                    let var = row.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>()
+                        / spatial as f64;
+                    let inv_std = 1.0 / (var + EPS as f64).sqrt();
+                    let (g, b) = (scale[r % c] as f64, bias[r % c] as f64);
+                    row.iter()
+                        .map(move |&v| (v as f64 - mean) * inv_std * g + b)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let mut out = Vec::new();
+            let got = instance_norm(
+                &TensorView::from_slice(&x, shape.clone()),
+                &TensorView::from_slice(&scale, vec![c]),
+                &TensorView::from_slice(&bias, vec![c]),
+                EPS,
+                &mut out,
+            );
+            assert_eq!(got.shape.to_vec(), shape);
+            assert_close(&got.data, &want, 1e-4, &format!("{shape:?}"));
         }
     }
 

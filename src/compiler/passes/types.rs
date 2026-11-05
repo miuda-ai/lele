@@ -73,6 +73,7 @@ pub(crate) fn follows_input(op: &Op, i: usize) -> Option<usize> {
         | Op::Shape { .. }
         | Op::Size
         | Op::Unary(Unary::Not)
+        | Op::IsNaN
         | Op::QuantizeLinear(_)
         | Op::DequantizeLinear(_)
         | Op::QLinearMatMulI8
@@ -84,7 +85,7 @@ pub(crate) fn follows_input(op: &Op, i: usize) -> Option<usize> {
         Op::Binary(binary) if binary.is_predicate() => None,
         Op::Where => Some(1),
         Op::Onnx { op_type, .. } => match op_type.as_str() {
-            "ArgMin" | "NonZero" | "IsNaN" | "IsInf" => None,
+            "ArgMin" | "NonZero" | "IsInf" => None,
             _ => Some(0),
         },
         _ => Some(0),
@@ -107,7 +108,7 @@ fn output_dtype(op: &Op, i: usize, input: &dyn Fn(usize) -> DType) -> DType {
         Op::Shape { .. } | Op::Size | Op::ArgMax { .. } | Op::TopK { .. } => I64,
         Op::ConvInteger(_) | Op::MatMulInteger => I32,
         Op::DynamicQuantizeLinear => [U8, F32, U8].get(i).copied().unwrap_or(Undefined),
-        Op::Binary(_) | Op::Unary(Unary::Not) => Bool,
+        Op::Binary(_) | Op::Unary(Unary::Not) | Op::IsNaN => Bool,
         Op::QuantizeLinear(attrs) => attrs.output_dtype.unwrap_or(match input(2) {
             Undefined => U8,
             t => t,
@@ -122,7 +123,7 @@ fn output_dtype(op: &Op, i: usize, input: &dyn Fn(usize) -> DType) -> DType {
             .get(i + 1)
             .map_or(Undefined, |&v| body.value(v).dtype),
         Op::Onnx { op_type, .. } => match op_type.as_str() {
-            "IsNaN" | "IsInf" => Bool,
+            "IsInf" => Bool,
             _ => I64,
         },
         _ => F32,

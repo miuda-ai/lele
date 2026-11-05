@@ -353,6 +353,9 @@ pub enum Op {
     Einsum {
         equation: String,
     },
+    Elu {
+        alpha: f32,
+    },
     Expand,
     Flatten {
         axis: i64,
@@ -384,6 +387,10 @@ pub enum Op {
         beta: f32,
     },
     Identity,
+    InstanceNormalization {
+        epsilon: f32,
+    },
+    IsNaN,
     LayerNormalization {
         axis: i64,
         epsilon: f32,
@@ -422,6 +429,12 @@ pub enum Op {
     },
     /// `allowzero` stays in the proto.
     Reshape,
+    /// Without a `reduction`: with one the node stays an [`Op::Onnx`].
+    ScatterElements {
+        axis: i64,
+    },
+    /// Without a `reduction`: with one the node stays an [`Op::Onnx`].
+    ScatterND,
     /// The other attributes (`cubic_coeff_a`, `antialias`, ...) stay in the
     /// proto.
     Resize {
@@ -465,6 +478,10 @@ pub enum Op {
     Transpose {
         /// Absent means reversing the axes.
         perm: Option<Vec<i64>>,
+    },
+    Trilu {
+        /// The upper triangle is kept; otherwise the lower.
+        upper: bool,
     },
     Unary(Unary),
     Unsqueeze {
@@ -671,6 +688,26 @@ impl Op {
                 alpha: attr_f(node, "alpha").unwrap_or(0.2),
                 beta: attr_f(node, "beta").unwrap_or(0.5),
             },
+            "InstanceNormalization" => Op::InstanceNormalization {
+                epsilon: attr_f(node, "epsilon").unwrap_or(1e-5),
+            },
+            "Elu" => Op::Elu {
+                alpha: attr_f(node, "alpha").unwrap_or(1.0),
+            },
+            "IsNaN" => Op::IsNaN,
+            "ScatterElements" => match attr_s(node, "reduction").as_deref() {
+                None | Some("none") => Op::ScatterElements {
+                    axis: attr_i(node, "axis").unwrap_or(0),
+                },
+                Some(_) => fallback(node),
+            },
+            "ScatterND" => match attr_s(node, "reduction").as_deref() {
+                None | Some("none") => Op::ScatterND,
+                Some(_) => fallback(node),
+            },
+            "Trilu" => Op::Trilu {
+                upper: attr_i(node, "upper").unwrap_or(1) != 0,
+            },
             "LayerNormalization" => Op::LayerNormalization {
                 axis: attr_i(node, "axis").unwrap_or(-1),
                 epsilon: attr_f(node, "epsilon").unwrap_or(1e-5),
@@ -774,6 +811,12 @@ impl Op {
             Op::Gemm { .. } => "Gemm",
             Op::Gru { .. } => "GRU",
             Op::HardSigmoid { .. } => "HardSigmoid",
+            Op::InstanceNormalization { .. } => "InstanceNormalization",
+            Op::Elu { .. } => "Elu",
+            Op::IsNaN => "IsNaN",
+            Op::ScatterElements { .. } => "ScatterElements",
+            Op::ScatterND => "ScatterND",
+            Op::Trilu { .. } => "Trilu",
             Op::LayerNormalization { .. } => "LayerNormalization",
             Op::LeakyRelu { .. } => "LeakyRelu",
             Op::LogSoftmax { .. } => "LogSoftmax",
@@ -926,11 +969,15 @@ impl Op {
                 set_attr_f(attrs, "alpha", alpha, 0.2);
                 set_attr_f(attrs, "beta", beta, 0.5);
             }
+            Op::InstanceNormalization { epsilon } => set_attr_f(attrs, "epsilon", epsilon, 1e-5),
+            Op::Trilu { upper } => set_attr_i(attrs, "upper", upper as i64, 1),
             Op::LayerNormalization { axis, epsilon } => {
                 set_attr_i(attrs, "axis", axis, -1);
                 set_attr_f(attrs, "epsilon", epsilon, 1e-5);
             }
             Op::LeakyRelu { alpha } => set_attr_f(attrs, "alpha", alpha, 0.01),
+            Op::Elu { alpha } => set_attr_f(attrs, "alpha", alpha, 1.0),
+            Op::ScatterElements { axis } => set_attr_i(attrs, "axis", axis, 0),
             Op::Softmax { axis } | Op::LogSoftmax { axis } => set_attr_opt_i(attrs, "axis", axis),
             Op::Pad { mode } => set_attr_opt_s(attrs, "mode", mode),
             Op::Reduce { axes, keepdims, .. } => {
@@ -999,7 +1046,9 @@ impl Op {
             | Op::MatMulInteger
             | Op::Max
             | Op::Range
+            | Op::IsNaN
             | Op::Reshape
+            | Op::ScatterND
             | Op::Size
             | Op::Slice
             | Op::Stft
@@ -1221,6 +1270,8 @@ mod tests {
             ("CumSum", vec![int("exclusive", 1), int("reverse", 0)]),
             ("Einsum", vec![string("equation", "bs,d->bsd")]),
             ("Gemm", vec![float("alpha", 1.0), int("transB", 1)]),
+            ("InstanceNormalization", vec![float("epsilon", 1e-3)]),
+            ("Trilu", vec![int("upper", 0)]),
             (
                 "GRU",
                 vec![int("hidden_size", 8), int("linear_before_reset", 1)],
@@ -1247,6 +1298,8 @@ mod tests {
             ("GatherElements", vec![int("axis", 0)]),
             ("HardSigmoid", vec![float("alpha", 0.2), float("beta", 0.6)]),
             ("LeakyRelu", vec![float("alpha", 0.1)]),
+            ("Elu", vec![float("alpha", 0.5)]),
+            ("ScatterElements", vec![int("axis", 1)]),
             ("LogSoftmax", vec![int("axis", 1)]),
             ("Pad", vec![string("mode", "reflect")]),
             ("ReduceMean", vec![ints("axes", &[-1]), int("keepdims", 1)]),

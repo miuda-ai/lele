@@ -153,6 +153,17 @@ fn leaky_relu_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32], alpha: f32) {
     vm::map!(simd, src, out, vm::leaky_relu, alpha)
 }
 
+fn elu_into(level: Level, src: &[f32], out: &mut [f32], alpha: f32) {
+    simd_call!(level, max = Avx2, elu_simd(src, out, alpha))
+}
+
+#[simd]
+fn elu_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32], alpha: f32) {
+    use fearless_simd::prelude::*;
+    let alpha = fearless_simd::f32x16::splat(simd, alpha);
+    vm::map!(simd, src, out, vm::elu, alpha)
+}
+
 fn sqrt_into(level: Level, src: &[f32], out: &mut [f32]) {
     simd_call!(level, max = Avx2, sqrt_simd(src, out))
 }
@@ -574,22 +585,15 @@ where
         }
         for d in (0..dims).rev() {
             coords[d] += 1;
+            // The strides of broadcast axes, and of axes an input lacks, are 0.
             if coords[d] < out_shape[d] {
-                if a.shape.len() > d && a.shape[d] != 1 {
-                    off_a += a_strides[d];
-                }
-                if b.shape.len() > d && b.shape[d] != 1 {
-                    off_b += b_strides[d];
-                }
+                off_a += a_strides[d];
+                off_b += b_strides[d];
                 break;
             } else {
                 coords[d] = 0;
-                if a.shape.len() > d && a.shape[d] != 1 {
-                    off_a -= a_strides[d] * (out_shape[d] - 1);
-                }
-                if b.shape.len() > d && b.shape[d] != 1 {
-                    off_b -= b_strides[d] * (out_shape[d] - 1);
-                }
+                off_a -= a_strides[d] * (out_shape[d] - 1);
+                off_b -= b_strides[d] * (out_shape[d] - 1);
             }
         }
     }
@@ -922,6 +926,25 @@ pub fn mod_f32<'b, 'a, T: ElementOps>(
         shape: std::borrow::Cow::Owned(a.shape.to_vec()),
     }
 }
+/// Mod of integers, which takes the sign of the divisor (the result of `fmod = 0`);
+/// a zero divisor gives 0.
+pub fn mod_i64<'b, 'a>(
+    a: &TensorView<'b, i64>,
+    b: &TensorView<'b, i64>,
+    out: &'a mut Vec<i64>,
+) -> TensorView<'a, i64> {
+    broadcast_binary_op_to(a, b, out, |x, y| {
+        if y == 0 {
+            return 0;
+        }
+        let r = x.wrapping_rem(y);
+        if r != 0 && (r < 0) != (y < 0) {
+            r + y
+        } else {
+            r
+        }
+    })
+}
 pub fn equal<'b, 'a>(
     a: &TensorView<'b>,
     b: &TensorView<'b>,
@@ -1047,6 +1070,26 @@ pub fn leaky_relu<'a, 'b>(
     unary(input, out, |level, src, out| {
         leaky_relu_into(level, src, out, alpha)
     })
+}
+
+pub fn elu<'a, 'b>(input: &TensorView<'b>, alpha: f32, out: &'a mut Vec<f32>) -> TensorView<'a> {
+    unary(input, out, |level, src, out| {
+        elu_into(level, src, out, alpha)
+    })
+}
+
+/// IsNaN: 1 where the element is NaN, else 0.
+pub fn is_nan<'a>(input: &TensorView<'_>, out: &'a mut Vec<i64>) -> TensorView<'a, i64> {
+    let len = input.data.len();
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
+    for (o, x) in out.iter_mut().zip(input.data.iter()) {
+        *o = x.is_nan() as i64;
+    }
+    TensorView {
+        data: Cow::Borrowed(out),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
 }
 
 pub fn sqrt<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
@@ -2612,6 +2655,39 @@ mod tests {
     use super::*;
     use crate::kernels::test_util::assert_close;
     use crate::tensor::TensorView;
+
+    #[test]
+    fn test_mod_i64_takes_the_sign_of_the_divisor() {
+        let a = TensorView::from_slice(&[7i64, -7, 7, -7, 0, 5], vec![2, 3]);
+        let b = TensorView::from_slice(&[3i64, 3, -3], vec![3]);
+        let mut out = Vec::new();
+        let r = mod_i64(&a, &b, &mut out);
+        assert_eq!(r.shape.to_vec(), [2, 3]);
+        // 7 mod 3 = 1, -7 mod 3 = 2, 7 mod -3 = -2; -7 mod 3 = 2, 0 mod 3 = 0, 5 mod -3 = -1.
+        assert_eq!(r.data.to_vec(), [1, 2, -2, 2, 0, -1]);
+        let zero = TensorView::from_slice(&[0i64], vec![1]);
+        assert_eq!(mod_i64(&a, &zero, &mut out).data.to_vec(), [0; 6]);
+    }
+
+    /// Comparisons broadcast shapes of different ranks from the right: a causal mask is
+    /// a column against a row.
+    #[test]
+    fn test_comparison_broadcasts_inputs_of_different_ranks() {
+        let col = TensorView::from_slice(&[0i64, 1, 2, 3], vec![4, 1]);
+        let row = TensorView::from_slice(&[0i64, 1, 2, 3], vec![4]);
+        let mut out = Vec::new();
+        let upper = less_i64(&col, &row, &mut out);
+        assert_eq!(upper.shape.to_vec(), [4, 4]);
+        let want: Vec<i64> = (0..16).map(|k| (k / 4 < k % 4) as i64).collect();
+        assert_eq!(upper.data.to_vec(), want);
+        // A row against a stack of columns: the row lies along the last axis, each
+        // column along the one before it.
+        let stack = TensorView::from_slice(&[0i64, 5, 1, 6, 2, 7], vec![2, 3, 1]);
+        let row = TensorView::from_slice(&[1i64, 4], vec![2]);
+        let got = less_i64(&stack, &row, &mut out);
+        assert_eq!(got.shape.to_vec(), [2, 3, 2]);
+        assert_eq!(got.data.to_vec(), [1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0]);
+    }
 
     /// Every set of axes of a `[2, 3, 4, 5]` tensor (consecutive ones take the fast
     /// path), with and without kept dimensions, against a reference.
