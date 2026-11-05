@@ -44,7 +44,6 @@ keywords = [
 ]
 categories = ["algorithms", "compilers", "science", "wasm"]
 exclude = [
-    "build.rs",
     "benches/*",
     "examples/*",
     "tests/*",

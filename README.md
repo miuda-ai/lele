@@ -98,7 +98,7 @@ selects a mirror; `LELE_SKIP_MODEL_GEN=1` skips generation and
 ### Or use the CLI
 
 ```bash
-cargo install lele
+cargo install --git https://github.com/miuda-ai/lele --bin lele_gen
 lele_gen model.onnx src/ MyModel
 ```
 
