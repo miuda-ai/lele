@@ -1,4 +1,5 @@
-use super::ir::{Graph, Node, NodeId};
+use super::ir::{Binary, DType, Graph, Node, NodeId, Op};
+use super::weights::{WeightRef, Weights};
 use super::{Allocator, AnalysisData, Compiler, sanitize_name};
 use crate::model::onnx_proto::{NodeProto, ValueInfoProto};
 use std::collections::{HashMap, HashSet};
@@ -14,15 +15,14 @@ pub(crate) struct OpContext<'a> {
     pub outputs: Vec<String>,
     pub buf_expr: String,
     pub indent: usize,
-    pub known_weights: &'a HashMap<String, (usize, usize, Vec<usize>, i32)>,
-    pub int64_map: &'a HashMap<String, (Vec<i64>, Vec<usize>)>,
+    pub weights: &'a Weights,
     #[allow(dead_code)]
     pub allocator: Option<&'a Allocator>,
     #[allow(dead_code)]
     pub analysis: Option<&'a AnalysisData>,
     pub current_id: &'a mut usize,
     pub compiler: &'a Compiler,
-    pub var_types: &'a HashMap<String, String>,
+    pub var_types: &'a VarTypes,
 }
 
 impl<'a> OpContext<'a> {
@@ -34,34 +34,92 @@ impl<'a> OpContext<'a> {
     pub fn ir(&self) -> &'a Node {
         self.graph.node(self.id)
     }
+
+    /// The weight input `i` reads, if it reads one.
+    pub fn weight(&self, i: usize) -> Option<&'a WeightRef> {
+        self.weights.get(self.node.input.get(i)?)
+    }
+
+    /// The element type input `i` is held in, whether it is a variable or a
+    /// weight.
+    pub fn input_type(&self, i: usize) -> ElemType {
+        self.node.input.get(i).map_or(ElemType::F32, |name| {
+            self.var_types.get(&sanitize_name(name))
+        })
+    }
+
+    /// The values of input `i`, if it is an int64 or int32 weight.
+    pub fn ints(&self, i: usize) -> Option<&'a [i64]> {
+        self.weights.ints(self.node.input.get(i)?)
+    }
 }
 
-/// Expression reading a weight of ONNX type `data_type` from the weights
-/// file, as `target_type` (`"i64"`, or f32 otherwise).
-pub(crate) fn weight_expr(
-    offset: usize,
-    len: usize,
-    shape: &[usize],
-    data_type: i32,
-    target_type: &str,
-) -> String {
-    let accessor = if target_type == "i64" {
-        match data_type {
-            6 => "weight_i32_i64",
-            9 => "weight_bool_i64",
+/// Element type of the `TensorView` holding a value in generated code.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ElemType {
+    #[default]
+    F32,
+    I64,
+}
+
+impl ElemType {
+    /// The type holding tensors of ONNX type `t`, lele's kernel conventions
+    /// aside: int64, int32 and bool tensors are i64, everything else f32.
+    pub fn of(t: DType) -> Self {
+        match t {
+            DType::I64 | DType::I32 | DType::Bool => Self::I64,
+            _ => Self::F32,
+        }
+    }
+
+    /// The Rust element type.
+    pub fn rust(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::I64 => "i64",
+        }
+    }
+}
+
+impl std::fmt::Display for ElemType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.rust())
+    }
+}
+
+/// [`ElemType`] of each value by sanitized name, f32 for names it does not
+/// know.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct VarTypes(HashMap<String, ElemType>);
+
+impl VarTypes {
+    pub fn get(&self, name: &str) -> ElemType {
+        self.0.get(name).copied().unwrap_or_default()
+    }
+
+    pub fn is_i64(&self, name: &str) -> bool {
+        self.get(name) == ElemType::I64
+    }
+}
+
+/// Expression reading weight `w` from the weights file as `target`.
+pub(crate) fn weight_expr(w: &WeightRef, target: ElemType) -> String {
+    let accessor = match target {
+        ElemType::I64 => match w.dtype {
+            DType::I32 => "weight_i32_i64",
+            DType::Bool => "weight_bool_i64",
             _ => "weight_i64",
-        }
-    } else {
-        match data_type {
-            2 => "weight_u8",
-            3 => "weight_i8",
-            6 => "weight_i32_f32",
-            7 => "weight_i64_f32",
-            10 => "weight_f16",
+        },
+        ElemType::F32 => match w.dtype {
+            DType::U8 => "weight_u8",
+            DType::I8 => "weight_i8",
+            DType::I32 => "weight_i32_f32",
+            DType::I64 => "weight_i64_f32",
+            DType::F16 => "weight_f16",
             _ => "weight_f32",
-        }
+        },
     };
-    format!("self.{accessor}({offset}, {len}, &{shape:?})")
+    format!("self.{accessor}({}, {}, &{:?})", w.offset, w.len, w.shape)
 }
 
 pub(crate) fn collect_recursive_metrics(
@@ -101,30 +159,20 @@ pub(crate) fn collect_recursive_metrics(
     }
 }
 
-/// Element type of the `TensorView` holding each value, by sanitized name,
-/// for `g` and its subgraphs: `"i64"` or `"f32"`. Expects
+/// [`ElemType`] of every value of `g` and its subgraphs. Expects
 /// [`infer_dtypes`](super::passes::infer_dtypes) to have run.
 ///
-/// int64, int32 and bool tensors are `"i64"`, everything else `"f32"`, with
-/// the exceptions of lele's kernels: 8-bit quantized data is held in f32,
-/// and so are the int32 results of `MatMulInteger` and `ConvInteger`, the
-/// indices `TopK` returns and the result of `Mod`. An operator whose output takes the type of
-/// an input takes its representation too, so these propagate.
-pub(crate) fn variable_types(g: &crate::compiler::ir::Graph) -> HashMap<String, String> {
-    use crate::compiler::ir::{DType, Graph, Op, ValueId};
+/// Values take [`ElemType::of`] their ONNX type, with the exceptions of
+/// lele's kernels: 8-bit quantized data is held in f32, and so are the int32
+/// results of `MatMulInteger` and `ConvInteger`, the indices `TopK` returns
+/// and the result of `Mod`. An operator whose output takes the type of an
+/// input takes its element type too, so these propagate.
+pub(crate) fn variable_types(g: &Graph) -> VarTypes {
+    use crate::compiler::ir::ValueId;
     use crate::compiler::passes::follows_input;
 
-    let of_dtype = |t: DType| match t {
-        DType::I64 | DType::I32 | DType::Bool => "i64",
-        _ => "f32",
-    };
-    fn walk(
-        g: &Graph,
-        outer: &HashMap<String, &'static str>,
-        of_dtype: &dyn Fn(DType) -> &'static str,
-        out: &mut HashMap<String, String>,
-    ) {
-        let mut repr: HashMap<ValueId, &'static str> = HashMap::new();
+    fn walk(g: &Graph, outer: &HashMap<String, ElemType>, out: &mut HashMap<String, ElemType>) {
+        let mut repr: HashMap<ValueId, ElemType> = HashMap::new();
         let captures: HashSet<ValueId> = g.captures().collect();
         for v in g.value_ids() {
             let value = g.value(v);
@@ -133,13 +181,13 @@ pub(crate) fn variable_types(g: &crate::compiler::ir::Graph) -> HashMap<String, 
                     .get(&value.name)
                     .filter(|_| captures.contains(&v))
                     .copied()
-                    .unwrap_or_else(|| of_dtype(value.dtype));
+                    .unwrap_or_else(|| ElemType::of(value.dtype));
                 repr.insert(v, r);
             }
         }
         for (_, node) in g.nodes() {
             let subgraphs = node.op.subgraphs();
-            let mut sub_reprs: Vec<HashMap<String, String>> = Vec::new();
+            let mut sub_reprs: Vec<HashMap<String, ElemType>> = Vec::new();
             if !subgraphs.is_empty() {
                 let mut scope = outer.clone();
                 for (&v, &r) in &repr {
@@ -147,54 +195,51 @@ pub(crate) fn variable_types(g: &crate::compiler::ir::Graph) -> HashMap<String, 
                 }
                 for sub in &subgraphs {
                     let mut sub_out = HashMap::new();
-                    walk(sub, &scope, of_dtype, &mut sub_out);
+                    walk(sub, &scope, &mut sub_out);
                     sub_reprs.push(sub_out.clone());
                     out.extend(sub_out);
                 }
             }
             for (i, v) in node.outputs().iter().enumerate() {
                 let Some(v) = *v else { continue };
-                let f32_kernel = match &node.op {
-                    Op::Onnx { op_type, .. } => {
-                        matches!(
-                            op_type.as_str(),
-                            "MatMulInteger" | "ConvInteger" | "TopK" | "Mod"
-                        )
-                    }
-                    _ => false,
-                };
+                let f32_kernel = matches!(
+                    node.op,
+                    Op::Binary(Binary::Mod)
+                        | Op::ConvInteger(_)
+                        | Op::MatMulInteger
+                        | Op::TopK { .. }
+                );
                 // If and Loop take the representation of their subgraphs'
                 // outputs.
-                let from_subgraph = |sub: &Graph, j: usize, reprs: &HashMap<String, String>| {
+                let from_subgraph = |sub: &Graph, j: usize, reprs: &HashMap<String, ElemType>| {
                     sub.outputs
                         .get(j)
                         .and_then(|&o| reprs.get(&sanitize_name(&sub.value(o).name)))
-                        .map(|r| if r == "i64" { "i64" } else { "f32" })
+                        .copied()
                 };
+                let of_dtype = || ElemType::of(g.value(v).dtype);
                 let r = if f32_kernel {
-                    "f32"
+                    ElemType::F32
                 } else if let Op::If { then_branch, .. } = &node.op {
-                    from_subgraph(then_branch, i, &sub_reprs[0])
-                        .unwrap_or_else(|| of_dtype(g.value(v).dtype))
+                    from_subgraph(then_branch, i, &sub_reprs[0]).unwrap_or_else(of_dtype)
                 } else if let Op::Loop { body } = &node.op {
-                    from_subgraph(body, i + 1, &sub_reprs[0])
-                        .unwrap_or_else(|| of_dtype(g.value(v).dtype))
+                    from_subgraph(body, i + 1, &sub_reprs[0]).unwrap_or_else(of_dtype)
                 } else {
                     match follows_input(&node.op, i).and_then(|k| node.input(k)) {
                         Some(input) => repr[&input],
-                        None => of_dtype(g.value(v).dtype),
+                        None => of_dtype(),
                     }
                 };
                 repr.insert(v, r);
             }
         }
         for (v, r) in repr {
-            out.insert(sanitize_name(&g.value(v).name), r.to_string());
+            out.insert(sanitize_name(&g.value(v).name), r);
         }
     }
     let mut types = HashMap::new();
-    walk(g, &HashMap::new(), &of_dtype, &mut types);
-    types
+    walk(g, &HashMap::new(), &mut types);
+    VarTypes(types)
 }
 
 /// A run of nodes of one IR graph to generate code for, in execution order:
@@ -233,15 +278,14 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
     chunk_writer: &mut Vec<String>, // Function definitions
     body_writer: &mut W,            // Forward body calls
     indent: usize,
-    known_weights: &HashMap<String, (usize, usize, Vec<usize>, i32)>,
-    int64_map: &HashMap<String, (Vec<i64>, Vec<usize>)>,
+    weights: &Weights,
     allocator: Option<&Allocator>,
     analysis: Option<&AnalysisData>,
     current_id: &mut usize,
     compiler: &Compiler,
     graph_inputs: &[ValueInfoProto],
     graph_outputs: &[ValueInfoProto],
-    var_types: &HashMap<String, String>,
+    var_types: &VarTypes,
 ) -> std::io::Result<()> {
     let chunk_size = 500;
     let total_nodes = nodes.len();
@@ -269,13 +313,7 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
         }
         for inp in &used_raw {
             let name = sanitize_name(inp);
-            if name.is_empty() {
-                continue;
-            }
-            if known_weights.contains_key(&name) {
-                continue;
-            }
-            if int64_map.contains_key(inp) {
+            if name.is_empty() || weights.contains(inp) {
                 continue;
             }
             if !defined_sanitized_chunk.contains(&name) {
@@ -301,11 +339,7 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
         if let Some(an) = analysis {
             for raw in potent_live {
                 let sanitized = sanitize_name(&raw);
-                // Filter weights
-                if known_weights.contains_key(&sanitized) {
-                    continue;
-                }
-                if int64_map.contains_key(&raw) {
+                if weights.contains(&raw) {
                     continue;
                 }
                 // If defined in this chunk OR is an input arg
@@ -327,17 +361,11 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
         let mut f = Vec::new();
         let args_sig: Vec<String> = chunk_inputs
             .iter()
-            .map(|n| {
-                let ty = var_types.get(n).map(|s| s.as_str()).unwrap_or("f32");
-                format!("{}: TensorView<'w, {}>", n, ty)
-            })
+            .map(|n| format!("{}: TensorView<'w, {}>", n, var_types.get(n)))
             .collect();
         let ret_sig: Vec<String> = chunk_outputs
             .iter()
-            .map(|n| {
-                let ty = var_types.get(n).map(|s| s.as_str()).unwrap_or("f32");
-                format!("TensorView<'static, {}>", ty)
-            })
+            .map(|n| format!("TensorView<'static, {}>", var_types.get(n)))
             .collect();
         let ret_type = if ret_sig.len() == 1 {
             ret_sig[0].clone()
@@ -355,16 +383,7 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
         )?;
         // Generate body
         generate_nodes(
-            chunk,
-            &mut f,
-            2,
-            known_weights,
-            int64_map,
-            allocator,
-            analysis,
-            current_id,
-            compiler,
-            var_types,
+            chunk, &mut f, 2, weights, allocator, analysis, current_id, compiler, var_types,
         )?;
         // Return — detach_or_own (zero-copy) for f32 views of the workspace or the weights,
         // which outlive the chunk; to_owned for everything else, i64 and views of buffers
@@ -373,8 +392,7 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
         let ret_vals: Vec<String> = chunk_outputs
             .iter()
             .map(|s| {
-                let ty = var_types.get(s).map(|t| t.as_str()).unwrap_or("f32");
-                if ty == "f32" && outlives_chunk(&body, s, 0) {
+                if var_types.get(s) == ElemType::F32 && outlives_chunk(&body, s, 0) {
                     format!("unsafe {{ {}.detach_or_own() }}", s)
                 } else {
                     format!("{}.to_owned()", s)
@@ -485,13 +503,12 @@ pub(crate) fn generate_nodes(
     ir_nodes: Nodes<'_>,
     w: &mut dyn Write,
     indent: usize,
-    known_weights: &HashMap<String, (usize, usize, Vec<usize>, i32)>,
-    int64_map: &HashMap<String, (Vec<i64>, Vec<usize>)>,
+    weights: &Weights,
     allocator: Option<&Allocator>,
     analysis: Option<&AnalysisData>,
     current_id: &mut usize,
     compiler: &Compiler,
-    var_types: &HashMap<String, String>,
+    var_types: &VarTypes,
 ) -> std::io::Result<()> {
     let tab = "    ".repeat(indent);
     let nodes = ir_nodes.protos;
@@ -502,7 +519,8 @@ pub(crate) fn generate_nodes(
         let remaining_nodes = &nodes[idx..];
         for pattern in &compiler.patterns {
             if let Some(len) = (pattern.matcher)(remaining_nodes) {
-                (pattern.generator)(remaining_nodes, known_weights, allocator, w, indent)?;
+                let table = weights.pattern_table();
+                (pattern.generator)(remaining_nodes, table, allocator, w, indent)?;
                 matched_len = len;
                 break;
             }
@@ -519,53 +537,34 @@ pub(crate) fn generate_nodes(
         idx += 1;
         *current_id += 1;
         let op = node.op_type.as_str();
+        let ir_op = &ir_nodes.graph.node(id).op;
         let outputs: Vec<String> = node.output.iter().map(|s| sanitize_name(s)).collect();
         // Skip Code Generation for Constants that are already in weights
-        if op == "Constant" && !outputs.is_empty() && known_weights.contains_key(&outputs[0]) {
+        if matches!(ir_op, Op::Constant { .. })
+            && !outputs.is_empty()
+            && weights.get(&node.output[0]).is_some()
+        {
             continue;
         }
         // Check if Div/Mod output is i64 (e.g. integer division for shape computation)
-        let div_mod_output_is_i64 = if matches!(op, "Div" | "Mod") {
-            outputs
-                .first()
-                .and_then(|out| var_types.get(out))
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-        } else {
-            false
-        };
+        let div_or_mod = matches!(ir_op, Op::Binary(Binary::Div | Binary::Mod));
+        let div_mod_output_is_i64 =
+            div_or_mod && outputs.first().is_some_and(|o| var_types.is_i64(o));
         let inputs: Vec<String> = node
             .input
             .iter()
             .map(|s| {
                 let name = sanitize_name(s);
-                if let Some((offset, len, shape, data_type)) = known_weights.get(&name) {
+                if let Some(weight) = weights.get(s) {
                     // For Div/Mod: only force f32 when output is NOT i64.
                     // When output is i64 (integer division), keep i64 types.
-                    let force_f32 = matches!(op, "Div" | "Mod") && !div_mod_output_is_i64;
-                    let target_type = if force_f32 {
-                        "f32"
+                    let force_f32 = div_or_mod && !div_mod_output_is_i64;
+                    let target = if force_f32 {
+                        ElemType::F32
                     } else {
-                        var_types.get(&name).map(|s| s.as_str()).unwrap_or("f32")
+                        var_types.get(&name)
                     };
-                    if target_type == "i64" {
-                        match data_type {
-                            7 => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape),
-                            6 => format!("self.weight_i32_i64({}, {}, &{:?})", offset, len, shape),
-                            9 => format!("self.weight_bool_i64({}, {}, &{:?})", offset, len, shape),
-                            _ => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape), // fallback
-                        }
-                    } else {
-                        match data_type {
-                            1 => format!("self.weight_f32({}, {}, &{:?})", offset, len, shape),
-                            2 => format!("self.weight_u8({}, {}, &{:?})", offset, len, shape),
-                            3 => format!("self.weight_i8({}, {}, &{:?})", offset, len, shape),
-                            6 => format!("self.weight_i32_f32({}, {}, &{:?})", offset, len, shape),
-                            7 => format!("self.weight_i64_f32({}, {}, &{:?})", offset, len, shape),
-                            10 => format!("self.weight_f16({}, {}, &{:?})", offset, len, shape),
-                            _ => format!("self.weight_f32({}, {}, &{:?})", offset, len, shape),
-                        }
-                    }
+                    weight_expr(weight, target)
                 } else {
                     name
                 }
@@ -573,7 +572,7 @@ pub(crate) fn generate_nodes(
             .collect();
         // Unused check
         let is_unused = if let Some(an) = analysis {
-            if op == "If" || op == "Loop" {
+            if matches!(ir_op, Op::If { .. } | Op::Loop { .. }) {
                 false
             }
             // Conservative for control flow
@@ -596,16 +595,8 @@ pub(crate) fn generate_nodes(
         }
         // For Div and Mod operations, force f32 type for output ONLY when output is not i64.
         // When output is i64 (integer division for shape computation), keep i64.
-        let force_f32 = matches!(op, "Div" | "Mod") && !div_mod_output_is_i64;
-        let is_i64 = if force_f32 {
-            false
-        } else {
-            outputs
-                .first()
-                .and_then(|out| var_types.get(out))
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-        };
+        let force_f32 = div_or_mod && !div_mod_output_is_i64;
+        let is_i64 = !force_f32 && outputs.first().is_some_and(|o| var_types.is_i64(o));
         let buf_expr = if let Some(alloc) = allocator {
             if !node.output.is_empty() {
                 if let Some(&idx) = alloc.tensor_to_buffer.get(&node.output[0]) {
@@ -638,7 +629,10 @@ pub(crate) fn generate_nodes(
             // Built-in handlers might not need Vec<f32> if they don't use buf_expr,
             // but we'll generate it by default if expected.
             // Some ops like Split/LSTM manage their own buffers.
-            if op != "DynamicQuantizeLinear" && op != "LSTM" && op != "Split" {
+            if !matches!(
+                ir_op,
+                Op::DynamicQuantizeLinear | Op::Lstm | Op::Split { .. }
+            ) {
                 writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[0])?;
             }
         }
@@ -650,8 +644,7 @@ pub(crate) fn generate_nodes(
             outputs: outputs.clone(),
             buf_expr,
             indent,
-            known_weights,
-            int64_map,
+            weights,
             allocator,
             analysis,
             current_id,
@@ -691,7 +684,6 @@ mod tests {
     use super::*;
     use crate::compiler::Compiler;
     use crate::model::onnx_proto::NodeProto;
-    use std::collections::HashMap;
 
     /// SenseVoice's attention mask came out of a cast into a chunk-local buffer and was
     /// returned as a borrowed view of it: every later chunk read freed memory.
@@ -734,9 +726,9 @@ mod tests {
     /// Code generated for `node` alone.
     fn generate_one(
         node: &NodeProto,
-        known_weights: &HashMap<String, (usize, usize, Vec<usize>, i32)>,
+        weights: &Weights,
         compiler: &Compiler,
-        var_types: &HashMap<String, String>,
+        var_types: &VarTypes,
     ) -> String {
         let g = Graph::from_onnx(crate::model::onnx_proto::GraphProto {
             node: vec![node.clone()],
@@ -754,8 +746,7 @@ mod tests {
             nodes,
             &mut output,
             0,
-            known_weights,
-            &HashMap::new(),
+            weights,
             None,
             None,
             &mut 0,
@@ -786,7 +777,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = generate_one(&node, &HashMap::new(), &compiler, &HashMap::new());
+        let result = generate_one(&node, &Weights::default(), &compiler, &VarTypes::default());
         assert!(result.contains("// Custom implementation for output1"));
         assert!(result.contains("let output1 = custom_kernel(&input1);"));
     }
@@ -806,7 +797,7 @@ mod tests {
         let div = node("Div", &["indices", "classes"], &["anchor"]);
         let int64 = |name: &str, v: i64| crate::model::onnx_proto::TensorProto {
             name: name.to_string(),
-            data_type: 7,
+            data_type: DType::I64.to_onnx(),
             int64_data: vec![v],
             ..Default::default()
         };
@@ -818,16 +809,14 @@ mod tests {
         let mut ir = crate::compiler::ir::Graph::from_onnx(graph);
         crate::compiler::passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);
-        let mut known_weights = HashMap::new();
-        known_weights.insert("k".to_string(), (0, 8, vec![1], 7));
-        known_weights.insert("classes".to_string(), (8, 8, vec![], 7));
-        assert_eq!(var_types["indices"], "f32");
-        assert_eq!(var_types["anchor"], "f32");
+        let weights = Weights::collect(&ir);
+        assert_eq!(var_types.get("indices"), ElemType::F32);
+        assert_eq!(var_types.get("anchor"), ElemType::F32);
 
-        let result = generate_one(&div, &known_weights, &Compiler::new(), &var_types);
+        let result = generate_one(&div, &weights, &Compiler::new(), &var_types);
         assert!(
             result.contains(
-                "let anchor = lele::kernels::div_trunc(&indices, &self.weight_i64_f32(8, 8, &[]), &mut buf_anchor);"
+                "let anchor = lele::kernels::div_trunc(&indices, &self.weight_i64_f32(16, 8, &[]), &mut buf_anchor);"
             ),
             "{result}"
         );
@@ -843,7 +832,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = generate_one(&node, &HashMap::new(), &compiler, &HashMap::new());
+        let result = generate_one(&node, &Weights::default(), &compiler, &VarTypes::default());
         assert!(result.contains("let mut buf_c = Vec::<f32>::new();"));
         assert!(result.contains("let c = lele::kernels::add(&a, &b, &mut buf_c);"));
     }
@@ -858,10 +847,10 @@ mod tests {
             name: name.to_string(),
             ..Default::default()
         };
-        let branch = |name: &str, data_type: i32, raw: Vec<u8>| GraphProto {
+        let branch = |name: &str, dtype: DType, raw: Vec<u8>| GraphProto {
             initializer: vec![TensorProto {
                 name: name.to_string(),
-                data_type,
+                data_type: dtype.to_onnx(),
                 dims: vec![2],
                 raw_data: raw,
                 ..Default::default()
@@ -879,14 +868,14 @@ mod tests {
                         name: "then_branch".to_string(),
                         g: Some(branch(
                             "w_f32",
-                            1,
+                            DType::F32,
                             [1.0f32, 2.0].map(f32::to_le_bytes).concat(),
                         )),
                         ..Default::default()
                     },
                     AttributeProto {
                         name: "else_branch".to_string(),
-                        g: Some(branch("w_i8", 3, vec![3, 4])),
+                        g: Some(branch("w_i8", DType::I8, vec![3, 4])),
                         ..Default::default()
                     },
                 ],

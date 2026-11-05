@@ -15,10 +15,13 @@ pub type OpHandler = Box<
     dyn Fn(&NodeProto, &[String], &[String], &str, &mut dyn Write, usize) -> std::io::Result<()>,
 >;
 pub type PatternMatcher = Box<dyn Fn(&[&NodeProto]) -> Option<usize>>;
+/// Weights by sanitized name, as `(byte offset, byte length, shape, ONNX data
+/// type)`.
+pub type WeightTable = HashMap<String, (usize, usize, Vec<usize>, i32)>;
 pub type PatternGenerator = Box<
     dyn Fn(
         &[&NodeProto],
-        &HashMap<String, (usize, usize, Vec<usize>, i32)>,
+        &WeightTable,
         Option<&Allocator>,
         &mut dyn Write,
         usize,
@@ -133,7 +136,7 @@ impl Compiler {
         M: Fn(&[&NodeProto]) -> Option<usize> + 'static,
         G: Fn(
                 &[&NodeProto],
-                &HashMap<String, (usize, usize, Vec<usize>, i32)>,
+                &WeightTable,
                 Option<&Allocator>,
                 &mut dyn Write,
                 usize,
@@ -180,6 +183,12 @@ impl Compiler {
         passes::fuse_qdq_matmul(&mut ir);
         if self.constant_folding {
             passes::fold_constants(&mut ir);
+            // Shape inference resolves the shape computations folding
+            // could not, which may leave more to fold.
+            passes::infer_dtypes(&mut ir);
+            passes::fold_shapes(&mut ir);
+            passes::fold_constants(&mut ir);
+            passes::eliminate_dead_code(&mut ir);
         }
         // Runs after folding so that only the activation pairs are left.
         passes::fuse_qdq(&mut ir);
@@ -192,13 +201,8 @@ impl Compiler {
         // Start from a previously compiled blob when weights are shared. The
         // shared bytes stay where they are; anything new is appended after them,
         // so the resulting file is a superset of the first model's weights.
-        let shared = self.shared_weights.borrow_mut().take();
-        let weights::Weights {
-            data: weights_data,
-            lookup: weight_lookup,
-            int64: int64_map,
-            by_content: content_hash_map,
-        } = weights::Weights::collect_shared(&ir, shared);
+        let weights =
+            weights::Weights::collect_shared(&ir, self.shared_weights.borrow_mut().take());
         let (graph_inputs, graph_outputs) = (ir.input_infos(), ir.output_infos());
         let (ids, protos) = lower_nodes(&ir);
         let protos: Vec<&NodeProto> = protos.iter().collect();
@@ -216,8 +220,7 @@ impl Compiler {
             &mut chunk_functions,
             &mut body_buffer,
             2,
-            &weight_lookup,
-            &int64_map,
+            &weights,
             Some(&allocator),
             Some(&analysis),
             &mut current_id,
@@ -318,25 +321,18 @@ impl Compiler {
             .iter()
             .map(|i| {
                 let name = sanitize_name(&i.name);
-                let ty = var_types.get(&name).map(|s| s.as_str()).unwrap_or("f32");
-                if ty == "f32" {
-                    format!("{}: TensorView<'a>", name)
-                } else {
-                    format!("{}: TensorView<'a, {}>", name, ty)
+                match var_types.get(&name) {
+                    ElemType::F32 => format!("{}: TensorView<'a>", name),
+                    ty => format!("{}: TensorView<'a, {}>", name, ty),
                 }
             })
             .collect();
         // Generate return type
         let ret_types: Vec<String> = graph_outputs
             .iter()
-            .map(|o| {
-                let name = sanitize_name(&o.name);
-                let ty = var_types.get(&name).map(|s| s.as_str()).unwrap_or("f32");
-                if ty == "f32" {
-                    "TensorView<'a>".to_string()
-                } else {
-                    format!("TensorView<'a, {}>", ty)
-                }
+            .map(|o| match var_types.get(&sanitize_name(&o.name)) {
+                ElemType::F32 => "TensorView<'a>".to_string(),
+                ty => format!("TensorView<'a, {}>", ty),
             })
             .collect();
         let ret_sig = if ret_types.len() == 1 {
@@ -396,9 +392,8 @@ impl Compiler {
             .iter()
             .map(|o| {
                 let name = sanitize_name(&o.name);
-                let target_type = var_types.get(&name).map(|s| s.as_str()).unwrap_or("f32");
-                if let Some((offset, len, shape, data_type)) = weight_lookup.get(&name) {
-                    weight_expr(*offset, *len, shape, *data_type, target_type)
+                if let Some(weight) = weights.get(&o.name) {
+                    weight_expr(weight, var_types.get(&name))
                 } else {
                     name
                 }
@@ -413,8 +408,8 @@ impl Compiler {
         writeln!(&mut code, "}}")?; // End impl
         Ok(CompilationResult {
             code: String::from_utf8(code).map_err(|e| format!("UTF-8 error: {}", e))?,
-            weights: weights_data,
-            content_hashes: content_hash_map,
+            weights: weights.data,
+            content_hashes: weights.by_content,
         })
     }
 }
@@ -491,11 +486,22 @@ mod codegen_smoke_tests {
             .compile(&relu_graph("w", f32_weight("w", &[8, 8], bytes.clone())))
             .expect("first model should compile");
 
-        // Same tensor under a different name, plus one genuinely new tensor.
+        // Same tensor under a different name, plus one genuinely new tensor
+        // that the graph reads (unused initializers are not written).
         let mut second_graph = relu_graph("w2", f32_weight("w2", &[8, 8], bytes.clone()));
         second_graph
             .initializer
-            .push(f32_weight("extra", &[4], vec![9, 9, 9, 9]));
+            .push(f32_weight("extra", &[8, 8], vec![9; 64]));
+        second_graph.node.push(NodeProto {
+            op_type: "Add".to_string(),
+            input: vec!["y".to_string(), "extra".to_string()],
+            output: vec!["z".to_string()],
+            ..Default::default()
+        });
+        second_graph.output = vec![crate::model::onnx_proto::ValueInfoProto {
+            name: "z".to_string(),
+            ..Default::default()
+        }];
 
         let second = Compiler::new()
             .with_name("SharedB")
@@ -561,7 +567,7 @@ mod conv_pattern_tests {
         };
         let init = |name: &str, dims: &[i64]| TensorProto {
             name: name.to_string(),
-            data_type: 1,
+            data_type: ir::DType::F32.to_onnx(),
             dims: dims.to_vec(),
             raw_data: vec![0u8; 4 * dims.iter().product::<i64>() as usize],
             ..Default::default()

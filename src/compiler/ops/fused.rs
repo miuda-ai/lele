@@ -1,10 +1,8 @@
 //! Code generation for the operators the fusion passes create.
 
 use super::super::{
-    generate::OpContext,
-    generate::weight_expr,
-    ir::{Activation, ConvAttrs, Op},
-    sanitize_name,
+    generate::{ElemType, OpContext, weight_expr},
+    ir::{Activation, ConvAttrs, DType, Op},
 };
 use std::io::Write;
 
@@ -21,10 +19,9 @@ impl ConvAttrs {
     }
 }
 
-pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<bool> {
+pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<()> {
     let tab = ctx.tab();
     let (inputs, outputs, buf) = (&ctx.inputs, &ctx.outputs, &ctx.buf_expr);
-    let node = ctx.node;
     match &ctx.ir().op {
         Op::Silu => writeln!(
             w,
@@ -50,9 +47,8 @@ pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         )?,
         Op::ConvAct { conv, act } => {
             let weight_shape = ctx
-                .known_weights
-                .get(&sanitize_name(&node.input[1]))
-                .map(|(_, _, shape, _)| shape.clone())
+                .weight(1)
+                .map(|weight| weight.shape.clone())
                 .unwrap_or(vec![3, 3, 3, 3]);
             let bias = match ctx.ir().input(2) {
                 Some(_) => format!("Some(&{})", inputs[2]),
@@ -74,7 +70,7 @@ pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
                     ints(&conv.pads, &[0, 0, 0, 0]),
                     ints(&conv.strides, &[1, 1]),
                 )?;
-                return Ok(true);
+                return Ok(());
             }
             let strides = ConvAttrs::per_axis(&conv.strides);
             let dilations = ConvAttrs::per_axis(&conv.dilations);
@@ -116,15 +112,19 @@ pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         Op::QLinearDynamic { relu } => {
             let (x, scale, zero_point, bias) = (&inputs[0], &inputs[2], &inputs[3], &inputs[4]);
             // A static weight is packed once for the integer GEMM.
-            match ctx.known_weights.get(&sanitize_name(&node.input[1])) {
-                Some((offset, len, shape, dt)) if (*dt == 2 || *dt == 3) && shape.len() == 2 => {
+            match ctx.weight(1) {
+                Some(weight)
+                    if matches!(weight.dtype, DType::U8 | DType::I8) && weight.shape.len() == 2 =>
+                {
                     writeln!(
                         w,
-                        "{tab}let {} = self.linear_quantized_packed(&{x}, {offset}, {len}, {}, {}, {}, {scale}, {zero_point}, {bias}, {relu}, {buf});",
+                        "{tab}let {} = self.linear_quantized_packed(&{x}, {}, {}, {}, {}, {}, {scale}, {zero_point}, {bias}, {relu}, {buf});",
                         outputs[0],
-                        shape[0],
-                        shape[1],
-                        *dt == 3,
+                        weight.offset,
+                        weight.len,
+                        weight.shape[0],
+                        weight.shape[1],
+                        weight.dtype == DType::I8,
                     )?
                 }
                 _ => {
@@ -143,8 +143,7 @@ pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         }
         Op::EmbeddingConcat { value } => {
             let int_value = value.as_ref().and_then(|t| {
-                let int = t.data_type == 6
-                    || t.data_type == 7
+                let int = matches!(DType::from_onnx(t.data_type), DType::I32 | DType::I64)
                     || !t.int64_data.is_empty()
                     || !t.int32_data.is_empty();
                 int.then(|| {
@@ -156,20 +155,17 @@ pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
                 })
             });
             // Weights are read as the type of the fill value.
-            let operand = |i: usize, ty: &str| {
-                let name = sanitize_name(&node.input[i]);
-                match ctx.known_weights.get(&name) {
-                    Some((offset, len, shape, dt)) => weight_expr(*offset, *len, shape, *dt, ty),
-                    None => name,
-                }
+            let operand = |i: usize, ty: ElemType| match ctx.weight(i) {
+                Some(weight) => weight_expr(weight, ty),
+                None => inputs[i].clone(),
             };
-            let shape = operand(0, "i64");
+            let shape = operand(0, ElemType::I64);
             match int_value {
                 Some(v) => writeln!(
                     w,
                     "{tab}let {} = self.embedding_concat_i64(&{shape}, {v}, {}, {buf});",
                     outputs[0],
-                    operand(1, "i64"),
+                    operand(1, ElemType::I64),
                 )?,
                 None => {
                     let v = value
@@ -181,12 +177,12 @@ pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
                         w,
                         "{tab}let {} = self.embedding_concat(&{shape}, {v:?}, {}, {buf});",
                         outputs[0],
-                        operand(1, "f32"),
+                        operand(1, ElemType::F32),
                     )?;
                 }
             }
         }
-        _ => return Ok(false),
+        op => unreachable!("{} is not a fused operator", op.op_type()),
     }
-    Ok(true)
+    Ok(())
 }

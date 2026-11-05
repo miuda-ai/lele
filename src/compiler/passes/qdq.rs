@@ -230,7 +230,7 @@ mod tests {
                         "QuantizeLinear",
                         &["x", "s", "z"],
                         "q",
-                        &[("output_dtype", 2)],
+                        &[("output_dtype", DType::U8.to_onnx() as i64)],
                     ),
                     node("DequantizeLinear", &["q", "s", "z"], "y", &[]),
                 ]),
@@ -353,10 +353,10 @@ mod tests {
     mod qlinear_matmul {
         use super::*;
 
-        fn init(name: &str, data_type: i32, dims: &[i64], raw: Vec<u8>) -> TensorProto {
+        fn init(name: &str, dtype: DType, dims: &[i64], raw: Vec<u8>) -> TensorProto {
             TensorProto {
                 name: name.to_string(),
-                data_type,
+                data_type: dtype.to_onnx(),
                 dims: dims.to_vec(),
                 raw_data: raw,
                 ..Default::default()
@@ -367,11 +367,11 @@ mod tests {
         /// point: the shapes `fuse_qdq_matmul` is meant to accept.
         fn initializers() -> Vec<TensorProto> {
             vec![
-                init("w", 3, &[4, 2], vec![1u8; 8]),
-                init("w_scale", 1, &[2], vec![0u8; 8]),
-                init("w_zp", 3, &[2], vec![0u8; 2]),
-                init("a_scale", 1, &[], vec![0u8; 4]),
-                init("a_zp", 2, &[], vec![7u8]),
+                init("w", DType::I8, &[4, 2], vec![1u8; 8]),
+                init("w_scale", DType::F32, &[2], vec![0u8; 8]),
+                init("w_zp", DType::I8, &[2], vec![0u8; 2]),
+                init("a_scale", DType::F32, &[], vec![0u8; 4]),
+                init("a_zp", DType::U8, &[], vec![7u8]),
             ]
         }
 
@@ -429,7 +429,7 @@ mod tests {
         #[test]
         fn keeps_matmul_when_weight_is_uint8() {
             let mut g = graph(nodes());
-            initializer(&mut g, "w").data_type = 2;
+            initializer(&mut g, "w").data_type = DType::U8.to_onnx();
             let g = run(g, fuse_qdq_matmul);
             assert_eq!(op_types(&g).last(), Some(&"MatMul"));
         }
@@ -487,7 +487,7 @@ mod tests {
             // The integer kernel multiplies unsigned activations by signed
             // weights.
             let mut g = graph(nodes());
-            initializer(&mut g, "a_zp").data_type = 3;
+            initializer(&mut g, "a_zp").data_type = DType::I8.to_onnx();
             let g = run(g, fuse_qdq_matmul);
             assert_eq!(op_types(&g).last(), Some(&"MatMul"));
         }

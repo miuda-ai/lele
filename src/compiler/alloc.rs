@@ -58,19 +58,20 @@ impl Schedule {
                         }
                     }
                 }
-                Op::Loop { .. } => {}
-                op => {
-                    // Zero-copy views.
-                    if matches!(
-                        op.op_type(),
-                        "Squeeze" | "Unsqueeze" | "Reshape" | "Identity" | "Flatten" | "Cast"
-                    ) && !inputs.is_empty()
-                        && !outputs.is_empty()
-                    {
-                        self.aliases
-                            .insert(outputs[0].clone(), vec![inputs[0].clone()]);
-                    }
+                // Zero-copy views.
+                Op::Squeeze { .. }
+                | Op::Unsqueeze { .. }
+                | Op::Reshape
+                | Op::ReshapeTo { .. }
+                | Op::Identity
+                | Op::Flatten { .. }
+                | Op::Cast { .. }
+                    if !inputs.is_empty() && !outputs.is_empty() =>
+                {
+                    self.aliases
+                        .insert(outputs[0].clone(), vec![inputs[0].clone()]);
                 }
+                _ => {}
             }
             self.steps.push(Step { inputs, outputs });
             for sub in node.op.subgraphs() {

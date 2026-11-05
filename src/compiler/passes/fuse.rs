@@ -5,7 +5,7 @@
 //! back. Every intermediate tensor must be read by the chain alone, so
 //! removing the chain cannot leave another reader without its input.
 
-use crate::compiler::ir::{Activation, Graph, Node, NodeId, Op, ValueId};
+use crate::compiler::ir::{Activation, Binary, Graph, NodeId, Op, Reduction, Unary, ValueId};
 use crate::model::onnx_proto::NodeProto;
 use crate::model::tensor_to_array;
 
@@ -26,18 +26,32 @@ pub(crate) fn fuse(g: &mut Graph) {
     }
 }
 
-/// Whether `node` runs the ONNX or lele operator `op_type`.
-fn is_op(node: &Node, op_type: &str) -> bool {
-    node.op.op_type() == op_type
-        && !matches!(&node.op, Op::Onnx { domain, .. } if !domain.is_empty() && domain != "ai.onnx")
+/// Matches a `binary` node.
+fn binary(binary: Binary) -> impl Fn(&Op) -> bool {
+    move |op| matches!(op, Op::Binary(b) if *b == binary)
 }
 
-/// The node producing `v` if it is a `op_type` node whose only reader is
-/// the chain being fused.
-fn sole_producer(g: &Graph, v: Option<ValueId>, op_type: &str) -> Option<NodeId> {
+/// Matches a `unary` node.
+fn unary(unary: Unary) -> impl Fn(&Op) -> bool {
+    move |op| matches!(op, Op::Unary(u) if *u == unary)
+}
+
+fn reduce_mean(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Reduce {
+            reduction: Reduction::Mean,
+            ..
+        }
+    )
+}
+
+/// The node producing `v` if `is_match` accepts its operator and its only
+/// reader is the chain being fused.
+fn sole_producer(g: &Graph, v: Option<ValueId>, is_match: impl Fn(&Op) -> bool) -> Option<NodeId> {
     let v = v?;
     let id = g.value(v).producer()?;
-    (is_op(g.node(id), op_type) && g.uses(v) == 1).then_some(id)
+    (is_match(&g.node(id).op) && g.uses(v) == 1).then_some(id)
 }
 
 /// The values of a compile-time constant: an initializer or a `Constant`.
@@ -68,11 +82,12 @@ fn other_operand(g: &Graph, id: NodeId, v: ValueId) -> Option<Option<ValueId>> {
     }
 }
 
-/// Binary nodes of `op_type` whose operands are tried in both orders. A
-/// fusion removes nodes, so callers skip those no longer in the graph.
-fn binary_nodes(g: &Graph, op_type: &str) -> Vec<NodeId> {
+/// The `op` nodes, whose operands callers try in both orders. A fusion
+/// removes nodes, so callers skip those no longer in the graph.
+fn binary_nodes(g: &Graph, op: Binary) -> Vec<NodeId> {
+    let is_op = binary(op);
     g.nodes()
-        .filter(|(_, n)| is_op(n, op_type) && n.inputs().len() == 2)
+        .filter(|(_, n)| is_op(&n.op) && n.inputs().len() == 2)
         .map(|(id, _)| id)
         .collect()
 }
@@ -90,41 +105,43 @@ fn named_after(g: &Graph, id: NodeId) -> NodeProto {
 fn fuse_layer_norm(g: &mut Graph) {
     let reduces_last_axis = |g: &Graph, id: NodeId| {
         let node = g.node(id);
-        let attr = |name: &str| node.proto.attribute.iter().find(|a| a.name == name);
-        let axes = match attr("axes") {
-            Some(a) => Some(a.ints.iter().map(|&x| x as f32).collect()),
+        let Op::Reduce { axes, keepdims, .. } = &node.op else {
+            return false;
+        };
+        let axes = match axes {
+            Some(axes) => Some(axes.iter().map(|&x| x as f32).collect()),
             None => constant(g, node.input(1)),
         };
-        axes.as_deref() == Some(&[-1.0]) && attr("keepdims").is_none_or(|a| a.i == 1)
+        axes.as_deref() == Some(&[-1.0]) && *keepdims
     };
-    for add in binary_nodes(g, "Add") {
+    for add in binary_nodes(g, Binary::Add) {
         if !g.contains(add) {
             continue;
         }
         let fused = (0..2).find_map(|k| {
             let node = g.node(add);
             let (scaled, bias) = (node.input(k)?, node.input(1 - k));
-            let mul = sole_producer(g, Some(scaled), "Mul")?;
+            let mul = sole_producer(g, Some(scaled), binary(Binary::Mul))?;
             let normed = g.node(mul).input(0)?;
             let scale = g.node(mul).input(1);
-            let div = sole_producer(g, Some(normed), "Div")?;
+            let div = sole_producer(g, Some(normed), binary(Binary::Div))?;
             let (centered, std) = (g.node(div).input(0)?, g.node(div).input(1));
-            let sqrt = sole_producer(g, std, "Sqrt")?;
-            let add_eps = sole_producer(g, g.node(sqrt).input(0), "Add")?;
+            let sqrt = sole_producer(g, std, unary(Unary::Sqrt))?;
+            let add_eps = sole_producer(g, g.node(sqrt).input(0), binary(Binary::Add))?;
             let (var, eps) = (g.node(add_eps).input(0), g.node(add_eps).input(1));
             let epsilon = constant(g, eps).filter(|e| e.len() == 1)?[0];
-            let var_mean = sole_producer(g, var, "ReduceMean")?;
-            let pow = sole_producer(g, g.node(var_mean).input(0), "Pow")?;
+            let var_mean = sole_producer(g, var, reduce_mean)?;
+            let pow = sole_producer(g, g.node(var_mean).input(0), binary(Binary::Pow))?;
             if g.node(pow).input(0) != Some(centered) || !is_scalar(g, g.node(pow).input(1), 2.0) {
                 return None;
             }
             // Read by the Pow and the Div.
             let sub = g.value(centered).producer()?;
-            if !is_op(g.node(sub), "Sub") || g.uses(centered) != 2 {
+            if !binary(Binary::Sub)(&g.node(sub).op) || g.uses(centered) != 2 {
                 return None;
             }
             let x = g.node(sub).input(0)?;
-            let mean = sole_producer(g, g.node(sub).input(1), "ReduceMean")?;
+            let mean = sole_producer(g, g.node(sub).input(1), reduce_mean)?;
             if g.node(mean).input(0) != Some(x)
                 || !reduces_last_axis(g, mean)
                 || !reduces_last_axis(g, var_mean)
@@ -145,24 +162,24 @@ fn fuse_layer_norm(g: &mut Graph) {
 /// `x * 0.5 * (1 + erf(x / sqrt(2)))`, with the 0.5 applied first or last
 /// → `Gelu`.
 fn fuse_gelu(g: &mut Graph) {
-    for mul2 in binary_nodes(g, "Mul") {
+    for mul2 in binary_nodes(g, Binary::Mul) {
         if !g.contains(mul2) {
             continue;
         }
         let fused = (0..2).find_map(|k| {
             let node = g.node(mul2);
             let (inner, outer) = (node.input(k), node.input(1 - k));
-            let mul1 = sole_producer(g, inner, "Mul")?;
+            let mul1 = sole_producer(g, inner, binary(Binary::Mul))?;
             // One Mul takes `1 + erf`, the other two operands are `x` and 0.5.
             let (add, rest) = (0..2).find_map(|j| {
-                let add = sole_producer(g, g.node(mul1).input(j), "Add")?;
+                let add = sole_producer(g, g.node(mul1).input(j), binary(Binary::Add))?;
                 Some((add, g.node(mul1).input(1 - j)))
             })?;
             let (erf, one) = (0..2).find_map(|j| {
-                let erf = sole_producer(g, g.node(add).input(j), "Erf")?;
+                let erf = sole_producer(g, g.node(add).input(j), unary(Unary::Erf))?;
                 Some((erf, g.node(add).input(1 - j)))
             })?;
-            let div = sole_producer(g, g.node(erf).input(0), "Div")?;
+            let div = sole_producer(g, g.node(erf).input(0), binary(Binary::Div))?;
             let x = g.node(div).input(0)?;
             let half_ok = (rest == Some(x) && is_scalar(g, outer, 0.5))
                 || (outer == Some(x) && is_scalar(g, rest, 0.5));
@@ -184,13 +201,13 @@ fn fuse_gelu(g: &mut Graph) {
 
 /// `x * sigmoid(x)` → `Silu`.
 fn fuse_silu(g: &mut Graph) {
-    for mul in binary_nodes(g, "Mul") {
+    for mul in binary_nodes(g, Binary::Mul) {
         if !g.contains(mul) {
             continue;
         }
         let fused = (0..2).find_map(|k| {
             let node = g.node(mul);
-            let sigmoid = sole_producer(g, node.input(k), "Sigmoid")?;
+            let sigmoid = sole_producer(g, node.input(k), unary(Unary::Sigmoid))?;
             let x = g.node(sigmoid).input(0)?;
             (node.input(1 - k) == Some(x)).then_some((sigmoid, x))
         });
@@ -204,14 +221,14 @@ fn fuse_silu(g: &mut Graph) {
 /// `Conv` without bias followed by `Add` of a per-channel constant → `Conv`
 /// with that bias.
 fn fuse_conv_bias(g: &mut Graph) {
-    for add in binary_nodes(g, "Add") {
+    for add in binary_nodes(g, Binary::Add) {
         if !g.contains(add) {
             continue;
         }
         let fused = (0..2).find_map(|k| {
             let conv_out = g.node(add).input(k)?;
             let bias = g.node(add).input(1 - k)?;
-            let conv = sole_producer(g, Some(conv_out), "Conv")?;
+            let conv = sole_producer(g, Some(conv_out), |op| matches!(op, Op::Conv(_)))?;
             let node = g.node(conv);
             if node.input(2).is_some() {
                 return None;
@@ -245,20 +262,20 @@ fn fuse_conv_bias(g: &mut Graph) {
 
 /// `Conv` followed by `Relu`, or a 2D `Conv` followed by `Silu` → `ConvAct`.
 fn fuse_conv_act(g: &mut Graph) {
-    let acts: Vec<NodeId> = g
+    let acts: Vec<(NodeId, Activation)> = g
         .nodes()
-        .filter(|(_, n)| is_op(n, "Relu") || is_op(n, "Silu"))
-        .map(|(id, _)| id)
+        .filter_map(|(id, n)| match n.op {
+            Op::Unary(Unary::Relu) => Some((id, Activation::Relu)),
+            Op::Silu => Some((id, Activation::Silu)),
+            _ => None,
+        })
         .collect();
-    for act_id in acts {
+    for (act_id, act) in acts {
         if !g.contains(act_id) {
             continue;
         }
-        let act = match g.node(act_id).op.op_type() {
-            "Relu" => Activation::Relu,
-            _ => Activation::Silu,
-        };
-        let Some(conv) = sole_producer(g, g.node(act_id).input(0), "Conv") else {
+        let input = g.node(act_id).input(0);
+        let Some(conv) = sole_producer(g, input, |op| matches!(op, Op::Conv(_))) else {
             continue;
         };
         let Op::Conv(attrs) = g.node(conv).op.clone() else {
@@ -277,13 +294,13 @@ fn fuse_conv_act(g: &mut Graph) {
 
 /// `MatMul` followed by `Add` → `Linear`.
 fn fuse_linear(g: &mut Graph) {
-    for add in binary_nodes(g, "Add") {
+    for add in binary_nodes(g, Binary::Add) {
         if !g.contains(add) {
             continue;
         }
         let fused = (0..2).find_map(|k| {
             let node = g.node(add);
-            let mm = sole_producer(g, node.input(k), "MatMul")?;
+            let mm = sole_producer(g, node.input(k), |op| matches!(op, Op::MatMul))?;
             Some((mm, node.input(1 - k)))
         });
         if let Some((mm, bias)) = fused {
@@ -304,19 +321,21 @@ fn fuse_linear(g: &mut Graph) {
 ///
 /// → `QLinearDynamic`.
 fn fuse_dynamic_quant_linear(g: &mut Graph) {
-    for add in binary_nodes(g, "Add") {
+    for add in binary_nodes(g, Binary::Add) {
         if !g.contains(add) {
             continue;
         }
         let fused = (0..2).find_map(|k| {
             let node = g.node(add);
             let (dequant, bias) = (node.input(k), node.input(1 - k));
-            let mul = sole_producer(g, dequant, "Mul")?;
+            let mul = sole_producer(g, dequant, binary(Binary::Mul))?;
             let (cast, scale) = (0..2).find_map(|j| {
-                let cast = sole_producer(g, g.node(mul).input(j), "Cast")?;
+                let input = g.node(mul).input(j);
+                let cast = sole_producer(g, input, |op| matches!(op, Op::Cast { .. }))?;
                 Some((cast, g.node(mul).input(1 - j)))
             })?;
-            let mmi = sole_producer(g, g.node(cast).input(0), "MatMulInteger")?;
+            let input = g.node(cast).input(0);
+            let mmi = sole_producer(g, input, |op| matches!(op, Op::MatMulInteger))?;
             let mmi_node = g.node(mmi);
             let (q, w, z, w_zp) = (
                 mmi_node.input(0),
@@ -325,13 +344,13 @@ fn fuse_dynamic_quant_linear(g: &mut Graph) {
                 mmi_node.input(3),
             );
             w_zp?;
-            let dql = sole_producer(g, q, "DynamicQuantizeLinear")?;
+            let dql = sole_producer(g, q, |op| matches!(op, Op::DynamicQuantizeLinear))?;
             let dql_node = g.node(dql);
             if dql_node.output(2) != z || g.uses(z?) != 1 {
                 return None;
             }
             let s = dql_node.output(1)?;
-            let scale_mul = sole_producer(g, scale, "Mul")?;
+            let scale_mul = sole_producer(g, scale, binary(Binary::Mul))?;
             let w_scale = other_operand(g, scale_mul, s)?;
             if g.uses(s) != 1 {
                 return None;
@@ -341,7 +360,7 @@ fn fuse_dynamic_quant_linear(g: &mut Graph) {
             // A ReLU reading nothing but the layer joins it.
             let out = g.node(add).output(0)?;
             let relu = match g.value(out).consumers() {
-                [r] if g.uses(out) == 1 && is_op(g.node(*r), "Relu") => Some(*r),
+                [r] if g.uses(out) == 1 && unary(Unary::Relu)(&g.node(*r).op) => Some(*r),
                 _ => None,
             };
             nodes.extend(relu);
@@ -367,7 +386,8 @@ fn fuse_embedding_concat(g: &mut Graph) {
         }
         let node = g.node(concat);
         let weight = node.input(0);
-        let Some(cos) = sole_producer(g, node.input(1), "ConstantOfShape") else {
+        let is_cos = |op: &Op| matches!(op, Op::ConstantOfShape { .. });
+        let Some(cos) = sole_producer(g, node.input(1), is_cos) else {
             continue;
         };
         let Op::ConstantOfShape { value } = g.node(cos).op.clone() else {
@@ -397,7 +417,7 @@ mod tests {
     fn scalar(name: &str, v: f32) -> TensorProto {
         TensorProto {
             name: name.to_string(),
-            data_type: 1,
+            data_type: crate::compiler::ir::DType::F32.to_onnx(),
             float_data: vec![v],
             ..Default::default()
         }

@@ -1,21 +1,32 @@
 //! Layout of the weights file.
 
-use super::ir::{Graph, Op};
-use super::{SharedWeights, sanitize_name};
+use super::ir::{DType, Graph, Op};
+use super::{SharedWeights, WeightTable, sanitize_name};
 use crate::model::onnx_proto::TensorProto;
 use crate::model::{tensor_to_array, tensor_to_vec_u8};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
-/// Where a weight lives in the weights file: byte offset, byte length,
-/// shape and ONNX data type.
-pub(crate) type WeightRef = (usize, usize, Vec<usize>, i32);
+/// Where a weight lives in the weights file.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WeightRef {
+    /// Byte offset.
+    pub offset: usize,
+    /// Length in bytes.
+    pub len: usize,
+    pub shape: Vec<usize>,
+    pub dtype: DType,
+}
 
 /// The weights file, with where each weight landed in it.
 #[derive(Default)]
 pub(crate) struct Weights {
     pub data: Vec<u8>,
     /// Weights by sanitized name.
-    pub lookup: HashMap<String, WeightRef>,
+    lookup: HashMap<String, WeightRef>,
+    /// `lookup` in the form [`Compiler::with_pattern`](super::Compiler::with_pattern)
+    /// generators take, built on first use.
+    pattern_table: OnceLock<WeightTable>,
     /// Values of int64 and int32 weights by name, for code generation to
     /// inline.
     pub int64: HashMap<String, (Vec<i64>, Vec<usize>)>,
@@ -49,9 +60,39 @@ impl Weights {
         weights
     }
 
+    /// The weight holding the tensor `name`.
+    pub(crate) fn get(&self, name: &str) -> Option<&WeightRef> {
+        self.lookup.get(&sanitize_name(name))
+    }
+
+    /// The weights as pattern generators take them.
+    pub(crate) fn pattern_table(&self) -> &WeightTable {
+        self.pattern_table.get_or_init(|| {
+            self.lookup
+                .iter()
+                .map(|(name, w)| {
+                    let entry = (w.offset, w.len, w.shape.clone(), w.dtype.to_onnx());
+                    (name.clone(), entry)
+                })
+                .collect()
+        })
+    }
+
+    /// The values of `name`, if it is an int64 or int32 weight.
+    pub(crate) fn ints(&self, name: &str) -> Option<&[i64]> {
+        self.int64.get(name).map(|(ints, _)| ints.as_slice())
+    }
+
+    /// Whether the tensor `name` is read from the weights rather than
+    /// computed.
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.get(name).is_some() || self.int64.contains_key(name)
+    }
+
     fn add_graph(&mut self, g: &Graph) {
         for &v in g.initializers() {
-            if let Some(t) = g.data(v) {
+            // Those that folding left without readers are not written.
+            if let Some(t) = g.data(v).filter(|_| g.uses(v) > 0) {
                 self.add(&g.value(v).name, t);
             }
         }
@@ -72,13 +113,14 @@ impl Weights {
     }
 
     fn add(&mut self, name: &str, t: &TensorProto) {
-        if (t.data_type == 7 || t.data_type == 6)
+        let dtype = DType::from_onnx(t.data_type);
+        if matches!(dtype, DType::I64 | DType::I32)
             && let Ok((data, dims)) = tensor_to_array(t)
         {
             let ints = data.iter().map(|&x| x as i64).collect();
             self.int64.insert(name.to_string(), (ints, dims));
         }
-        let Ok((bytes, shape, data_type)) = tensor_to_vec_u8(t) else {
+        let Ok((bytes, shape, _)) = tensor_to_vec_u8(t) else {
             return;
         };
         if bytes.is_empty() {
@@ -97,8 +139,11 @@ impl Weights {
             (offset, bytes.len())
         });
         // The first weight of a name wins.
-        self.lookup
-            .entry(sanitize_name(name))
-            .or_insert((offset, len, shape, data_type));
+        self.lookup.entry(sanitize_name(name)).or_insert(WeightRef {
+            offset,
+            len,
+            shape,
+            dtype,
+        });
     }
 }

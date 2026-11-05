@@ -1,11 +1,13 @@
+//! Code generation for shape and layout operators, casts, constants and
+//! quantization.
+
 use super::super::{
-    generate::OpContext,
-    ir::{DType, Op},
+    generate::{ElemType, OpContext},
+    ir::{DType, Op, ReshapeDim},
 };
 use std::io::Write;
 
-pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<bool> {
-    let op = ctx.node.op_type.as_str();
+pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<()> {
     let tab = ctx.tab();
     let inputs = &ctx.inputs;
     let outputs = &ctx.outputs;
@@ -18,16 +20,10 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             if idx >= ctx.node.input.len() || ctx.node.input[idx].is_empty() {
                 return Ok("&[]".to_string());
             }
-            let name = &ctx.node.input[idx];
-            if let Some((ints, _)) = ctx.int64_map.get(name) {
+            if let Some(ints) = ctx.ints(idx) {
                 Ok(format!("&{:?}", ints))
             } else {
-                let is_i64 = ctx
-                    .var_types
-                    .get(&ctx.inputs[idx])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
-                if is_i64 {
+                if ctx.input_type(idx) == ElemType::I64 {
                     // For i64 tensors, use .data directly
                     Ok(format!("&{}.data[..]", ctx.inputs[idx]))
                 } else {
@@ -48,16 +44,10 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             if idx >= ctx.node.input.len() || ctx.node.input[idx].is_empty() {
                 return Ok("None".to_string());
             }
-            let name = &ctx.node.input[idx];
-            if let Some((ints, _)) = ctx.int64_map.get(name) {
+            if let Some(ints) = ctx.ints(idx) {
                 Ok(format!("Some(&{:?})", ints))
             } else {
-                let is_i64 = ctx
-                    .var_types
-                    .get(&ctx.inputs[idx])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
-                if is_i64 {
+                if ctx.input_type(idx) == ElemType::I64 {
                     Ok(format!("Some(&{}.data[..])", ctx.inputs[idx]))
                 } else {
                     let temp_name = format!("temp_i64_{}", idx);
@@ -71,22 +61,16 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             }
         };
 
-    match op {
-        "Transpose" => {
-            let perm = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "perm")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
+    match &ctx.ir().op {
+        Op::Transpose { perm } => {
+            let perm = perm.as_deref().unwrap_or_default();
             writeln!(
                 w,
                 "{}let {} = lele::kernels::transpose(&{}, &{:?}, {});",
                 tab, outputs[0], inputs[0], perm, buf_expr
             )?;
         }
-        "Reshape" => {
+        Op::Reshape => {
             let shape_raw = resolve_i64_with_temp(1, ctx, w, &tab)?;
             // Replace 0 with -1 in reshape targets (ONNX 0 means "copy from source",
             // but in static compilation -1/infer is more robust)
@@ -110,27 +94,40 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 tab, outputs[0], inputs[0], shape
             )?;
         }
-        "Flatten" => {
+        Op::ReshapeTo { dims } => {
+            let x = &inputs[0];
+            let dims: Vec<String> = dims
+                .iter()
+                .map(|d| match d {
+                    ReshapeDim::Fixed(n) => n.to_string(),
+                    ReshapeDim::Input(k) => format!("{x}.shape[{k}] as i64"),
+                    ReshapeDim::Infer => "-1".to_string(),
+                })
+                .collect();
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::reshape(&{}, &[{}]);",
+                tab,
+                outputs[0],
+                x,
+                dims.join(", ")
+            )?;
+        }
+        Op::Flatten { axis } => {
             // Flatten: reshape to 2D [batch_size, -1]
             // axis parameter determines where to flatten (default is 1)
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(1) as usize;
+            let axis = *axis as usize;
             writeln!(
                 w,
                 "{}let {} = lele::kernels::flatten(&{}, {});",
                 tab, outputs[0], inputs[0], axis
             )?;
         }
-        "Unsqueeze" => {
-            let axes = match &ctx.ir().op {
-                _ if ctx.ir().input(1).is_some() => resolve_i64_with_temp(1, ctx, w, &tab)?,
-                Op::Unsqueeze { axes } => format!("&{:?}", axes.clone().unwrap_or_default()),
-                _ => "&[]".to_string(),
+        Op::Unsqueeze { axes } => {
+            let axes = if ctx.ir().input(1).is_some() {
+                resolve_i64_with_temp(1, ctx, w, &tab)?
+            } else {
+                format!("&{:?}", axes.as_deref().unwrap_or_default())
             };
             writeln!(
                 w,
@@ -138,11 +135,11 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 tab, outputs[0], inputs[0], axes
             )?;
         }
-        "Squeeze" => {
-            let axes = match &ctx.ir().op {
+        Op::Squeeze { axes } => {
+            let axes = match axes {
                 _ if ctx.ir().input(1).is_some() => resolve_i64_opt_with_temp(1, ctx, w, &tab)?,
-                Op::Squeeze { axes: Some(axes) } => format!("Some(&{axes:?})"),
-                _ => "None".to_string(),
+                Some(axes) => format!("Some(&{axes:?})"),
+                None => "None".to_string(),
             };
             writeln!(
                 w,
@@ -150,11 +147,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 tab, outputs[0], inputs[0], axes
             )?;
         }
-        "Concat" => {
-            let axis = match ctx.ir().op {
-                Op::Concat { axis } => axis,
-                _ => 0,
-            };
+        Op::Concat { axis } => {
             let args = inputs
                 .iter()
                 .map(|s| format!("&{}", s))
@@ -166,32 +159,21 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 tab, outputs[0], args, axis, buf_expr
             )?;
         }
-        "Where" => {
+        Op::Where => {
             writeln!(
                 w,
                 "{}let {} = lele::kernels::where_op(&{}, &{}, &{}, {});",
                 tab, outputs[0], inputs[0], inputs[1], inputs[2], buf_expr
             )?;
         }
-        "Gather" => {
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(0);
+        Op::Gather { axis } => {
             writeln!(
                 w,
                 "{}let {} = lele::kernels::gather(&{}, &{}, {}, {});",
                 tab, outputs[0], inputs[0], inputs[1], axis, buf_expr
             )?;
         }
-        "Shape" => {
-            let (start, end) = match ctx.ir().op {
-                Op::Shape { start, end } => (start, end),
-                _ => (None, None),
-            };
+        Op::Shape { start, end } => {
             if start.is_none() && end.is_none() {
                 writeln!(
                     w,
@@ -210,23 +192,18 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 )?;
             }
         }
-        "Size" => writeln!(
+        Op::Size => writeln!(
             w,
             "{}let {} = lele::kernels::size(&{});",
             tab, outputs[0], inputs[0]
         )?,
-        "Cast" => {
-            let to = match ctx.ir().op {
-                Op::Cast { to } => Some(to.to_onnx() as i64),
-                _ => None,
-            };
-
+        Op::Cast { to } => {
             // Always use a temporary buffer for Cast to avoid borrow conflicts
             // Cast operations typically convert between types, and reusing buffers
             // can lead to borrowing issues when the input TensorView holds a reference
             // to the same buffer we're trying to mutably borrow for output
 
-            if to == Some(7) || to == Some(6) || to == Some(9) {
+            if let DType::I64 | DType::I32 | DType::Bool = to {
                 writeln!(
                     w,
                     "{}let mut temp_cast_buf_{} = Vec::<i64>::new();",
@@ -237,14 +214,9 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                     "{}let {} = lele::kernels::utils::cast_to_i64(&{}, &mut temp_cast_buf_{});",
                     tab, outputs[0], inputs[0], outputs[0]
                 )?;
-            } else if to == Some(1) {
+            } else if *to == DType::F32 {
                 // Check if input is already f32, in which case cast is a no-op
-                let input_type = ctx
-                    .var_types
-                    .get(&ctx.inputs[0])
-                    .map(|s| s.as_str())
-                    .unwrap_or("f32");
-                if input_type == "f32" {
+                if ctx.input_type(0) == ElemType::F32 {
                     writeln!(
                         w,
                         "{}let {} = {}.clone(); // Cast f32->f32 is no-op",
@@ -270,17 +242,10 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 )?;
             }
         }
-        "ConstantOfShape" => {
-            let is_i64 = ctx
-                .var_types
-                .get(&ctx.outputs[0])
-                .map(|s| s == "i64")
-                .unwrap_or(false);
-            let value = match &ctx.ir().op {
-                Op::ConstantOfShape { value } => value.as_ref(),
-                _ => None,
-            };
+        Op::ConstantOfShape { value } => {
+            let is_i64 = ctx.var_types.is_i64(&ctx.outputs[0]);
             let val = value
+                .as_ref()
                 .map(|t| {
                     if let Ok((data, _)) = crate::model::tensor_to_array(t)
                         && !data.is_empty()
@@ -304,7 +269,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 )?;
             }
         }
-        "Slice" => {
+        Op::Slice => {
             let starts = resolve_i64_with_temp(1, ctx, w, &tab)?;
             let ends = resolve_i64_with_temp(2, ctx, w, &tab)?;
             let axes = resolve_i64_with_temp(3, ctx, w, &tab)?;
@@ -315,7 +280,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 tab, outputs[0], inputs[0], starts, ends, axes, steps, buf_expr
             )?;
         }
-        "Expand" => {
+        Op::Expand => {
             let shape = resolve_i64_with_temp(1, ctx, w, &tab)?;
             writeln!(
                 w,
@@ -323,7 +288,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 tab, outputs[0], inputs[0], shape, buf_expr
             )?;
         }
-        "Tile" => {
+        Op::Tile => {
             let repeats = resolve_i64_with_temp(1, ctx, w, &tab)?;
             writeln!(
                 w,
@@ -331,28 +296,13 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 tab, outputs[0], inputs[0], repeats, buf_expr
             )?;
         }
-        "Split" => {
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(0);
+        Op::Split { axis, split } => {
             let splits = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
                 resolve_i64_with_temp(1, ctx, w, &tab)?
             } else {
-                let split_attr = ctx
-                    .node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "split")
-                    .map(|a| a.ints.clone())
-                    .unwrap_or_else(|| {
-                        let num_outputs = outputs.len();
-                        vec![0; num_outputs]
-                    });
-                format!("&{:?}", split_attr)
+                // Without sizes, the kernel splits evenly.
+                let split = split.clone().unwrap_or_else(|| vec![0; outputs.len()]);
+                format!("&{:?}", split)
             };
             // Use split_owned which returns owned TensorViews directly,
             // avoiding the overhead of creating local buffers and cloning
@@ -371,14 +321,8 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 )?;
             }
         }
-        "Pad" => {
-            let mode = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "mode")
-                .map(|a| String::from_utf8_lossy(&a.s))
-                .unwrap_or("constant".into());
+        Op::Pad { mode } => {
+            let mode = mode.as_deref().unwrap_or("constant");
             let constant_value =
                 if inputs.len() > 2 && !ctx.node.input[2].is_empty() && !inputs[2].is_empty() {
                     format!("Some(&{})", inputs[2])
@@ -387,17 +331,11 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 };
             // For pad operation, we need pads as &[i64]
             let pads_expr = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
-                let name = &ctx.node.input[1];
-                if let Some((ints, _)) = ctx.int64_map.get(name) {
+                if let Some(ints) = ctx.ints(1) {
                     format!("&{:?}", ints)
                 } else {
                     // pads is a computed tensor, we need to extract data
-                    let is_i64 = ctx
-                        .var_types
-                        .get(&ctx.inputs[1])
-                        .map(|t| t == "i64")
-                        .unwrap_or(false);
-                    if is_i64 {
+                    if ctx.input_type(1) == ElemType::I64 {
                         format!("&{}.data[..]", inputs[1])
                     } else {
                         // Need to convert f32 to i64
@@ -418,19 +356,16 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 tab, outputs[0], inputs[0], pads_expr, constant_value, mode, buf_expr
             )?;
         }
-        "QuantizeLinear" | "DequantizeLinear" | "FakeQuantizeLinear" => {
-            let node = ctx.ir();
-            let attrs = match &node.op {
-                Op::QuantizeLinear(a) | Op::DequantizeLinear(a) | Op::FakeQuantizeLinear(a) => a,
-                _ => panic!("{op} '{}' outside the default domain", ctx.node.name),
-            };
+        op @ (Op::QuantizeLinear(attrs)
+        | Op::DequantizeLinear(attrs)
+        | Op::FakeQuantizeLinear(attrs)) => {
             let (axis, block_size) = (attrs.axis, attrs.block_size);
-            let zero_point = node.input(2);
+            let zero_point = ctx.ir().input(2);
             let zp_expr = match zero_point {
                 Some(_) => format!("Some(&{})", inputs[2]),
                 None => "None".to_string(),
             };
-            if op == "DequantizeLinear" {
+            if let Op::DequantizeLinear(_) = op {
                 writeln!(
                     w,
                     "{}let {} = lele::kernels::dequantize_linear(&{}, &{}, {}, {}, {}, {});",
@@ -443,8 +378,8 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                     .map(|zp| ctx.graph.value(zp).dtype)
                     .filter(|&t| t != DType::Undefined);
                 let out_dt = match (attrs.output_dtype, zp_dt, zero_point) {
-                    (Some(t), _, _) | (None, Some(t), _) => t.to_onnx(),
-                    (None, None, None) => 2,
+                    (Some(t), _, _) | (None, Some(t), _) => t,
+                    (None, None, None) => DType::U8,
                     // Guessing uint8 would silently clamp every negative code
                     // to 0 on an int8 model, so refuse to compile instead.
                     (None, None, Some(zp)) => panic!(
@@ -455,8 +390,9 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                         ctx.graph.value(zp).name
                     ),
                 };
-                let (qmin, qmax) = crate::kernels::quant_range(out_dt).unwrap_or((0.0, 255.0));
-                let kernel = if op == "FakeQuantizeLinear" {
+                let (qmin, qmax) =
+                    crate::kernels::quant_range(out_dt.to_onnx()).unwrap_or((0.0, 255.0));
+                let kernel = if let Op::FakeQuantizeLinear(_) = op {
                     "fake_quantize_linear"
                 } else {
                     "quantize_linear"
@@ -478,15 +414,18 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 )?;
             }
         }
-        "QLinearMatMulI8" => {
+        Op::QLinearMatMulI8 => {
             // Produced by `Compiler::fuse_qdq_matmul`, so the weight is always
             // an int8 initializer with a known blob offset. It is passed by
             // offset rather than as a `TensorView` because the runtime packs it
             // into an architecture-specific layout once and caches that.
-            let weight = crate::compiler::sanitize_name(&ctx.node.input[3]);
-            let Some((offset, len, shape, _)) = ctx.known_weights.get(&weight) else {
-                panic!("QLinearMatMulI8 weight {weight} is not a known initializer");
+            let Some(weight) = ctx.weight(3) else {
+                panic!(
+                    "QLinearMatMulI8 weight {} is not a known initializer",
+                    ctx.node.input[3]
+                );
             };
+            let (offset, len, shape) = (weight.offset, weight.len, &weight.shape);
             writeln!(
                 w,
                 "{}let {} = self.qmatmul_i8(&{}, &{}, &{}, {}, {}, {}, {}, &{}, {});",
@@ -503,7 +442,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 buf_expr
             )?;
         }
-        "DynamicQuantizeLinear" => {
+        Op::DynamicQuantizeLinear => {
             writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[0])?;
             writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[1])?;
             writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[2])?;
@@ -538,23 +477,22 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 tab, outputs[2], outputs[2]
             )?;
         }
-        "Identity" | "Constant" => {
-            if let Some((offset, len, shape, dt)) = ctx.known_weights.get(&outputs[0]) {
-                let weight_fn = match dt {
-                    1 => "weight_f32",
-                    2 => "weight_u8",
-                    3 => "weight_i8",
-                    6 => "weight_i32",
-                    7 => "weight_i64",
-                    10 => "weight_f16",
+        op @ (Op::Identity | Op::Constant { .. }) => {
+            if let Some(weight) = ctx.weights.get(&ctx.node.output[0]) {
+                let weight_fn = match weight.dtype {
+                    DType::U8 => "weight_u8",
+                    DType::I8 => "weight_i8",
+                    DType::I32 => "weight_i32",
+                    DType::I64 => "weight_i64",
+                    DType::F16 => "weight_f16",
                     _ => "weight_f32",
                 };
                 writeln!(
                     w,
                     "{}let {} = self.{}({}, {}, &{:?});",
-                    tab, outputs[0], weight_fn, offset, len, shape
+                    tab, outputs[0], weight_fn, weight.offset, weight.len, weight.shape
                 )?;
-            } else if let Some((ints, shape)) = ctx.int64_map.get(&ctx.node.output[0]) {
+            } else if let Some((ints, shape)) = ctx.weights.int64.get(&ctx.node.output[0]) {
                 let floats: Vec<String> =
                     ints.iter().map(|&x| format!("{:.1}", x as f32)).collect();
                 writeln!(
@@ -565,11 +503,11 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                     floats.join(", "),
                     shape
                 )?;
-            } else if op == "Identity" {
+            } else if let Op::Identity = op {
                 writeln!(w, "{}let {} = {}.clone();", tab, outputs[0], inputs[0])?;
             } else {
                 // More complex Constant logic
-                let val = match &ctx.ir().op {
+                let val = match op {
                     Op::Constant { value } => Some(value),
                     _ => None,
                 };
@@ -623,30 +561,11 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 }
             }
         }
-        "TopK" => {
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(-1);
-            let largest = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "largest")
-                .map(|a| a.i)
-                .unwrap_or(1)
-                != 0;
-            let sorted = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "sorted")
-                .map(|a| a.i)
-                .unwrap_or(1)
-                != 0;
+        Op::TopK {
+            axis,
+            largest,
+            sorted,
+        } => {
             // inputs[1] is k (as a tensor). We need its value at codegen time.
             // It's typically a constant weight.
             writeln!(
@@ -674,21 +593,14 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 outputs[0]
             )?;
         }
-        "GatherElements" => {
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(0);
+        Op::GatherElements { axis } => {
             writeln!(
                 w,
                 "{}let {} = lele::kernels::gather_elements(&{}, &{}, {}, {});",
                 tab, outputs[0], inputs[0], inputs[1], axis, buf_expr
             )?;
         }
-        _ => return Ok(false),
+        op => unreachable!("{} is not a tensor operator", op.op_type()),
     }
-    Ok(true)
+    Ok(())
 }
