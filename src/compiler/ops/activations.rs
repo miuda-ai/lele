@@ -36,7 +36,7 @@ pub(crate) fn handle_activation_ops(
             "{}let {} = lele::kernels::sigmoid(&{}, {});",
             tab, outputs[0], inputs[0], buf_expr
         )?,
-        "Softmax" => {
+        "Softmax" | "LogSoftmax" => {
             let axis = ctx
                 .node
                 .attribute
@@ -44,10 +44,11 @@ pub(crate) fn handle_activation_ops(
                 .find(|a| a.name == "axis")
                 .map(|a| a.i)
                 .unwrap_or(-1);
+            let kernel = if op == "Softmax" { "softmax" } else { "log_softmax" };
             writeln!(
                 w,
-                "{}let {} = lele::kernels::softmax(&{}, {}, {});",
-                tab, outputs[0], inputs[0], axis, buf_expr
+                "{}let {} = lele::kernels::{}(&{}, {}, {});",
+                tab, outputs[0], kernel, inputs[0], axis, buf_expr
             )?;
         }
         "ArgMax" => {

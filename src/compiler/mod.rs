@@ -529,6 +529,14 @@ impl Compiler {
                     .find(|a| a.name == "to")
                     .map(|a| a.i as i32)
                     .unwrap_or(input_dt),
+                // Typed by its fill value, not by the int64 shape it consumes.
+                "ConstantOfShape" => node
+                    .attribute
+                    .iter()
+                    .find(|a| a.name == "value")
+                    .and_then(|a| a.t.as_ref())
+                    .map(|t| t.data_type)
+                    .unwrap_or(1),
                 // QDQ weights fold back to plain float initializers.
                 "DequantizeLinear" => 1,
                 "QuantizeLinear" => Self::quantize_output_dtype(node, &constants),
@@ -1127,17 +1135,13 @@ impl Compiler {
                     .find(|a| a.name == "value")
                     .and_then(|a| a.t.as_ref())
                     .and_then(|t| {
-                        if !t.float_data.is_empty() {
-                            Some(t.float_data[0])
-                        } else if !t.double_data.is_empty() {
-                            Some(t.double_data[0] as f32)
-                        } else if !t.int32_data.is_empty() {
-                            Some(t.int32_data[0] as f32)
-                        } else if !t.int64_data.is_empty() {
-                            Some(t.int64_data[0] as f32)
-                        } else {
-                            None
+                        if !t.double_data.is_empty() {
+                            return Some(t.double_data[0] as f32);
                         }
+                        // PyTorch's exporter stores the fill value in
+                        // `raw_data`; reading only the typed fields folded
+                        // `ConstantOfShape(value=1)` to zeros.
+                        tensor_to_array(t).ok().and_then(|(d, _)| d.first().copied())
                     })
                     .unwrap_or(0.0);
                 let shape: Vec<usize> = data.iter().map(|&x| x as usize).collect();
@@ -1661,6 +1665,16 @@ impl Compiler {
 
         writeln!(
             &mut code,
+            "    pub fn weight_bool_i64(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i64> {{"
+        )?;
+        writeln!(
+            &mut code,
+            "        TensorView::from_bytes_bool_as_i64(&self.data[offset..offset+len], shape.to_vec())"
+        )?;
+        writeln!(&mut code, "    }}")?;
+
+        writeln!(
+            &mut code,
             "    pub fn weight_i32(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'static, i32> {{"
         )?;
         writeln!(
@@ -1821,6 +1835,7 @@ impl Compiler {
                         match data_type {
                             7 => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape),
                             6 => format!("self.weight_i32_i64({}, {}, &{:?})", offset, len, shape),
+                            9 => format!("self.weight_bool_i64({}, {}, &{:?})", offset, len, shape),
                             _ => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape),
                         }
                     } else {
@@ -2538,5 +2553,72 @@ mod conv_pattern_tests {
             let fused = if next == "Relu" { "conv2d_fused(" } else { "Some(&self.weight_f32" };
             assert!(call.contains(fused), "{next}: {call}");
         }
+    }
+}
+
+#[cfg(test)]
+mod constant_folding_tests {
+    use super::*;
+    use crate::model::onnx_proto::AttributeProto;
+
+    /// `ConstantOfShape([2], value)` with the shape as an int64 initializer.
+    fn constant_of_shape(value: TensorProto) -> GraphProto {
+        GraphProto {
+            node: vec![NodeProto {
+                op_type: "ConstantOfShape".to_string(),
+                input: vec!["shape".to_string()],
+                output: vec!["y".to_string()],
+                attribute: vec![AttributeProto {
+                    name: "value".to_string(),
+                    t: Some(value),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            initializer: vec![TensorProto {
+                name: "shape".to_string(),
+                data_type: 7,
+                dims: vec![1],
+                int64_data: vec![2],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn folded(g: &GraphProto) -> &TensorProto {
+        assert!(g.node.is_empty(), "ConstantOfShape was not folded");
+        g.initializer.iter().find(|t| t.name == "y").unwrap()
+    }
+
+    #[test]
+    fn folds_constant_of_shape_with_raw_int64_value() {
+        // PyTorch's exporter writes the fill value as raw bytes; reading only
+        // the typed fields used to fold this to zeros.
+        let mut g = constant_of_shape(TensorProto {
+            data_type: 7,
+            dims: vec![1],
+            raw_data: 1i64.to_le_bytes().to_vec(),
+            ..Default::default()
+        });
+        Compiler::fold_constants_graph(&mut g, &HashMap::new());
+        let y = folded(&g);
+        assert_eq!(y.data_type, 7);
+        assert_eq!(y.int64_data, [1, 1]);
+    }
+
+    #[test]
+    fn folds_constant_of_shape_with_float_value_as_float() {
+        // The output takes the value's type, not the int64 shape's.
+        let mut g = constant_of_shape(TensorProto {
+            data_type: 1,
+            dims: vec![1],
+            raw_data: 0.5f32.to_le_bytes().to_vec(),
+            ..Default::default()
+        });
+        Compiler::fold_constants_graph(&mut g, &HashMap::new());
+        let y = folded(&g);
+        assert_eq!(y.data_type, 1);
+        assert_eq!(y.float_data, [0.5, 0.5]);
     }
 }

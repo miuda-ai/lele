@@ -1769,3 +1769,128 @@ fn test_reduce_prod_of_shape_vector() {
     let got = reduce_prod(&t, &[0], false, &mut buf);
     assert_eq!(got.data.as_ref(), &[24_000i64]);
 }
+
+#[test]
+fn test_log_softmax_matches_reference() {
+    // [2, 3, 4], reduced over each axis in turn, so the strided (inner > 1)
+    // paths are covered as well as the contiguous last axis.
+    let shape = [2usize, 3, 4];
+    let data: Vec<f32> = (0..24).map(|i| ((i * 7 % 11) as f32 - 5.0) * 1.3).collect();
+    let t = TensorView::from_slice(&data, shape.to_vec());
+    for axis in [-1i32, 0, 1, 2] {
+        let a = if axis < 0 { 2 } else { axis as usize };
+        let inner: usize = shape[a + 1..].iter().product();
+        let mut want = vec![0f32; 24];
+        for (i, w) in want.iter_mut().enumerate() {
+            let base = i - (i / inner % shape[a]) * inner;
+            let sum: f64 = (0..shape[a])
+                .map(|k| (data[base + k * inner] as f64).exp())
+                .sum();
+            *w = (data[i] as f64 - sum.ln()) as f32;
+        }
+        let mut buf = Vec::new();
+        let got = log_softmax(&t, axis, &mut buf);
+        assert_eq!(got.shape.as_ref(), &shape);
+        assert_close(&got.data, &want, 1e-5, &format!("log_softmax axis {axis}"));
+    }
+}
+
+#[test]
+fn test_log_softmax_keeps_far_tail() {
+    // A CTC head's blank logit often dwarfs the rest; the tail must stay
+    // finite and exact rather than underflowing through exp().
+    let data = vec![100.0f32, 0.0, -50.0];
+    let t = TensorView::from_slice(&data, vec![1usize, 3]);
+    let mut buf = Vec::new();
+    let got = log_softmax(&t, -1, &mut buf);
+    assert_close(&got.data, &[0.0, -100.0, -150.0], 1e-4, "log_softmax tail");
+}
+
+#[test]
+fn test_matmul_2d_by_3d_keeps_batch_dim() {
+    // T-one's mel filterbank: [64, 81] x [1, 81, T]. The batch dim used to be
+    // dropped, giving [64, T].
+    let (m, k, n) = (3usize, 4usize, 5usize);
+    let a: Vec<f32> = (0..m * k).map(|i| i as f32 * 0.5 - 2.0).collect();
+    let mut want = Vec::new();
+    for batch in [1usize, 2] {
+        let b: Vec<f32> = (0..batch * k * n).map(|i| (i % 7) as f32 - 3.0).collect();
+        want.clear();
+        for bi in 0..batch {
+            for i in 0..m {
+                for j in 0..n {
+                    want.push((0..k).map(|p| a[i * k + p] * b[bi * k * n + p * n + j]).sum());
+                }
+            }
+        }
+        let ta = TensorView::from_slice(&a, vec![m, k]);
+        let tb = TensorView::from_slice(&b, vec![batch, k, n]);
+        let mut buf = Vec::new();
+        let got = matmul(&ta, &tb, &mut buf);
+        assert_eq!(got.shape.as_ref(), &[batch, m, n]);
+        assert_close(&got.data, &want, 1e-4, &format!("matmul 2d x [{batch},k,n]"));
+    }
+}
+
+#[test]
+fn test_matmul_fused_add_2d_by_3d_keeps_batch_dim() {
+    // T-one's mel filterbank plus its bias, fused into Linear: the batch dim
+    // used to be dropped as in `matmul`, giving [64, T].
+    let (m, k, n) = (3usize, 4usize, 5usize);
+    let a: Vec<f32> = (0..m * k).map(|i| i as f32 * 0.5 - 2.0).collect();
+    let mut want = Vec::new();
+    for (batch, bias) in [(1usize, vec![0.25f32]), (2, (0..n).map(|j| j as f32).collect())] {
+        let b: Vec<f32> = (0..batch * k * n).map(|i| (i % 7) as f32 - 3.0).collect();
+        want.clear();
+        for bi in 0..batch {
+            for i in 0..m {
+                for j in 0..n {
+                    let dot: f32 = (0..k).map(|p| a[i * k + p] * b[bi * k * n + p * n + j]).sum();
+                    want.push(dot + bias[j % bias.len()]);
+                }
+            }
+        }
+        let ta = TensorView::from_slice(&a, vec![m, k]);
+        let tb = TensorView::from_slice(&b, vec![batch, k, n]);
+        let tbias = TensorView::from_slice(&bias, vec![bias.len()]);
+        let mut buf = Vec::new();
+        let got = matmul_fused_add(&ta, &tb, &tbias, &mut buf);
+        assert_eq!(got.shape.as_ref(), &[batch, m, n]);
+        assert_close(&got.data, &want, 1e-4, &format!("matmul_fused_add 2d x [{batch},k,n]"));
+    }
+}
+
+#[test]
+fn test_split_without_sizes_splits_evenly() {
+    // No `split` input or attribute: the compiler passes zeros, meaning
+    // equal parts (the GLU in a conformer's conv module).
+    let data: Vec<f32> = (0..2 * 6 * 3).map(|i| i as f32).collect();
+    let t = TensorView::from_slice(&data, vec![2usize, 6, 3]);
+    let parts = split_owned(&t, 1, &[0, 0]);
+    assert_eq!(parts.len(), 2);
+    for (p, part) in parts.iter().enumerate() {
+        assert_eq!(part.shape.as_ref(), &[2, 3, 3]);
+        let want: Vec<f32> = (0..2)
+            .flat_map(|o| (0..9).map(move |r| (o * 18 + p * 9 + r) as f32))
+            .collect();
+        assert_eq!(part.data.as_ref(), want.as_slice());
+    }
+    // Uneven: the last part takes the remainder.
+    let data: Vec<f32> = (0..7).map(|i| i as f32).collect();
+    let t = TensorView::from_slice(&data, vec![7usize]);
+    let mut bufs = vec![Vec::new(), Vec::new(), Vec::new()];
+    let parts = split(&t, 0, &[0, 0, 0], &mut bufs);
+    let sizes: Vec<usize> = parts.iter().map(|p| p.shape[0]).collect();
+    assert_eq!(sizes, [3, 3, 1]);
+    assert_eq!(parts[2].data.as_ref(), &[6.0]);
+}
+
+#[test]
+fn test_bool_weights_load_one_byte_per_element() {
+    // 16 bools is a multiple of 8 bytes, which `from_bytes_i64` reads as two
+    // int64s; masks must go through the bool loader.
+    let mask: Vec<u8> = (0..16).map(|i| (i % 3 == 0) as u8).collect();
+    let t = TensorView::from_bytes_bool_as_i64(&mask, vec![4, 4]);
+    let want: Vec<i64> = mask.iter().map(|&b| b as i64).collect();
+    assert_eq!(t.data.as_ref(), want.as_slice());
+}
