@@ -3,6 +3,7 @@ use std::io::Write;
 
 pub mod activations;
 pub mod control_flow;
+pub mod fused;
 pub mod math;
 pub mod nn;
 pub mod tensor;
@@ -26,6 +27,10 @@ pub(crate) fn dispatch_builtin(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
     }
     // Try control flow
     if control_flow::handle_control_flow_ops(ctx, w)? {
+        return Ok(true);
+    }
+    // Try ops created by fusion
+    if fused::handle_fused_ops(ctx, w)? {
         return Ok(true);
     }
 

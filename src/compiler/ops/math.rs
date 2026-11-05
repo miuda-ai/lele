@@ -196,19 +196,13 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                         "{}let {} = lele::kernels::{}(&{}, &{}, {});",
                         tab, outputs[0], func, inputs[0], inputs[1], buf_expr
                     )?;
-                } else if a_is_weight_f32 {
-                    writeln!(
-                        w,
-                        "{}let {} = lele::kernels::equal_i64_f32_lhs(&{}, &{}, {});",
-                        tab, outputs[0], inputs[0], inputs[1], buf_expr
-                    )?;
-                } else if type_a == "f32"
-                    && (inputs[1].contains("weight_i64")
-                        || ctx
-                            .var_types
-                            .get(&sanitize_name(&ctx.node.input[1]))
-                            .map(|t| t == "i64")
-                            .unwrap_or(false))
+                } else if a_is_weight_f32
+                    || type_a == "f32"
+                        && (inputs[1].contains("weight_i64")
+                            || ctx
+                                .var_types
+                                .get(&sanitize_name(&ctx.node.input[1]))
+                                .is_some_and(|t| t == "i64"))
                 {
                     writeln!(
                         w,

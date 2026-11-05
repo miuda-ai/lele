@@ -1,4 +1,7 @@
-use super::super::generate::OpContext;
+use super::super::{
+    generate::OpContext,
+    ir::{ConvAttrs, Op},
+};
 use std::io::Write;
 
 /// Compute explicit pads from auto_pad attribute for SAME_UPPER/SAME_LOWER.
@@ -64,27 +67,14 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
 
     match op {
         "Conv" => {
-            let dilations = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "dilations")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
-            let group = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "group")
-                .map(|a| a.i)
-                .unwrap_or(1);
-            let auto_pad = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "auto_pad")
-                .and_then(|a| std::str::from_utf8(&a.s).ok())
-                .unwrap_or("NOTSET");
+            // Only a Conv outside the default domain is untyped.
+            let conv = match &ctx.ir().op {
+                Op::Conv(conv) => conv.clone(),
+                _ => ConvAttrs::parse(ctx.node),
+            };
+            let dilations = conv.dilations.clone().unwrap_or_default();
+            let group = conv.group.unwrap_or(1);
+            let auto_pad = conv.auto_pad.as_deref().unwrap_or("NOTSET");
             let kernel_shape: Vec<i64> = {
                 let weight_name = &ctx.node.input[1];
                 let weight_name_s = super::super::sanitize_name(weight_name);
@@ -104,21 +94,10 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
             let pads = if auto_pad != "NOTSET" && !auto_pad.is_empty() {
                 compute_same_pads(&kernel_shape, &[1, 1], &dilations, auto_pad).unwrap_or_default()
             } else {
-                ctx.node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "pads")
-                    .map(|a| a.ints.clone())
-                    .unwrap_or(vec![])
+                conv.pads.clone().unwrap_or_default()
             };
-            let strides = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "strides")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
-            let bias_arg = if inputs.len() > 2 {
+            let strides = conv.strides.clone().unwrap_or_default();
+            let bias_arg = if ctx.ir().input(2).is_some() {
                 format!("Some(&{})", inputs[2])
             } else {
                 "None".to_string()
@@ -300,20 +279,13 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
             }
         }
         "LayerNormalization" => {
-            let epsilon = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "epsilon")
-                .map(|a| a.f)
-                .unwrap_or(1e-5);
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(-1);
+            let (axis, epsilon) = match ctx.ir().op {
+                Op::LayerNormalization { axis, epsilon } => (axis, epsilon),
+                _ => panic!(
+                    "LayerNormalization '{}' outside the default domain",
+                    ctx.node.name
+                ),
+            };
             let scale = if ctx.node.input.len() > 1
                 && !ctx.node.input[1].is_empty()
                 && !inputs[1].is_empty()

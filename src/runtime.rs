@@ -100,6 +100,7 @@ impl<'a> Weights<'a> {
 
     /// 8-bit weights packed for the integer GEMM, with their zero points
     /// subtracted, so the cached entry must match those and the scales.
+    #[allow(clippy::too_many_arguments)]
     fn get_qweights(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool, zero_point: &[f32], scale: &[f32]) -> Arc<QWeights> {
         let key = (offset, len, k, n, signed);
         // A list per shape key: the same initializer is used by both the
