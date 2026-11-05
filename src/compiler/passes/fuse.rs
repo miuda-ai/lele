@@ -5,13 +5,16 @@
 //! back. Every intermediate tensor must be read by the chain alone, so
 //! removing the chain cannot leave another reader without its input.
 
-use crate::compiler::ir::{Activation, Binary, Graph, NodeId, Op, Reduction, Unary, ValueId};
-use crate::model::onnx_proto::NodeProto;
+use crate::compiler::ir::{
+    Activation, Binary, DType, Graph, NodeId, Op, Reduction, Unary, ValueId,
+};
+use crate::model::onnx_proto::{NodeProto, TensorProto};
 use crate::model::tensor_to_array;
 
 /// Runs every fusion on `g` and its subgraphs.
 pub(crate) fn fuse(g: &mut Graph) {
     fuse_layer_norm(g);
+    fuse_scale_norm(g);
     fuse_gelu(g);
     fuse_silu(g);
     fuse_conv_bias(g);
@@ -54,17 +57,21 @@ fn sole_producer(g: &Graph, v: Option<ValueId>, is_match: impl Fn(&Op) -> bool) 
     (is_match(&g.node(id).op) && g.uses(v) == 1).then_some(id)
 }
 
-/// The values of a compile-time constant: an initializer or a `Constant`.
-fn constant(g: &Graph, v: Option<ValueId>) -> Option<Vec<f32>> {
+/// A compile-time constant: an initializer or a `Constant`.
+fn constant_tensor(g: &Graph, v: Option<ValueId>) -> Option<&TensorProto> {
     let v = v?;
-    let tensor = match g.data(v) {
-        Some(t) => t,
+    match g.data(v) {
+        Some(t) => Some(t),
         None => match &g.producer(v)?.op {
-            Op::Constant { value } => value,
-            _ => return None,
+            Op::Constant { value } => Some(value),
+            _ => None,
         },
-    };
-    tensor_to_array(tensor).ok().map(|(data, _)| data)
+    }
+}
+
+/// The values of a compile-time constant.
+fn constant(g: &Graph, v: Option<ValueId>) -> Option<Vec<f32>> {
+    tensor_to_array(constant_tensor(g, v)?).ok().map(|(data, _)| data)
 }
 
 /// Whether `v` is a constant scalar close to `expected`.
@@ -100,20 +107,22 @@ fn named_after(g: &Graph, id: NodeId) -> NodeProto {
     }
 }
 
+/// Whether reduction `id` is over the last axis alone, keeping it.
+fn reduces_last_axis(g: &Graph, id: NodeId) -> bool {
+    let node = g.node(id);
+    let Op::Reduce { axes, keepdims, .. } = &node.op else {
+        return false;
+    };
+    let axes = match axes {
+        Some(axes) => Some(axes.iter().map(|&x| x as f32).collect()),
+        None => constant(g, node.input(1)),
+    };
+    axes.as_deref() == Some(&[-1.0]) && *keepdims
+}
+
 /// `x - mean(x)`, normalized by `sqrt(mean((x - mean(x))^2) + eps)`, then
 /// scaled and shifted, all over the last axis → `LayerNormalization`.
 fn fuse_layer_norm(g: &mut Graph) {
-    let reduces_last_axis = |g: &Graph, id: NodeId| {
-        let node = g.node(id);
-        let Op::Reduce { axes, keepdims, .. } = &node.op else {
-            return false;
-        };
-        let axes = match axes {
-            Some(axes) => Some(axes.iter().map(|&x| x as f32).collect()),
-            None => constant(g, node.input(1)),
-        };
-        axes.as_deref() == Some(&[-1.0]) && *keepdims
-    };
     for add in binary_nodes(g, Binary::Add) {
         if !g.contains(add) {
             continue;
@@ -155,6 +164,66 @@ fn fuse_layer_norm(g: &mut Graph) {
             let op = Op::LayerNormalization { axis: -1, epsilon };
             let proto = named_after(g, add);
             g.fuse(&nodes, op, proto, inputs.to_vec());
+        }
+    }
+}
+
+/// `gamma * (x / (ReduceL2(x) * scale + eps))` over the last axis, with
+/// constant scalars `scale` and `eps` and the operands of each `Mul` and
+/// `Add` in either order → `ScaleNorm`.
+fn fuse_scale_norm(g: &mut Graph) {
+    let scalar = |g: &Graph, v| {
+        constant(g, v).and_then(|c| match c[..] {
+            [c] if c.is_finite() => Some(c),
+            _ => None,
+        })
+    };
+    for mul in binary_nodes(g, Binary::Mul) {
+        if !g.contains(mul) {
+            continue;
+        }
+        let fused = (0..2).find_map(|k| {
+            let node = g.node(mul);
+            let (normed, gamma) = (node.input(k), node.input(1 - k));
+            let div = sole_producer(g, normed, binary(Binary::Div))?;
+            let (x, denom) = (g.node(div).input(0)?, g.node(div).input(1));
+            let add = sole_producer(g, denom, binary(Binary::Add))?;
+            let (scaled, epsilon) = (0..2).find_map(|j| {
+                let eps = scalar(g, g.node(add).input(1 - j))?;
+                Some((g.node(add).input(j), eps))
+            })?;
+            let scale_mul = sole_producer(g, scaled, binary(Binary::Mul))?;
+            let (norm, scale) = (0..2).find_map(|j| {
+                let scale = scalar(g, g.node(scale_mul).input(1 - j))?;
+                Some((g.node(scale_mul).input(j), scale))
+            })?;
+            let is_l2 = |op: &Op| {
+                matches!(
+                    op,
+                    Op::Reduce {
+                        reduction: Reduction::L2,
+                        ..
+                    }
+                )
+            };
+            let l2 = sole_producer(g, norm, is_l2)?;
+            // The kernel takes f32, and a constant gamma of one element per
+            // column (rank 1, so it broadcasts along the last axis) or of one.
+            let gamma_ok = constant_tensor(g, gamma).is_some_and(|t| {
+                t.dims.len() <= 1 || t.dims.iter().product::<i64>() == 1
+            });
+            if g.node(l2).input(0) != Some(x)
+                || !reduces_last_axis(g, l2)
+                || g.value(x).dtype != DType::F32
+                || !gamma_ok
+            {
+                return None;
+            }
+            Some(([l2, scale_mul, add, div, mul], [Some(x), gamma], scale, epsilon))
+        });
+        if let Some((nodes, inputs, scale, epsilon)) = fused {
+            let proto = named_after(g, mul);
+            g.fuse(&nodes, Op::ScaleNorm { scale, epsilon }, proto, inputs.to_vec());
         }
     }
 }
@@ -301,6 +370,13 @@ fn fuse_linear(g: &mut Graph) {
         let fused = (0..2).find_map(|k| {
             let node = g.node(add);
             let mm = sole_producer(g, node.input(k), |op| matches!(op, Op::MatMul))?;
+            // `Linear` computes the product's shape: not an `Add` that broadcasts
+            // it to more (when shape inference knows both).
+            let shape = |v: Option<ValueId>| v.and_then(|v| g.value(v).shape.clone());
+            match (shape(node.input(k)), shape(node.output(0))) {
+                (Some(product), Some(sum)) if product != sum => return None,
+                _ => {}
+            }
             Some((mm, node.input(1 - k)))
         });
         if let Some((mm, bias)) = fused {
@@ -437,6 +513,7 @@ mod tests {
             ..Default::default()
         };
         let mut ir = Graph::from_onnx(g);
+        crate::compiler::passes::infer_dtypes(&mut ir);
         fuse(&mut ir);
         ir.into_onnx().node.into_iter().map(|n| n.op_type).collect()
     }
@@ -528,6 +605,53 @@ mod tests {
         assert_eq!(fused(nodes, vec![]), ["Sigmoid", "Mul", "Add"]);
     }
 
+    /// `MatMul` + `Add` of shaped inputs fuses when the sum has the product's shape,
+    /// and not when the `Add` broadcasts the product to more (a bias with extra
+    /// leading dimensions), which `Linear` cannot compute.
+    #[test]
+    fn fuses_linear_only_when_the_bias_keeps_the_product_shape() {
+        use crate::model::onnx_proto::{TensorShapeProto, TypeProto, tensor_shape_proto, type_proto};
+        let input = |name: &str, dims: &[i64]| ValueInfoProto {
+            name: name.to_string(),
+            r#type: Some(TypeProto {
+                value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                    elem_type: crate::compiler::ir::DType::F32.to_onnx(),
+                    shape: Some(TensorShapeProto {
+                        dim: dims
+                            .iter()
+                            .map(|&d| tensor_shape_proto::Dimension {
+                                value: Some(tensor_shape_proto::dimension::Value::DimValue(d)),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    }),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let fused = |bias: &[i64]| {
+            let g = GraphProto {
+                node: vec![node("MatMul", &["x", "w"], "m"), node("Add", &["m", "b"], "y")],
+                input: vec![input("x", &[2, 3]), input("w", &[3, 4]), input("b", bias)],
+                output: vec![ValueInfoProto {
+                    name: "y".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let mut ir = Graph::from_onnx(g);
+            crate::compiler::passes::infer_dtypes(&mut ir);
+            crate::compiler::passes::fold_shapes(&mut ir);
+            fuse(&mut ir);
+            ir.into_onnx().node.into_iter().map(|n| n.op_type).collect::<Vec<_>>()
+        };
+        assert_eq!(fused(&[4]), ["Linear"]);
+        assert_eq!(fused(&[2, 4]), ["Linear"]);
+        assert_eq!(fused(&[5, 1, 4]), ["MatMul", "Add"]);
+        assert_eq!(fused(&[1, 2, 4]), ["MatMul", "Add"]);
+    }
+
     #[test]
     fn fuses_matmul_add_into_linear() {
         let nodes = vec![
@@ -536,6 +660,55 @@ mod tests {
             node("Add", &["b", "m"], "y"),
         ];
         assert_eq!(fused(nodes, vec![]), ["Relu", "Linear"]);
+    }
+
+    /// T-one's ScaleNorm: `gamma * (x / (ReduceL2(x) * scale + eps))`, of an
+    /// f32 `x` (a Cast, so its type is known), with the operands of each `Mul`
+    /// and `Add` in either order.
+    #[test]
+    fn fuses_scale_norm() {
+        let nodes = |swap: bool| {
+            let mut cast = node("Cast", &["input"], "x");
+            cast.attribute.push(crate::model::onnx_proto::AttributeProto {
+                name: "to".to_string(),
+                i: 1,
+                ..Default::default()
+            });
+            let mut l2 = node("ReduceL2", &["x"], "norm");
+            l2.attribute.push(crate::model::onnx_proto::AttributeProto {
+                name: "axes".to_string(),
+                ints: vec![-1],
+                ..Default::default()
+            });
+            let order = |a: &'static str, b: &'static str| if swap { [b, a] } else { [a, b] };
+            vec![
+                cast,
+                l2,
+                node("Mul", &order("norm", "scale"), "scaled"),
+                node("Add", &order("scaled", "eps"), "denom"),
+                node("Div", &["x", "denom"], "normed"),
+                node("Mul", &order("gamma", "normed"), "y"),
+            ]
+        };
+        let gamma = TensorProto {
+            name: "gamma".to_string(),
+            data_type: crate::compiler::ir::DType::F32.to_onnx(),
+            dims: vec![4],
+            float_data: vec![1.0, 2.0, 3.0, 4.0],
+            ..Default::default()
+        };
+        let constants = vec![scalar("scale", 0.5), scalar("eps", 1e-8), gamma];
+        for swap in [false, true] {
+            assert_eq!(fused(nodes(swap), constants.clone()), ["Cast", "ScaleNorm"]);
+        }
+
+        // A scale that is not a constant, or a norm over another axis, is left.
+        let mut other = constants.clone();
+        other.remove(0);
+        assert_eq!(fused(nodes(false), other).len(), 6);
+        let mut nodes = nodes(false);
+        nodes[1].attribute[0].ints = vec![1];
+        assert_eq!(fused(nodes, constants).len(), 6);
     }
 
     #[test]

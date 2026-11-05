@@ -194,9 +194,9 @@ impl PerTensor {
 /// the scalar definition's operations in its order (an exact division, not a reciprocal),
 /// so every element matches it.
 pub(crate) fn quantize_per_tensor(level: Level, p: &PerTensor, src: &[f32], out: &mut Vec<f32>) {
-    // Every element is written, so the buffer is not filled first: workspace buffers
-    // alternate between tensor sizes, and zeroing them was 4-5% of Smart Turn.
-    crate::kernels::utils::ensure_capacity(out, src.len());
+    // SAFETY: every element is written, so the buffer is not filled first: workspace
+    // buffers alternate between tensor sizes, and zeroing them was 4-5% of Smart Turn.
+    unsafe { crate::kernels::utils::ensure_capacity(out, src.len()) };
     simd_call!(level, quantize_per_tensor_simd(p, src, out))
 }
 

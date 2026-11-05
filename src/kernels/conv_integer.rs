@@ -255,7 +255,8 @@ pub(crate) fn conv_integer_at<'a>(
         Kind::Int(packed) => packed,
         Kind::Float(centered) => {
             return CENTERED.with_borrow_mut(|x| {
-                utils::ensure_capacity(x, input.data.len());
+                // SAFETY: every element is written below before any is read.
+                unsafe { utils::ensure_capacity(x, input.data.len()) };
                 for (x, &v) in x.iter_mut().zip(input.data.iter()) {
                     *x = v - pad;
                 }
@@ -300,7 +301,8 @@ pub(crate) fn conv_integer_at<'a>(
     let (oc, per_group, cg) = (w.out_channels, w.out_channels / groups, w.channels);
     let depth = kh * kw * cg;
 
-    utils::ensure_capacity(out, batch * oc * positions);
+    // SAFETY: every group's channels are written below before any is read.
+    unsafe { utils::ensure_capacity(out, batch * oc * positions) };
     // `u8` codes go into the GEMM as they are; `i8` ones shifted into `u8` first.
     let signed = x_zero_point < 0 || input.data.iter().any(|&x| x < 0.0);
     let (shift, center) = if signed {
@@ -323,8 +325,12 @@ pub(crate) fn conv_integer_at<'a>(
     CHANNELS_LAST.with_borrow_mut(|nhwc| {
         PATCHES.with_borrow_mut(|patches| {
             SUMS.with_borrow_mut(|sums| {
-                utils::ensure_capacity(nhwc, spatial * in_channels);
-                utils::ensure_capacity(sums, positions * per_group);
+                // SAFETY: the transposed input and the sums of each block are
+                // written before they are read.
+                unsafe {
+                    utils::ensure_capacity(nhwc, spatial * in_channels);
+                    utils::ensure_capacity(sums, positions * per_group);
+                }
                 for b in 0..batch {
                     let x = &input.data[b * in_channels * spatial..][..in_channels * spatial];
                     transpose(x, in_channels, spatial, nhwc);
@@ -334,7 +340,9 @@ pub(crate) fn conv_integer_at<'a>(
                             let a: &[f32] = if pointwise && groups == 1 {
                                 &nhwc[r0 * in_channels..][..m * in_channels]
                             } else {
-                                utils::ensure_capacity(patches, m * depth);
+                                // SAFETY: every patch row is written below
+                                // before any is read.
+                                unsafe { utils::ensure_capacity(patches, m * depth) };
                                 for (i, row) in
                                     patches[..m * depth].chunks_exact_mut(depth).enumerate()
                                 {

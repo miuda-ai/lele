@@ -16,7 +16,8 @@ pub fn softmax<'b, 'a>(
     let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
     assert!(axis < ndim);
     let numel = input.data.len();
-    utils::ensure_capacity(out_buf, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out_buf, numel) };
     let out_slice = unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), numel) };
     let inner_size: usize = input.shape[axis + 1..].iter().product();
     let axis_size = input.shape[axis];
@@ -200,7 +201,8 @@ pub fn log_softmax<'b, 'a>(
     let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
     assert!(axis < ndim);
     let numel = input.data.len();
-    utils::ensure_capacity(out_buf, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out_buf, numel) };
     let out_slice = unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), numel) };
     let inner_size: usize = input.shape[axis + 1..].iter().product();
     let axis_size = input.shape[axis];
@@ -289,7 +291,8 @@ pub fn layer_norm<'b, 'a>(
     let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
     let outer_size: usize = input.shape[..axis].iter().product();
     let norm_size: usize = input.shape[axis..].iter().product();
-    utils::ensure_capacity(out_buf, input.data.len());
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out_buf, input.data.len()) };
     let out_slice =
         unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), input.data.len()) };
     debug_assert_eq!(outer_size * norm_size, input.data.len());
@@ -318,7 +321,8 @@ pub fn batch_norm<'b, 'a>(
 ) -> TensorView<'a> {
     let shape = &input.shape;
     let numel = input.data.len();
-    utils::ensure_capacity(out_buf, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out_buf, numel) };
     let out_slice = unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), numel) };
     // [outer, channels, inner...]: every rank is the 4D NCHW case with the
     // trailing dimensions flattened.
@@ -449,7 +453,8 @@ pub fn rms_norm<'b, 'a>(
     let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
     let outer_size: usize = input.shape[..axis].iter().product();
     let norm_size: usize = input.shape[axis..].iter().product();
-    utils::ensure_capacity(out_buf, input.data.len());
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out_buf, input.data.len()) };
     let out_slice =
         unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), input.data.len()) };
     debug_assert_eq!(outer_size * norm_size, input.data.len());
@@ -465,6 +470,83 @@ pub fn rms_norm<'b, 'a>(
     TensorView {
         data: Cow::Borrowed(out_slice),
         shape: std::borrow::Cow::Owned(input.shape.to_vec()),
+    }
+}
+
+/// `x / (‖x‖₂ * scale + epsilon) * gamma` over the last axis (ScaleNorm; with `scale`
+/// `1/√n` the norm is the RMS), `gamma` holding one element per column or a single
+/// one. Each step rounds as `ReduceL2`, `Mul`, `Add`, `Div` and `Mul` do, so the
+/// result is theirs bit for bit.
+pub fn scale_norm<'a>(
+    input: &TensorView<'_>,
+    gamma: &TensorView<'_>,
+    scale: f32,
+    epsilon: f32,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let n = *input.shape.last().expect("scale_norm: a scalar input");
+    let len = input.data.len();
+    assert!(
+        gamma.data.len() == n || gamma.data.len() == 1,
+        "scale_norm: {} scales for rows of {n}",
+        gamma.data.len()
+    );
+    // SAFETY: every row is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
+    if let Some(rows) = len.checked_div(n) {
+        let out = &mut out[..len];
+        let params = (scale, epsilon);
+        simd_call!(
+            Level::new(),
+            max = Avx2,
+            scale_norm_rows_simd(n, rows, &input.data, &gamma.data, out, params)
+        );
+    }
+    TensorView {
+        data: Cow::Borrowed(&out[..len]),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
+}
+
+#[simd]
+fn scale_norm_rows_simd<S: Simd>(
+    simd: S,
+    n: usize,
+    rows: usize,
+    src: &[f32],
+    gamma: &[f32],
+    out: &mut [f32],
+    (scale, epsilon): (f32, f32),
+) {
+    let (mut src, mut out) = (&src[..rows * n], &mut out[..rows * n]);
+    for _ in 0..rows {
+        let row;
+        (row, src) = src.split_at(n);
+        let out_row;
+        (out_row, out) = std::mem::take(&mut out).split_at_mut(n);
+        // The sum `reduce_l2` takes, so the norm is its.
+        let denom = crate::kernels::math::sum_squares(row).sqrt() * scale + epsilon;
+        let denom_v = f32x16::splat(simd, denom);
+        let (x, x_tail) = row.as_chunks::<LANES>();
+        let (o, o_tail) = out_row.as_chunks_mut::<LANES>();
+        if let [g] = gamma[..] {
+            let g_v = f32x16::splat(simd, g);
+            for (x, o) in x.iter().zip(o) {
+                (g_v * (f32x16::load_array_ref(simd, x) / denom_v)).store_array(o);
+            }
+            for (&x, o) in x_tail.iter().zip(o_tail) {
+                *o = g * (x / denom);
+            }
+        } else {
+            let (g, g_tail) = gamma[..n].as_chunks::<LANES>();
+            for ((x, g), o) in x.iter().zip(g).zip(o) {
+                let q = f32x16::load_array_ref(simd, x) / denom_v;
+                (f32x16::load_array_ref(simd, g) * q).store_array(o);
+            }
+            for ((&x, &g), o) in x_tail.iter().zip(g_tail).zip(o_tail) {
+                *o = g * (x / denom);
+            }
+        }
     }
 }
 
@@ -1051,5 +1133,36 @@ mod tests {
         }
         check_batch_norm(vec![2, 3, 5, 7], &mut rng);
         check_batch_norm(vec![4, 67], &mut rng);
+    }
+
+    /// `scale_norm` is `ReduceL2`, `Mul`, `Add`, `Div` and `Mul` in turn, bit for bit,
+    /// over row lengths around the vector widths, with one gamma per column or one.
+    #[test]
+    fn test_scale_norm_is_the_unfused_chain() {
+        use crate::kernels::math::{add, div, mul, reduce_l2};
+        let mut rng = Rng::new(8);
+        for &n in AWKWARD_LENS.iter().chain(&[384]) {
+            let shape = vec![2, ROWS, n];
+            let data = rng.vec(2 * ROWS * n, -3.0, 3.0);
+            let x = TensorView::from_slice(&data, shape.clone());
+            for gamma in [rng.vec(n, -2.0, 2.0), vec![1.5]] {
+                let g = TensorView::from_slice(&gamma, vec![gamma.len()]);
+                let (scale, eps) = (1.0 / (n as f32).sqrt(), 1e-8);
+                let s = TensorView::from_slice(std::slice::from_ref(&scale), vec![]);
+                let e = TensorView::from_slice(std::slice::from_ref(&eps), vec![]);
+                let mut bufs: [Vec<f32>; 5] = Default::default();
+                let [b0, b1, b2, b3, b4] = &mut bufs;
+                let norm = reduce_l2(&x, &[-1], true, b0);
+                let scaled = mul(&norm, &s, b1);
+                let denom = add(&scaled, &e, b2);
+                let normed = div(&x, &denom, b3);
+                let want = mul(&g, &normed, b4);
+                let mut out = Vec::new();
+                let got = scale_norm(&x, &g, scale, eps, &mut out);
+                assert_eq!(got.shape, want.shape);
+                let what = format!("n {n} gammas {}", gamma.len());
+                crate::kernels::test_util::assert_same_bits(&got.data, &want.data, &what);
+            }
+        }
     }
 }

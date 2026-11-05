@@ -441,6 +441,7 @@ fn output_shapes(g: &Graph, node: &Node, elems: &Elems) -> Vec<Option<Shape>> {
         | Op::LeakyRelu { .. }
         | Op::LogSoftmax { .. }
         | Op::QuantizeLinear(_)
+        | Op::ScaleNorm { .. }
         | Op::Silu
         | Op::Softmax { .. } => first(shape(0)),
         Op::DynamicQuantizeLinear => {

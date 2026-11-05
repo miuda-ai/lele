@@ -610,8 +610,8 @@ pub(crate) fn quantize_rows_at(
     dst: &mut Vec<i32>,
 ) {
     assert!(src.len() >= m * k);
-    // Every pair is written, so the buffer is not filled first.
-    crate::kernels::utils::ensure_capacity(dst, m * k.div_ceil(2));
+    // SAFETY: every pair is written, so the buffer is not filled first.
+    unsafe { crate::kernels::utils::ensure_capacity(dst, m * k.div_ceil(2)) };
     simd_call!(
         level,
         quantize_rows_simd(src, m, k, scale, zero_point, center, dst)
@@ -745,7 +745,8 @@ pub fn mat_mul_integer_f32<'a>(
     let batch_a: usize = a.shape[..ad - 2].iter().product();
     let batch_b: usize = b.shape[..bd - 2].iter().product();
     let batch = batch_a.max(batch_b);
-    crate::kernels::utils::ensure_capacity(out, batch * m * n);
+    // SAFETY: every batch of C is written whole below before any is read.
+    unsafe { crate::kernels::utils::ensure_capacity(out, batch * m * n) };
     let scale = scale.unwrap_or(&[1.0]);
     let e = Epilogue {
         scale: 1.0,
@@ -827,7 +828,8 @@ pub(crate) fn run_at(
         }),
         Packed::Float(b) => A_FLOAT.with_borrow_mut(|a| {
             let (k, n) = (w.k, w.n);
-            crate::kernels::utils::ensure_capacity(a, m * k);
+            // SAFETY: every element is written below before any is read.
+            unsafe { crate::kernels::utils::ensure_capacity(a, m * k) };
             simd_call!(
                 level,
                 quantize_rows_f32_simd(src, m * k, scale, zero_point, center, a)
@@ -942,8 +944,8 @@ fn quantized_matmul<'a>(
         x.shape, w.k, w.n
     );
     let m: usize = x.shape[..x.shape.len().saturating_sub(1)].iter().product();
-    // C is written whole, so the buffer is not filled first.
-    crate::kernels::utils::ensure_capacity(out, m * w.n);
+    // SAFETY: C is written whole, so the buffer is not filled first.
+    unsafe { crate::kernels::utils::ensure_capacity(out, m * w.n) };
     run_at(
         Level::new(),
         w,

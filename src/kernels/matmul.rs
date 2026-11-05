@@ -17,6 +17,7 @@ use crate::kernels::matmul_nn::{BSrc, Dims, SMALL_M, gemm_nn, gemm_small_m};
 use fearless_simd::Level;
 
 /// Accumulation mode for matmul output.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Accum {
     /// Overwrite the destination: C = alpha * A * B
     Replace,

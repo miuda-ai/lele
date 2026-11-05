@@ -69,7 +69,8 @@ pub fn average_pool2d<'b, 'a>(
         ((in_w as i64 + pad_left as i64 + pad_right as i64 - kw as i64) / sw as i64 + 1) as usize;
 
     let total = batch * channels * out_h * out_w;
-    crate::kernels::utils::ensure_capacity(out, total);
+    // SAFETY: every element is written below before any is read.
+    unsafe { crate::kernels::utils::ensure_capacity(out, total) };
 
     let data = &input.data;
     let o_slice = out.as_mut_slice();

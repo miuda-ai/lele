@@ -57,7 +57,8 @@ pub fn conv1d_pointwise<'a, W: WeightElem>(
         w_in == in_channels && in_channels > 1,
         "conv1d_pointwise: {in_channels} input channels against weights of {w_in}"
     );
-    utils::ensure_capacity(out, batch * out_channels * len);
+    // SAFETY: the product replaces every element.
+    unsafe { utils::ensure_capacity(out, batch * out_channels * len) };
     pointwise(
         input,
         &weights.data,
@@ -179,8 +180,20 @@ fn conv1d_fused_at<'b, 'a>(
     } else {
         panic!("Conv1d: Unsupported input rank {}", rank);
     };
+    assert!(w_shape.len() == 3, "Conv1d: weights of shape {w_shape:?}");
     let out_channels = w_shape[0];
     let kernel_size = w_shape[2];
+    // Each group's rows are computed from its share of the input; a group count
+    // that does not divide both would leave output rows unwritten.
+    let g = group as usize;
+    assert!(
+        group > 0
+            && in_channels.is_multiple_of(g)
+            && out_channels.is_multiple_of(g)
+            && w_shape[1] * g == in_channels,
+        "Conv1d: {in_channels} input and {out_channels} output channels in {group} groups \
+         against weights of shape {w_shape:?}"
+    );
     let dilation = if dilations.is_empty() {
         1
     } else {
@@ -196,7 +209,9 @@ fn conv1d_fused_at<'b, 'a>(
     let output_len =
         (input_len + pad_left + pad_right - dilation * (kernel_size - 1) - 1) / stride + 1;
     let total_output_size = batch_size * out_channels * output_len;
-    utils::ensure_capacity(out, total_output_size);
+    // SAFETY: every element is written below before any is read (the group
+    // count divides the channels, asserted above).
+    unsafe { utils::ensure_capacity(out, total_output_size) };
     let in_channels_per_group = in_channels / group as usize;
     let out_channels_per_group = out_channels / group as usize;
     let unfolded_rows = in_channels_per_group * kernel_size;

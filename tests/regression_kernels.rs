@@ -763,17 +763,29 @@ fn test_pad_reflect_symmetric() {
     );
 
     assert_eq!(result.shape.as_ref(), &[1, 1, 4, 5]);
-    let d = &result.data;
-    // Verify it's not all zeros (reflect should produce non-zero at borders)
-    let sum: f32 = d.iter().sum();
-    assert!(sum > 0.0, "pad reflect should produce non-zero output");
-    // Verify original data is preserved in the center
-    assert_eq!(d[5 + 1], 1.0);
-    assert_eq!(d[5 + 2], 2.0);
-    assert_eq!(d[5 + 3], 3.0);
-    assert_eq!(d[5 * 2 + 1], 4.0);
-    assert_eq!(d[5 * 2 + 2], 5.0);
-    assert_eq!(d[5 * 2 + 3], 6.0);
+    // np.pad([[1, 2, 3], [4, 5, 6]], 1, "reflect"): the edges are not repeated.
+    #[rustfmt::skip]
+    let expected = [
+        5.0, 4.0, 5.0, 6.0, 5.0,
+        2.0, 1.0, 2.0, 3.0, 2.0,
+        5.0, 4.0, 5.0, 6.0, 5.0,
+        2.0, 1.0, 2.0, 3.0, 2.0,
+    ];
+    assert_eq!(result.data.as_ref(), &expected);
+}
+
+#[test]
+#[should_panic(expected = "reflect pads")]
+fn test_pad_reflect_rejects_pads_as_long_as_the_axis() {
+    let input = vec![1.0f32, 2.0, 3.0];
+    let mut out_buf = Vec::new();
+    pad(
+        &TensorView::from_slice(&input, vec![3]),
+        &[0, 3],
+        None,
+        "reflect",
+        &mut out_buf,
+    );
 }
 
 #[test]

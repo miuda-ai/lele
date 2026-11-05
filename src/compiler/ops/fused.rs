@@ -28,6 +28,12 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             "{tab}let {} = lele::kernels::silu(&{}, {buf});",
             outputs[0], inputs[0]
         )?,
+        // `{:?}` writes each float so that it reads back the same.
+        Op::ScaleNorm { scale, epsilon } => writeln!(
+            w,
+            "{tab}let {} = lele::kernels::scale_norm(&{}, &{}, {scale:?}, {epsilon:?}, {buf});",
+            outputs[0], inputs[0], inputs[1]
+        )?,
         Op::Gelu { approximate } => {
             let kernel = match approximate.as_deref() {
                 None | Some("none") => "gelu_erf",

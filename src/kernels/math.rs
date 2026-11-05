@@ -20,7 +20,8 @@ fn unary<'a>(
 ) -> TensorView<'a> {
     const LANES: usize = 16;
     let n = input.data.len();
-    utils::ensure_capacity(out, n);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, n) };
     if n >= LANES {
         kernel(Level::new(), &input.data, out);
     } else {
@@ -225,7 +226,8 @@ where
         )
     });
     let numel = out_shape.iter().product::<usize>();
-    utils::ensure_capacity(output_buf, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(output_buf, numel) };
     let dims = out_shape.len();
     let o_slice = output_buf.as_mut_slice();
 
@@ -502,7 +504,8 @@ where
         )
     });
     let numel = out_shape.iter().product::<usize>();
-    utils::ensure_capacity(output_buf, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(output_buf, numel) };
     let dims = out_shape.len();
     if a.data.len() == 1 {
         let val_a = a.data[0];
@@ -633,7 +636,8 @@ fn add_inner<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Deb
     }
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
-        utils::ensure_capacity(out, len);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, len) };
         let a_slice = &a.data;
         let b_slice = &b.data;
         let o_slice = out.as_mut_slice();
@@ -683,7 +687,8 @@ fn mul_inner<'b, 'a, T: Clone + Copy + std::ops::Mul<Output = T> + std::fmt::Deb
     }
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
-        utils::ensure_capacity(out, len);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, len) };
         let a_slice = &a.data;
         let b_slice = &b.data;
         let o_slice = out.as_mut_slice();
@@ -714,7 +719,8 @@ pub fn sub<'b, 'a, T: Clone + Copy + std::ops::Sub<Output = T> + std::fmt::Debug
     }
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
-        utils::ensure_capacity(out, len);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, len) };
         let a_slice = &a.data;
         let b_slice = &b.data;
         let o_slice = out.as_mut_slice();
@@ -734,7 +740,8 @@ pub fn sub<'b, 'a, T: Clone + Copy + std::ops::Sub<Output = T> + std::fmt::Debug
 }
 pub fn reciprocal<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     for i in 0..numel {
         out[i] = 1.0 / input.data[i];
     }
@@ -772,7 +779,8 @@ pub fn erf<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
 
 pub fn softplus<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     for i in 0..numel {
         let x = input.data[i];
         out[i] = if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
@@ -789,7 +797,8 @@ pub fn hard_sigmoid<'b, 'a>(
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let i_slice = &input.data;
     let o_slice = out.as_mut_slice();
     #[cfg(target_arch = "aarch64")]
@@ -839,7 +848,8 @@ pub fn div<'b, 'a, T: Clone + Copy + std::ops::Div<Output = T> + std::fmt::Debug
     }
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
-        utils::ensure_capacity(out, len);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, len) };
         let a_slice = &a.data;
         let b_slice = &b.data;
         let o_slice = out.as_mut_slice();
@@ -875,7 +885,8 @@ pub fn mod_f32<'b, 'a, T: ElementOps>(
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     let len = a.data.len();
-    utils::ensure_capacity(out, len);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
     let b_scalar = b.data.len() == 1;
     let o_slice = out.as_mut_slice();
     let b_slice = &b.data;
@@ -937,7 +948,7 @@ pub fn equal_i64_f32_lhs<'a, 'b>(
     equal_i64_impl(&a_as_i64, &a.shape, &b.data, &b.shape, out)
 }
 
-fn equal_i64_impl<'a, T: PartialEq + Copy>(
+fn equal_i64_impl<'a, T: PartialEq + Copy + std::fmt::Debug>(
     a_data: &[T],
     a_shape: &[usize],
     b_data: &[T],
@@ -947,25 +958,18 @@ fn equal_i64_impl<'a, T: PartialEq + Copy>(
     let out_shape = utils::broadcast_shapes(a_shape, b_shape)
         .unwrap_or_else(|| panic!("Shapes not broadcastable: a={:?} b={:?}", a_shape, b_shape));
     let numel = out_shape.iter().product::<usize>();
-    utils::ensure_capacity(out, numel);
-    if a_data.len() == 1 && b_data.len() == 1 {
-        out[0] = if a_data[0] == b_data[0] { 1 } else { 0 };
-    } else if a_data.len() == 1 {
-        let val_a = a_data[0];
-        for i in 0..numel {
-            out[i] = if val_a == b_data[i] { 1 } else { 0 };
-        }
-    } else if b_data.len() == 1 {
-        let val_b = b_data[0];
-        for i in 0..numel {
-            out[i] = if a_data[i] == val_b { 1 } else { 0 };
-        }
-    } else if a_data.len() == b_data.len() {
-        for i in 0..numel {
-            out[i] = if a_data[i] == b_data[i] { 1 } else { 0 };
-        }
-    } else {
-        panic!("equal_i64: complex broadcast not implemented");
+    let eq = |x: T, y: T| (x == y) as i64;
+    // Each fast path reads operands that hold one value or the whole output.
+    let (a_len, b_len) = (a_data.len(), b_data.len());
+    if !(a_len == numel || a_len == 1) || !(b_len == numel || b_len == 1) {
+        let a = TensorView::from_slice(a_data, a_shape.to_vec());
+        let b = TensorView::from_slice(b_data, b_shape.to_vec());
+        return broadcast_binary_op_to(&a, &b, out, eq);
+    }
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = eq(a_data[if a_len == 1 { 0 } else { i }], b_data[if b_len == 1 { 0 } else { i }]);
     }
     TensorView {
         data: Cow::Borrowed(out),
@@ -1033,7 +1037,8 @@ pub fn sqrt<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView
 
 pub fn round<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let len = input.data.len();
-    utils::ensure_capacity(out, len);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
     let in_slice = &input.data;
     let out_slice = out.as_mut_slice();
     for i in 0..len {
@@ -1049,7 +1054,8 @@ pub fn round<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorVie
 
 pub fn floor<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let len = input.data.len();
-    utils::ensure_capacity(out, len);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
     let in_slice = &input.data;
     let out_slice = out.as_mut_slice();
     for i in 0..len {
@@ -1065,7 +1071,8 @@ pub fn floor<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorVie
 
 pub fn ceil<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let len = input.data.len();
-    utils::ensure_capacity(out, len);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
     let in_slice = &input.data;
     let out_slice = out.as_mut_slice();
     for i in 0..len {
@@ -1087,7 +1094,8 @@ pub fn pow<'b, 'a, T: ElementOps>(
     if b.data.len() == 1 {
         let exp_val = b.data.first().unwrap().as_f32();
         let len = a.data.len();
-        utils::ensure_capacity(out, len);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, len) };
         let a_slice = &a.data;
         let o_slice = out.as_mut_slice();
         if exp_val == 3.0 {
@@ -1119,7 +1127,8 @@ pub fn pow<'b, 'a, T: ElementOps>(
     }
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
-        utils::ensure_capacity(out, len);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, len) };
         let a_slice = &a.data;
         let b_slice = &b.data;
         let o_slice = out.as_mut_slice();
@@ -1141,7 +1150,8 @@ pub fn not<'b, 'a, T: ElementOps>(
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
     let len = input.data.len();
-    utils::ensure_capacity(out, len);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
     let i_slice = &input.data;
     let o_slice = out.as_mut_slice();
     let zero = T::from_f32(0.0);
@@ -1188,7 +1198,8 @@ pub fn reduce_mean<'b, 'a>(
             out_shape.resize(dims, 1);
         }
         let scale = 1.0f32 / inner as f32;
-        utils::ensure_capacity(out, outer);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, outer) };
         for (o, dst) in out.iter_mut().enumerate() {
             let run = &input.data[o * inner..(o + 1) * inner];
             // Eight independent accumulators: f32 addition is not associative,
@@ -1580,7 +1591,8 @@ pub fn reduce_l2<'b, 'a>(
 
     if resolved_axes.len() == 1 && resolved_axes[0] == dims - 1 && input.shape[dims - 1] == 2 {
         let n = input.data.len() / 2;
-        utils::ensure_capacity(out, n);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, n) };
         let mut out_shape = Vec::new();
         for i in 0..dims {
             if i != dims - 1 {
@@ -1661,6 +1673,35 @@ pub fn reduce_l2<'b, 'a>(
         out.resize(out_numel, 0.0);
     }
     out.fill(0.0);
+    // Fast path: the reduced axes are consecutive, so the input is `[outer, reduced,
+    // inner]` and each output the norm of `reduced` elements `inner` apart; squares
+    // summed row by row of `inner` elements, or along a run when `inner` is 1.
+    if let (Some(&first), Some(&last)) = (resolved_axes.first(), resolved_axes.last())
+        && last - first + 1 == resolved_axes.len()
+    {
+        let reduced: usize = input.shape[first..=last].iter().product();
+        let inner: usize = input.shape[last + 1..].iter().product();
+        let data = &input.data[..];
+        for (o, out_block) in out[..out_numel].chunks_mut(inner.max(1)).enumerate() {
+            let block = &data[o * reduced * inner..][..reduced * inner];
+            if inner == 1 {
+                out_block[0] = sum_squares(block).sqrt();
+            } else {
+                for row in block.chunks_exact(inner) {
+                    for (s, &v) in out_block.iter_mut().zip(row) {
+                        *s += v * v;
+                    }
+                }
+                for s in out_block.iter_mut() {
+                    *s = s.sqrt();
+                }
+            }
+        }
+        return TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(out_shape),
+        };
+    }
     let real_out_strides = utils::compute_strides(&out_shape);
     let mut input_to_out_strides = vec![0; dims];
     let mut out_dim_idx = 0;
@@ -1705,6 +1746,23 @@ pub fn reduce_l2<'b, 'a>(
     }
 }
 
+/// The sum of the squares of `run`, in eight independent accumulators (f32 addition is
+/// not associative, so a single one would keep the loop serial on the add latency).
+pub(crate) fn sum_squares(run: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let (chunks, rest) = run.as_chunks::<8>();
+    for c in chunks {
+        for (a, &v) in acc.iter_mut().zip(c) {
+            *a += v * v;
+        }
+    }
+    let mut s = ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
+    for &v in rest {
+        s += v * v;
+    }
+    s
+}
+
 pub fn max<'b, 'a>(
     a: &TensorView<'b>,
     b: &TensorView<'b>,
@@ -1712,7 +1770,8 @@ pub fn max<'b, 'a>(
 ) -> TensorView<'a> {
     if a.shape == b.shape {
         let len = a.data.len();
-        utils::ensure_capacity(out, len);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, len) };
         let out_slice = out.as_mut_slice();
         for i in 0..len {
             out_slice[i] = a.data[i].max(b.data[i]);
@@ -1730,7 +1789,8 @@ pub fn max<'b, 'a>(
         });
         // Both inputs can be broadcast, so the output can be larger than either.
         let len = out_shape.iter().product();
-        utils::ensure_capacity(out, len);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, len) };
         let out_slice = out.as_mut_slice();
         let ndim = out_shape.len();
         let mut coords = vec![0usize; ndim];
@@ -1793,7 +1853,8 @@ pub fn clip<'b, 'a, T: ElementOps, U: ElementOps, V: ElementOps>(
         .map(|v| T::from_f32(v.as_f32()))
         .unwrap_or(T::constant_max());
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     for i in 0..numel {
         let val = input.data[i].clamp_val(min_val, max_val);
         out[i] = V::from_f32(val.as_f32());
@@ -1811,7 +1872,8 @@ pub fn prelu<'b, 'a>(
     if slope.data.len() == 1 {
         let s = slope.data[0];
         let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, numel) };
         for i in 0..numel {
             let x = input.data[i];
             out[i] = if x < 0.0 { x * s } else { x };
@@ -1838,7 +1900,8 @@ pub fn range<'a>(
     } else {
         0
     };
-    utils::ensure_capacity(out, n);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, n) };
     let out_slice = out.as_mut_slice();
     for (i, o) in out_slice[..n].iter_mut().enumerate() {
         *o = start_val + (i as f32) * delta_val;
@@ -1862,7 +1925,8 @@ pub fn range_i64<'a>(
     } else {
         0
     };
-    utils::ensure_capacity(out, n);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, n) };
     let out_slice = out.as_mut_slice();
     for (i, o) in out_slice[..n].iter_mut().enumerate() {
         *o = start_val + (i as i64) * delta_val;
@@ -1871,7 +1935,8 @@ pub fn range_i64<'a>(
 }
 pub fn sin<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
         out_slice[i] = input.data[i].sin();
@@ -1880,7 +1945,8 @@ pub fn sin<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
 }
 pub fn cos<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
         out_slice[i] = input.data[i].cos();
@@ -1892,7 +1958,8 @@ pub fn exp<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
 }
 pub fn log<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
         out_slice[i] = input.data[i].ln();
@@ -1904,7 +1971,8 @@ pub fn neg<'b, 'a, T: ElementOps>(
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
         out_slice[i] = T::from_f32(-input.data[i].as_f32());
@@ -2013,7 +2081,8 @@ where
         axis as usize
     };
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let o_slice = out.as_mut_slice();
     let i_slice = &input.data;
     let ax_dim = input.shape[ax];
@@ -2071,7 +2140,8 @@ pub fn einsum_bs_d_bsd<'b, 'a>(
     let d_len = b.data.len();
     let bs_len = a.data.len();
     let numel = bs_len * d_len;
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let o_slice = out.as_mut_slice();
     let mut idx = 0;
     for i in 0..bs_len {
@@ -2125,7 +2195,8 @@ pub fn expand<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         }
     }
     let numel: usize = out_shape.iter().product();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let input_strides = utils::compute_strides(input_shape);
     // Broadcast dimensions (missing or of size 1) don't advance the input.
     let offset_in = ndim_out - ndim_in;
@@ -2173,7 +2244,8 @@ pub fn tile<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         .map(|(&dim, &rep)| dim * rep)
         .collect();
     let numel = out_shape.iter().product();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let out_slice = out.as_mut_slice();
     let input_strides = utils::compute_strides(&input.shape);
     let mut coords = vec![0; ndim];
@@ -2338,6 +2410,7 @@ pub fn stft_power_spectrum<'b, 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernels::test_util::assert_close;
     use crate::tensor::TensorView;
 
     /// Every set of axes of a `[2, 3, 4, 5]` tensor (consecutive ones take the fast
@@ -2372,6 +2445,67 @@ mod tests {
                     })
                     .collect();
                 assert_eq!(got.shape.as_ref(), &want_shape[..], "axes {axes:?}");
+            }
+        }
+    }
+
+    /// `equal_i64` broadcasting both operands (`[1, 6]` against `[6, 1]`, which used
+    /// to index past them), and one against a scalar or a whole.
+    #[test]
+    fn test_equal_i64_broadcasts_both_operands() {
+        let (row, col): (Vec<i64>, Vec<i64>) = ((0..6).collect(), (0..6).map(|i| 5 - i).collect());
+        let r = TensorView::from_slice(&row, vec![1, 6]);
+        let c = TensorView::from_slice(&col, vec![6, 1]);
+        let mut out = Vec::new();
+        let got = equal_i64(&r, &c, &mut out);
+        assert_eq!(got.shape.as_ref(), &[6, 6]);
+        for (k, &v) in got.data.iter().enumerate() {
+            let (i, j) = (k / 6, k % 6);
+            assert_eq!(v, (row[j] == col[i]) as i64, "at {i},{j}");
+        }
+        let three = [3i64];
+        let s = TensorView::from_slice(&three, vec![]);
+        let mut out = Vec::new();
+        let got = equal_i64(&r, &s, &mut out);
+        assert_eq!(got.data.as_ref(), &[0, 0, 0, 1, 0, 0]);
+        let mut out = Vec::new();
+        let got = equal_i64(&r, &r, &mut out);
+        assert_eq!(got.data.as_ref(), &[1; 6]);
+    }
+
+    /// Every set of axes of a `[2, 3, 4, 11]` tensor (consecutive ones take the fast
+    /// path; a last axis of 11 sums one chunk of eight and a remainder), with and
+    /// without kept dimensions, against a reference in f64.
+    #[test]
+    fn test_reduce_l2_matches_reference_on_every_axis_set() {
+        let shape = [2usize, 3, 4, 11];
+        let n: usize = shape.iter().product();
+        let data: Vec<f32> = (0..n).map(|i| ((i * 37) % n) as f32 / 10.0 - 13.0).collect();
+        let t = TensorView::from_slice(&data, shape.to_vec());
+        for mask in 1u32..16 {
+            let axes: Vec<i64> = (0..4).filter(|d| mask & (1 << d) != 0).collect();
+            for keepdims in [false, true] {
+                let mut out = Vec::new();
+                let got = reduce_l2(&t, &axes, keepdims, &mut out);
+                let kept: Vec<usize> = (0..4).filter(|&d| mask & (1 << d) == 0).collect();
+                let out_n: usize = kept.iter().map(|&d| shape[d]).product();
+                let mut want = vec![0.0f64; out_n];
+                for (i, &v) in data.iter().enumerate() {
+                    let idx = [i / 132, i / 44 % 3, i / 11 % 4, i % 11];
+                    let o = kept.iter().fold(0, |o, &d| o * shape[d] + idx[d]);
+                    want[o] += v as f64 * v as f64;
+                }
+                let want: Vec<f64> = want.iter().map(|s| s.sqrt()).collect();
+                let what = format!("axes {axes:?} keepdims {keepdims}");
+                assert_close(&got.data, &want, 1e-6, &what);
+                let want_shape: Vec<usize> = (0..4)
+                    .filter_map(|d| match (mask & (1 << d) != 0, keepdims) {
+                        (false, _) => Some(shape[d]),
+                        (true, true) => Some(1),
+                        (true, false) => None,
+                    })
+                    .collect();
+                assert_eq!(got.shape.as_ref(), &want_shape[..], "{what}");
             }
         }
     }

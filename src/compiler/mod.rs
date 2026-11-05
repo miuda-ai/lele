@@ -248,7 +248,14 @@ impl Compiler {
             passes::fuse_qdq(&mut ir);
         }
         if opt.operator_fusion {
+            // Some fusions apply to f32 alone.
+            passes::infer_dtypes(&mut ir);
             passes::fuse(&mut ir);
+            if opt.dead_code_elimination {
+                // The constants fused chains read (an epsilon, a scale) are
+                // left without readers, and would each keep a buffer.
+                passes::eliminate_dead_code(&mut ir);
+            }
         }
         passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);

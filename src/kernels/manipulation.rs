@@ -610,7 +610,8 @@ fn concat_impl<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     }
 
     let out_numel = out_shape.iter().product::<usize>();
-    utils::ensure_capacity(out, out_numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, out_numel) };
     if out_numel == 0 {
         return TensorView::from_slice(out, out_shape);
     }
@@ -680,7 +681,8 @@ pub fn slice<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
                 let start_offset = start * stride;
                 let end_offset = end * stride;
 
-                utils::ensure_capacity(out, end_offset - start_offset);
+                // SAFETY: the run is copied in whole below.
+                unsafe { utils::ensure_capacity(out, end_offset - start_offset) };
                 out.copy_from_slice(&input.data[start_offset..end_offset]);
 
                 let mut out_shape = input.shape.to_vec();
@@ -796,7 +798,8 @@ pub fn slice<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         out_shape[i] = count as usize;
     }
     let out_numel = out_shape.iter().product::<usize>();
-    utils::ensure_capacity(out, out_numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, out_numel) };
 
     if out_numel == 0 {
         return TensorView::from_slice(out, out_shape);
@@ -870,7 +873,8 @@ pub fn pad<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         new_shape[i] += p[i] + p[i + rank];
     }
     let total = new_shape.iter().product::<usize>();
-    utils::ensure_capacity(out, total);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, total) };
     // For constant mode: use provided constant_value or default to 0 (per ONNX spec)
     let fill_val: T = if let Some(cv) = constant_value {
         if !cv.data.is_empty() {
@@ -998,6 +1002,16 @@ fn pad_reflect_inplace<T: Clone + Copy>(
     p: &[usize],
     rank: usize,
 ) {
+    // Reflection excludes the edge, so it reaches at most `dim - 1` elements in.
+    for d in 0..rank {
+        let end_pad = new_shape[d] - input_shape[d] - p[d];
+        assert!(
+            p[d].max(end_pad) < input_shape[d] || p[d].max(end_pad) == 0,
+            "Pad: reflect pads of {} and {end_pad} on an axis of {}",
+            p[d],
+            input_shape[d]
+        );
+    }
     let total: usize = new_shape.iter().product();
     let strides = utils::compute_strides(new_shape);
     let mut coords = vec![0usize; rank];
@@ -1015,11 +1029,13 @@ fn pad_reflect_inplace<T: Clone + Copy>(
                 let c = coords[d];
                 let pad_begin = p[d];
                 let pad_end = p[d] + input_shape[d];
+                // Mirrored about the first and last elements, which are not
+                // repeated: `[1, 2, 3, 4]` pads to `[.., 3, 2 | 1, 2, 3, 4 | 3, 2, ..]`.
                 let reflected = if c < pad_begin {
                     pad_begin + (pad_begin - c)
                 } else if c >= pad_end {
                     let past = c - pad_end;
-                    pad_end - 1 - past
+                    pad_end - 2 - past
                 } else {
                     c
                 };
@@ -1061,7 +1077,8 @@ where
         out_shape.push(data.shape[i]);
     }
     let out_numel = out_shape.iter().product::<usize>();
-    utils::ensure_capacity(out, out_numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, out_numel) };
     let outer_dim: usize = data.shape[..axis].iter().product();
     let axis_dim = data.shape[axis];
     let inner_dim: usize = data.shape[axis + 1..].iter().product();
@@ -1106,7 +1123,8 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
     );
     let out_shape: Vec<usize> = (0..ndim).map(|i| input_shape[perm_at(i)]).collect();
     let out_numel = input.data.len();
-    utils::ensure_capacity(out, out_numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, out_numel) };
     let dst = &mut out[..out_numel];
     // Two axes longer than 1 that swap places, the rest of length 1, as in
     // most model transposes: a matrix transpose, without the planning that
@@ -1272,7 +1290,8 @@ pub fn split<'a, T: Clone + Copy + std::fmt::Debug>(
         let mut out_shape = input.shape.to_vec();
         out_shape[axis] = split_size;
         let out_numel = out_shape.iter().product::<usize>();
-        utils::ensure_capacity(&mut outputs[i], out_numel);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(&mut outputs[i], out_numel) };
         for outer_idx in 0..outer_dim {
             let src_offset = outer_idx * input.shape[axis] * inner_dim + axis_offset * inner_dim;
             let dst_offset = outer_idx * split_size * inner_dim;
@@ -1393,7 +1412,8 @@ where
     // Fast path: all same shape — direct elementwise, no coordinates
     if condition.shape == x.shape && x.shape == y.shape {
         let numel = cond_data.len();
-        utils::ensure_capacity(out, numel);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, numel) };
         let o = out.as_mut_slice();
         for i in 0..numel {
             unsafe {
@@ -1409,15 +1429,32 @@ where
 
     let out_shape = utils::broadcast_shapes(&condition.shape, &x.shape)
         .and_then(|s| utils::broadcast_shapes(&s, &y.shape))
-        .unwrap_or_else(|| condition.shape.to_vec());
+        .unwrap_or_else(|| {
+            panic!(
+                "Where: condition {:?}, x {:?} and y {:?} do not broadcast",
+                condition.shape, x.shape, y.shape
+            )
+        });
     let out_numel: usize = out_shape.iter().product();
     let dims = out_shape.len();
-    utils::ensure_capacity(out, out_numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, out_numel) };
+    if out_numel == 0 {
+        return TensorView::from_slice(out, out_shape);
+    }
     let o = out.as_mut_slice();
+    // The condition repeats whole over the output when its dimensions, past any
+    // leading ones, are the output's last ones; then element `i` of the output
+    // takes element `i % cond_numel` of it.
+    let cond_repeats = {
+        let first = condition.shape.iter().position(|&d| d != 1);
+        let trailing = first.map_or(&[][..], |f| &condition.shape[f..]);
+        out_shape.ends_with(trailing)
+    };
 
     // Fast path: both x and y are scalars — just fill based on condition
     // This is the attention mask pattern: where(mask, 0.0, -inf)
-    if x.data.len() == 1 && y.data.len() == 1 {
+    if x.data.len() == 1 && y.data.len() == 1 && cond_repeats {
         let x_val = x.data[0];
         let y_val = y.data[0];
         let cond_numel = cond_data.len();
@@ -1431,7 +1468,7 @@ where
                     };
                 }
             }
-        } else if cond_numel > 0 && out_numel % cond_numel == 0 {
+        } else {
             let repeat = out_numel / cond_numel;
             for r in 0..repeat {
                 let base = r * cond_numel;
@@ -1452,7 +1489,7 @@ where
 
     // Fast path: scalar x, condition broadcasts, y is full-sized
     // This is the attention mask pattern: where(mask, -inf, attention_scores)
-    if x.data.len() == 1 && y.data.len() == out_numel {
+    if x.data.len() == 1 && y.data.len() == out_numel && cond_repeats {
         let x_val = x.data[0];
         let cond_numel = cond_data.len();
 
@@ -1483,7 +1520,7 @@ where
         return TensorView::from_slice(out, out_shape);
     }
 
-    if x.data.len() == out_numel && y.data.len() == out_numel {
+    if x.data.len() == out_numel && y.data.len() == out_numel && cond_repeats {
         // Condition broadcasts, x and y are full — use stride-based cond index
         let cond_numel = cond_data.len();
         if cond_numel == 1 {
@@ -1565,6 +1602,70 @@ where
 mod tests {
     use super::*;
     use crate::tensor::TensorView;
+
+    /// `where_op` against indexing each operand by its broadcast coordinates, for
+    /// conditions that repeat over the output (trailing dimensions) and ones that
+    /// do not (a middle dimension of 1), with x and y full, scalar, or one each.
+    #[test]
+    fn test_where_matches_broadcast_reference() {
+        let out_shape = [2usize, 2, 3, 3];
+        let n: usize = out_shape.iter().product();
+        let full_x: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let full_y: Vec<f32> = (0..n).map(|i| -(i as f32) - 1.0).collect();
+        let (one_x, one_y) = (vec![100.0f32], vec![-100.0f32]);
+        // Index of output coordinates `c` into an operand of `shape`, broadcast.
+        let index = |shape: &[usize], c: &[usize]| {
+            let skip = c.len() - shape.len();
+            shape.iter().zip(&c[skip..]).fold(0, |i, (&d, &k)| i * d + if d == 1 { 0 } else { k })
+        };
+        for cond_shape in [vec![3, 3], vec![2, 1, 3, 3], vec![2, 2, 1, 3], vec![1], vec![2, 2, 3, 3]] {
+            let cn: usize = cond_shape.iter().product();
+            let cond: Vec<i64> = (0..cn).map(|i| ((i * 7) % 3 == 0) as i64).collect();
+            let c = TensorView::from_slice(&cond, cond_shape.clone());
+            for (xs, ys) in [(true, true), (false, false), (false, true)] {
+                let (xd, xshape) = if xs { (&full_x, out_shape.to_vec()) } else { (&one_x, vec![]) };
+                let (yd, yshape) = if ys { (&full_y, out_shape.to_vec()) } else { (&one_y, vec![]) };
+                let x = TensorView::from_slice(xd, xshape.clone());
+                let y = TensorView::from_slice(yd, yshape.clone());
+                let mut out = Vec::new();
+                let got = where_op(&c, &x, &y, &mut out);
+                let want_shape = [&cond_shape, &xshape, &yshape]
+                    .iter()
+                    .try_fold(vec![], |s, t| utils::broadcast_shapes(&s, t))
+                    .unwrap();
+                assert_eq!(got.shape.as_ref(), &want_shape[..]);
+                for (i, &v) in got.data.iter().enumerate() {
+                    // Coordinates of `i` in the output, padded to rank 4.
+                    let mut co = [0usize; 4];
+                    let mut rest = i;
+                    for (k, &d) in want_shape.iter().enumerate().rev() {
+                        co[4 - want_shape.len() + k] = rest % d;
+                        rest /= d;
+                    }
+                    let want = if cond[index(&cond_shape, &co)] != 0 {
+                        xd[index(&xshape, &co)]
+                    } else {
+                        yd[index(&yshape, &co)]
+                    };
+                    assert_eq!(v, want, "cond {cond_shape:?} x {xshape:?} y {yshape:?} at {co:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "do not broadcast")]
+    fn test_where_rejects_shapes_that_do_not_broadcast() {
+        let cond = vec![1i64; 6];
+        let (x, y) = (vec![1.0f32; 6], vec![2.0f32; 4]);
+        let mut out = Vec::new();
+        where_op(
+            &TensorView::from_slice(&cond, vec![2, 3]),
+            &TensorView::from_slice(&x, vec![2, 3]),
+            &TensorView::from_slice(&y, vec![2, 2]),
+            &mut out,
+        );
+    }
 
     #[test]
     fn test_slice_with_step_on_inner_axis() {

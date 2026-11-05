@@ -138,9 +138,11 @@ pub(crate) fn quantize_rows(
     row_sums: &mut Vec<i32>,
 ) {
     assert!(src.len() >= m * k);
-    // Every quad and sum is written, so the buffers are not filled first.
-    crate::kernels::utils::ensure_capacity(dst, m * k.div_ceil(4));
-    crate::kernels::utils::ensure_capacity(row_sums, m);
+    // SAFETY: every quad and sum is written, so the buffers are not filled first.
+    unsafe {
+        crate::kernels::utils::ensure_capacity(dst, m * k.div_ceil(4));
+        crate::kernels::utils::ensure_capacity(row_sums, m);
+    }
     let flip = if dot == Dot::Sdot {
         0x8080_8080u32 as i32
     } else {
@@ -196,7 +198,10 @@ fn quantize_rows_simd<S: Simd>(
         let out = &mut dst[r * quads..][..quads];
         let mut sum = zero;
         let (sixty_fours, rest) = row.as_chunks::<64>();
-        let (out64, out_rest) = out.as_chunks_mut::<16>();
+        // Split where the inputs do: `out` holds a quad more for a partial one, so
+        // when 61..=63 codes remain it has a whole 16 more than the 64s fill.
+        let (out64, out_rest) = out.split_at_mut(sixty_fours.len() * 16);
+        let out64 = out64.as_chunks_mut::<16>().0;
         for (x, o) in sixty_fours.iter().zip(out64) {
             let q: [i32x16<S>; 4] = core::array::from_fn(|v| vcode(&x[16 * v..][..16]));
             sum = sum + q[0] + q[1] + q[2] + q[3];
@@ -492,4 +497,53 @@ fn emulate<S: Simd>(
         acc[i].wrapping_add((0..4).map(|t| a_byte(x[t]) * y[t] as i8 as i32).sum())
     });
     i32x16::from_slice(simd, &out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernels::test_util::{Rng, levels};
+
+    /// `quantize_rows` against quantizing element by element, at every depth up to
+    /// two 64s and a partial quad (61..=63 left over used to panic), both layouts and
+    /// every level.
+    #[test]
+    fn test_quantize_rows_matches_scalar_at_every_depth() {
+        let mut rng = Rng::new(3);
+        let (m, scale, zero_point) = (3, 0.05, 7);
+        for k in 1..=131 {
+            let src = rng.vec(m * k, -4.0, 4.0);
+            for dot in [Dot::Vnni, Dot::Sdot] {
+                let flip = if dot == Dot::Sdot { 0x80 } else { 0 };
+                let quads = k.div_ceil(4);
+                let mut want = vec![0i32; m * quads];
+                let mut want_sums = vec![0i32; m];
+                for r in 0..m {
+                    for q in 0..quads {
+                        let mut word = 0u32;
+                        for t in 0..4 {
+                            let code = match src[r * k..][..k].get(4 * q + t) {
+                                Some(&x) => {
+                                    let c = ((x / scale).round_ties_even() as i32 + zero_point)
+                                        .clamp(0, 255);
+                                    want_sums[r] += c;
+                                    c as u32
+                                }
+                                None => 0,
+                            };
+                            word |= (code ^ flip) << (8 * t);
+                        }
+                        want[r * quads + q] = word as i32;
+                    }
+                }
+                for level in levels() {
+                    let (mut got, mut sums) = (Vec::new(), Vec::new());
+                    quantize_rows(level, dot, &src, m, k, scale, zero_point, &mut got, &mut sums);
+                    let what = format!("k {k} {dot:?} {level:?}");
+                    assert_eq!(got, want, "{what}");
+                    assert_eq!(sums, want_sums, "{what}");
+                }
+            }
+        }
+    }
 }

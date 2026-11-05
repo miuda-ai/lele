@@ -136,161 +136,159 @@ impl WeightElem for PackedF16 {
     }
 }
 
+/// Shapes of a batched `a x b`: `(m, k, n)`, the batch counts of `a` and `b`, and
+/// the output shape. Batch dims broadcast numpy-style, so `[M,K] x [1,K,N]` is
+/// `[1,M,N]`: the lower-rank operand's missing leading dims still appear in the output.
+fn matmul_shape<B>(
+    a: &TensorView<'_>,
+    b: &TensorView<'_, B>,
+) -> ((usize, usize, usize), usize, usize, Vec<usize>)
+where
+    B: Clone + std::fmt::Debug,
+{
+    let (a_dims, b_dims) = (a.shape.len(), b.shape.len());
+    assert!(a_dims >= 2 && b_dims >= 2, "MatMul of {:?} and {:?}", a.shape, b.shape);
+    let (m, k) = (a.shape[a_dims - 2], a.shape[a_dims - 1]);
+    let (k_b, n) = (b.shape[b_dims - 2], b.shape[b_dims - 1]);
+    assert_eq!(k, k_b, "MatMul K dim mismatch: {} vs {}", k, k_b);
+    let batch_a: usize = a.shape[..a_dims - 2].iter().product();
+    let batch_b: usize = b.shape[..b_dims - 2].iter().product();
+    let mut out_shape = utils::broadcast_shapes(&a.shape[..a_dims - 2], &b.shape[..b_dims - 2])
+        .expect("MatMul batch dims do not broadcast");
+    // An empty batch broadcasts to an empty output.
+    let batches = if batch_a == 0 || batch_b == 0 { 0 } else { batch_a.max(batch_b) };
+    assert!(
+        (batch_a == 1 || batch_b == 1 || batch_a == batch_b)
+            && out_shape.iter().product::<usize>() == batches,
+        "MatMul broadcast not fully supported yet"
+    );
+    assert!(
+        a.data.len() >= batch_a * m * k && b.data.len() >= batch_b * k * n,
+        "MatMul operands shorter than their shapes {:?} and {:?}",
+        a.shape,
+        b.shape
+    );
+    out_shape.push(m);
+    out_shape.push(n);
+    ((m, k, n), batch_a, batch_b, out_shape)
+}
+
+/// Each batch of `out` (`m x n`, as [`matmul_shape`] gives them) `= a * b`, or `+=`
+/// with [`Accum::Add`].
+fn matmul_batches<B: WeightElem>(
+    a: &TensorView<'_>,
+    b: &TensorView<'_, B>,
+    ((m, k, n), batch_a, batch_b): ((usize, usize, usize), usize, usize),
+    accum: Accum,
+    out: &mut [f32],
+) {
+    for (b_i, out) in out.chunks_exact_mut(m * n).enumerate() {
+        let a_offset = if batch_a == 1 { 0 } else { b_i * m * k };
+        let b_offset = if batch_b == 1 { 0 } else { b_i * k * n };
+        // SAFETY: `matmul_shape` checked that the operands hold every batch, and
+        // `out` is one batch.
+        unsafe {
+            let a_mat =
+                MatRef::<f32>::from_raw_parts(a.data.as_ptr().add(a_offset), m, k, k as isize, 1);
+            let out_mat = MatMut::<f32>::from_raw_parts_mut(out.as_mut_ptr(), m, n, n as isize, 1);
+            B::matmul_into(out_mat, accum, a_mat, b.data.as_ptr().add(b_offset), k, n);
+        }
+    }
+}
+
 pub fn matmul<'a, B: WeightElem>(
     a: &TensorView<'_>,
     b: &TensorView<'_, B>,
     out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let a_dims = a.shape.len();
-    let b_dims = b.shape.len();
-    assert!(a_dims >= 2);
-    assert!(b_dims >= 2);
-    let m = a.shape[a_dims - 2];
-    let k = a.shape[a_dims - 1];
-    let k_b = b.shape[b_dims - 2];
-    let n = b.shape[b_dims - 1];
-
-    assert_eq!(k, k_b, "MatMul K dim mismatch: {} vs {}", k, k_b);
-    let batch_a: usize = a.shape[..a_dims - 2].iter().product();
-    let batch_b: usize = b.shape[..b_dims - 2].iter().product();
-    let final_batch = batch_a.max(batch_b);
-
-    // Batch dims broadcast numpy-style, so `[M,K] x [1,K,N]` is `[1,M,N]`: the
-    // lower-rank operand's missing leading dims still appear in the output.
-    let mut out_shape = utils::broadcast_shapes(&a.shape[..a_dims - 2], &b.shape[..b_dims - 2])
-        .expect("MatMul batch dims do not broadcast");
-    assert!(
-        (batch_a == 1 || batch_b == 1 || batch_a == batch_b)
-            && out_shape.iter().product::<usize>() == final_batch,
-        "MatMul broadcast not fully supported yet"
-    );
-    out_shape.push(m);
-    out_shape.push(n);
-
-    let output_len = final_batch * m * n;
-    utils::ensure_capacity(out_buf, output_len);
-
-    let out_slice: &mut [f32] =
-        unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), output_len) };
-    let stride_a = m * k;
-    let stride_b = k * n;
-    let stride_out = m * n;
-
-    for b_i in 0..final_batch {
-        let a_offset = if batch_a == 1 { 0 } else { b_i * stride_a };
-        let b_offset = if batch_b == 1 { 0 } else { b_i * stride_b };
-        let out_offset = b_i * stride_out;
-
-        unsafe {
-            let a_mat =
-                MatRef::<f32>::from_raw_parts(a.data.as_ptr().add(a_offset), m, k, k as isize, 1);
-            let out_mat = MatMut::<f32>::from_raw_parts_mut(
-                out_slice.as_mut_ptr().add(out_offset),
-                m,
-                n,
-                n as isize,
-                1,
-            );
-            let b_ptr = b.data.as_ptr().add(b_offset);
-            B::matmul_into(out_mat, Accum::Replace, a_mat, b_ptr, k, n);
-        }
+    let (dims, batch_a, batch_b, out_shape) = matmul_shape(a, b);
+    let output_len = out_shape.iter().product();
+    // SAFETY: the product replaces every element.
+    unsafe { utils::ensure_capacity(out_buf, output_len) };
+    let out = &mut out_buf[..output_len];
+    if output_len > 0 {
+        matmul_batches(a, b, (dims, batch_a, batch_b), Accum::Replace, out);
     }
     TensorView {
-        data: Cow::Borrowed(out_slice),
+        data: Cow::Borrowed(out),
         shape: Cow::Owned(out_shape),
     }
 }
+
 pub fn matmul_fused_add<'a, B: WeightElem>(
     a: &TensorView<'_>,
     b: &TensorView<'_, B>,
     bias: &TensorView<'_>,
     out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let a_dims = a.shape.len();
-    let b_dims = b.shape.len();
-    let batch_a: usize = a.shape[..a_dims - 2].iter().product::<usize>().max(1);
-    let batch_b: usize = b.shape[..b_dims - 2].iter().product::<usize>().max(1);
-    let final_batch = batch_a.max(batch_b);
-
-    let m = a.shape[a_dims - 2];
-    let k = a.shape[a_dims - 1];
-    let n = b.shape[b_dims - 1];
-    let out_numel = final_batch * m * n;
-
-    utils::ensure_capacity(out_buf, out_numel);
-    let out_slice = unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), out_numel) };
-
-    let stride_a = m * k;
-    let stride_b = k * n;
-    let stride_out = m * n;
-
-    // Check if bias matches output columns for fused operation
-    if bias.data.len() == n {
-        for b_i in 0..final_batch {
-            let a_offset = if batch_a == 1 { 0 } else { b_i * stride_a };
-            let b_offset = if batch_b == 1 { 0 } else { b_i * stride_b };
-            let out_offset = b_i * stride_out;
-
-            // Pre-fill output rows with bias
-            for i in 0..m {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        bias.data.as_ptr(),
-                        out_slice.as_mut_ptr().add(out_offset + i * n),
-                        n,
-                    );
+    let (dims, batch_a, batch_b, out_shape) = matmul_shape(a, b);
+    let n = dims.2;
+    let out_numel: usize = out_shape.iter().product();
+    // SAFETY: the bias or the product is written to every element before any
+    // is read.
+    unsafe { utils::ensure_capacity(out_buf, out_numel) };
+    let out = &mut out_buf[..out_numel];
+    if out_numel == 0 {
+        return TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(out_shape),
+        };
+    }
+    let bias_data = &bias.data[..];
+    // How the bias broadcasts against the output.
+    let bias_shape = utils::broadcast_shapes(&out_shape, &bias.shape);
+    assert!(
+        bias_shape.as_ref() == Some(&out_shape) && bias_data.len() == bias.shape.iter().product(),
+        "MatMul output {out_shape:?} and bias {:?} do not broadcast",
+        bias.shape
+    );
+    if bias_data.len() == n && bias.shape.last() == Some(&n) {
+        // One bias per column: written first, then the product added to it.
+        for row in out.chunks_exact_mut(n) {
+            row.copy_from_slice(bias_data);
+        }
+        matmul_batches(a, b, (dims, batch_a, batch_b), Accum::Add, out);
+    } else {
+        matmul_batches(a, b, (dims, batch_a, batch_b), Accum::Replace, out);
+        // The bias repeats whole over the output when its dimensions, past any
+        // leading ones, are the output's last ones.
+        let first = bias.shape.iter().position(|&d| d != 1);
+        let trailing = first.map_or(&[][..], |f| &bias.shape[f..]);
+        if bias_data.len() == 1 {
+            bias_act_inplace(out, bias_data[0], Activation::None);
+        } else if out_shape.ends_with(trailing) {
+            for chunk in out.chunks_exact_mut(bias_data.len()) {
+                for (o, &b) in chunk.iter_mut().zip(bias_data) {
+                    *o += b;
                 }
             }
-
-            // GEMM: C = 1.0 * A * B + 1.0 * C (where C is pre-filled with bias)
-            unsafe {
-                let a_mat = MatRef::<f32>::from_raw_parts(
-                    a.data.as_ptr().add(a_offset),
-                    m,
-                    k,
-                    k as isize,
-                    1,
-                );
-                let out_mat = MatMut::<f32>::from_raw_parts_mut(
-                    out_slice.as_mut_ptr().add(out_offset),
-                    m,
-                    n,
-                    n as isize,
-                    1,
-                );
-                let b_ptr = b.data.as_ptr().add(b_offset);
-                B::matmul_into(out_mat, Accum::Add, a_mat, b_ptr, k, n);
-            }
-        }
-    } else {
-        // Fallback: compute GEMM first, then add bias
-        let view = matmul(a, b, out_buf);
-        let len = view.data.len();
-        let bias_data = &bias.data;
-
-        if bias_data.len() == 1 {
-            bias_act_inplace(&mut out_slice[..len], bias_data[0], Activation::None);
-        } else if bias_data.len() == len {
-            for (o, &b) in out_slice[..len].iter_mut().zip(bias_data.iter()) {
-                *o += b;
-            }
         } else {
-            let b_len = bias_data.len();
-            for i in 0..len {
-                out_slice[i] += bias_data[i % b_len];
+            // Coordinates of each output element, and the bias element they take.
+            let rank = out_shape.len();
+            let mut strides = vec![0; rank];
+            let mut s = 1;
+            for (i, &d) in bias.shape.iter().enumerate().rev() {
+                if d != 1 {
+                    strides[rank - bias.shape.len() + i] = s;
+                }
+                s *= d;
+            }
+            let mut coords = vec![0; rank];
+            for o in out.iter_mut() {
+                let at: usize = coords.iter().zip(&strides).map(|(c, s)| c * s).sum();
+                *o += bias_data[at];
+                for d in (0..rank).rev() {
+                    coords[d] += 1;
+                    if coords[d] < out_shape[d] {
+                        break;
+                    }
+                    coords[d] = 0;
+                }
             }
         }
     }
-
-    // As in `matmul`, batch dims broadcast numpy-style: `[M,K] x [1,K,N]` is
-    // `[1,M,N]`.
-    let mut out_shape = utils::broadcast_shapes(&a.shape[..a_dims - 2], &b.shape[..b_dims - 2])
-        .expect("MatMul batch dims do not broadcast");
-    out_shape.push(m);
-    out_shape.push(n);
-
     TensorView {
-        data: Cow::Borrowed(out_slice),
+        data: Cow::Borrowed(out),
         shape: Cow::Owned(out_shape),
     }
 }
@@ -328,7 +326,8 @@ pub fn gemm<'a>(
     assert_eq!(k, k2, "Gemm K dim mismatch");
 
     let output_len = m * n;
-    utils::ensure_capacity(out_buf, output_len);
+    // SAFETY: the product replaces every element.
+    unsafe { utils::ensure_capacity(out_buf, output_len) };
     // With no C to add, the product overwrites the buffer, so it is not filled first.
     let accum = match c {
         Some(_) if beta == 0.0 => Accum::Replace,
@@ -399,8 +398,9 @@ mod tests {
         }
     }
 
-    /// Biases that are not one value per column take the path that adds
-    /// them after the product: one value, one per output, or repeated.
+    /// Biases broadcast as ONNX `Add` does: one per column (added to), and the
+    /// others added after the product: one value, one per output, repeating over
+    /// the batch, or one per row (a middle dimension).
     #[test]
     fn test_matmul_fused_add_other_bias_shapes() {
         // [2, 3, 5] x [5, 17]: long enough rows for whole vectors and tails.
@@ -415,25 +415,56 @@ mod tests {
             .collect();
         let at = TensorView::from_slice(&a, vec![batch, m, k]);
         let bt = TensorView::from_slice(&b, vec![k, n]);
-        let full: Vec<f32> = (0..batch * m * n).map(|i| i as f32 * 0.25).collect();
-        for bias in [vec![1.5f32], full, vec![10.0, 20.0, 30.0]] {
+        for bias_shape in [vec![1], vec![batch, m, n], vec![1, m, n], vec![m, 1], vec![n]] {
+            let len: usize = bias_shape.iter().product();
+            let bias: Vec<f32> = (0..len).map(|i| i as f32 * 0.25 - 2.0).collect();
             let mut out = Vec::new();
             let got = matmul_fused_add(
                 &at,
                 &bt,
-                &TensorView::from_slice(&bias, vec![bias.len()]),
+                &TensorView::from_slice(&bias, bias_shape.clone()),
                 &mut out,
             );
             assert_eq!(got.shape.as_ref(), &[batch, m, n]);
-            for (i, (&g, &p)) in got.data.iter().zip(&product).enumerate() {
-                let want = p + bias[i % bias.len()];
-                assert!(
-                    (g - want).abs() < 1e-4,
-                    "bias len {} at {i}: {g} vs {want}",
-                    bias.len()
-                );
+            for (idx, (&g, &p)) in got.data.iter().zip(&product).enumerate() {
+                let co = [idx / (m * n), idx / n % m, idx % n];
+                // The bias element at `co`, broadcast.
+                let skip = 3 - bias_shape.len();
+                let at = bias_shape
+                    .iter()
+                    .zip(&co[skip..])
+                    .fold(0, |at, (&d, &c)| at * d + if d == 1 { 0 } else { c });
+                let want = p + bias[at];
+                assert!((g - want).abs() < 1e-4, "bias {bias_shape:?} at {co:?}: {g} vs {want}");
             }
         }
+    }
+
+    /// An empty batch gives an empty output, and a bias that does not broadcast to
+    /// the product is refused.
+    #[test]
+    fn test_matmul_fused_add_empty_batch_and_bad_bias() {
+        let (a, b, bias) = (Vec::<f32>::new(), vec![1.0f32; 6], vec![1.0f32; 3]);
+        let mut out = Vec::new();
+        let got = matmul_fused_add(
+            &TensorView::from_slice(&a, vec![0, 2, 2]),
+            &TensorView::from_slice(&b, vec![2, 3]),
+            &TensorView::from_slice(&bias, vec![3]),
+            &mut out,
+        );
+        assert_eq!(got.shape.as_ref(), &[0, 2, 3]);
+        assert!(got.data.is_empty());
+        let a = vec![1.0f32; 4];
+        let bad = std::panic::catch_unwind(|| {
+            let mut out = Vec::new();
+            matmul_fused_add(
+                &TensorView::from_slice(&a, vec![2, 2]),
+                &TensorView::from_slice(&b, vec![2, 3]),
+                &TensorView::from_slice(&bias[..2], vec![2]),
+                &mut out,
+            );
+        });
+        assert!(bad.is_err());
     }
 
     #[test]

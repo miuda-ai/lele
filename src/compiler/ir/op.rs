@@ -494,6 +494,12 @@ pub enum Op {
     },
     /// `x * sigmoid(x)`.
     Silu,
+    /// `x / (ReduceL2(x, last axis) * scale + epsilon) * gamma` (ScaleNorm).
+    /// Inputs: `[x, gamma]`.
+    ScaleNorm {
+        scale: f32,
+        epsilon: f32,
+    },
     /// `MatMul` + `Add`. Inputs: `[a, b, bias]`.
     Linear,
     /// Dynamically quantized linear layer: `DynamicQuantizeLinear` of the
@@ -770,6 +776,7 @@ impl Op {
             Op::QLinearMatMulI8 => "QLinearMatMulI8",
             Op::ConvAct { .. } => "ConvAct",
             Op::Silu => "Silu",
+            Op::ScaleNorm { .. } => "ScaleNorm",
             Op::Linear => "Linear",
             Op::QLinearDynamic { .. } => "QLinearDynamic",
             Op::EmbeddingConcat { .. } => "EmbeddingConcat",
@@ -919,6 +926,10 @@ impl Op {
             }
             Op::Transpose { perm } => set_attr_ints(attrs, "perm", perm),
             Op::QLinearDynamic { relu } => set_attr_i(attrs, "relu", relu as i64, 0),
+            Op::ScaleNorm { scale, epsilon } => {
+                set_attr_f(attrs, "scale", scale, 1.0);
+                set_attr_f(attrs, "epsilon", epsilon, 0.0);
+            }
             Op::QuantizeLinear(a) | Op::DequantizeLinear(a) | Op::FakeQuantizeLinear(a) => {
                 a.write(attrs)
             }

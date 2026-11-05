@@ -61,7 +61,8 @@ fn binary_f32(
         return None;
     }
     if a.len() == numel && b.len() == numel {
-        utils::ensure_capacity(out, numel);
+        // SAFETY: `tiled` writes every element before reading any.
+        unsafe { utils::ensure_capacity(out, numel) };
         tiled(level, op, false, a, b, out);
         return Some(shape);
     }
@@ -75,7 +76,8 @@ fn binary_f32(
     };
     let (outer, mid, inner) = blocks(small_shape, &shape)?;
     debug_assert_eq!(small.len(), mid);
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     debug_assert_eq!(outer * mid * inner, numel);
     if inner == 1 {
         // The small operand is a tile that repeats `outer` times.
