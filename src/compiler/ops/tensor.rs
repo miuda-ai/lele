@@ -449,7 +449,8 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
         }
         Op::QWeightMatMul => {
             // Produced by `fuse_weight_only_matmul`, so the weight is always a
-            // 2-D int8 or uint8 initializer, read from its bytes in place.
+            // 2-D int8 or uint8 initializer, read from its bytes in place
+            // (packed in panels if `pack_weights` packed it).
             let Some(weight) = ctx.weight(1) else {
                 panic!(
                     "QWeightMatMul weight {} is not a known initializer",
@@ -462,13 +463,14 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             };
             writeln!(
                 w,
-                "{tab}let {} = self.weight_only_matmul(&{}, {}, {}, ({}, {}), &{}, {zero_point}, {buf_expr});",
+                "{tab}let {} = self.weight_only_matmul(&{}, {}, {}, ({}, {}), {}, &{}, {zero_point}, {buf_expr});",
                 outputs[0],
                 inputs[0],
                 weight.bytes(),
                 weight.dtype == DType::I8,
                 weight.shape[0],
                 weight.shape[1],
+                weight.packed,
                 inputs[2],
             )?;
         }

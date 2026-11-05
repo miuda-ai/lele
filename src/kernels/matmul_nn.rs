@@ -23,10 +23,10 @@
 //! multiply-adds. That holds a row of A in a register for four steps, so they are 5 rows
 //! high: 20 accumulators, 5 of A and 4 of B, of the 32 registers.
 
-use crate::kernels::bias_act::{Act, act_f32x8};
+use crate::kernels::bias_act::{Act, act_inplace_at};
 use crate::kernels::simd::simd_call;
 use aligned_vec::AVec;
-use fearless_simd::{Level, Simd, f32x4, f32x8};
+use fearless_simd::{Level, Simd, f32x4, f32x8, i8x16, i32x8, u8x16};
 use fearless_simd_macros::simd;
 
 /// Rows of C per register tile.
@@ -59,17 +59,58 @@ pub(crate) enum BSrc<'a> {
     /// f32 packed by the caller, a block at a time, as a convolution unfolds its input
     /// ([`Packer`]).
     Packer(&'a Packer<'a>),
-    /// Integer codes of a quantized weight, row-major: element `c` is `c - zero_point`.
-    /// Widened like f16, and exactly (the codes and their zero point are small integers),
-    /// so the product is that of the widened matrix; the scale goes into `alpha`.
+    /// Integer codes of a quantized weight, row-major: element `c` of column `j` is
+    /// `(c - zero_point) * scales[j]`, or `c - zero_point` without `scales` (a scale for
+    /// the whole weight goes into `alpha`). Widened like f16, as `DequantizeLinear`
+    /// computes it, so the product is that of the dequantized matrix.
     U8 {
         codes: &'a [u8],
         zero_point: f32,
+        scales: &'a [f32],
     },
     I8 {
         codes: &'a [i8],
         zero_point: f32,
+        scales: &'a [f32],
     },
+    /// The codes of a quantized weight in panel order ([`pack_panels`]), `n` a multiple
+    /// of `NR`, widened as the tiles read them (less their zero point). Each column's
+    /// scale, if it has one, multiplies its sums as they are stored, which rounds
+    /// differently from widening the dequantized matrix.
+    CodesPacked {
+        codes: Panel<'a>,
+        scales: &'a [f32],
+    },
+}
+
+/// A packed B as the tiles widen it: f16, or integer codes less their zero point. The
+/// widened values are exact.
+#[derive(Clone, Copy)]
+pub(crate) enum Panel<'a> {
+    F16(&'a [half::f16]),
+    U8(&'a [u8], f32),
+    I8(&'a [i8], f32),
+}
+
+impl<'a> Panel<'a> {
+    /// Elements `start..start + len`.
+    fn slice(self, start: usize, len: usize) -> Self {
+        match self {
+            Panel::F16(h) => Panel::F16(&h[start..][..len]),
+            Panel::U8(c, zp) => Panel::U8(&c[start..][..len], zp),
+            Panel::I8(c, zp) => Panel::I8(&c[start..][..len], zp),
+        }
+    }
+
+    /// All of it, widened into `dst`.
+    #[inline(always)]
+    fn widen<S: Simd>(self, simd: S, dst: &mut [f32]) {
+        match self {
+            Panel::F16(h) => widen_f16(simd, h, dst),
+            Panel::U8(c, zp) => widen_codes(simd, c, zp, &[], dst),
+            Panel::I8(c, zp) => widen_codes(simd, c, zp, &[], dst),
+        }
+    }
 }
 
 /// Writes the block of B `kc` deep from row `pc` and `nc` wide from column `jc`
@@ -86,37 +127,135 @@ impl<'a> BSrc<'a> {
         }
     }
 
-    /// Widens elements `start..start + dst.len()` into `dst`.
+    /// Widens elements `start..start + dst.len()` into `dst`, the first of them in
+    /// column `col`.
     #[inline(always)]
-    fn widen<S: Simd>(self, simd: S, start: usize, dst: &mut [f32]) {
+    fn widen<S: Simd>(self, simd: S, start: usize, col: usize, dst: &mut [f32]) {
+        let len = dst.len();
         match self {
-            BSrc::F32(b) => dst.copy_from_slice(&b[start..][..dst.len()]),
-            BSrc::F16(b) => widen_f16(simd, &b[start..][..dst.len()], dst),
-            BSrc::U8 { codes, zero_point } => {
-                widen_codes(&codes[start..][..dst.len()], zero_point, dst)
-            }
-            BSrc::I8 { codes, zero_point } => {
-                widen_codes(&codes[start..][..dst.len()], zero_point, dst)
-            }
-            BSrc::F16Packed(_) | BSrc::Packer(_) => {
+            BSrc::F32(b) => dst.copy_from_slice(&b[start..][..len]),
+            BSrc::F16(b) => widen_f16(simd, &b[start..][..len], dst),
+            BSrc::U8 {
+                codes,
+                zero_point,
+                scales,
+            } => widen_codes(
+                simd,
+                &codes[start..][..len],
+                zero_point,
+                column_scales(scales, col, len),
+                dst,
+            ),
+            BSrc::I8 {
+                codes,
+                zero_point,
+                scales,
+            } => widen_codes(
+                simd,
+                &codes[start..][..len],
+                zero_point,
+                column_scales(scales, col, len),
+                dst,
+            ),
+            BSrc::F16Packed(_) | BSrc::CodesPacked { .. } | BSrc::Packer(_) => {
                 unreachable!("packed B is read by the panel")
             }
         }
     }
 }
 
-/// `dst[i] = src[i] - zero_point`: exact, whichever integer type the codes are.
+/// The scales of columns `col..col + len`, or none if the weight has none per column.
 #[inline(always)]
-fn widen_codes<T: Copy + Into<f32>>(src: &[T], zero_point: f32, dst: &mut [f32]) {
+fn column_scales(scales: &[f32], col: usize, len: usize) -> &[f32] {
+    if scales.is_empty() { scales } else { &scales[col..][..len] }
+}
+
+/// An integer code of a quantized weight: one byte, signed or not.
+trait Code: Copy + Into<f32> {
+    /// Sixteen codes as 32-bit integers, two vectors of eight.
+    fn widen16<S: Simd>(simd: S, codes: &[Self; 16]) -> [i32x8<S>; 2];
+}
+
+impl Code for i8 {
+    #[inline(always)]
+    fn widen16<S: Simd>(simd: S, codes: &[i8; 16]) -> [i32x8<S>; 2] {
+        use fearless_simd::prelude::*;
+        let (lo, hi) = i8x16::from_slice(simd, codes).widen();
+        let ((a, b), (c, d)) = (lo.widen(), hi.widen());
+        [a.combine(b), c.combine(d)]
+    }
+}
+
+impl Code for u8 {
+    #[inline(always)]
+    fn widen16<S: Simd>(simd: S, codes: &[u8; 16]) -> [i32x8<S>; 2] {
+        use fearless_simd::prelude::*;
+        let (lo, hi) = u8x16::from_slice(simd, codes).widen();
+        let ((a, b), (c, d)) = (lo.widen(), hi.widen());
+        // At most 255: the same value signed, which converts to f32 in one step.
+        [a.combine(b).bitcast(), c.combine(d).bitcast()]
+    }
+}
+
+/// A row of a packed panel of codes, less their zero point (exact).
+#[inline(always)]
+fn widen_code_row<S: Simd, T: Code>(simd: S, src: &[T; NR], zero_point: f32, dst: &mut [f32; NR]) {
+    use fearless_simd::prelude::*;
+    let zp = f32x8::splat(simd, zero_point);
+    for (v, ints) in T::widen16(simd, src).into_iter().enumerate() {
+        (f32x8::float_from(ints) - zp).store_slice(&mut dst[8 * v..][..8]);
+    }
+}
+
+/// `dst[i] = (src[i] - zero_point) * scales[i]`, or `src[i] - zero_point` without
+/// `scales`: `DequantizeLinear`'s arithmetic, sixteen at a time (the same operations,
+/// so the same values). The subtraction is exact, whichever integer type the codes are.
+#[inline(always)]
+fn widen_codes<S: Simd, T: Code>(
+    simd: S,
+    src: &[T],
+    zero_point: f32,
+    scales: &[f32],
+    dst: &mut [f32],
+) {
+    use fearless_simd::prelude::*;
     assert_eq!(src.len(), dst.len());
-    for (d, &s) in dst.iter_mut().zip(src) {
-        *d = s.into() - zero_point;
+    assert!(scales.is_empty() || scales.len() == dst.len());
+    let zp = f32x8::splat(simd, zero_point);
+    let (codes, _) = src.as_chunks::<16>();
+    let (out, _) = dst.as_chunks_mut::<16>();
+    for (i, (codes, out)) in codes.iter().zip(out).enumerate() {
+        for (v, ints) in T::widen16(simd, codes).into_iter().enumerate() {
+            let mut x = f32x8::float_from(ints) - zp;
+            if !scales.is_empty() {
+                x *= f32x8::from_slice(simd, &scales[16 * i + 8 * v..][..8]);
+            }
+            x.store_slice(&mut out[8 * v..][..8]);
+        }
+    }
+    let done = 16 * codes.len();
+    let (src, dst) = (&src[done..], &mut dst[done..]);
+    let scales = if scales.is_empty() { scales } else { &scales[done..] };
+    if scales.is_empty() {
+        for (d, &s) in dst.iter_mut().zip(src) {
+            *d = s.into() - zero_point;
+        }
+    } else {
+        assert_eq!(scales.len(), dst.len());
+        for ((d, &s), &scale) in dst.iter_mut().zip(src).zip(scales) {
+            *d = (s.into() - zero_point) * scale;
+        }
     }
 }
 
 /// A row-major `k x n` B, `n` a multiple of `NR`, in the order `gemm_nn` packs it: its
 /// depth blocks in turn, each its panels of `NR` columns in turn, each `kc` rows of `NR`.
 pub(crate) fn pack_f16(b: &[half::f16], k: usize, n: usize) -> Vec<half::f16> {
+    pack_panels(b, k, n)
+}
+
+/// [`pack_f16`] for elements of any type (the codes of a quantized B).
+pub(crate) fn pack_panels<T: Copy>(b: &[T], k: usize, n: usize) -> Vec<T> {
     assert!(n % NR == 0, "pack_f16: {n} columns");
     assert_eq!(b.len(), k * n, "pack_f16: B is not k x n");
     let depth = block_depth(k);
@@ -208,8 +347,8 @@ const IN_PLACE: u8 = 0;
 const PACKED_PANEL: u8 = 1;
 /// In place, writing the packed panel as it goes.
 const PACK_NOW: u8 = 2;
-/// Widening the packed f16 panel `Tile::src16` (two vectors wide) as it goes, and
-/// writing the widened panel if given somewhere to.
+/// Widening the packed panel `Tile::panel` (two vectors wide) as it goes, and writing
+/// the widened panel if given somewhere to.
 const WIDEN_NOW: u8 = 3;
 
 #[simd]
@@ -244,16 +383,19 @@ fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32], b
             } else {
                 nc / NR
             };
-            // Packed f16 (whole panels only): its panels for this block lie in order from
-            // `start`. The tiles of the first group of rows widen them as they read them,
-            // into the packed panels for the next groups; tiles multiplying by lanes read
-            // the block widened first.
-            let mut block16: &[half::f16] = &[];
-            if let BSrc::F16Packed(b) = b {
-                let len = panels * kc * NR;
-                block16 = &b[pc * d.n + jc * kc..][..len];
+            // Packed f16 or codes (whole panels only): its panels for this block lie in
+            // order from `start`. The tiles of the first group of rows widen them as they
+            // read them, into the packed panels for the next groups; tiles multiplying by
+            // lanes read the block widened first.
+            let packed = match b {
+                BSrc::F16Packed(b) => Some(Panel::F16(b)),
+                BSrc::CodesPacked { codes, .. } => Some(codes),
+                _ => None,
+            };
+            let block = packed.map(|p| p.slice(pc * d.n + jc * kc, panels * kc * NR));
+            if let Some(block) = block {
                 if lanes {
-                    widen_f16(simd, block16, &mut bpack[..len]);
+                    block.widen(simd, &mut bpack[..panels * kc * NR]);
                 }
             } else if let BSrc::Packer(pack) = b {
                 pack((pc, kc, jc, nc), &mut bpack[..panels * kc * NR]);
@@ -282,10 +424,12 @@ fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32], b
                     let slot = &mut bpack[jp * kc * NR..][..kc * NR];
                     // (Only for a row-major f32 B, in the branches below that read it.)
                     let in_place = || &b32.expect("f16 B is packed")[pc * d.ldb + j..];
-                    let panel16 = if block16.is_empty() {
-                        block16
-                    } else {
-                        &block16[jp * kc * NR..][..kc * NR]
+                    let panel = block.map(|b| b.slice(jp * kc * NR, kc * NR));
+                    let scales = match b {
+                        BSrc::CodesPacked { scales, .. } if !scales.is_empty() => {
+                            &scales[j..][..NR]
+                        }
+                        _ => &[],
                     };
                     macro_rules! tile {
                         ($mode:expr, $src:expr, $lds:expr, $dst:expr) => {{
@@ -295,7 +439,8 @@ fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32], b
                                 lds: $lds,
                                 width,
                                 accumulate,
-                                src16: panel16,
+                                panel,
+                                scales,
                                 act,
                             };
                             // A panel no wider than a vector takes the one-vector tiles.
@@ -327,7 +472,7 @@ fn gemm_nn_simd<S: Simd>(simd: S, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32], b
                             }
                         }};
                     }
-                    if !panel16.is_empty() && !lanes && ir == 0 {
+                    if panel.is_some() && !lanes && ir == 0 {
                         // Reads the same values in the same order as the in-place tiles.
                         let dst: &mut [f32] = if pack { slot } else { &mut [] };
                         tile!(WIDEN_NOW, &[], NR, dst)
@@ -374,7 +519,7 @@ fn pack_b<S: Simd>(
         let width = NR.min(jc + nc - j);
         if !b_cols {
             for (p, row) in panel.as_chunks_mut::<NR>().0.iter_mut().enumerate() {
-                b.widen(simd, (pc + p) * ldb + j, &mut row[..width]);
+                b.widen(simd, (pc + p) * ldb + j, j, &mut row[..width]);
                 row[width..].fill(0.0);
             }
             continue;
@@ -420,8 +565,11 @@ struct Tile<'a> {
     kc: usize,
     /// `IN_PLACE`, `PACKED_PANEL`, `PACK_NOW` or `WIDEN_NOW`.
     mode: u8,
-    /// The packed f16 panel, for `WIDEN_NOW`.
-    src16: &'a [half::f16],
+    /// The packed panel, for `WIDEN_NOW`.
+    panel: Option<Panel<'a>>,
+    /// The scales of the panel's columns, multiplying the sums as they are stored (or
+    /// none).
+    scales: &'a [f32],
     /// Elements between the rows of the panel of B as given.
     lds: usize,
     /// Columns of C written (the panel may be zero-padded past them).
@@ -507,14 +655,28 @@ macro_rules! tile_fn {
                     }
                 }
                 WIDEN_NOW => {
-                    let mut out = dst.as_chunks_mut::<NR>().0.iter_mut();
-                    for (p, row16) in t.src16.as_chunks::<NR>().0[..kc].iter().enumerate() {
-                        let mut row = [0.0f32; NR];
-                        widen_f16(simd, row16, &mut row);
-                        if let Some(out) = out.next() {
-                            *out = row;
+                    // One loop per element type, so each widens its rows without a branch.
+                    macro_rules! widen_rows {
+                        ($rows:expr, |$src:ident, $row:ident| $widen:expr) => {{
+                            let mut out = dst.as_chunks_mut::<NR>().0.iter_mut();
+                            for (p, $src) in $rows.as_chunks::<NR>().0[..kc].iter().enumerate() {
+                                let mut $row = [0.0f32; NR];
+                                $widen;
+                                if let Some(out) = out.next() {
+                                    *out = $row;
+                                }
+                                step!(p, $row.first_chunk().unwrap());
+                            }
+                        }};
+                    }
+                    match t.panel.expect("a panel to widen") {
+                        Panel::F16(h) => widen_rows!(h, |src, row| widen_f16(simd, src, &mut row)),
+                        Panel::I8(c, zp) => {
+                            widen_rows!(c, |src, row| widen_code_row(simd, src, zp, &mut row))
                         }
-                        step!(p, row.first_chunk().unwrap());
+                        Panel::U8(c, zp) => {
+                            widen_rows!(c, |src, row| widen_code_row(simd, src, zp, &mut row))
+                        }
                     }
                 }
                 _ => {
@@ -526,7 +688,7 @@ macro_rules! tile_fn {
                     }
                 }
             }
-            store_tile(simd, d, acc, c, t.width, t.accumulate, t.act);
+            store_tile(simd, d, acc, c, t);
         }
     };
 }
@@ -642,7 +804,7 @@ macro_rules! lane_tile_fn {
                     }
                 }
             }
-            store_tile(simd, d, acc, c, t.width, t.accumulate, t.act);
+            store_tile(simd, d, acc, c, t);
         }
     };
 }
@@ -658,54 +820,53 @@ lane_tile_fn!(lanes3_narrow, 3, 1);
 lane_tile_fn!(lanes2_narrow, 2, 1);
 lane_tile_fn!(lanes1_narrow, 1, 1);
 
-/// Writes `act(alpha * acc)` to the `R` rows of C, the first `width` columns, adding
-/// `alpha * acc` to what is there first if asked.
+/// Writes `act(alpha * acc)` (or, if the tile's columns have scales, `act(scale * acc)`)
+/// to the `R` rows of C, the first `t.width` columns, adding what is there first if
+/// `t.accumulate`.
+///
+/// The activation is applied to the rows once all are stored, still in L1, by one call
+/// to its own kernel per row. Inlined here, its polynomials made the tiles keep their
+/// accumulators on the stack, and so did a call with accumulators still to store, which
+/// it would clobber (T-one's products ran at half speed either way).
 #[inline(always)]
 fn store_tile<S: Simd, const R: usize, const V: usize>(
     simd: S,
     d: &Dims,
     acc: [[f32x8<S>; V]; R],
     c: &mut [f32],
-    width: usize,
-    accumulate: bool,
-    act: Option<Act>,
+    t: &Tile,
 ) {
     use fearless_simd::prelude::*;
-    let alpha = f32x8::splat(simd, d.alpha);
+    let (width, accumulate, act) = (t.width, t.accumulate, t.act);
+    let scale: [f32x8<S>; V] = core::array::from_fn(|v| match t.scales {
+        [] => f32x8::splat(simd, d.alpha),
+        scales => f32x8::from_slice(simd, &scales[v * 8..][..8]),
+    });
     for r in 0..R {
         let row = &mut c[r * d.ldc..][..width];
-        let vals = acc[r].map(|a| a * alpha);
+        let vals: [f32x8<S>; V] = core::array::from_fn(|v| acc[r][v] * scale[v]);
         if width == 8 * V {
-            let mut out = vals;
-            if accumulate {
-                for (v, out) in out.iter_mut().enumerate() {
-                    *out = *out + f32x8::from_slice(simd, &row[v * 8..][..8]);
+            for (v, val) in vals.iter().enumerate() {
+                let dst = &mut row[v * 8..][..8];
+                if accumulate {
+                    (*val + f32x8::from_slice(simd, dst)).store_slice(dst);
+                } else {
+                    val.store_slice(dst);
                 }
-            }
-            if let Some(act) = act {
-                out = act_f32x8(simd, act, out);
-            }
-            for (v, out) in out.iter().enumerate() {
-                out.store_slice(&mut row[v * 8..][..8]);
             }
         } else {
             let mut flat = [0.0f32; NR];
             for (v, val) in vals.iter().enumerate() {
                 val.store_slice(&mut flat[v * 8..][..8]);
             }
-            for (x, &v) in flat.iter_mut().zip(row.iter()) {
-                if accumulate {
-                    *x += v;
-                }
+            for (x, &v) in row.iter_mut().zip(&flat) {
+                *x = if accumulate { *x + v } else { v };
             }
-            if let Some(act) = act {
-                let x: [f32x8<S>; 2] =
-                    core::array::from_fn(|v| f32x8::from_slice(simd, &flat[v * 8..][..8]));
-                for (v, y) in act_f32x8(simd, act, x).iter().enumerate() {
-                    y.store_slice(&mut flat[v * 8..][..8]);
-                }
-            }
-            row.copy_from_slice(&flat[..width]);
+        }
+    }
+    if let Some(act) = act {
+        for r in 0..R {
+            act_inplace_at(simd.level(), act, &mut c[r * d.ldc..][..width]);
         }
     }
 }
@@ -722,7 +883,7 @@ pub(crate) fn gemm_small_m(level: Level, d: &Dims, a: &[f32], b: BSrc, c: &mut [
     if let BSrc::F32(b) = b {
         return simd_call!(level, gemm_small_m_simd(d, a, b, c));
     }
-    if matches!(b, BSrc::F16Packed(_) | BSrc::Packer(_)) {
+    if matches!(b, BSrc::F16Packed(_) | BSrc::CodesPacked { .. } | BSrc::Packer(_)) {
         unreachable!("packed B goes to gemm_nn");
     }
     // f16 and integer codes: blocks of `WIDEN_ROWS` rows of B, widened, each a product of
@@ -748,7 +909,7 @@ fn gemm_small_m_wide_simd<S: Simd>(
         let rows = WIDEN_ROWS.min(d.k - p);
         let wide = &mut wide[..rows * d.n];
         for (i, row) in wide.chunks_exact_mut(d.n).enumerate() {
-            b.widen(simd, (p + i) * d.ldb, row);
+            b.widen(simd, (p + i) * d.ldb, 0, row);
         }
         let block = Dims {
             k: rows,

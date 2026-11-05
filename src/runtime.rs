@@ -413,7 +413,8 @@ impl Weights<'_> {
     }
 
     /// `a` times a quantized `[k, n]` weight of integer codes, whose values are
-    /// `scale * (code - zero_point)`, read from the weights as they are stored.
+    /// `(code - zero_point) * scale`, with one scale or one per column, read from the
+    /// weights as they are stored: row-major, or `packed` in panels.
     pub fn weight_only_matmul<'c, 'd>(
         &self,
         a: &TensorView<'c>,
@@ -421,6 +422,7 @@ impl Weights<'_> {
         weight_len: usize,
         weight_signed: bool,
         weight_shape: (usize, usize),
+        packed: bool,
         scale: &TensorView<'c>,
         zero_point: Option<&TensorView<'c>>,
         output_buf: &'d mut Vec<f32>,
@@ -435,7 +437,7 @@ impl Weights<'_> {
             kernels::Codes::U8(bytes)
         };
         let zp = zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0);
-        kernels::weight_only_matmul(a, codes, weight_shape, zp, scale.data[0], output_buf)
+        kernels::weight_only_matmul(a, codes, weight_shape, zp, &scale.data, packed, output_buf)
     }
 
     /// Linear layer on an input that is already quantized (attention).

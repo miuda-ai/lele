@@ -14,7 +14,7 @@
 
 use crate::kernels::bias_act::{Act, act_inplace};
 use crate::kernels::matmul_dot::{DotDims, gemm_dot};
-use crate::kernels::matmul_nn::{BSrc, Dims, SMALL_M, gemm_nn, gemm_small_m};
+use crate::kernels::matmul_nn::{BSrc, Dims, Panel, SMALL_M, gemm_nn, gemm_small_m};
 use aligned_vec::AVec;
 use fearless_simd::Level;
 
@@ -304,6 +304,15 @@ pub fn pack_f16(b: &[half::f16], k: usize, n: usize) -> Vec<half::f16> {
     crate::kernels::matmul_nn::pack_f16(b, k, n)
 }
 
+/// The one-byte integer codes of a quantized `k x n` B laid out as [`pack_f16`] lays out
+/// f16, in the order [`matmul_codes`] reads them packed.
+///
+/// # Panics
+/// If `n` is not a multiple of [`PACK_COLS`] or `b` does not hold `k * n` codes.
+pub fn pack_codes(b: &[u8], k: usize, n: usize) -> Vec<u8> {
+    crate::kernels::matmul_nn::pack_panels(b, k, n)
+}
+
 /// [`matmul_f16`] with B as [`pack_f16`] lays it out, `a.ncols` rows of `dst.ncols`
 /// columns. With more than 4 rows of C the product is [`matmul_f16`]'s, bit for bit;
 /// with fewer, it is computed in panels too, so it may round differently.
@@ -402,11 +411,20 @@ enum BMat<'a> {
     },
     /// As [`pack_f16`] lays it out.
     F16Packed(&'a [half::f16]),
-    /// Row-major integer codes, `ldb` elements between rows, less `zero_point`.
+    /// Row-major integer codes, `ldb` elements between rows, less `zero_point`, times
+    /// the scale of their column if `scales` has them.
     Codes {
         codes: Codes<'a>,
         ldb: usize,
         zero_point: f32,
+        scales: &'a [f32],
+    },
+    /// Integer codes as [`pack_codes`] lays them out, less `zero_point`; the scale of
+    /// each column, if `scales` has them, multiplies its sums.
+    CodesPacked {
+        codes: Codes<'a>,
+        zero_point: f32,
+        scales: &'a [f32],
     },
 }
 
@@ -435,10 +453,13 @@ impl Codes<'_> {
 
 /// [`matmul`] with B a quantized matrix: row-major integer `codes` of `a.ncols` rows of
 /// `dst.ncols` columns, `ldb` elements apart, whose values are
-/// `scale * (code - zero_point)`. The product is that of B widened to f32, to within
-/// the rounding of multiplying by `scale` after the sum (`alpha` is the scale): the codes
-/// are only widened a block at a time as the kernels read them, so a large B is streamed
-/// as the integers it is stored in.
+/// `(code - zero_point) * scale`, with one scale for all of B or one per column in
+/// `scales`. The codes are only widened a block at a time as the kernels read them, so
+/// a large B is streamed as the integers it is stored in.
+///
+/// With a scale per column, B is widened as `DequantizeLinear` computes it, and the
+/// product is that of the dequantized matrix, bit for bit. A single scale multiplies
+/// the sums instead (it is `alpha`), which rounds differently.
 pub fn matmul_codes(
     dst: MatMut<f32>,
     accum: Accum,
@@ -446,8 +467,16 @@ pub fn matmul_codes(
     codes: Codes<'_>,
     ldb: usize,
     zero_point: f32,
-    scale: f32,
+    scales: &[f32],
 ) {
+    let n = dst.ncols;
+    let (alpha, scales) = match scales {
+        [scale] => (*scale, &[][..]),
+        _ => {
+            assert_eq!(scales.len(), n, "matmul: {} scales for {n} columns", scales.len());
+            (1.0, scales)
+        }
+    };
     matmul_b(
         Level::new(),
         dst,
@@ -457,8 +486,46 @@ pub fn matmul_codes(
             codes,
             ldb,
             zero_point,
+            scales,
         },
-        scale,
+        alpha,
+    )
+}
+
+/// [`matmul_codes`] with the codes as [`pack_codes`] lays them out (`dst.ncols` a multiple
+/// of [`PACK_COLS`]), widened as the kernels read them, so the product streams them from
+/// start to end.
+///
+/// A scale per column multiplies the sums of its column as they are stored rather than
+/// the widened codes: the product is that of the dequantized matrix to within rounding,
+/// not bit for bit.
+pub fn matmul_codes_packed(
+    dst: MatMut<f32>,
+    accum: Accum,
+    a: MatRef<f32>,
+    codes: Codes<'_>,
+    zero_point: f32,
+    scales: &[f32],
+) {
+    let n = dst.ncols;
+    let (alpha, scales) = match scales {
+        [scale] => (*scale, &[][..]),
+        _ => {
+            assert_eq!(scales.len(), n, "matmul: {} scales for {n} columns", scales.len());
+            (1.0, scales)
+        }
+    };
+    matmul_b(
+        Level::new(),
+        dst,
+        accum,
+        a,
+        BMat::CodesPacked {
+            codes,
+            zero_point,
+            scales,
+        },
+        alpha,
     )
 }
 
@@ -512,10 +579,13 @@ fn matmul_b_act(
             codes,
             ldb,
             zero_point,
+            scales,
         } if n <= DOT_MAX_N => {
-            b_wide = (0..k)
-                .flat_map(|p| (0..n).map(move |j| codes.get(p * ldb + j) - zero_point))
-                .collect();
+            let value = |p: usize, j: usize| {
+                let x = codes.get(p * ldb + j) - zero_point;
+                if scales.is_empty() { x } else { x * scales[j] }
+            };
+            b_wide = (0..k).flat_map(|p| (0..n).map(move |j| value(p, j))).collect();
             // SAFETY: `b_wide` holds the `k x n` row-major elements addressed.
             BMat::F32(unsafe { MatRef::from_raw_parts(b_wide.as_ptr(), k, n, n as isize, 1) })
         }
@@ -530,12 +600,21 @@ fn matmul_b_act(
             codes,
             ldb,
             zero_point,
+            scales,
         } => {
             assert!(codes.len() >= (k - 1) * ldb + n, "matmul: B is too short");
             Err((
                 match codes {
-                    Codes::U8(codes) => BSrc::U8 { codes, zero_point },
-                    Codes::I8(codes) => BSrc::I8 { codes, zero_point },
+                    Codes::U8(codes) => BSrc::U8 {
+                        codes,
+                        zero_point,
+                        scales,
+                    },
+                    Codes::I8(codes) => BSrc::I8 {
+                        codes,
+                        zero_point,
+                        scales,
+                    },
                 },
                 ldb,
             ))
@@ -544,6 +623,19 @@ fn matmul_b_act(
             assert!(n % PACK_COLS == 0, "matmul: packed B has {n} columns");
             assert_eq!(data.len(), k * n, "matmul: packed B is not k x n");
             Err((BSrc::F16Packed(data), n))
+        }
+        BMat::CodesPacked {
+            codes,
+            zero_point,
+            scales,
+        } => {
+            assert!(n % PACK_COLS == 0, "matmul: packed B has {n} columns");
+            assert_eq!(codes.len(), k * n, "matmul: packed B is not k x n");
+            let codes = match codes {
+                Codes::U8(c) => Panel::U8(c, zero_point),
+                Codes::I8(c) => Panel::I8(c, zero_point),
+            };
+            Err((BSrc::CodesPacked { codes, scales }, n))
         }
         BMat::F32(b) => Ok(b),
     };
@@ -624,7 +716,7 @@ fn run_b(
                 act,
             };
             // Packed B is read in panels whatever the rows of C.
-            if m <= SMALL_M && !matches!(b, BSrc::F16Packed(_)) {
+            if m <= SMALL_M && !matches!(b, BSrc::F16Packed(_) | BSrc::CodesPacked { .. }) {
                 gemm_small_m(level, &dims, a_data, b, c);
                 act_rows(c, ldc);
             } else {
@@ -855,9 +947,10 @@ mod tests {
         }
     }
 
-    /// A quantized B is read as the matrix it stands for, `code - zero_point`, scaled
-    /// by `alpha`, and the product is that of the widened matrix bit for bit, for few rows
-    /// of C and many, wide and narrow.
+    /// A quantized B is read as the matrix it stands for, `code - zero_point` (times
+    /// the scale of its column, if it has one per column), scaled by `alpha`, and the
+    /// product is that of the widened matrix bit for bit, for few rows of C and many,
+    /// wide and narrow.
     #[test]
     fn test_matmul_codes_is_matmul_of_widened_b() {
         let mut rng = Rng::new(9);
@@ -882,13 +975,21 @@ mod tests {
                 let a = rng.vec(m * k, -1.0, 1.0);
                 let u8s: Vec<u8> = (0..k * ldb).map(|_| rng.f32(0.0, 256.0) as u8).collect();
                 let i8s: Vec<i8> = (0..k * ldb).map(|_| rng.f32(-128.0, 128.0) as i8).collect();
-                for signed in [false, true] {
+                let column_scales = rng.vec(n, 0.001, 0.1);
+                for (signed, per_column) in [(false, false), (true, false), (false, true), (true, true)] {
                     let (codes, zero_point) = if signed {
                         (Codes::I8(&i8s), -7.0)
                     } else {
                         (Codes::U8(&u8s), 128.0)
                     };
-                    let b32: Vec<f32> = (0..k * ldb).map(|i| codes.get(i) - zero_point).collect();
+                    let scales: &[f32] = if per_column { &column_scales } else { &[] };
+                    // (The padding past column `n` is never read.)
+                    let b32: Vec<f32> = (0..k * ldb)
+                        .map(|i| {
+                            let x = codes.get(i) - zero_point;
+                            scales.get(i % ldb).map_or(x, |s| x * s)
+                        })
+                        .collect();
                     for (alpha, add) in [(0.03, false), (-1.5, true)] {
                         let c0 = rng.vec(m * n, -1.0, 1.0);
                         let accum = || if add { Accum::Add } else { Accum::Replace };
@@ -913,12 +1014,13 @@ mod tests {
                                     codes,
                                     ldb,
                                     zero_point,
+                                    scales,
                                 },
                                 alpha,
                             );
                         }
                         let what = format!(
-                            "{level:?} m={m} n={n} k={k} signed={signed} alpha={alpha} add={add}"
+                            "{level:?} m={m} n={n} k={k} signed={signed} per_column={per_column} alpha={alpha} add={add}"
                         );
                         assert_same_bits(&got, &want, &what);
                     }
@@ -983,6 +1085,109 @@ mod tests {
                     } else {
                         for (g, w) in got.iter().zip(&want) {
                             assert!((g - w).abs() <= 1e-4 * (1.0 + w.abs()), "{what}: {g} vs {w}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Packed codes are the matrix they stand for. With one scale (`alpha`), the product
+    /// is that of the codes row-major, bit for bit, from 5 rows of C; with a scale per
+    /// column, which multiplies the sums, it is the dequantized product to within
+    /// rounding.
+    #[test]
+    fn test_matmul_codes_packed_is_matmul_of_dequantized_b() {
+        let mut rng = Rng::new(10);
+        let sizes = [
+            (1, 16, 1),
+            (1, 1536, 384),
+            (3, 48, 70),
+            (4, 32, 1100),
+            (5, 384, 1536),
+            (6, 16, 513),
+            (10, 1536, 384),
+            (13, 160, 1030),
+        ];
+        for level in levels() {
+            for &(m, n, k) in &sizes {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let u8s: Vec<u8> = (0..k * n).map(|_| rng.f32(0.0, 256.0) as u8).collect();
+                let column_scales = rng.vec(n, 0.001, 0.1);
+                for (signed, per_column) in [(false, false), (true, false), (false, true), (true, true)] {
+                    let i8s: Vec<i8> = u8s.iter().map(|&c| c as i8).collect();
+                    let (codes, zero_point) = if signed {
+                        (Codes::I8(&i8s), -7.0)
+                    } else {
+                        (Codes::U8(&u8s), 128.0)
+                    };
+                    let packed_u8 = pack_codes(&u8s, k, n);
+                    let packed_i8: Vec<i8> = packed_u8.iter().map(|&c| c as i8).collect();
+                    let packed = match codes {
+                        Codes::U8(_) => Codes::U8(&packed_u8),
+                        Codes::I8(_) => Codes::I8(&packed_i8),
+                    };
+                    let scales: &[f32] = if per_column { &column_scales } else { &[] };
+                    for (alpha, add) in [(1.0, false), (-1.5, true)] {
+                        if per_column && alpha != 1.0 {
+                            continue;
+                        }
+                        let c0 = rng.vec(m * n, -1.0, 1.0);
+                        let accum = || if add { Accum::Add } else { Accum::Replace };
+                        let (mut want, mut got) = (c0.clone(), c0.clone());
+                        // SAFETY: each pointer addresses the row-major elements given.
+                        unsafe {
+                            let a = || MatRef::from_raw_parts(a.as_ptr(), m, k, k as isize, 1);
+                            matmul_b(
+                                level,
+                                MatMut::from_raw_parts_mut(want.as_mut_ptr(), m, n, n as isize, 1),
+                                accum(),
+                                a(),
+                                BMat::Codes {
+                                    codes,
+                                    ldb: n,
+                                    zero_point,
+                                    scales,
+                                },
+                                alpha,
+                            );
+                            matmul_b(
+                                level,
+                                MatMut::from_raw_parts_mut(got.as_mut_ptr(), m, n, n as isize, 1),
+                                accum(),
+                                a(),
+                                BMat::CodesPacked {
+                                    codes: packed,
+                                    zero_point,
+                                    scales,
+                                },
+                                alpha,
+                            );
+                        }
+                        let what = format!(
+                            "{level:?} m={m} n={n} k={k} signed={signed} per_column={per_column} add={add}"
+                        );
+                        if m > SMALL_M && !per_column {
+                            assert_same_bits(&got, &want, &what);
+                        } else {
+                            let reference: Vec<f64> = (0..m * n)
+                                .map(|i| {
+                                    let (r, j) = (i / n, i % n);
+                                    let sum: f64 = (0..k)
+                                        .map(|p| {
+                                            let b = (codes.get(p * n + j) - zero_point) as f64;
+                                            let s = scales.get(j).map_or(1.0, |&s| s as f64);
+                                            a[r * k + p] as f64 * b * s
+                                        })
+                                        .sum();
+                                    let base = if add { c0[i] as f64 } else { 0.0 };
+                                    base + alpha as f64 * sum
+                                })
+                                .collect();
+                            // Terms are up to 128 times the column's scale: f32 rounding
+                            // of `k` of them.
+                            let term = 128.0 * alpha.abs() as f64 * if per_column { 0.1 } else { 1.0 };
+                            assert_close(&got, &reference, 1e-7 * k as f64 * term, &what);
                         }
                     }
                 }

@@ -135,6 +135,10 @@ pub fn act_inplace(act: Act, data: &mut [f32]) {
 
 /// [`act_inplace`] at `level`. Where it has no fused multiply-add, the activations round
 /// differently: kernels applying one as they store must run at the level it would.
+///
+/// Never inlined: kernels call it once per row or plane they store, and inlined into
+/// them its polynomials crowd out their own registers (and their builds' memory).
+#[inline(never)]
 pub(crate) fn act_inplace_at(level: Level, act: Act, data: &mut [f32]) {
     let run = |data: &mut [f32]| match act {
         Act::Relu => simd_call!(level, max = Avx2, relu_simd(data)),

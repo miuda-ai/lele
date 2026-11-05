@@ -1,7 +1,7 @@
 use crate::kernels::bias_act::{Act, act_inplace, bias_act_inplace};
 use crate::kernels::matmul::{
     Accum, Codes, MatMut, MatRef, Par, matmul as strided_matmul, matmul_act as strided_matmul_act,
-    matmul_codes, matmul_f16_a, matmul_f16_act, matmul_f16_packed_a, matmul_f16_packed_act,
+    matmul_codes, matmul_codes_packed, matmul_f16_a, matmul_f16_act, matmul_f16_packed_a, matmul_f16_packed_act,
 };
 use crate::kernels::utils;
 use crate::tensor::TensorView;
@@ -241,15 +241,19 @@ pub fn matmul_act<'a, B: WeightElem>(
 }
 
 /// `a * b` with `b` a quantized `[k, n]` matrix of integer `codes`, whose values are
-/// `scale * (code - zero_point)`: the product of [`matmul`] with it widened to f32 (see
+/// `(code - zero_point) * scale`, with one scale or one per column in `scales`: the
+/// product of [`matmul`] with it widened to f32 (see
 /// [`crate::kernels::matmul::matmul_codes`]), without ever holding it in f32. `a` is
-/// `[.., k]`, its leading dims are the rows of the product.
+/// `[.., k]`, its leading dims are the rows of the product. `packed` codes are laid out
+/// as [`crate::kernels::matmul::pack_codes`] lays them out (see
+/// [`crate::kernels::matmul::matmul_codes_packed`]).
 pub fn weight_only_matmul<'a>(
     a: &TensorView<'_>,
     codes: Codes<'_>,
     (k, n): (usize, usize),
     zero_point: f32,
-    scale: f32,
+    scales: &[f32],
+    packed: bool,
     out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     assert_eq!(
@@ -273,7 +277,11 @@ pub fn weight_only_matmul<'a>(
         unsafe {
             let a_mat = MatRef::<f32>::from_raw_parts(a.data.as_ptr(), m, k, k as isize, 1);
             let out_mat = MatMut::<f32>::from_raw_parts_mut(out.as_mut_ptr(), m, n, n as isize, 1);
-            matmul_codes(out_mat, Accum::Replace, a_mat, codes, n, zero_point, scale);
+            if packed {
+                matmul_codes_packed(out_mat, Accum::Replace, a_mat, codes, zero_point, scales);
+            } else {
+                matmul_codes(out_mat, Accum::Replace, a_mat, codes, n, zero_point, scales);
+            }
         }
     }
     TensorView {

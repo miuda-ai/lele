@@ -46,11 +46,13 @@ pub enum Layout {
     /// As ONNX stores a tensor: its elements in row-major order.
     #[default]
     Stored,
-    /// An f16 matrix `[k, n]` as [`pack_f16`](crate::kernels::matmul::pack_f16)
-    /// lays it out, or the f16 weights `[m, k, 1]` of a pointwise `Conv` as
-    /// it lays out their transpose `[k, m]`. Only the matrix product kernels
-    /// read such data, and passes leave it alone.
-    PackedF16,
+    /// A matrix `[k, n]` in the panels the matrix product kernels read
+    /// ([`pack_f16`](crate::kernels::matmul::pack_f16) lays them out): f16, or
+    /// the integer codes of a weight-only quantized product. Or the f16
+    /// weights `[m, k, 1]` of a pointwise `Conv`, as their transpose `[k, m]`.
+    /// Only the matrix product kernels read such data, and passes leave it
+    /// alone.
+    Packed,
 }
 
 /// A tensor: a graph input, an initializer, a node output, or a value a

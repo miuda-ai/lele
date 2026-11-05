@@ -18,9 +18,8 @@ pub(crate) struct WeightRef {
     len: usize,
     pub shape: Vec<usize>,
     pub dtype: DType,
-    /// An f16 matrix stored as [`pack_f16`](crate::kernels::matmul::pack_f16)
-    /// lays it out (or lays out its transpose: see
-    /// [`Layout::PackedF16`]).
+    /// A matrix stored in panels as [`pack_f16`](crate::kernels::matmul::pack_f16)
+    /// lays them out (or its transpose: see [`Layout::Packed`]).
     pub packed: bool,
     /// The value of a rank-0 weight, which code reads inline: it is not
     /// written to the weights file, and has no offset there.
@@ -222,7 +221,7 @@ impl Weights {
             // Those that folding left without readers are not written.
             if let Some(t) = g.data(v).filter(|_| g.uses(v) > 0) {
                 let value = g.value(v);
-                self.add(&value.name, t, value.layout == Layout::PackedF16);
+                self.add(&value.name, t, value.layout == Layout::Packed);
             }
         }
         for (_, node) in g.nodes() {

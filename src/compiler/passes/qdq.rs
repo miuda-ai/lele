@@ -220,10 +220,11 @@ fn fuse_qdq_matmul_weight(g: &mut Graph) {
 }
 
 /// `MatMul(a, DequantizeLinear(w, scale, zero_point))` with `w` an int8 or uint8
-/// 2-D initializer, or the transpose of one, and a scalar `scale` and `zero_point`,
-/// becomes a `QWeightMatMul`, which reads `w` as the integers it is stored in, a
-/// block at a time, rather than as the f32 matrix folding would leave: the
-/// weights stay a quarter the size on disk, in memory and on the bus.
+/// 2-D initializer, or the transpose of one, and a scalar `scale` and `zero_point`
+/// (or an f32 scale per output column and no zero point, or zeros), becomes a
+/// `QWeightMatMul`, which reads `w` as the integers it is stored in, a block at a
+/// time, rather than as the f32 matrix folding would leave: the weights stay a
+/// quarter the size on disk, in memory and on the bus.
 ///
 /// Models that tie their output projection to the token embedding (Whisper's)
 /// store it transposed, and dequantize that copy; the transpose is done here, in
@@ -231,6 +232,9 @@ fn fuse_qdq_matmul_weight(g: &mut Graph) {
 /// taken first, by [`fuse_qdq_matmul`].
 pub(crate) fn fuse_weight_only_matmul(g: &mut Graph) {
     let numel = |t: &TensorProto| t.dims.iter().product::<i64>().max(1);
+    let all_zero = |t: &TensorProto| {
+        t.raw_data.iter().all(|&b| b == 0) && t.int32_data.iter().all(|&v| v == 0)
+    };
 
     struct Rewrite {
         matmul: NodeId,
@@ -239,6 +243,8 @@ pub(crate) fn fuse_weight_only_matmul(g: &mut Graph) {
         transpose: Option<(NodeId, ValueId)>,
         /// The initializer the codes are, or are the transpose of.
         codes: ValueId,
+        /// f16 scales per column, widened to the f32 the kernel takes (exactly).
+        widen_scales: Option<ValueId>,
         inputs: Vec<Option<ValueId>>,
     }
     let mut rewrites = Vec::new();
@@ -262,15 +268,14 @@ pub(crate) fn fuse_weight_only_matmul(g: &mut Graph) {
         let (Some(x), Some(scale)) = (dq.input(0), dq.input(1)) else {
             continue;
         };
-        if !g.data(scale).is_some_and(|t| numel(t) == 1) {
+        let Some((scales, scale_dtype)) = g
+            .data(scale)
+            .map(|t| (numel(t), DType::from_onnx(t.data_type)))
+        else {
             continue;
-        }
-        let zero_point = dq.input(2);
-        if let Some(zp) = zero_point
-            && !g.data(zp).is_some_and(|t| numel(t) == 1)
-        {
-            continue;
-        }
+        };
+        let mut zero_point = dq.input(2);
+        let zero_points = zero_point.map(|zp| g.data(zp).map(|t| (numel(t), all_zero(t))));
 
         let (codes, transpose) = if g.data(x).is_some() {
             (x, None)
@@ -296,12 +301,31 @@ pub(crate) fn fuse_weight_only_matmul(g: &mut Graph) {
         if !matches!(DType::from_onnx(w.data_type), DType::U8 | DType::I8) || w.dims.len() != 2 {
             continue;
         }
+        // One scale, or one per column of the dequantized `[k, n]` matrix, f32 or f16
+        // (which only this product may read: it is widened in place).
+        let cols = if transpose.is_some() { w.dims[0] } else { w.dims[1] };
+        let per_column = scales != 1;
+        let widen_scales = (per_column && scale_dtype == DType::F16).then_some(scale);
+        if per_column
+            && (scales != cols
+                || !matches!(attrs.axis, 1 | -1)
+                || !(scale_dtype == DType::F32 || widen_scales.is_some() && g.uses(scale) == 1))
+        {
+            continue;
+        }
+        // One zero point, or one per column that are all zero, which is none.
+        match zero_points {
+            None | Some(Some((1, _))) => {}
+            Some(Some((len, true))) if len == cols && per_column => zero_point = None,
+            _ => continue,
+        }
 
         rewrites.push(Rewrite {
             matmul: mm_id,
             dequantize: dq_id,
             transpose,
             codes,
+            widen_scales,
             inputs: vec![
                 Some(a),
                 Some(transpose.map_or(codes, |(_, out)| out)),
@@ -340,6 +364,21 @@ pub(crate) fn fuse_weight_only_matmul(g: &mut Graph) {
                     dims: vec![cols as i64, rows as i64],
                     data_type: dtype.to_onnx(),
                     raw_data: bytes,
+                    ..Default::default()
+                },
+            );
+        }
+        if let Some(scale) = r.widen_scales {
+            let Some(values) = crate::compiler::ir::matching::constant(g, Some(scale)) else {
+                continue;
+            };
+            let dims = g.data(scale).expect("scales without data").dims.clone();
+            g.set_data(
+                scale,
+                TensorProto {
+                    dims,
+                    data_type: DType::F32.to_onnx(),
+                    raw_data: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
                     ..Default::default()
                 },
             );
@@ -1087,9 +1126,53 @@ mod tests {
         }
 
         #[test]
-        fn keeps_a_scale_per_column() {
-            let mut g = graph(DType::U8, false);
+        fn takes_a_scale_per_column() {
+            for transpose in [false, true] {
+                let mut g = graph(DType::I8, transpose);
+                let cols = if transpose { 2 } else { 3 };
+                g.initializer[1] = init("s", DType::F32, &[cols], vec![0; 4 * cols as usize]);
+                let g = run(g, fuse_weight_only_matmul);
+                assert_eq!(op_types(&g), ["QWeightMatMul"], "transpose={transpose}");
+            }
+        }
+
+        #[test]
+        fn widens_f16_scales_per_column() {
+            let mut g = graph(DType::I8, false);
+            let halves = [0.5f32, 0.25, 3.0].map(|x| half::f16::from_f32(x).to_le_bytes());
+            g.initializer[1] = init("s", DType::F16, &[3], halves.concat());
+            let g = run(g, fuse_weight_only_matmul);
+            assert_eq!(op_types(&g), ["QWeightMatMul"]);
+            let s = g.initializer.iter().find(|t| t.name == "s").unwrap();
+            assert_eq!(DType::from_onnx(s.data_type), DType::F32);
+            let want: Vec<u8> = [0.5f32, 0.25, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+            assert_eq!(s.raw_data, want);
+        }
+
+        #[test]
+        fn drops_zero_points_per_column_that_are_zero() {
+            let mut g = graph(DType::I8, false);
             g.initializer[1] = init("s", DType::F32, &[3], vec![0; 12]);
+            g.initializer[2] = init("z", DType::I8, &[3], vec![0; 3]);
+            let g = run(g, fuse_weight_only_matmul);
+            assert_eq!(op_types(&g), ["QWeightMatMul"]);
+            assert_eq!(g.node[0].input, ["a", "w", "s", ""]);
+        }
+
+        #[test]
+        fn keeps_zero_points_per_column_that_are_not_zero() {
+            let mut g = graph(DType::I8, false);
+            g.initializer[1] = init("s", DType::F32, &[3], vec![0; 12]);
+            g.initializer[2] = init("z", DType::I8, &[3], vec![0, 1, 0]);
+            let g = run(g, fuse_weight_only_matmul);
+            assert_eq!(op_types(&g), ["DequantizeLinear", "MatMul"]);
+        }
+
+        #[test]
+        fn keeps_a_scale_per_row() {
+            let mut g = graph(DType::I8, false);
+            g.initializer[1] = init("s", DType::F32, &[2], vec![0; 8]);
+            g.node[0] = node("DequantizeLinear", &["w", "s", "z"], "wd", &[("axis", 0)]);
             let g = run(g, fuse_weight_only_matmul);
             assert_eq!(op_types(&g), ["DequantizeLinear", "MatMul"]);
         }
