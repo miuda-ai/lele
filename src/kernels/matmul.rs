@@ -1195,6 +1195,90 @@ mod tests {
         }
     }
 
+    /// The AVX-512 tiles sum each element of C as the AVX2 tiles do, so from 5 rows of C
+    /// (below, both read B in order instead) the product is the same, bit for bit, unless
+    /// the last panel is no wider than 8 columns, which the AVX2 tiles sum in two halves.
+    #[test]
+    fn test_avx512_tiles_match_avx2_tiles() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let best = Level::new();
+            let (Some(wide), Some(avx2)) = (best.as_avx512(), best.as_avx2()) else {
+                return;
+            };
+            let (wide, avx2) = (Level::Avx512(wide), Level::Avx2(avx2));
+            let mut rng = Rng::new(11);
+            // One group of rows and several; panels in pairs, a lone one, a last one of
+            // 9-15 columns, several column and depth blocks.
+            let sizes = [
+                (5, 384, 1536),
+                (6, 16, 513),
+                (10, 1536, 384),
+                (12, 48, 70),
+                (13, 160, 1030),
+                (25, 144, 40),
+                (40, 272, 700),
+                (7, 30, 50),
+                (31, 203, 600),
+            ];
+            for &(m, n, k) in &sizes {
+                let a = rng.vec(m * k, -1.0, 1.0);
+                let b = rng.vec(k * n, -1.0, 1.0);
+                let b16: Vec<half::f16> = b.iter().map(|&x| half::f16::from_f32(x)).collect();
+                let whole = n % PACK_COLS == 0;
+                let packed16 = if whole { pack_f16(&b16, k, n) } else { vec![] };
+                let codes: Vec<u8> = (0..k * n).map(|_| rng.f32(0.0, 256.0) as u8).collect();
+                let codes: Vec<i8> = if whole {
+                    pack_codes(&codes, k, n).iter().map(|&c| c as i8).collect()
+                } else {
+                    vec![]
+                };
+                let scales = rng.vec(n, 0.001, 0.1);
+                let c0 = rng.vec(m * n, -1.0, 1.0);
+                for case in ["f32", "f16", "f16 packed", "codes packed"] {
+                    if case.ends_with("packed") && !whole {
+                        continue;
+                    }
+                    for add in [false, true] {
+                        let run = |level| {
+                            let mut c = c0.clone();
+                            // SAFETY: each pointer addresses the row-major elements given.
+                            unsafe {
+                                let b = match case {
+                                    "f32" => BMat::F32(MatRef::from_raw_parts(
+                                        b.as_ptr(),
+                                        k,
+                                        n,
+                                        n as isize,
+                                        1,
+                                    )),
+                                    "f16" => BMat::F16 { data: &b16, ldb: n },
+                                    "f16 packed" => BMat::F16Packed(&packed16),
+                                    _ => BMat::CodesPacked {
+                                        codes: Codes::I8(&codes),
+                                        zero_point: -7.0,
+                                        scales: &scales,
+                                    },
+                                };
+                                matmul_b(
+                                    level,
+                                    MatMut::from_raw_parts_mut(c.as_mut_ptr(), m, n, n as isize, 1),
+                                    if add { Accum::Add } else { Accum::Replace },
+                                    MatRef::from_raw_parts(a.as_ptr(), m, k, k as isize, 1),
+                                    b,
+                                    -1.5,
+                                );
+                            }
+                            c
+                        };
+                        let what = format!("{case} m={m} n={n} k={k} add={add}");
+                        assert_same_bits(&run(wide), &run(avx2), &what);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_matmul_matches_reference_at_every_level() {
         let mut rng = Rng::new(3);

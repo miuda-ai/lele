@@ -27,6 +27,8 @@ use crate::kernels::bias_act::{Act, act_inplace_at};
 use crate::kernels::simd::simd_call;
 use aligned_vec::AVec;
 use fearless_simd::{Level, Simd, f32x4, f32x8, i8x16, i32x8, u8x16};
+#[cfg(target_arch = "x86_64")]
+use fearless_simd::{f32x16, x86::Avx512};
 use fearless_simd_macros::simd;
 
 /// Rows of C per register tile.
@@ -333,6 +335,10 @@ pub(crate) fn gemm_nn(level: Level, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32])
         let len = PANELS * block_depth(d.k) * NR;
         if bpack.len() < len {
             bpack.resize(len, 0.0);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if let Level::Avx512(simd) = level {
+            return gemm_nn_wide(simd, d, a, b, c, bpack);
         }
         simd_call!(level, gemm_nn_simd(d, a, b, c, bpack))
     })
@@ -867,6 +873,365 @@ fn store_tile<S: Simd, const R: usize, const V: usize>(
     if let Some(act) = act {
         for r in 0..R {
             act_inplace_at(simd.level(), act, &mut c[r * d.ldc..][..width]);
+        }
+    }
+}
+
+/// Most rows of C per AVX-512 register tile ([`gemm_nn_wide`]).
+#[cfg(target_arch = "x86_64")]
+const WIDE_MR: usize = 12;
+
+/// [`gemm_nn_simd`] at the AVX-512 level, with tiles of 512-bit vectors: each vector is a
+/// whole panel of B, and a tile takes two panels side by side (32 columns) and up to
+/// `WIDE_MR` rows: 24 accumulators, 2 vectors of B and 2 broadcasts of the 32 registers.
+/// The rows of C are split into groups as even as groups of at most `WIDE_MR` allow:
+/// with up to `WIDE_MR` rows (T-one's 5 and 10) there is one group, and B is read once.
+///
+/// On an Ice Lake Xeon this runs T-one's products about twice as fast as the AVX2 tiles
+/// (150-160 GFLOP/s with B in cache, against 75-90).
+///
+/// Each lane of C sums the same products in the same order as the 256-bit tiles, so the
+/// product is the same, bit for bit, as at the AVX2 level (except in the narrow last
+/// panel, which those split into two sums).
+#[cfg(target_arch = "x86_64")]
+#[simd]
+fn gemm_nn_wide(simd: Avx512, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32], bpack: &mut [f32]) {
+    let b32 = b.f32();
+    let depth = block_depth(d.k);
+    let mr = d.m.div_ceil(d.m.div_ceil(WIDE_MR));
+    let pack = d.m > mr;
+    let mut pc = 0;
+    while pc < d.k {
+        let kc = depth.min(d.k - pc);
+        let accumulate = d.add || pc > 0;
+        let act = if pc + kc == d.k { d.act } else { None };
+        let mut jc = 0;
+        while jc < d.n {
+            let nc = (PANELS * NR).min(d.n - jc);
+            let panels = nc.div_ceil(NR);
+            // The tiles load whole panels: a narrower last one is packed up front.
+            let first_prepacked = if d.b_cols || matches!(b, BSrc::Packer(_)) {
+                0
+            } else {
+                nc / NR
+            };
+            let packed = match b {
+                BSrc::F16Packed(b) => Some(Panel::F16(b)),
+                BSrc::CodesPacked { codes, .. } => Some(codes),
+                _ => None,
+            };
+            let block = packed.map(|p| p.slice(pc * d.n + jc * kc, panels * kc * NR));
+            if block.is_none() {
+                if let BSrc::Packer(pack) = b {
+                    pack((pc, kc, jc, nc), &mut bpack[..panels * kc * NR]);
+                } else {
+                    let first = if b32.is_some() { first_prepacked } else { 0 };
+                    pack_b(simd, b, d.ldb, d.b_cols, pc, kc, jc, nc, first, bpack);
+                }
+            }
+            let mut ir = 0;
+            while ir < d.m {
+                let rows = mr.min(d.m - ir);
+                let a = &a[ir * d.lda + pc..];
+                let mut jp = 0;
+                while jp < panels {
+                    let widen = block.is_some() && ir == 0;
+                    let from_slot =
+                        !widen && (jp >= first_prepacked || (pack && ir > 0) || b32.is_none());
+                    // Two panels at a time where both are read the same way.
+                    let v = if jp + 1 < panels && (widen || from_slot || jp + 1 < first_prepacked) {
+                        2
+                    } else {
+                        1
+                    };
+                    let j = jc + jp * NR;
+                    let c = &mut c[ir * d.ldc + j..];
+                    let slots = &mut bpack[jp * kc * NR..][..v * kc * NR];
+                    let in_place = || &b32.expect("f16 B is packed")[pc * d.ldb + j..];
+                    let (mode, src, lds, dst): (u8, &[f32], usize, &mut [f32]) = if widen {
+                        (WIDEN_NOW, &[], NR, if pack { slots } else { &mut [] })
+                    } else if from_slot {
+                        (PACKED_PANEL, slots, NR, &mut [])
+                    } else if pack {
+                        (PACK_NOW, in_place(), d.ldb, slots)
+                    } else {
+                        (IN_PLACE, in_place(), d.ldb, &mut [])
+                    };
+                    let t = Tile {
+                        kc,
+                        mode,
+                        lds,
+                        width: (v * NR).min(d.n - j),
+                        accumulate,
+                        panel: block.map(|b| b.slice(jp * kc * NR, v * kc * NR)),
+                        scales: match b {
+                            BSrc::CodesPacked { scales, .. } if !scales.is_empty() => {
+                                &scales[j..][..v * NR]
+                            }
+                            _ => &[],
+                        },
+                        act,
+                    };
+                    macro_rules! tiles {
+                        ($($r:literal => $two:ident, $one:ident;)*) => {
+                            match (rows, v) {
+                                $(($r, 2) => $two(simd, d, &t, a, src, dst, c),)*
+                                $(($r, _) => $one(simd, d, &t, a, src, dst, c),)*
+                                _ => unreachable!("{rows} rows in a tile"),
+                            }
+                        };
+                    }
+                    tiles! {
+                        12 => wide12, wide12_one;
+                        11 => wide11, wide11_one;
+                        10 => wide10, wide10_one;
+                        9 => wide9, wide9_one;
+                        8 => wide8, wide8_one;
+                        7 => wide7, wide7_one;
+                        6 => wide6, wide6_one;
+                        5 => wide5, wide5_one;
+                        4 => wide4, wide4_one;
+                        3 => wide3, wide3_one;
+                        2 => wide2, wide2_one;
+                        1 => wide1, wide1_one;
+                    }
+                    jp += v;
+                }
+                ir += mr;
+            }
+            jc += nc;
+        }
+        pc += kc;
+    }
+}
+
+/// How far ahead of the rows it reads a tile widening packed B prefetches each panel.
+/// On an Ice Lake Xeon, products did about as well from 512 bytes to 4 KB ahead, and no
+/// better with hints to L2 or past the caches than to L1. T-one per chunk: f16 7-8%
+/// faster, int8 0-4%.
+#[cfg(target_arch = "x86_64")]
+const PREFETCH_AHEAD: usize = 2048;
+
+/// Asks for the cache line at `p` (fearless_simd has no prefetch). The address need not
+/// be valid: a prefetch does not fault.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+    // SAFETY: a prefetch reads nothing the program sees and does not fault.
+    unsafe { _mm_prefetch::<_MM_HINT_T0>(p as *const i8) }
+}
+
+/// 16 f16 widened, with AVX-512's `vcvtph2ps` (fearless_simd has no f16). Exact.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn widen_f16_wide(simd: Avx512, src: &[half::f16; NR]) -> f32x16<Avx512> {
+    use core::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm512_cvtph_ps};
+    use fearless_simd::SimdInto;
+    // SAFETY: the token enables AVX512F; the load reads the 32 bytes of `src`.
+    unsafe { _mm512_cvtph_ps(_mm256_loadu_si256(src.as_ptr() as *const __m256i)) }.simd_into(simd)
+}
+
+/// 16 codes widened, less their zero point (exact).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn widen_codes_wide<T: Code>(simd: Avx512, src: &[T; NR], zero_point: f32) -> f32x16<Avx512> {
+    use fearless_simd::prelude::*;
+    let [lo, hi] = T::widen16(simd, src);
+    let x = f32x16::float_from(lo.combine(hi));
+    // (A zero point of zero is skipped: subtracting it would change nothing.)
+    if zero_point == 0.0 {
+        x
+    } else {
+        x - f32x16::splat(simd, zero_point)
+    }
+}
+
+/// As [`tile_fn`], at the AVX-512 level ([`gemm_nn_wide`]): `R` rows of C and `V` whole
+/// panels of B, one 512-bit vector each. Packed, the panels lie `kc * NR` apart (in
+/// `src`, `dst` and `t.panel` alike); in place, side by side in the rows of `src`.
+///
+/// The rows are listed (`[0 1 ...]`) and each is written out, not looped over: from 7 rows
+/// LLVM left the loops over them rolled until after it had placed `acc`, which then stayed
+/// on the stack, stored at every step (a 10-row tile ran at less than half the speed of
+/// a 5-row).
+macro_rules! wide_tile_fn {
+    ($name:ident, $v:literal, [$($r:literal)*]) => {
+        #[cfg(target_arch = "x86_64")]
+        #[simd]
+        #[inline(never)]
+        fn $name(
+            simd: Avx512,
+            d: &Dims,
+            t: &Tile,
+            a: &[f32],
+            src: &[f32],
+            dst: &mut [f32],
+            c: &mut [f32],
+        ) {
+            use fearless_simd::prelude::*;
+            const R: usize = [$($r),*].len();
+            const V: usize = $v;
+            const W: usize = NR * V;
+            let kc = t.kc;
+            let a_rows: [&[f32]; R] = [$(&a[$r * d.lda..][..kc]),*];
+            let mut acc = [[f32x16::splat(simd, 0.0); V]; R];
+            macro_rules! step {
+                ($p:expr, $bv:expr) => {{
+                    let bv: [f32x16<Avx512>; V] = $bv;
+                    $({
+                        let av = f32x16::splat(simd, a_rows[$r][$p]);
+                        for v in 0..V {
+                            acc[$r][v] = av.mul_add(bv[v], acc[$r][v]);
+                        }
+                    })*
+                }};
+            }
+            // The rows of each of the `V` panels of a packed source.
+            macro_rules! panels {
+                ($s:expr) => {{
+                    let s = $s;
+                    let p: [&[[_; NR]]; V] =
+                        core::array::from_fn(|v| &s[v * kc * NR..].as_chunks::<NR>().0[..kc]);
+                    p
+                }};
+            }
+            match t.mode {
+                PACKED_PANEL => {
+                    let rows = panels!(src);
+                    for p in 0..kc {
+                        step!(p, core::array::from_fn(|v| f32x16::from_slice(simd, &rows[v][p])));
+                    }
+                }
+                IN_PLACE => {
+                    for (p, row) in src.chunks(t.lds).take(kc).enumerate() {
+                        let row: &[f32; W] = row.first_chunk().unwrap();
+                        step!(p, core::array::from_fn(|v| {
+                            f32x16::from_slice(simd, &row[v * NR..][..NR])
+                        }));
+                    }
+                }
+                WIDEN_NOW => {
+                    // One loop per element type, so each widens its rows without a branch.
+                    macro_rules! widen_rows {
+                        ($codes:expr, |$src:ident| $widen:expr) => {{
+                            let rows = panels!($codes);
+                            let out = &mut dst.as_chunks_mut::<NR>().0;
+                            // B comes from memory, a row of each panel per step: one
+                            // prefetch per cache line of each, `PREFETCH_AHEAD` bytes on
+                            // (into the next panels past the last rows).
+                            let row_bytes = core::mem::size_of_val(&rows[0][0]);
+                            let (ahead, every) = (PREFETCH_AHEAD / row_bytes, 64 / row_bytes);
+                            for p in 0..kc {
+                                if p % every == 0 {
+                                    for v in 0..V {
+                                        prefetch(rows[v].as_ptr().wrapping_add(p + ahead));
+                                    }
+                                }
+                                let bv: [f32x16<Avx512>; V] = core::array::from_fn(|v| {
+                                    let $src = &rows[v][p];
+                                    $widen
+                                });
+                                if !out.is_empty() {
+                                    for v in 0..V {
+                                        bv[v].store_slice(&mut out[v * kc + p]);
+                                    }
+                                }
+                                step!(p, bv);
+                            }
+                        }};
+                    }
+                    match t.panel.expect("a panel to widen") {
+                        Panel::F16(h) => widen_rows!(h, |src| widen_f16_wide(simd, src)),
+                        Panel::I8(c, zp) if zp == 0.0 => {
+                            widen_rows!(c, |src| widen_codes_wide(simd, src, 0.0))
+                        }
+                        Panel::I8(c, zp) => widen_rows!(c, |src| widen_codes_wide(simd, src, zp)),
+                        Panel::U8(c, zp) => widen_rows!(c, |src| widen_codes_wide(simd, src, zp)),
+                    }
+                }
+                _ => {
+                    let out = &mut dst.as_chunks_mut::<NR>().0;
+                    for (p, row) in src.chunks(t.lds).take(kc).enumerate() {
+                        let row: &[f32; W] = row.first_chunk().unwrap();
+                        for v in 0..V {
+                            out[v * kc + p] = *row[v * NR..].first_chunk().unwrap();
+                        }
+                        step!(p, core::array::from_fn(|v| {
+                            f32x16::from_slice(simd, &row[v * NR..][..NR])
+                        }));
+                    }
+                }
+            }
+            let scale: [f32x16<Avx512>; V] = core::array::from_fn(|v| match t.scales {
+                [] => f32x16::splat(simd, d.alpha),
+                scales => f32x16::from_slice(simd, &scales[v * NR..][..NR]),
+            });
+            $(store_wide_row(simd, &mut c[$r * d.ldc..][..t.width], acc[$r], scale, t.accumulate);)*
+            if let Some(act) = t.act {
+                for r in 0..R {
+                    act_inplace_at(simd.level(), act, &mut c[r * d.ldc..][..t.width]);
+                }
+            }
+        }
+    };
+}
+
+wide_tile_fn!(wide12, 2, [0 1 2 3 4 5 6 7 8 9 10 11]);
+wide_tile_fn!(wide11, 2, [0 1 2 3 4 5 6 7 8 9 10]);
+wide_tile_fn!(wide10, 2, [0 1 2 3 4 5 6 7 8 9]);
+wide_tile_fn!(wide9, 2, [0 1 2 3 4 5 6 7 8]);
+wide_tile_fn!(wide8, 2, [0 1 2 3 4 5 6 7]);
+wide_tile_fn!(wide7, 2, [0 1 2 3 4 5 6]);
+wide_tile_fn!(wide6, 2, [0 1 2 3 4 5]);
+wide_tile_fn!(wide5, 2, [0 1 2 3 4]);
+wide_tile_fn!(wide4, 2, [0 1 2 3]);
+wide_tile_fn!(wide3, 2, [0 1 2]);
+wide_tile_fn!(wide2, 2, [0 1]);
+wide_tile_fn!(wide1, 2, [0]);
+// For a lone last panel.
+wide_tile_fn!(wide12_one, 1, [0 1 2 3 4 5 6 7 8 9 10 11]);
+wide_tile_fn!(wide11_one, 1, [0 1 2 3 4 5 6 7 8 9 10]);
+wide_tile_fn!(wide10_one, 1, [0 1 2 3 4 5 6 7 8 9]);
+wide_tile_fn!(wide9_one, 1, [0 1 2 3 4 5 6 7 8]);
+wide_tile_fn!(wide8_one, 1, [0 1 2 3 4 5 6 7]);
+wide_tile_fn!(wide7_one, 1, [0 1 2 3 4 5 6]);
+wide_tile_fn!(wide6_one, 1, [0 1 2 3 4 5]);
+wide_tile_fn!(wide5_one, 1, [0 1 2 3 4]);
+wide_tile_fn!(wide4_one, 1, [0 1 2 3]);
+wide_tile_fn!(wide3_one, 1, [0 1 2]);
+wide_tile_fn!(wide2_one, 1, [0 1]);
+wide_tile_fn!(wide1_one, 1, [0]);
+
+/// [`store_tile`] for a row of [`wide_tile_fn`]: `acc * scale` written to `row` (its
+/// first `row.len()` columns), or added to it if `accumulate`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn store_wide_row<const V: usize>(
+    simd: Avx512,
+    row: &mut [f32],
+    acc: [f32x16<Avx512>; V],
+    scale: [f32x16<Avx512>; V],
+    accumulate: bool,
+) {
+    use fearless_simd::prelude::*;
+    let vals: [f32x16<Avx512>; V] = core::array::from_fn(|v| acc[v] * scale[v]);
+    if row.len() == NR * V {
+        for (v, val) in vals.iter().enumerate() {
+            let dst = &mut row[v * NR..][..NR];
+            if accumulate {
+                (*val + f32x16::from_slice(simd, dst)).store_slice(dst);
+            } else {
+                val.store_slice(dst);
+            }
+        }
+    } else {
+        let mut flat = [0.0f32; 2 * NR];
+        for (v, val) in vals.iter().enumerate() {
+            val.store_slice(&mut flat[v * NR..][..NR]);
+        }
+        for (x, &v) in row.iter_mut().zip(&flat) {
+            *x = if accumulate { *x + v } else { v };
         }
     }
 }
