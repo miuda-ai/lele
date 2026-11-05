@@ -1,6 +1,31 @@
 use super::{Pattern, sanitize_name};
 use crate::model::onnx_proto::NodeProto;
 
+/// A Conv node's `strides`, `dilations`, `group`, `pads` and `auto_pad`.
+/// Strides and dilations come out with one entry per spatial axis of a 2D
+/// convolution (a single value covers both); each axis keeps its own, so a
+/// stride of `[2, 1]` stays `[2, 1]`.
+fn conv_attributes(conv: &NodeProto) -> (Vec<i64>, Vec<i64>, usize, Vec<i64>, String) {
+    let per_axis = |ints: &[i64]| match ints {
+        [] => vec![1, 1],
+        [v] => vec![*v, *v],
+        _ => ints.to_vec(),
+    };
+    let (mut strides, mut dilations) = (vec![1, 1], vec![1, 1]);
+    let (mut groups, mut pads, mut auto_pad) = (1, Vec::new(), String::new());
+    for attr in &conv.attribute {
+        match attr.name.as_str() {
+            "strides" => strides = per_axis(&attr.ints),
+            "dilations" => dilations = per_axis(&attr.ints),
+            "group" => groups = attr.i as usize,
+            "pads" => pads = attr.ints.clone(),
+            "auto_pad" => auto_pad = String::from_utf8_lossy(&attr.s).to_string(),
+            _ => {}
+        }
+    }
+    (strides, dilations, groups, pads, auto_pad)
+}
+
 pub fn get_default_patterns() -> Vec<Pattern> {
     vec![
         Pattern {
@@ -597,38 +622,12 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                     &add.input[0]
                 };
                 let bias_s = sanitize_name(bias_name_raw);
-                let mut stride = 1;
-                let mut dilation = 1;
-                let mut groups = 1;
-                let mut pads_vec: Vec<i64> = vec![];
-                let mut auto_pad = String::new();
-                for attr in &conv.attribute {
-                    match attr.name.as_str() {
-                        "strides" => {
-                            if !attr.ints.is_empty() {
-                                stride = attr.ints[0] as usize;
-                            }
-                        }
-                        "dilations" => {
-                            if !attr.ints.is_empty() {
-                                dilation = attr.ints[0] as usize;
-                            }
-                        }
-                        "group" => groups = attr.i as usize,
-                        "pads" => {
-                            pads_vec = attr.ints.clone();
-                        }
-                        "auto_pad" => {
-                            auto_pad = String::from_utf8_lossy(&attr.s).to_string();
-                        }
-                        _ => {}
-                    }
-                }
+                let (strides, dilations, groups, mut pads_vec, auto_pad) = conv_attributes(conv);
                 if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") && pads_vec.is_empty() {
                     let kh = weight_shape.get(2).copied().unwrap_or(1) as i64;
                     let kw = weight_shape.get(3).copied().unwrap_or(weight_shape.get(2).copied().unwrap_or(1) as usize) as i64;
-                    let pad_total_h = (kh - 1) * dilation as i64;
-                    let pad_total_w = (kw - 1) * dilation as i64;
+                    let pad_total_h = (kh - 1) * dilations[0];
+                    let pad_total_w = (kw - 1) * dilations[1];
                     let (pt, pb) = if auto_pad == "SAME_LOWER" {
                         (pad_total_h - pad_total_h / 2, pad_total_h / 2)
                     } else {
@@ -674,14 +673,14 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                             w,
                             "{}let {} = lele::kernels::conv2d(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
                             tab, output_name, input_expr, weight_expr, bias_expr,
-                            [dilation as i64; 2], groups, padding_arr.as_slice(), [stride as i64; 2], buf_expr
+                            dilations, groups, padding_arr.as_slice(), strides, buf_expr
                         )?;
                     } else {
                         writeln!(
                             w,
                             "{}let {} = lele::kernels::conv1d(&{}, &{}, {}, &{:?}, {}, &{:?}, &{:?}, {});",
                             tab, output_name, input_expr, weight_expr, bias_expr,
-                            [dilation as i64], groups, &padding_arr[..2], [stride as i64], buf_expr
+                            [dilations[0]], groups, &padding_arr[..2], [strides[0]], buf_expr
                         )?;
                     }
                 } else {
@@ -702,14 +701,14 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                             w,
                             "{}let {} = lele::kernels::conv2d(&{}, &{}, None, &{:?}, {}, &{:?}, &{:?}, {});",
                             tab, conv_out_name, input_expr, weight_expr,
-                            [dilation as i64; 2], groups, padding_arr.as_slice(), [stride as i64; 2], conv_buf
+                            dilations, groups, padding_arr.as_slice(), strides, conv_buf
                         )?;
                     } else {
                         writeln!(
                             w,
                             "{}let {} = lele::kernels::conv1d(&{}, &{}, None, &{:?}, {}, &{:?}, &{:?}, {});",
                             tab, conv_out_name, input_expr, weight_expr,
-                            [dilation as i64], groups, &padding_arr[..2], [stride as i64], conv_buf
+                            [dilations[0]], groups, &padding_arr[..2], [strides[0]], conv_buf
                         )?;
                     }
                     writeln!(
@@ -793,39 +792,13 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 } else {
                     "None".to_string()
                 };
-                let mut stride = 1;
-                let mut dilation = 1;
-                let mut groups = 1;
-                let mut pads_vec: Vec<i64> = vec![];
-                let mut auto_pad = String::new();
-                for attr in &conv.attribute {
-                    match attr.name.as_str() {
-                        "strides" => {
-                            if !attr.ints.is_empty() {
-                                stride = attr.ints[0] as usize;
-                            }
-                        }
-                        "dilations" => {
-                            if !attr.ints.is_empty() {
-                                dilation = attr.ints[0] as usize;
-                            }
-                        }
-                        "group" => groups = attr.i as usize,
-                        "pads" => {
-                            pads_vec = attr.ints.clone();
-                        }
-                        "auto_pad" => {
-                            auto_pad = String::from_utf8_lossy(&attr.s).to_string();
-                        }
-                        _ => {}
-                    }
-                }
+                let (strides, dilations, groups, mut pads_vec, auto_pad) = conv_attributes(conv);
                 // Compute SAME padding if auto_pad is set
                 if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") && pads_vec.is_empty() {
                     let kh = weight_shape.get(2).copied().unwrap_or(1) as i64;
                     let kw = weight_shape.get(3).copied().unwrap_or(weight_shape.get(2).copied().unwrap_or(1) as usize) as i64;
-                    let pad_total_h = (kh - 1) * dilation as i64;
-                    let pad_total_w = (kw - 1) * dilation as i64;
+                    let pad_total_h = (kh - 1) * dilations[0];
+                    let pad_total_w = (kw - 1) * dilations[1];
                     let (pt, pb) = if auto_pad == "SAME_LOWER" {
                         (pad_total_h - pad_total_h / 2, pad_total_h / 2)
                     } else {
@@ -864,10 +837,10 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         input_expr,
                         weight_expr,
                         bias,
-                        [dilation as i64; 2],
+                        dilations,
                         groups,
                         padding_arr.as_slice(),
-                        [stride as i64; 2],
+                        strides,
                         buf_expr
                     )?;
                 } else {
@@ -879,8 +852,8 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                         input_expr,
                         weight_expr,
                         bias,
-                        stride,
-                        dilation,
+                        strides[0],
+                        dilations[0],
                         groups,
                         padding_arr[0] as usize,
                         buf_expr

@@ -318,7 +318,7 @@ fn embedding_concat_i64<'c, 'd>(
         let p2o_pd_op_add_8_0 = Add_23.clone();
         let Add_25 = lele::kernels::add(&p2o_pd_op_add_6_0, &p2o_pd_op_add_8_0, &mut ws.buf_2);
         let p2o_pd_op_add_9_0 = Add_25.clone();
-        let Add_27 = lele::kernels::conv2d(&p2o_pd_op_add_9_0, &self.weight_f32(128832, 1728, &[48, 1, 3, 3]), Some(&self.weight_f32(130560, 192, &[1, 48, 1, 1])), &[1, 1], 48, &[1, 1, 1, 1], &[2, 2], &mut ws.buf_4);
+        let Add_27 = lele::kernels::conv2d(&p2o_pd_op_add_9_0, &self.weight_f32(128832, 1728, &[48, 1, 3, 3]), Some(&self.weight_f32(130560, 192, &[1, 48, 1, 1])), &[1, 1], 48, &[1, 1, 1, 1], &[2, 1], &mut ws.buf_4);
         let p2o_pd_op_add_10_0 = Add_27.clone();
         let Add_29 = lele::kernels::conv2d(&p2o_pd_op_add_10_0, &self.weight_f32(130752, 18432, &[96, 48, 1, 1]), Some(&self.weight_f32(149184, 384, &[1, 96, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_3);
         let p2o_pd_op_add_11_0 = Add_29.clone();
@@ -356,7 +356,7 @@ fn embedding_concat_i64<'c, 'd>(
         let p2o_pd_op_add_21_0 = Add_55.clone();
         let Add_57 = lele::kernels::add(&p2o_pd_op_add_19_0, &p2o_pd_op_add_21_0, &mut ws.buf_0);
         let p2o_pd_op_add_22_0 = Add_57.clone();
-        let Add_59 = lele::kernels::conv2d(&p2o_pd_op_add_22_0, &self.weight_f32(510624, 3456, &[96, 1, 3, 3]), Some(&self.weight_f32(514080, 384, &[1, 96, 1, 1])), &[1, 1], 96, &[1, 1, 1, 1], &[2, 2], &mut ws.buf_4);
+        let Add_59 = lele::kernels::conv2d(&p2o_pd_op_add_22_0, &self.weight_f32(510624, 3456, &[96, 1, 3, 3]), Some(&self.weight_f32(514080, 384, &[1, 96, 1, 1])), &[1, 1], 96, &[1, 1, 1, 1], &[2, 1], &mut ws.buf_4);
         let p2o_pd_op_add_23_0 = Add_59.clone();
         let Add_61 = lele::kernels::conv2d(&p2o_pd_op_add_23_0, &self.weight_f32(514464, 73728, &[192, 96, 1, 1]), Some(&self.weight_f32(588192, 768, &[1, 192, 1, 1])), &[1, 1], 1, &[0, 0, 0, 0], &[1, 1], &mut ws.buf_2);
         let p2o_pd_op_add_24_0 = Add_61.clone();

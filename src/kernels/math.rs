@@ -226,9 +226,6 @@ where
     });
     let numel = out_shape.iter().product::<usize>();
     utils::ensure_capacity(output_buf, numel);
-    unsafe {
-        output_buf.set_len(numel);
-    }
     let dims = out_shape.len();
     let o_slice = output_buf.as_mut_slice();
 
@@ -496,9 +493,6 @@ where
     });
     let numel = out_shape.iter().product::<usize>();
     utils::ensure_capacity(output_buf, numel);
-    unsafe {
-        output_buf.set_len(numel);
-    }
     let dims = out_shape.len();
     if a.data.len() == 1 {
         let val_a = a.data[0];
@@ -786,9 +780,6 @@ pub fn hard_sigmoid<'b, 'a>(
 ) -> TensorView<'a> {
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let i_slice = &input.data;
     let o_slice = out.as_mut_slice();
     #[cfg(target_arch = "aarch64")]
@@ -865,9 +856,6 @@ pub fn mod_f32<'b, 'a, T: ElementOps>(
 ) -> TensorView<'a> {
     let len = a.data.len();
     utils::ensure_capacity(out, len);
-    unsafe {
-        out.set_len(len);
-    }
     let b_scalar = b.data.len() == 1;
     let o_slice = out.as_mut_slice();
     let b_slice = &b.data;
@@ -944,9 +932,6 @@ fn equal_i64_impl<'a, T: PartialEq + Copy>(
     });
     let numel = out_shape.iter().product::<usize>();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     if a_data.len() == 1 && b_data.len() == 1 {
         out[0] = if a_data[0] == b_data[0] { 1 } else { 0 };
     } else if a_data.len() == 1 {
@@ -1085,7 +1070,6 @@ pub fn pow<'b, 'a, T: ElementOps>(
         let exp_val = b.data.first().unwrap().as_f32();
         let len = a.data.len();
         utils::ensure_capacity(out, len);
-        unsafe { out.set_len(len); }
         let a_slice = &a.data;
         let o_slice = out.as_mut_slice();
         if exp_val == 3.0 {
@@ -1121,9 +1105,6 @@ pub fn pow<'b, 'a, T: ElementOps>(
         utils::ensure_capacity(out, len);
         let a_slice = &a.data;
         let b_slice = &b.data;
-        unsafe {
-            out.set_len(len);
-        }
         let o_slice = out.as_mut_slice();
         for i in 0..len {
             unsafe {
@@ -1191,7 +1172,6 @@ pub fn reduce_mean<'b, 'a>(
         }
         let scale = 1.0f32 / inner as f32;
         utils::ensure_capacity(out, outer);
-        unsafe { out.set_len(outer) };
         for (o, dst) in out.iter_mut().enumerate() {
             let run = &input.data[o * inner..(o + 1) * inner];
             // Eight independent accumulators: f32 addition is not associative,
@@ -1554,9 +1534,6 @@ pub fn reduce_l2<'b, 'a>(
     {
         let n = input.data.len() / 2;
         utils::ensure_capacity(out, n);
-        unsafe {
-            out.set_len(n);
-        }
         let mut out_shape = Vec::new();
         for i in 0..dims {
             if i != dims - 1 {
@@ -1686,9 +1663,6 @@ pub fn max<'b, 'a>(
 ) -> TensorView<'a> {
     let len = a.data.len().max(b.data.len());
     utils::ensure_capacity(out, len);
-    unsafe {
-        out.set_len(len);
-    }
     let out_slice = out.as_mut_slice();
     if a.shape == b.shape {
         for i in 0..len {
@@ -1757,9 +1731,6 @@ pub fn clip<'b, 'a, T: ElementOps, U: ElementOps, V: ElementOps>(
         .unwrap_or(T::constant_max());
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     for i in 0..numel {
         let val = input.data[i].clamp_val(min_val, max_val);
         out[i] = V::from_f32(val.as_f32());
@@ -1805,9 +1776,6 @@ pub fn range<'a>(
         0
     };
     utils::ensure_capacity(out, n);
-    unsafe {
-        out.set_len(n);
-    }
     let out_slice = out.as_mut_slice();
     for i in 0..n {
         out_slice[i] = start_val + (i as f32) * delta_val;
@@ -1832,9 +1800,6 @@ pub fn range_i64<'a>(
         0
     };
     utils::ensure_capacity(out, n);
-    unsafe {
-        out.set_len(n);
-    }
     let out_slice = out.as_mut_slice();
     for i in 0..n {
         out_slice[i] = start_val + (i as i64) * delta_val;
@@ -1844,9 +1809,6 @@ pub fn range_i64<'a>(
 pub fn sin<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
         out_slice[i] = input.data[i].sin();
@@ -1856,9 +1818,6 @@ pub fn sin<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
 pub fn cos<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
         out_slice[i] = input.data[i].cos();
@@ -1871,9 +1830,6 @@ pub fn exp<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
 pub fn log<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
         out_slice[i] = input.data[i].ln();
@@ -1883,9 +1839,6 @@ pub fn log<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
 pub fn neg<'b, 'a, T: ElementOps>(input: &TensorView<'b, T>, out: &'a mut Vec<T>) -> TensorView<'a, T> {
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
         out_slice[i] = T::from_f32(-input.data[i].as_f32());
@@ -1981,9 +1934,6 @@ where
     };
     let numel = input.data.len();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let o_slice = out.as_mut_slice();
     let i_slice = &input.data;
     let ax_dim = input.shape[ax];
@@ -2042,9 +1992,6 @@ pub fn einsum_bs_d_bsd<'b, 'a>(
     let bs_len = a.data.len();
     let numel = bs_len * d_len;
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let o_slice = out.as_mut_slice();
     let mut idx = 0;
     for i in 0..bs_len {
@@ -2103,9 +2050,6 @@ pub fn expand<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     }
     let numel: usize = out_shape.iter().product();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let input_strides = utils::compute_strides(input_shape);
     let mut virtual_strides = vec![0; ndim_out];
     for i in 0..ndim_out {
@@ -2159,9 +2103,6 @@ pub fn tile<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         .collect();
     let numel = out_shape.iter().product();
     utils::ensure_capacity(out, numel);
-    unsafe {
-        out.set_len(numel);
-    }
     let out_slice = out.as_mut_slice();
     let mut coords = vec![0; ndim];
     for i in 0..numel {

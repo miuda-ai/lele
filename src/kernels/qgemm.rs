@@ -722,20 +722,6 @@ fn quantize_rows_f32_simd<S: Simd>(simd: S, src: &[f32], len: usize, scale: f32,
 fn sgemm(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, c: &mut [f32]) {
     use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul};
     assert!(a.len() >= m * k && b.len() >= k * n && c.len() >= m * n);
-    // Accelerate aborts the process on an empty product (it requires
-    // `lda >= max(1, k)`), so those stay on the portable kernel.
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    if m > 0 && n > 0 && k > 0 {
-        crate::kernels::gemm::accelerate_init();
-        // SAFETY: the slices hold the row-major operands of the sizes given.
-        unsafe {
-            crate::kernels::gemm::accelerate_sgemm(
-                m as i32, n as i32, k as i32, 1.0, a.as_ptr(), k as i32, b.as_ptr(), n as i32, 0.0,
-                c.as_mut_ptr(), n as i32,
-            );
-        }
-        return;
-    }
     // SAFETY: the slices hold the row-major operands of the sizes given.
     unsafe {
         let a = MatRef::<f32>::from_raw_parts(a.as_ptr(), m, k, k as isize, 1);

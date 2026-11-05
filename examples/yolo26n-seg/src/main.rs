@@ -61,7 +61,6 @@ fn main() {
     let mut best_time = f64::MAX;
     let mut times = Vec::new();
     for _ in 0..n_runs {
-        lele::kernels::reset_conv_stats();
         let start_infer = Instant::now();
         let _ = model.forward_with_workspace(&mut ws, input.clone());
         let elapsed = start_infer.elapsed().as_secs_f64() * 1000.0;
@@ -70,8 +69,6 @@ fn main() {
         }
         times.push(elapsed);
     }
-    // Print stats from last run
-    lele::kernels::print_conv_stats();
     // Final run for output
     let (logits, mask_features) = model.forward_with_workspace(&mut ws, input.clone());
     let logits: TensorView<'static, f32> = logits.to_owned();
